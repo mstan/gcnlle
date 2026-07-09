@@ -23,5 +23,6 @@ build_dir() {  # <src-subdir>
 
 build_dir recompiler
 build_dir runtime
+build_dir tools/ipl_descramble
 
 echo "=== done ==="
