@@ -1,0 +1,38 @@
+# Build outputs
+build/
+build-*/
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.pdb
+
+# Generated recompiler output (regenerated from the IPL)
+generated/
+
+# Copyrighted console firmware — NEVER commit. You supply your own dump.
+bios/*.bin
+bios/*.img
+bios/*.IPL
+bios/ipl*.*
+!bios/README.md
+
+# Copyrighted disc images
+*.iso
+*.gcm
+*.rvz
+*.ciso
+*.wbfs
+
+# Oracle emulator binaries / cores (fetched, not vendored)
+oracle/dolphin/
+oracle/*.dll
+
+# Scratch / logs / captures
+_*/
+*.log
+*.png
+*.bmp
+*.json.tmp
+!docs/**/*.png
