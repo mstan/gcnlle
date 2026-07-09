@@ -192,26 +192,75 @@ SI — all GPL-3.0), use **reshine** as the runtime-architecture reference
 (especially its GX-FIFO→GL path and its `docs/`), and consult **gcrecomp**'s
 `gc_hw.h` for the register map.
 
+**The runtime must satisfy the IPL's *embedded* SDK.** The IPL/BS2 is not
+hand-written bare-metal glue — it is a DOL-like C program **linked against
+early Nintendo SDK code**, and a large fraction of the payload is ordinary SDK
+library routines (`OSInit`, `DVDInit`, `CARDInit`, `VIInit`, `PADInit`, …).
+This is *good* for the LLE stance: those routines are **guest code we
+recompile and run**, not host APIs we HLE. But it sets the bar for "minimal
+runtime" — the device models must satisfy what those embedded SDK routines
+expect from VI/GX/EXI/DSP/AI/ARAM, not merely what obviously-hand-written IPL
+logic touches. (External design review, 2026-07-09.)
+
+**Two operating disciplines carried out of that review:**
+- **Observe before implementing GX.** Do not pre-guess the GX subset. Stand up
+  a **GX FIFO recorder** (an always-on ring of parsed CP/BP/XF packets, in the
+  ring-buffer spirit of our PRINCIPLES) and implement only the commands the IPL
+  actually emits. No "2D blitter" shortcut — the menu is a real 3D glass-cube
+  scene (transforms, textures, alpha, EFB→XFB copy).
+- **DSP as a silence shim first.** Start audio as a DSP/AI/ARAM shim that
+  accepts commands and advances mailboxes/interrupts but outputs silence; only
+  promote DSP to first-class if the menu actually blocks on DSP-side
+  completion (decided empirically from the trace, not guessed).
+
 ---
 
 ## 6. Milestones
 
-**M0 — IPL ingest & descramble.** Point the recompiler's slice-walker at
-`bios/ipl.bin`. Handle BS1 descrambling: either **recompile BS1** so it
-descrambles BS2 in-CPU (most faithful LLE), or **descramble offline** and
-recompile the plaintext body (pragmatic, still LLE at the menu level).
-*Deliverable:* recompiler emits C for the IPL boot region; the decode
-cross-checks against `dtk` disassembly of the same (descrambled) bytes.
+> **Design-review revision (2026-07-09).** The original plan made
+> "IPL ingest + descramble" M0. The review reordered this: **defer BS1 and the
+> in-CPU descrambler to M1**, and make M0 a *declarative seed contract* that
+> boots offline-descrambled BS2 from the real IPL start. This gets the menu
+> proving the runtime without BS1/descramble edge cases eating the first month
+> — and it sidesteps a DolRecomp limitation for free: DolRecomp does not handle
+> self-modifying code, and the bootrom's cache/DMA **descramble is exactly
+> that**, so deferring BS1 defers the SMC problem too.
 
-**M1 — CPU core boots under the runtime.** Wire `runtime/` (MEM1, cpu_glue,
-dispatch) to the recompiled entry and stand up the Dolphin trace oracle.
-*Deliverable:* recompiled IPL executes early boot; **lockstep vs Dolphin** on
-PC + registers + low-memory write order (order+state+caller diffing, never
-frame alignment).
+**M0 — Declarative seed contract → BS2 boots to first divergence.** Construct a
+seed with a *provenance for every byte* — no lifting a Dolphin RAM snapshot as
+input (that would make the oracle a data source, not a checker). Specifically:
+- plaintext BS2/IPL, obtained by an **offline descramble of the real IPL ROM**,
+  loaded at its real target address;
+- **entry at the true IPL start routine** (which runs
+  `BS2Init → OSInit → DVDInit → CARDInit → CheckSram → VIInit → PADInit →
+  BS2Main`) — *not* at an already-initialized inner menu function. `BS2Init`
+  clears low memory and sets physical-memory-size / console-type itself, so
+  almost nothing in MEM1 needs seeding;
+- MEM1 = deterministic reset pattern except the loaded payload;
+- BAT/MMU/MSR/HID CPU latches reconstructed from **BS1 disassembly + docs**
+  (the only genuinely Dolphin-adjacent unknowns; Dolphin *verifies* them, never
+  provides them — any latch we can't derive is a **flagged debt**, not a silent
+  snapshot);
+- EXI ROM / SRAM / RTC backed by **explicit fixtures** (valid SRAM checksum,
+  fixed RTC epoch), no disc or a fixed dummy disc.
 
-**M2 — VI + GX → rolling-cube logo.** Model VI scanout (XFB → host window) and
-enough of the Flipper GX FIFO to render the boot animation (harvest reshine's
-GX-FIFO→GL path). *Deliverable:* a **screenshot of the GameCube logo**.
+*Oracle:* the Dolphin trace verifies the first low-mem writes, MMIO writes, EXI
+traffic, interrupt order, and GX FIFO stream. *Deliverable:* recompiled BS2
+executes from the seed and **locksteps vs Dolphin** (order + state + caller) up
+to a documented first divergence.
+
+**M1 — Real BS1 + in-CPU descrambler.** Recompile/run BS1 (starts at
+`0xFFF00100`, prepares hardware, descrambles/copies BS2 via EXI ROM reads) so
+the boot is faithful end-to-end. This is where the **self-modifying-code /
+cache/DMA descramble** work lives — tackled only *after* the menu is alive, so
+it can't block early progress. *Deliverable:* boot from real scrambled ROM with
+no offline pre-descramble, matching Dolphin from reset.
+
+**M2 — VI + GX FIFO recorder → rolling-cube logo.** Model VI scanout (XFB →
+host window). Build the **GX FIFO recorder first**, inventory the exact CP/BP/XF
+packets + primitives + texture formats the IPL emits, then implement only that
+subset (harvest reshine's GX-FIFO→GL path). *Deliverable:* a **screenshot of
+the GameCube logo**.
 
 **M3 — EXI: RTC + SRAM → date/time & settings.** Model the EXI RTC and SRAM.
 *Deliverable:* the menu shows and **sets date & time** and sound/screen/
@@ -230,42 +279,65 @@ screen. No game loading. *Deliverable:* menu → disc-screen transition.
 
 ## 7. Open technical questions / risks
 
-These are the genuinely uncertain parts — good candidates for external
-discussion:
+**Resolved by the 2026-07-09 design review:**
 
-1. **Descramble strategy (M0).** Recompile BS1 (fully faithful, but BS1 is
-   tiny, tricky, and does hash verification we'd need to satisfy) vs.
-   descramble the image offline and recompile the plaintext (simpler, and the
-   menu is still real LLE, but BS1's own behavior isn't reproduced). Which is
-   the right altitude for "LLE-first" here?
-2. **GX fixed-function complexity (M2).** The boot animation uses the TEV
-   fixed-function pipeline via the GX FIFO. How much of GX must be modeled to
-   render *just the logo + menu* (vs. a full game)? reshine's immediate-mode
-   OpenGL mapping is the reference — is that enough, or do we need EFB→XFB
-   copies modeled faithfully?
-3. **Oracle mechanics with Dolphin (M1).** Best way to get a per-step
-   PC/register/mem trace out of Dolphin headlessly: its scripting/debugger
-   interface, a movie/`--batch` run, a libretro core, or a small trace-tap
-   patch to a local build? We need the same JSONL shape both sides emit.
-4. **Timing model.** How much cycle/timing fidelity does the IPL menu require?
-   The menu is largely event-driven (VI retrace interrupts, input polling), so
-   possibly little — but the boot animation and audio may be timing-sensitive.
-5. **Audio (M2/M3).** What exactly produces the startup chime and menu sounds
-   — DSP microcode from the IPL running on ARAM data, or simpler AI streaming?
-   How much DSP LLE is needed just for the menu?
-6. **EXI RTC/SRAM specifics (M3).** Exact RTC command protocol and SRAM layout
-   (settings fields, checksum, RTC bias). GXRuntime models this already —
-   verify its fidelity against Dolphin.
-7. **Region/revision coverage.** Do we target one IPL revision first (which?),
-   and how much does the menu differ across NTSC-U / NTSC-J / PAL?
+- ~~Descramble altitude.~~ **Settled:** offline-descramble for M0, real in-CPU
+  BS1 descramble deferred to M1 (§6). Keeps the LLE line without letting the
+  bootrom eat the project first.
+- ~~Dolphin trace mechanics.~~ **Settled:** a small **trace-tap patch to a
+  local Dolphin build** (force CPU interpreter + deterministic RTC/SRAM/memcard;
+  emit a tiered trace: event ledger → full-register divergence window →
+  memory-watch expansion). Not the GUI debugger, movie/`--batch`, or a libretro
+  core — those are either not automatable or below the instruction/MMIO
+  granularity we need. A ~30-line local `--boot-gc-ipl` flag beats abusing the
+  game/disc-oriented stock CLI.
+
+**Standing discipline (from the review, matches PRINCIPLES.md):** the oracle
+must stay *independent of the code under test*. Use Dolphin traces for **event
+order + state targets only**; take *implementation* from YAGCD/hardware docs and
+our own observations. Never transplant Dolphin implementation code into the
+runtime (it also protects the GPL boundary — keep the trace-tap patch local).
+
+**Still genuinely open — to be answered *empirically from the trace*, not by
+speculation:**
+
+1. **PE completion waits (M2).** Does the menu **busy-wait on PE draw-done /
+   finish tokens**, or fire-and-forget the FIFO? Decides whether M2 needs real
+   PE completion *timing* or can ack instantly. → Shows up as a spin on a GX/PE
+   MMIO read in the trace.
+2. **Memory-card UI prerequisites (M4).** Is card presence/format/dir/BAM
+   enough to *navigate* the card manager, or does that UI first gate on the RTC
+   and on **IPL-ROM font data being decoded correctly** (i.e. is font/EXI-ROM
+   fidelity a prerequisite to even reaching a legible card screen)? → Shows up
+   as ordering in the EXI / low-mem stream.
+3. **Timing model.** How much cycle/timing fidelity does the menu require? Menu
+   is largely event-driven (VI retrace, input polling) so possibly little — but
+   the boot animation and audio may be timing-sensitive.
+4. **Audio / DSP scope (M2/M3).** What produces the startup chime and menu
+   sounds — IPL DSP ucode on ARAM (the `gc-ipl` repo carrying a *Jaudio*
+   decompile dir is a warning sign it isn't a single AI-DMA beep) or simpler AI
+   streaming? Silence-shim first; promote only if the menu blocks on it.
+5. **EXI RTC/SRAM specifics (M3).** Exact RTC command protocol and SRAM layout
+   (settings fields, checksum, RTC bias). GXRuntime models this — verify its
+   fidelity against Dolphin.
+6. **Region/revision coverage.** Which IPL revision first, and how much does the
+   menu differ across NTSC-U / NTSC-J / PAL?
 
 ---
 
 ## 8. Current status (as of this writing)
 
-- Repo scaffolded and committed (`git`, GPL-3.0).
+- Repo scaffolded and committed (`git`, GPL-3.0), private at
+  `github.com/mstan/gcnrecompiled`.
 - `recompiler/` = DolRecomp fork, **builds green, 10/10 tests pass**.
 - `runtime/` = LLE skeleton, compiles a placeholder (no IPL yet).
 - `bios/`, `oracle/`, `tools/`, `docs/` structured with READMEs/plans.
 - `./build.sh` builds the tree (handles the mingw64 PATH quirk).
-- **Nothing boots the IPL yet.** M0 is the next work.
+- Plan pressure-tested in an **external design review (2026-07-09)**; M0/M1
+  reordered to the declarative-seed-contract form above (§6), GX-recorder and
+  DSP-silence-shim disciplines adopted (§5), descramble + trace mechanics
+  settled (§7).
+- **Nothing boots the IPL yet.** M0 (seed contract + Dolphin trace-tap) is the
+  next work; it is gated on a user-supplied `bios/ipl.bin` for the actual
+  recompile, but the trace-tap, offline descrambler, and seed-contract format
+  can be built ahead of that.

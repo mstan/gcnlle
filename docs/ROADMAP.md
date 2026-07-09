@@ -21,22 +21,32 @@ phase), never instead of it.
 
 ## Milestones
 
-**M0 — IPL ingest & descramble.** Point the recompiler's slice-walker at
-`bios/ipl.bin`. Handle the BS1 descrambler: either recompile BS1 so it
-descrambles BS2 in-CPU (most faithful), or descramble offline and recompile
-the plaintext body. Deliverable: recompiler emits C for the IPL entry region;
-disassembly cross-checks against `dtk`.
+*(Reordered per the 2026-07-09 design review — see DESIGN.md §6 for the full
+rationale. BS1/descramble deferred to M1; M0 is now a declarative seed
+contract. This also defers DolRecomp's self-modifying-code gap, since the
+bootrom descramble IS the SMC.)*
 
-**M1 — CPU core boots under the runtime.** Wire `runtime/` (MEM1, cpu_glue,
-dispatch) to the recompiled entry. Bring up `oracle/` Dolphin trace frontend.
-Deliverable: recompiled IPL executes early boot; **lockstep vs Dolphin** on
-PC + register + low-mem-write order (order+state+caller diffing, not frame
-alignment).
+**M0 — Declarative seed contract → BS2 boots to first divergence.** Boot
+offline-descrambled BS2 (from the real ROM) at the **true IPL start routine**
+(lets `BS2Init`/`OSInit`/… initialize low-mem itself). Every seed byte has a
+provenance — ROM / BS1-disasm / fixture — and **no Dolphin RAM snapshot is
+lifted as input** (oracle stays a checker, not a data source). Wire
+`runtime/` (MEM1, cpu_glue, dispatch) and the Dolphin trace-tap. Deliverable:
+recompiled BS2 **locksteps vs Dolphin** on PC + register + low-mem/MMIO/EXI/GX
+write order (order+state+caller, not frame alignment) to a documented first
+divergence.
 
-**M2 — VI + GX → rolling-cube logo.** Model Video Interface scanout (XFB →
-host window) and enough of the Flipper GX FIFO to render the boot animation.
-Harvest reshine's GX-FIFO→GL path as reference. Deliverable: **screenshot of
-the GameCube logo** (screenshot-before-asserting, per PRINCIPLES).
+**M1 — Real BS1 + in-CPU descrambler.** Recompile/run BS1 (`0xFFF00100`) so it
+descrambles/copies BS2 via EXI ROM reads — the faithful end-to-end boot. This
+is where the self-modifying cache/DMA descramble work lives; done after the
+menu is alive so it can't block early progress. Deliverable: boot from the real
+scrambled ROM with no offline pre-descramble, matching Dolphin from reset.
+
+**M2 — VI + GX FIFO recorder → rolling-cube logo.** Model VI scanout (XFB →
+host window). Build a **GX FIFO recorder first**, inventory the exact CP/BP/XF
+packets the IPL emits, then implement only that subset (harvest reshine's
+GX-FIFO→GL path). Deliverable: **screenshot of the GameCube logo**
+(screenshot-before-asserting, per PRINCIPLES).
 
 **M3 — EXI: RTC + SRAM → date/time & settings.** Model the EXI RTC (real-time
 clock) and SRAM (persisted settings). Deliverable: the menu shows/sets **date
@@ -53,10 +63,15 @@ disc screen transition.
 ## Independent-oracle discipline
 
 Dolphin is a separately-authored emulator, so it can arbitrate shared-layer
-(bus/timing/EXI) bugs our own code can't self-check. Build a headless trace
-frontend mirroring psxrecomp's `beetle_libretro` pattern: same JSONL RAM/PC
-trace shape both sides emit, diffed by value+order. Reproduce by driving the
-menu, not by aligning savestates.
+(bus/timing/EXI) bugs our own code can't self-check. Unlike our libretro-core
+oracle pattern (snesref/beetle), Dolphin gets a **small trace-tap patch to a
+local build** — instruction/MMIO-granular traces are below what a libretro core
+exposes, and Dolphin's core is unmaintained. Force the CPU interpreter +
+deterministic RTC/SRAM/memcard; emit the same trace shape both sides produce,
+diffed by value+order. Use Dolphin only for **event order + state targets**;
+take *implementation* from YAGCD/hardware docs (keep the oracle independent, and
+keep the GPL patch local). Reproduce by driving the menu, not by aligning
+savestates.
 
 ## Asset used from each investigated repo
 
