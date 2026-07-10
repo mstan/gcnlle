@@ -268,6 +268,21 @@ a global monotonic `seq` counter incremented per emitted record so `diff.py`
 orders correctly. Buffer writes; flush on exit / SIGINT so a killed headless run
 still yields a usable prefix.
 
+## Trace-window control (GcnTrace.h)
+
+`NoteRetired(insn)` arms the tap's stop flag on two conditions, both env-tunable
+so the same build can capture different boot windows:
+
+- `GCN_TRACE_MAX_INSNS` — stop after N retired instructions (0 = unlimited).
+- `GCN_TRACE_MAX_SC` — stop after the Nth `sc` (primary opcode 17). **Default 1**
+  reproduces the original "first-syscall boundary" trace. Set to **0** to run
+  through every `sc` (the BS2 exception handlers execute in Dolphin), bounded
+  only by `GCN_TRACE_MAX_INSNS` — this is how we extend the oracle past the
+  stage-2 syscall wall (`oracle/dolphin_trace_ext.bat`) once the runtime can
+  execute the low-memory handlers itself.
+- `GCN_TRACE_NO_RETIRED` — MMIO/EXI records only (skip per-instruction RETIRED),
+  keeping the extended trace compact for the value+order diff.
+
 ---
 
 ## Verification status (per PRINCIPLES "Tool Skepticism")

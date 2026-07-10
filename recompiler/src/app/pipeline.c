@@ -397,6 +397,40 @@ int emit_ipl_split(const IPLFile* ipl, const char* output_path,
                                     ipl->entry_point, jobs, local_chunks_dir);
 }
 
+int emit_ipl_multi_split(const IPLFile* images, u32 image_count,
+                         const char* output_path, DolRecompCPU cpu, u32 jobs,
+                         int local_chunks_dir) {
+    if (image_count == 0)
+        return 0;
+
+    // Each flat image is one code section spanning its whole blob, at its own
+    // base. The generic emitter builds a single unified dispatch table keyed on
+    // absolute address, so disjoint bases (low-memory handlers at 0x8000xxxx +
+    // stage-1/2 at 0x8120xxxx) compose without any special casing.
+    LoadedCodeSection* sections =
+        (LoadedCodeSection*)calloc(image_count, sizeof(LoadedCodeSection));
+    if (!sections) {
+        fprintf(stderr, "error: out of memory\n");
+        return 0;
+    }
+    for (u32 i = 0; i < image_count; i++) {
+        sections[i].label = "ipl";
+        sections[i].name = NULL;
+        sections[i].data = images[i].file_data;
+        sections[i].index = i;
+        sections[i].file_offset = 0;
+        sections[i].address = images[i].base_address;
+        sections[i].size = images[i].code_size;
+        sections[i].embedded_data_mode = EMBEDDED_DATA_DOL;
+    }
+
+    int ok = emit_code_sections_split(sections, image_count, output_path, cpu,
+                                      images[0].entry_point, jobs,
+                                      local_chunks_dir);
+    free(sections);
+    return ok;
+}
+
 typedef struct {
     RELFile rel;
 } RELBatchItem;

@@ -353,6 +353,12 @@ void ppc_rfi(CPUState* cpu, u32 cia) {
     cpu->msr = (cpu->msr & ~PPC_MSR_RFI_MASK) | (cpu->srr1 & PPC_MSR_RFI_MASK);
     cpu->msr &= ~PPC_MSR_POW;
     cpu->pc = cpu->srr0 & ~3u;
+    /* Returning from the handler clears the pending-exception state so the
+     * dispatch loop resumes normal execution at srr0. Without this the loop's
+     * exception gate (or any consumer) would treat the handled exception as
+     * still live. */
+    cpu->exception = 0;
+    cpu->program_exception = 0;
 }
 
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {

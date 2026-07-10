@@ -31,14 +31,22 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 echo "[1/4] descramble IPL (full image + BS2 payload)"
 "$DESC" "$IPL" -o "$TMP/descr.bin" --bs2 "$TMP/bs2.bin"
 
-echo "[2/4] run stage-1 to DMA stage-2, dump post-DMA MEM1 code image"
+echo "[2/4] run stage-1 to DMA stage-2, dump post-DMA image + low-mem handlers"
+# Two regions: the DMA-loaded stage-2 (0x81200000) AND the BS2 exception handlers
+# BS2 installs in low memory (0x80000000..0x80003000) before the first `sc`. The
+# runtime stops at that `sc`, at which point both are present in MEM1.
 GCN_IPL_ROM="$(to_win "$TMP/descr.bin")" \
-GCN_MEM_DUMP="0x81200000:0x270000:$(to_win "$TMP/postdma.bin")" \
+GCN_MEM_DUMP="0x81200000:0x270000:$(to_win "$TMP/postdma.bin");0x80000000:0x3000:$(to_win "$TMP/lowmem.bin")" \
   "$BOOT" "$TMP/bs2.bin" 5000000 >/dev/null 2>&1 || true   # stops at first sc; that's fine
 [ -f "$TMP/postdma.bin" ] || { echo "error: no post-DMA dump produced"; exit 1; }
+[ -f "$TMP/lowmem.bin" ]  || { echo "error: no low-mem dump produced"; exit 1; }
 
-echo "[3/4] recompile the post-DMA image (both stages, base 0x81200000)"
-"$DOL" --gamecube-ipl "$TMP/postdma.bin" "$TMP/out" --base 0x81200000 --entry 0x81200150 -j8 >/dev/null
+echo "[3/4] recompile the post-DMA image + low-mem handlers into one table"
+# Primary image = stage-1/2 (base 0x81200000). Extra segment = low-memory
+# exception handlers at 0x80000000; the 0xC00 syscall vector routes there via
+# the dispatch's physical-PC alias (0xC00 -> 0x80000C00).
+"$DOL" --gamecube-ipl "$TMP/postdma.bin" "$TMP/out" --base 0x81200000 --entry 0x81200150 \
+  --segment "0x80000000:$TMP/lowmem.bin" -j8 >/dev/null
 
 echo "[4/4] install into runtime/generated/"
 GEN="$(dirname "$(find "$TMP/out" -name generated.h | head -1)")"

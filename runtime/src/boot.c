@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -148,23 +149,29 @@ int main(int argc, char** argv) {
         "  dsisr       : 0x%08X\n",
         reason, cpu.pc, cpu.exception, cpu.lr, cpu.srr0, cpu.dar, cpu.dsisr);
 
-    /* Modify-before-recomp: dump a MEM1 region (the post-DMA code image) so the
-     * DMA-loaded stage-2 can be recompiled from what actually lands in RAM.
-     * GCN_MEM_DUMP="<hexaddr>:<hexlen>:<path>" (guest addr, e.g. 0x81200000). */
+    /* Modify-before-recomp: dump MEM1 regions (the post-DMA code image + the
+     * BS2 low-memory exception handlers) so DMA-loaded / runtime-written code can
+     * be recompiled from what actually lands in RAM. GCN_MEM_DUMP is one or more
+     * ';'-separated "<hexaddr>:<hexlen>:<path>" specs (guest addr, e.g.
+     * 0x81200000 for stage-2, 0x80000000 for the low-memory handlers). */
     const char* dump_spec = getenv("GCN_MEM_DUMP");
     if (dump_spec) {
-        unsigned daddr = 0, dlen = 0; char dpath[512] = {0};
-        if (sscanf(dump_spec, "%x:%x:%511[^\n]", &daddr, &dlen, dpath) == 3 &&
-            daddr >= GC_RAM_BASE &&
-            (unsigned long long)daddr + dlen <= (unsigned long long)GC_RAM_BASE + cpu.ram_size) {
-            FILE* df = fopen(dpath, "wb");
-            if (df) {
-                fwrite(cpu.ram + (daddr - GC_RAM_BASE), 1, dlen, df);
-                fclose(df);
-                fprintf(stdout, "gcn boot: dumped MEM1[0x%08X..0x%08X] -> %s\n",
-                        daddr, daddr + dlen, dpath);
-            } else fprintf(stderr, "gcn boot: cannot open dump path %s\n", dpath);
-        } else fprintf(stderr, "gcn boot: bad/out-of-range GCN_MEM_DUMP\n");
+        char specs[2048];
+        snprintf(specs, sizeof(specs), "%s", dump_spec);
+        for (char* s = strtok(specs, ";"); s; s = strtok(NULL, ";")) {
+            unsigned daddr = 0, dlen = 0; char dpath[512] = {0};
+            if (sscanf(s, "%x:%x:%511[^\n]", &daddr, &dlen, dpath) == 3 &&
+                daddr >= GC_RAM_BASE &&
+                (unsigned long long)daddr + dlen <= (unsigned long long)GC_RAM_BASE + cpu.ram_size) {
+                FILE* df = fopen(dpath, "wb");
+                if (df) {
+                    fwrite(cpu.ram + (daddr - GC_RAM_BASE), 1, dlen, df);
+                    fclose(df);
+                    fprintf(stdout, "gcn boot: dumped MEM1[0x%08X..0x%08X] -> %s\n",
+                            daddr, daddr + dlen, dpath);
+                } else fprintf(stderr, "gcn boot: cannot open dump path %s\n", dpath);
+            } else fprintf(stderr, "gcn boot: bad/out-of-range GCN_MEM_DUMP spec '%s'\n", s);
+        }
     }
 
     gcn_dsp_free(&dsp);

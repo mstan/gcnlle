@@ -22,8 +22,21 @@
 int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     u32 blocks = 0;
     while (max_blocks == 0u || blocks < max_blocks) {
-        if (!dolrecomp_call(ctx, ctx->pc)) return 0;  /* off-image PC / no func */
-        if (ctx->exception) return 0;
+        /* A block that raises an exception returns with ctx->pc set to the vector
+         * (e.g. 0xC00 for `sc`) and ctx->exception still set — the generated
+         * per-instruction guards use that flag to abort the FAULTING block. But
+         * the exception has now been delivered: ctx->pc IS the handler. Clear the
+         * flag before running the handler block, or its own first guard
+         * (`if (ctx->exception) return;`) misfires and it loops on the vector
+         * without ever executing. If the vector has no recompiled handler,
+         * dolrecomp_call returns 0; restore the flag so the stop diagnostic still
+         * reports the exception. The handler ends in `rfi` (pc=srr0). */
+        u32 pending = ctx->exception;
+        ctx->exception = 0;
+        if (!dolrecomp_call(ctx, ctx->pc)) {   /* off-image PC / no handler */
+            ctx->exception = pending;
+            return 0;
+        }
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
         blocks++;
     }

@@ -5,6 +5,11 @@
 #include "common/types.h"
 #include "backend/emitter.h"
 
+/* Extra flat segments recompiled alongside the primary IPL image into one
+ * unified dispatch table (e.g. the BS2 exception handlers in low memory, which
+ * live at a base disjoint from the stage-1/2 image). */
+#define DOLRECOMP_MAX_SEGMENTS 8
+
 typedef struct {
     const char* input_path;
     const char* title_id_arg;
@@ -14,6 +19,9 @@ typedef struct {
     u32 rel_base;
     u32 ipl_base;
     u32 ipl_entry;
+    u32 seg_base[DOLRECOMP_MAX_SEGMENTS];
+    const char* seg_path[DOLRECOMP_MAX_SEGMENTS];
+    u32 seg_count;
     int gamecube_mode;
     int cpu_explicit;
     int rel_base_set;

@@ -128,6 +128,16 @@ u8* gcn_mem_resolve(CPUState* cpu, u32 addr, u32* avail) {
         *avail = cpu->ram_size - offset;
         return cpu->ram + offset;
     }
+    /* Physical (real-mode) mirror: with MSR[IR]/[DR] cleared — as on any exception
+     * entry — effective addresses ARE physical, and physical 0x00000000 is MEM1.
+     * The BS2 exception handlers (installed in low memory, entered via the 0xC00
+     * syscall vector) run in this mode and access physical low memory directly.
+     * Physical MMIO (0x0C00xxxx) is NOT mapped here — no modeled handler touches
+     * it yet; if one does it will diverge loudly (the signal to route it). */
+    if (addr < cpu->ram_size) {
+        *avail = cpu->ram_size - addr;
+        return cpu->ram + addr;
+    }
     if (cpu->mem2 && cpu->mem2_size) {
         if (addr >= WII_MEM2_BASE && addr < WII_MEM2_BASE + cpu->mem2_size) {
             u32 offset = addr - WII_MEM2_BASE;

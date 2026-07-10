@@ -91,12 +91,30 @@ int main(int argc, char** argv) {
     }
 
     if (opts.ipl_mode) {
-        IPLFile ipl;
-        if (!ipl_load(&ipl, input_path, opts.ipl_base, opts.ipl_entry))
-            return 1;
+        IPLFile images[1 + DOLRECOMP_MAX_SEGMENTS];
+        u32 image_count = 0;
 
-        ipl_print_info(&ipl, "GameCube IPL/BS2");
+        if (!ipl_load(&images[0], input_path, opts.ipl_base, opts.ipl_entry))
+            return 1;
+        image_count = 1;
+
+        // Extra flat segments (e.g. the BS2 exception handlers dumped from low
+        // memory) recompiled into the same dispatch table. Each is loaded at its
+        // own base with entry == base (offset 0 is always inside the blob).
+        for (u32 s = 0; s < opts.seg_count; s++) {
+            if (!ipl_load(&images[image_count], opts.seg_path[s],
+                          opts.seg_base[s], opts.seg_base[s])) {
+                for (u32 k = 0; k < image_count; k++) ipl_free(&images[k]);
+                return 1;
+            }
+            image_count++;
+        }
+
+        ipl_print_info(&images[0], "GameCube IPL/BS2");
         printf("cpu: %s\n", cpu_display_name(effective_cpu));
+        for (u32 s = 1; s < image_count; s++)
+            printf("extra segment: %u bytes at 0x%08X (from %s)\n",
+                   images[s].code_size, images[s].base_address, opts.seg_path[s - 1]);
 
         if (!output_arg) {
             printf("\ngenerating code...\n");
@@ -108,7 +126,7 @@ int main(int argc, char** argv) {
         } else {
             if (!build_gamecube_output_path(output_arg, named_output_path,
                                             sizeof(named_output_path))) {
-                ipl_free(&ipl);
+                for (u32 k = 0; k < image_count; k++) ipl_free(&images[k]);
                 return 1;
             }
             output_path = named_output_path;
@@ -116,14 +134,14 @@ int main(int argc, char** argv) {
         }
 
         printf("\nwriting output to: %s\n", output_path);
-        if (!emit_ipl_split(&ipl, output_path, effective_cpu, opts.jobs,
-                            local_chunks_dir)) {
-            ipl_free(&ipl);
-            return 1;
-        }
+        int ok = (image_count > 1)
+            ? emit_ipl_multi_split(images, image_count, output_path,
+                                   effective_cpu, opts.jobs, local_chunks_dir)
+            : emit_ipl_split(&images[0], output_path, effective_cpu, opts.jobs,
+                             local_chunks_dir);
 
-        ipl_free(&ipl);
-        return 0;
+        for (u32 k = 0; k < image_count; k++) ipl_free(&images[k]);
+        return ok ? 0 : 1;
     }
 
     if (espresso_rpx_mode) {

@@ -20,6 +20,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  --gamecube-ipl                 Recompile a flat descrambled BS2/IPL blob\n");
     fprintf(stderr, "  --base <addr>                  IPL load base (default 0x81300000)\n");
     fprintf(stderr, "  --entry <addr>                 IPL entry PC (default = base)\n");
+    fprintf(stderr, "  --segment <base>:<file>        Extra flat segment recompiled into the same table (repeatable)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
     fprintf(stderr, "  --setup                        Download titles database and optionally install wit\n");
     fprintf(stderr, "\n");
@@ -194,6 +195,42 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
             if (!parse_u32_arg(arg + 8, "--entry", &opts->ipl_entry))
                 return 0;
             opts->ipl_entry_set = 1;
+            continue;
+        }
+
+        /* --segment <base>:<path>  — an extra flat code segment loaded at <base>
+         * and recompiled into the same dispatch table as the primary IPL image.
+         * Split on the FIRST ':' so Windows drive paths (F:/...) survive. */
+        if (strcmp(arg, "--segment") == 0 || strncmp(arg, "--segment=", 10) == 0) {
+            const char* spec = (arg[9] == '=') ? arg + 10
+                             : (i + 1 < argc ? argv[++i] : NULL);
+            if (!spec) {
+                fprintf(stderr, "error: --segment needs <base>:<path>\n");
+                return 0;
+            }
+            const char* colon = strchr(spec, ':');
+            if (!colon || colon == spec) {
+                fprintf(stderr, "error: --segment expects <base>:<path>\n");
+                return 0;
+            }
+            if (opts->seg_count >= DOLRECOMP_MAX_SEGMENTS) {
+                fprintf(stderr, "error: too many --segment (max %d)\n",
+                        DOLRECOMP_MAX_SEGMENTS);
+                return 0;
+            }
+            char base_str[32];
+            size_t blen = (size_t)(colon - spec);
+            if (blen >= sizeof(base_str)) {
+                fprintf(stderr, "error: --segment base too long\n");
+                return 0;
+            }
+            memcpy(base_str, spec, blen);
+            base_str[blen] = '\0';
+            if (!parse_u32_arg(base_str, "--segment base",
+                               &opts->seg_base[opts->seg_count]))
+                return 0;
+            opts->seg_path[opts->seg_count] = colon + 1;
+            opts->seg_count++;
             continue;
         }
 
