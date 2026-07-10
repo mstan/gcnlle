@@ -4,8 +4,14 @@
  * source the register/poll/transfer semantics are transcribed from.
  */
 #include "si/si.h"
+#include "debug/rings.h"
 
 #include <string.h>
+
+void gcn_si_set_irq(GcnSi* si, GcnSiIrqFn fn, void* user) {
+    si->irq = fn;
+    si->irq_user = user;
+}
 
 void gcn_si_init(GcnSi* si) {
     memset(si, 0, sizeof *si);
@@ -22,6 +28,29 @@ static u32 si_any_rdst(const GcnSi* si) {
     for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
         if (si->ch[n].rdst) return 1;
     return 0;
+}
+
+/* ---- interrupt line (SI.cpp UpdateInterrupts:98-116) ----
+ * Dolphin derives RDSTINT = OR of the live per-channel RDST bits, then raises
+ * the line on (RDSTINT & RDSTINTMSK) || (TCINT & TCINTMSK). We mirror the
+ * derivation here from the same live RDST bits gcn_si_read exposes (never a
+ * stored RDSTINT), so the line matches what a SICOMCSR read would return. The
+ * continuous-VI-poll re-arm of RDST stays a SICOMCSR-read side effect (see the
+ * header's timing-free model); this evaluation reads the current bits, so an
+ * input-buffer read that clears RDST correctly drops the line until the next
+ * SICOMCSR read re-arms it. Pushed to PI on EVERY evaluation (PI INTSR is W1C). */
+static void si_update_interrupts(GcnSi* si) {
+    int rdstint = si_any_rdst(si);
+    int level = (rdstint && (si->comcsr & GCN_SI_CSR_RDSTINTMSK)) ||
+                ((si->comcsr & GCN_SI_CSR_TCINT) && (si->comcsr & GCN_SI_CSR_TCINTMSK));
+    if (si->irq)
+        si->irq(si->irq_user, level);
+    if (level != si->irq_level) {
+        gcn_ring_event(level ? GCN_EV_IRQ_RAISE : GCN_EV_IRQ_CLEAR,
+                       /*source*/ 3u /* PI cause bit index of INT_CAUSE_SI=0x8 */,
+                       0u, 0u);
+        si->irq_level = level;
+    }
 }
 
 /* Synchronous SI transfer (mirror of Dolphin RunSIBuffer, SI.cpp:146-201). The
@@ -83,7 +112,9 @@ u32 gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size) {
         GcnSiChannel* c = &si->ch[n];
         if (sub == 0x4u || sub == 0x8u) {
             c->rdst = 0;                    /* reading input clears read-status */
-            return (sub == 0x4u) ? c->in_hi : c->in_lo;
+            u32 v = (sub == 0x4u) ? c->in_hi : c->in_lo;
+            si_update_interrupts(si);       /* cleared RDST may drop RDSTINT */
+            return v;
         }
         return c->out;
     }
@@ -98,6 +129,7 @@ u32 gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size) {
             if (si->ch[n].connected) si->ch[n].rdst = 1;
         u32 v = si->comcsr & ~GCN_SI_CSR_RDSTINT;
         if (si_any_rdst(si)) v |= GCN_SI_CSR_RDSTINT;
+        si_update_interrupts(si);   /* the re-armed RDST just moved the line */
         return v;
     }
     case GCN_SI_SISR: {
@@ -144,14 +176,18 @@ void gcn_si_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
          * by recomputation on the next read (SI.cpp:375-378). */
         if (value & GCN_SI_CSR_TSTART) {
             si->comcsr |= GCN_SI_CSR_TSTART;
-            si_run_buffer(si);
+            si_run_buffer(si);          /* completes synchronously, latches TCINT */
         }
+        /* Mask/ack changes and a completed transfer's TCINT all move the line
+         * (SI.cpp CSR write handler ends in UpdateInterrupts:390). */
+        si_update_interrupts(si);
         return;
     case GCN_SI_SISR:
         /* Error bits are write-1-to-clear; WR triggers per-channel SendCommand
          * (mode/rumble) and self-clears. The IPL boot path does not use WR yet,
          * so we clear it and defer SendCommand until the oracle shows it. */
         si->sisr &= ~(value & 0x0FFFFFFFu);
+        si_update_interrupts(si);       /* SI.cpp:355 SISR write -> UpdateInterrupts */
         return;
     case GCN_SI_EXILK: si->exilk = value; return;
     default: break;

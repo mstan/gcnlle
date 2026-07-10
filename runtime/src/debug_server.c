@@ -11,6 +11,7 @@
  */
 #include "debug/debug_server.h"
 #include "debug/rings.h"
+#include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -189,6 +190,16 @@ static void handle_line(Client* c, const char* line) {
     else if (!strcmp(cmd, "event_dump")) {
         u32 count = 256; json_uint(line, "count", &count);
         n = gcn_ring_event_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
+    }
+    else if (!strcmp(cmd, "dsp_state")) {
+        /* Live DSP-LLE core state: pc, control reg, and non-consuming peeks of
+         * both mailboxes (bit 31 = mail pending). Diagnoses CPU<->DSP task
+         * handshake stalls without perturbing the run. */
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"pc\":%u,\"control\":%u,"
+            "\"mbox_dsp_to_cpu\":%u,\"mbox_cpu_to_dsp\":%u}\n",
+            (unsigned)dsp_lle_pc(), (unsigned)dsp_lle_read_control(),
+            (unsigned)dsp_lle_peek_mbox_dsp(), (unsigned)dsp_lle_peek_mbox_cpu());
     }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
         /* No framebuffer until VI/XFB scanout exists (M2). The command is part

@@ -96,6 +96,14 @@ uint32_t dsp_lle_peek_mbox_cpu(void) {
   return g_core->PeekMailbox(Mailbox::CPU);
 }
 
+uint16_t dsp_lle_pc(void) {
+  return g_core ? g_core->DSPState().pc : 0;
+}
+
+uint32_t dsp_lle_peek_mbox_dsp(void) {
+  return g_core ? g_core->PeekMailbox(Mailbox::DSP) : 0;
+}
+
 uint8_t* dsp_lle_aram(void) { return g_dsp_aram; }
 uint32_t dsp_lle_aram_size(void) { return GCN_DSP_LLE_ARAM_SIZE; }
 

@@ -32,6 +32,13 @@ uint32_t dsp_lle_peek_mbox_cpu(void);
 /* Advance the DSP; ppc_cycles is the PPC-side period (DSP runs ~1/6th). */
 void     dsp_lle_update(int ppc_cycles);
 
+/* Observability (debug_server "dsp_state"): current DSP program counter and a
+ * non-consuming peek of the DSP->CPU mailbox (Dolphin Mailbox::DSP — the box
+ * the DSP posts into via DMBH/DMBL; bit 31 = mail pending). The CPU->DSP box
+ * peek is dsp_lle_peek_mbox_cpu above (Mailbox::CPU). */
+uint16_t dsp_lle_pc(void);
+uint32_t dsp_lle_peek_mbox_dsp(void);
+
 /* Consume a pending DSP->CPU interrupt request (1 if one fired since last call). */
 int      dsp_lle_take_interrupt(void);
 

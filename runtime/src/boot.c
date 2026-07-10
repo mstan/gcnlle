@@ -22,12 +22,44 @@
 #include "pi/pi.h"
 #include "dsp/dsp.h"
 #include "ai/ai.h"
+#include "vi/vi.h"
+#include "di/di.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* VI display-interrupt line -> PI interrupt cause (level-triggered). */
+static void vi_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_VI, level);
+}
+
+/* DI drive interrupt line -> PI interrupt cause (level-triggered). */
+static void di_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_DI, level);
+}
+
+/* DSP mailbox / ARAM / AI-DMA interrupt line -> PI interrupt cause. */
+static void dsp_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_DSP, level);
+}
+
+/* EXI (any-channel) interrupt line -> PI interrupt cause. */
+static void exi_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_EXI, level);
+}
+
+/* SI (RDST/transfer-complete) interrupt line -> PI interrupt cause. */
+static void si_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_SI, level);
+}
+
+/* AI (streaming) interrupt line -> PI interrupt cause. */
+static void ai_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_AI, level);
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -110,6 +142,12 @@ int main(int argc, char** argv) {
     gcn_mmio_register(&bus, "PI", GCN_PI_BASE, GCN_PI_SIZE,
                       gcn_pi_read, gcn_pi_write, &pi);
 
+    /* EXI/SI were constructed above (before PI); wire their interrupt lines now
+     * that the PI sink exists. EXI asserts INT_CAUSE_EXI (transfer-complete /
+     * device / cover), SI asserts INT_CAUSE_SI (RDST / transfer-complete). */
+    gcn_exi_set_irq(&exi, exi_irq_to_pi, &pi);
+    gcn_si_set_irq(&si, si_irq_to_pi, &pi);
+
     /* DSP: the REAL DSP core runs its firmware (IROM + uploaded ucode). Load the
      * DSP ROM dumps (GCN_DSP_ROM / GCN_DSP_COEF, default bios/dsp_{rom,coef}.bin).
      * The Flipper AR/AI DMA engine is modeled inside the DSP device itself. */
@@ -127,14 +165,37 @@ int main(int argc, char** argv) {
         cpu_free(&cpu); free(payload); return 1;
     }
     gcn_dsp_init(&dsp, dsp_rom, dsp_coef, cpu.ram, cpu.ram_size);
+    gcn_dsp_set_irq(&dsp, dsp_irq_to_pi, &pi);
     gcn_mmio_register(&bus, "DSP", GCN_DSP_BASE, GCN_DSP_SIZE,
                       gcn_dsp_read, gcn_dsp_write, &dsp);
 
     /* AI: audio-interface control register (menu reads/writes it during init). */
     static GcnAi ai;
     gcn_ai_init(&ai);
+    gcn_ai_set_irq(&ai, ai_irq_to_pi, &pi);
     gcn_mmio_register(&bus, "AI", GCN_AI_BASE, GCN_AI_SIZE,
                       gcn_ai_read, gcn_ai_write, &ai);
+
+    /* VI: register file + cycle-driven beam counter + display interrupts. The
+     * IPL busy-waits on the vertical beam position (0xCC00202C); the beam is
+     * driven from the guest time base by the dispatch loop (gcn_vi_tick). The
+     * DI comparators assert INT_CAUSE_VI in the PI cause word. */
+    static GcnVi vi;
+    gcn_vi_init(&vi);
+    gcn_vi_set_irq(&vi, vi_irq_to_pi, &pi);
+    gcn_mmio_register(&bus, "VI", GCN_VI_BASE, GCN_VI_SIZE,
+                      gcn_vi_read, gcn_vi_write, &vi);
+
+    /* DI: the GameCube DVD drive with NO DISC INSERTED. The menu kicks a
+     * DVDReadDiskID (DICMDBUF0=0xA8000040, DICR=3) and polls DICVR every frame;
+     * with no disc the read completes with DEINT and DICVR bit 0 (cover open)
+     * reads 1, so the menu concludes "no disc" and proceeds. The drive
+     * interrupt line asserts INT_CAUSE_DI in the PI cause word. */
+    static GcnDi di;
+    gcn_di_init(&di);
+    gcn_di_set_irq(&di, di_irq_to_pi, &pi);
+    gcn_mmio_register(&bus, "DI", GCN_DI_BASE, GCN_DI_SIZE,
+                      gcn_di_read, gcn_di_write, &di);
 
     gcn_mmio_install(&bus, &cpu);
 

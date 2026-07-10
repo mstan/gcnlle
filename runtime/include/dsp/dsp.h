@@ -45,6 +45,25 @@
 #define GCN_DSP_AR_ARADDR   0x24u     /* ARAM DMA ARAM address            */
 #define GCN_DSP_AR_CNT      0x28u     /* ARAM DMA control/length (kicks)  */
 
+/* Audio DMA (MEM1 -> AI FIFO) registers (Dolphin DSP.cpp:63-67). */
+#define GCN_DSP_AID_START_HI    0x30u /* source address hi (GCN: & 0x03FF) */
+#define GCN_DSP_AID_START_LO    0x32u /* source address lo (& 0xFFE0)      */
+#define GCN_DSP_AID_BLOCKS_LEN  0x34u /* "ever used?" — plain storage      */
+#define GCN_DSP_AID_CTRL        0x36u /* enable (bit 15) + block count     */
+#define GCN_DSP_AID_BLOCKS_LEFT 0x3Au /* read-only countdown               */
+
+#define GCN_DSP_AID_ENABLE      0x8000u
+#define GCN_DSP_AID_NUMBLOCKS   0x7FFFu
+
+/* Audio-DMA block pacing. Real hardware consumes one 32-byte block at 4 kHz
+ * (DSP.cpp:423 — 32 bytes at 4 kHz == 4 bytes at 32 kHz 16-bit stereo), i.e.
+ * every 486 MHz / 4 kHz = 121500 core cycles. The dispatch loop ticks the DSP
+ * once per block (96 device-clock cycles), so one audio block elapses every
+ * 121500/96 ~= 1266 ticks. Nominal timing — the poll-collapsed oracle diff is
+ * insensitive to the exact rate; what matters is that AID interrupts PACE the
+ * guest's audio frame loop. */
+#define GCN_DSP_AID_TICKS_PER_BLOCK 1266u
+
 /* DSP CSR bits (Dolphin UDSPControl). */
 #define GCN_DSP_CSR_RES      0x0001u  /* reset DSP (write-1, auto-clears) */
 #define GCN_DSP_CSR_PIINT    0x0002u  /* assert PI interrupt to CPU       */
@@ -70,16 +89,34 @@
  * the identical poll reads, so any value >= 1 matches by value+order. */
 #define GCN_DSP_ARAM_DMA_NOMINAL_POLLS  4u
 
+/* Level change on the DSP->PI interrupt line (level: 1 assert, 0 deassert). */
+typedef void (*GcnDspIrqFn)(void* user, int level);
+
 typedef struct {
     u16   reg[GCN_DSP_SIZE / 2];      /* generic 16-bit register backing  */
     u16   csr;                        /* CPU-side CSR bits (int status/masks) */
     bool  dma_active;                 /* ARAM DMA in flight               */
     u32   dma_polls_left;             /* CSR polls until it "completes"    */
+
+    /* Audio DMA engine (Dolphin DSP.cpp AudioDMA / UpdateAudioDMA). The data
+     * sink (host audio out) is deferred; this models the addressing and the
+     * AID interrupt pacing the guest's audio frame loop is clocked by. */
+    u32   aid_source;                 /* programmed source address         */
+    u16   aid_ctrl;                   /* enable + block count              */
+    u32   aid_cur_addr;               /* current block address             */
+    u16   aid_blocks_left;            /* remaining 32-byte blocks          */
+    u8    aid_int_pending;            /* fifo-start AID int, fires next tick */
+    u32   aid_accum;                  /* tick accumulator (block pacing)   */
+
+    int   irq_level;                  /* last DSP->PI line level (edge detect for the ring) */
+    GcnDspIrqFn irq;                  /* sink for the DSP interrupt line (boot.c -> PI) */
+    void*       irq_user;
 } GcnDsp;
 
 /* irom/coef are the raw big-endian DSP ROM bytes (dsp_rom.bin / dsp_coef.bin);
  * mem1 is the guest MEM1 backing the DSP DMAs against. */
 void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size);
+void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user);
 void gcn_dsp_free(GcnDsp* dsp);
 void gcn_dsp_tick(u32 ppc_cycles);   /* advance the DSP core (called per block) */
 u32  gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size);

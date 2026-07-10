@@ -20,9 +20,50 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The dispatch loop ticks one DSP (like the one VI/DI); registered at init. */
+static GcnDsp* s_dsp = NULL;
+
+void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user) {
+    dsp->irq = fn;
+    dsp->irq_user = user;
+}
+
+/* ---- interrupt line (DSP.cpp UpdateInterrupts:372-382) ----
+ * Dolphin computes ((Hex>>1) & Hex & (INT_DSP|INT_ARAM|INT_AID)) != 0 over the
+ * control register — i.e. the line is high when any interrupt status bit is set
+ * AND the enable mask bit directly to its left is set. All six of those bits
+ * (AID/ARAM/DSP interrupt + masks) live outside DSP_CONTROL_MASK, so they are
+ * CPU-side (dsp->csr) and the line reads entirely from it. Pushed to the PI DSP
+ * cause line on EVERY evaluation (not just edges): PI INTSR is W1C, so an
+ * acked-but-still-asserted level must re-appear — exactly as in Dolphin. */
+static void dsp_update_interrupts(GcnDsp* dsp) {
+    int level =
+        ((dsp->csr & GCN_DSP_CSR_AIDINT) && (dsp->csr & GCN_DSP_CSR_AIDMASK)) ||
+        ((dsp->csr & GCN_DSP_CSR_ARINT)  && (dsp->csr & GCN_DSP_CSR_ARMASK))  ||
+        ((dsp->csr & GCN_DSP_CSR_DSPINT) && (dsp->csr & GCN_DSP_CSR_DSPMASK));
+
+    if (dsp->irq)
+        dsp->irq(dsp->irq_user, level);
+    if (level != dsp->irq_level) {
+        gcn_ring_event(level ? GCN_EV_IRQ_RAISE : GCN_EV_IRQ_CLEAR,
+                       /*source*/ 6u /* PI cause bit index of INT_CAUSE_DSP=0x40 */,
+                       0u, 0u);
+        dsp->irq_level = level;
+    }
+}
+
+/* Consume a DSP->CPU mailbox interrupt request from the real core (if any) and
+ * latch the CPU-side DSP mailbox interrupt status bit. Consume-once in the core;
+ * the latch persists in dsp->csr until the guest W1C-acks it. */
+static void dsp_latch_mailbox_int(GcnDsp* dsp) {
+    if (dsp_lle_take_interrupt())
+        dsp->csr |= GCN_DSP_CSR_DSPINT;
+}
+
 void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size) {
     memset(dsp, 0, sizeof *dsp);
     dsp_lle_init(irom, coef, mem1, mem1_size);   /* brings up the core + ARAM */
+    s_dsp = dsp;
 }
 
 void gcn_dsp_free(GcnDsp* dsp) {
@@ -30,9 +71,45 @@ void gcn_dsp_free(GcnDsp* dsp) {
     dsp_lle_shutdown();   /* frees the shared ARAM */
 }
 
+/* Audio-DMA block pump (DSP.cpp UpdateAudioDMA:424-454): every audio-block
+ * period, consume one 32-byte block; when the count runs out, auto-reload from
+ * the programmed source/length and raise the AID interrupt. The one-block
+ * "fifo start" interrupt latched at enable time (aid_int_pending — Dolphin
+ * schedules it 200 cycles after the CONTROL_LEN write) also lands here. */
+static void dsp_aid_tick(GcnDsp* dsp) {
+    if (dsp->aid_int_pending) {
+        dsp->aid_int_pending = 0;
+        dsp->csr |= GCN_DSP_CSR_AIDINT;
+    }
+    if (++dsp->aid_accum < GCN_DSP_AID_TICKS_PER_BLOCK)
+        return;
+    dsp->aid_accum = 0;
+    if (!(dsp->aid_ctrl & GCN_DSP_AID_ENABLE))
+        return;
+    if (dsp->aid_blocks_left != 0) {
+        dsp->aid_blocks_left--;
+        dsp->aid_cur_addr += 32;
+    }
+    if (dsp->aid_blocks_left == 0) {
+        dsp->aid_cur_addr    = dsp->aid_source;
+        dsp->aid_blocks_left = (u16)(dsp->aid_ctrl & GCN_DSP_AID_NUMBLOCKS);
+        dsp->csr |= GCN_DSP_CSR_AIDINT;
+    }
+}
+
 void gcn_dsp_tick(u32 ppc_cycles) {
     if (getenv("GCN_DSP_NOTICK")) return;   /* bisect guard */
     dsp_lle_update((int)ppc_cycles);
+    /* Latch a pending DSP->CPU mailbox interrupt and (re)assert the PI line every
+     * block. This is what lets the interrupt reach PI while the guest sits in the
+     * OS idle loop waiting on it — delivery no longer depends on the guest
+     * happening to read the CSR (see read_csr). Level-triggered re-assertion also
+     * restores the line after a W1C ack of a still-pending source. */
+    if (s_dsp) {
+        dsp_latch_mailbox_int(s_dsp);
+        dsp_aid_tick(s_dsp);
+        dsp_update_interrupts(s_dsp);
+    }
 }
 
 static u16 idx16(u32 off) { return (u16)(off >> 1); }
@@ -66,11 +143,10 @@ static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
 /* CPU-side CSR bits (masks, interrupt status, ARAM-DMA bit), combined with the
  * DSP-owned bits read from the real core. */
 static u32 read_csr(GcnDsp* dsp) {
-    /* A DSP->CPU interrupt request from the core latches the mailbox int bit. */
-    if (dsp_lle_take_interrupt()) {
-        dsp->csr |= GCN_DSP_CSR_DSPINT;
-        gcn_ring_event(GCN_EV_IRQ_RAISE, /*source*/ 5u /*DSP*/, 0u, 0u);
-    }
+    /* A DSP->CPU interrupt request from the core latches the mailbox int bit
+     * (consume-once; the tick also polls this — whichever runs first wins, the
+     * latch in dsp->csr is shared). */
+    dsp_latch_mailbox_int(dsp);
 
     u32 v = (dsp->csr & ~GCN_DSP_CONTROL_MASK)
           | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u)
@@ -80,6 +156,9 @@ static u32 read_csr(GcnDsp* dsp) {
         dsp->dma_active = false;
         dsp->csr |= GCN_DSP_CSR_ARINT;   /* AR DMA complete raises the ARAM int */
     }
+    /* Any of the six interrupt/mask bits may have just changed (DSPINT latched
+     * above, ARINT on DMA completion): re-evaluate the line. */
+    dsp_update_interrupts(dsp);
     return v;
 }
 
@@ -92,6 +171,22 @@ static void write_csr(GcnDsp* dsp, u16 w) {
     /* CPU-side interrupt masks are stored. */
     const u16 MASKS = GCN_DSP_CSR_AIDMASK | GCN_DSP_CSR_ARMASK | GCN_DSP_CSR_DSPMASK;
     dsp->csr = (u16)((dsp->csr & ~MASKS) | (w & MASKS));
+    /* W1C acks and mask changes both move the line (DSP.cpp write handler ends in
+     * UpdateInterrupts:301). */
+    dsp_update_interrupts(dsp);
+}
+
+/* Audio-DMA 16-bit register read (DSP.cpp RegisterMMIO:314-361). */
+static u32 read16_aid(GcnDsp* dsp, u32 off) {
+    switch (off) {
+    case GCN_DSP_AID_START_HI:   return dsp->aid_source >> 16;
+    case GCN_DSP_AID_START_LO:   return dsp->aid_source & 0xFFFFu;
+    case GCN_DSP_AID_CTRL:       return dsp->aid_ctrl;
+    case GCN_DSP_AID_BLOCKS_LEFT:
+        /* Zero-based countdown (DSP.cpp:354-359). */
+        return dsp->aid_blocks_left > 0 ? (u32)dsp->aid_blocks_left - 1u : 0u;
+    default:                     return dsp->reg[idx16(off)];
+    }
 }
 
 u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
@@ -106,9 +201,45 @@ u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     case GCN_DSP_CSR:        return read_csr(dsp);
     default: break;
     }
+    if (off >= GCN_DSP_AID_START_HI && off <= GCN_DSP_AID_BLOCKS_LEFT) {
+        if (size == 4)
+            return (read16_aid(dsp, off) << 16) | read16_aid(dsp, off + 2u);
+        return read16_aid(dsp, off);
+    }
     if (size == 4)
         return ((u32)dsp->reg[idx16(off)] << 16) | (u32)dsp->reg[idx16(off) + 1];
     return dsp->reg[idx16(off)];
+}
+
+/* Audio-DMA 16-bit register write (DSP.cpp RegisterMMIO:314-361). The GCN
+ * address restriction masks are DSP.cpp:200-203; BLOCKS_LEFT is InvalidWrite. */
+static void write16_aid(GcnDsp* dsp, u32 off, u16 value) {
+    switch (off) {
+    case GCN_DSP_AID_START_HI:
+        dsp->aid_source = (dsp->aid_source & 0x0000FFFFu) | ((u32)(value & 0x03FFu) << 16);
+        return;
+    case GCN_DSP_AID_START_LO:
+        dsp->aid_source = (dsp->aid_source & 0xFFFF0000u) | (value & 0xFFE0u);
+        return;
+    case GCN_DSP_AID_CTRL: {
+        /* On a 0->1 enable edge, load the transfer and raise the fifo-start AID
+         * interrupt one tick later (DSP.cpp:326-347). While already enabled the
+         * new values autoload when the current transfer wraps. */
+        int already_enabled = (dsp->aid_ctrl & GCN_DSP_AID_ENABLE) != 0;
+        dsp->aid_ctrl = value;
+        if (!already_enabled && (value & GCN_DSP_AID_ENABLE)) {
+            dsp->aid_cur_addr    = dsp->aid_source;
+            dsp->aid_blocks_left = (u16)(value & GCN_DSP_AID_NUMBLOCKS);
+            dsp->aid_int_pending = 1;
+        }
+        return;
+    }
+    case GCN_DSP_AID_BLOCKS_LEFT:
+        return;                       /* read-only (DSP.cpp:361 InvalidWrite) */
+    default:
+        dsp->reg[idx16(off)] = value;
+        return;
+    }
 }
 
 void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
@@ -124,6 +255,16 @@ void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     case GCN_DSP_MBOX_OUT_L: return;
     case GCN_DSP_CSR:        write_csr(dsp, (u16)value); return;
     default: break;
+    }
+
+    if (off >= GCN_DSP_AID_START_HI && off <= GCN_DSP_AID_BLOCKS_LEFT) {
+        if (size == 4) {
+            write16_aid(dsp, off, (u16)(value >> 16));
+            write16_aid(dsp, off + 2u, (u16)value);
+        } else {
+            write16_aid(dsp, off, (u16)value);
+        }
+        return;
     }
 
     /* store into the generic 16-bit backing (32-bit writes fill two halves) */

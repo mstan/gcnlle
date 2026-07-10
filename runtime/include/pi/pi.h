@@ -22,11 +22,26 @@
  * GameCube (matching YAGCD's documented console-type register); modelling it is
  * what pushes the stage-2 lockstep past pc 0x813004B0.
  *
- * Any PI register whose real behaviour differs from plain read-back (e.g. the
- * FIFO write-pointer advancing on GX traffic, or INTSR reflecting live
- * interrupt state) will DIVERGE from the oracle loudly when the menu exercises
- * it — that divergence is the signal to model it, never a silent fake
- * (PRINCIPLES: Runtime Boundaries).
+ * INTSR (0x00) is NOT plain read-back: it is the live interrupt-cause word.
+ * Device models assert/deassert cause bits through gcn_pi_set_interrupt (the
+ * VI display-interrupt line is the first user); reads return the live word;
+ * writes are write-1-to-clear (Dolphin ProcessorInterface.cpp:77-82, cause &=
+ * ~val). Level-driven sources re-assert on their next evaluation, so a W1C ack
+ * of a still-asserted line reappears — exactly the hardware behaviour. The
+ * power-on value is INT_CAUSE_RST_BUTTON | INT_CAUSE_VI (ProcessorInterface
+ * Init:54 — RST_BUTTON high means "reset button not pressed").
+ *
+ * Delivery: gcn_pi_deliver_external (called by the dispatch loop at every
+ * block boundary — the runtime's safe point) vectors the CPU to 0x500 via
+ * ppc_take_exception when (cause & mask) is nonzero and MSR[EE] is set. It is
+ * level-triggered exactly like the hardware: an unacked cause re-delivers as
+ * soon as the handler's rfi restores MSR[EE] (Dolphin UpdateException:
+ * (cause & mask) -> EXCEPTION_EXTERNAL_INT).
+ *
+ * Any other PI register whose real behaviour differs from plain read-back
+ * (e.g. the FIFO write-pointer advancing on GX traffic) will DIVERGE from the
+ * oracle loudly when the menu exercises it — that divergence is the signal to
+ * model it, never a silent fake (PRINCIPLES: Runtime Boundaries).
  */
 #ifndef GCN_PI_PI_H
 #define GCN_PI_PI_H
@@ -50,10 +65,39 @@
  * type register. The IPL reads it once (stage-2) to identify the hardware. */
 #define GCN_PI_REVISION_RETAIL  0x246500B1u
 
-typedef struct { u32 reg[GCN_PI_SIZE / 4]; } GcnPi;
+/* Interrupt-cause bits (INTSR/INTMR; Dolphin ProcessorInterface.h). */
+#define GCN_PI_INT_ERROR       0x00001u
+#define GCN_PI_INT_RSW         0x00002u   /* reset switch                   */
+#define GCN_PI_INT_DI          0x00004u   /* disc interface                 */
+#define GCN_PI_INT_SI          0x00008u   /* serial interface               */
+#define GCN_PI_INT_EXI         0x00010u
+#define GCN_PI_INT_AI          0x00020u   /* audio-interface streaming      */
+#define GCN_PI_INT_DSP         0x00040u
+#define GCN_PI_INT_MEMORY      0x00080u
+#define GCN_PI_INT_VI          0x00100u   /* video interface (display ints) */
+#define GCN_PI_INT_PE_TOKEN    0x00200u
+#define GCN_PI_INT_PE_FINISH   0x00400u
+#define GCN_PI_INT_CP          0x00800u
+#define GCN_PI_INT_DEBUG       0x01000u
+#define GCN_PI_INT_HSP         0x02000u
+#define GCN_PI_INT_RST_BUTTON  0x10000u   /* 1 = reset button NOT pressed   */
+
+typedef struct {
+    u32 reg[GCN_PI_SIZE / 4];
+    u32 intsr;                  /* live interrupt-cause word (not in reg[]) */
+} GcnPi;
 
 void gcn_pi_init(GcnPi* pi);
 u32  gcn_pi_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
+
+/* Assert (set=1) or deassert (set=0) interrupt-cause bits. Called by device
+ * models (VI today; DI/SI/EXI/DSP as their interrupt lines get wired). */
+void gcn_pi_set_interrupt(GcnPi* pi, u32 cause_mask, int set);
+
+/* Take the external-interrupt exception (vector 0x500) if (cause & mask) is
+ * pending, MSR[EE] is set and no exception is mid-delivery. Called by the
+ * dispatch loop at every block boundary. */
+void gcn_pi_deliver_external(CPUState* cpu);
 
 #endif /* GCN_PI_PI_H */

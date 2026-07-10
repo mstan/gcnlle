@@ -78,6 +78,9 @@ typedef struct {
     u8  mode;        /* controller reporting mode                   */
 } GcnSiChannel;
 
+/* Level change on the SI->PI interrupt line (level: 1 assert, 0 deassert). */
+typedef void (*GcnSiIrqFn)(void* user, int level);
+
 typedef struct {
     GcnSiChannel ch[GCN_SI_CHANNELS];
     u32 poll;        /* SIPOLL   */
@@ -85,9 +88,14 @@ typedef struct {
     u32 sisr;        /* SISR error/WR bits (RDST computed on read)  */
     u32 exilk;       /* SIEXILK  */
     u8  iobuf[128];  /* SI I/O buffer for TSTART transfers          */
+    int irq_level;   /* last SI->PI line level (edge detect for the ring) */
+    GcnSiIrqFn irq;  /* sink for the SI interrupt line (boot.c -> PI) */
+    void*      irq_user;
 } GcnSi;
 
 void gcn_si_init(GcnSi* si);
+/* Register the SI interrupt-line sink (boot.c trampoline into PI INT_CAUSE_SI). */
+void gcn_si_set_irq(GcnSi* si, GcnSiIrqFn fn, void* user);
 u32  gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_si_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 

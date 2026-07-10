@@ -46,6 +46,7 @@
 #define PPC_EXC_ALIGNMENT     0x00000004u
 #define PPC_EXC_SYSTEM_CALL   0x00000008u
 #define PPC_EXC_MACHINE_CHECK 0x00000010u
+#define PPC_EXC_EXTERNAL      0x00000020u  /* external interrupt (PI cause & mask) */
 
 #define PPC_PROGRAM_FP        0x00100000u
 #define PPC_PROGRAM_ILLEGAL   0x00080000u
@@ -56,6 +57,7 @@
 
 #define PPC_VECTOR_MACHINE_CHECK 0x00200u
 #define PPC_VECTOR_DSI           0x00300u
+#define PPC_VECTOR_EXTERNAL      0x00500u
 #define PPC_VECTOR_ALIGNMENT     0x00600u
 #define PPC_VECTOR_PROGRAM       0x00700u
 #define PPC_VECTOR_SYSTEM_CALL   0x00C00u

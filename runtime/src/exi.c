@@ -8,6 +8,7 @@
  */
 #include "exi/exi.h"
 #include "memory/memory.h"
+#include "debug/rings.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -46,6 +47,39 @@ void gcn_exi_init(GcnExi* exi) {
     exi->dev_present[0] = 1;
     exi->dev_present[1] = 0;
     exi->dev_present[2] = 0;
+}
+
+void gcn_exi_set_irq(GcnExi* exi, GcnExiIrqFn fn, void* user) {
+    exi->irq = fn;
+    exi->irq_user = user;
+}
+
+/* ---- interrupt line (EXI.cpp UpdateInterrupts:240-253 + EXI_Channel.cpp
+ *      CEXIChannel::IsCausingInterrupt:251-267) ----
+ * Per channel the line is (EXIINT & EXIINTMASK) || (TCINT & TCINTMASK) ||
+ * (EXTINT & EXTINTMASK) from that channel's CSR; the PI line is the OR across
+ * all channels. Dolphin also latches EXIINT from a device's IsInterruptSet()
+ * (memcards / the ch0-dev4 -> ch2 mapping); no device asserts EXIINT in this
+ * milestone (memcards are M4), so we OR only the modeled CSR bits — a real
+ * memcard interrupt would surface here when that device lands. Pushed to PI on
+ * EVERY evaluation (PI INTSR is W1C, so a still-asserted level must re-appear). */
+static void exi_update_interrupts(GcnExi* exi) {
+    int level = 0;
+    for (u32 ch = 0; ch < GCN_EXI_CHANNELS; ch++) {
+        u32 csr = exi->channels[ch].csr;
+        if (((csr & GCN_EXI_CSR_EXIINT) && (csr & GCN_EXI_CSR_EXIINTMASK)) ||
+            ((csr & GCN_EXI_CSR_TCINT)  && (csr & GCN_EXI_CSR_TCINTMASK))  ||
+            ((csr & GCN_EXI_CSR_EXTINT) && (csr & GCN_EXI_CSR_EXTINTMASK)))
+            level = 1;
+    }
+    if (exi->irq)
+        exi->irq(exi->irq_user, level);
+    if (level != exi->irq_level) {
+        gcn_ring_event(level ? GCN_EV_IRQ_RAISE : GCN_EV_IRQ_CLEAR,
+                       /*source*/ 4u /* PI cause bit index of INT_CAUSE_EXI=0x10 */,
+                       0u, 0u);
+        exi->irq_level = level;
+    }
 }
 
 void gcn_exi_set_rom(GcnExi* exi, const u8* rom, u32 size, u32 base) {
@@ -90,6 +124,10 @@ static void write_csr(GcnExi* exi, u32 ch, u32 value) {
         reset_transaction(exi, ch);
         exi->prev_cs[ch] = (u8)cs;
     }
+
+    /* Mask changes and W1C acks of EXIINT/TCINT/EXTINT all move the line
+     * (Dolphin's CSR write handler ends in UpdateInterrupts). */
+    exi_update_interrupts(exi);
 }
 
 /* ---- device transfers ------------------------------------------------------*/
@@ -225,9 +263,11 @@ static void start_transfer(GcnExi* exi, CPUState* cpu, u32 ch) {
 
     device_transfer(exi, cpu, ch, cs, rw, dma, len);
 
-    /* Complete synchronously: clear TSTART, latch transfer-complete interrupt. */
+    /* Complete synchronously: clear TSTART, latch transfer-complete interrupt
+     * (EXI_Channel.cpp:210 m_status.TCINT=1), then re-evaluate the PI line. */
     c->cr  &= ~GCN_EXI_CR_TSTART;
     c->csr |= GCN_EXI_CSR_TCINT;
+    exi_update_interrupts(exi);
 }
 
 /* ---- MMIO dispatch entry points -------------------------------------------*/

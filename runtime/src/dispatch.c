@@ -9,6 +9,9 @@
 #include "generated.h"        /* DolRecomp dispatch inlines + func_ decls */
 #include "dispatch/dispatch.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
+#include "vi/vi.h"            /* advance the VI beam counter per block       */
+#include "di/di.h"            /* complete deferred DI drive commands per block */
+#include "pi/pi.h"            /* deliver pending external interrupts         */
 #include "debug/rings.h"      /* always-on block/PC ring */
 #include "debug/debug_server.h" /* pumped once per block (non-blocking) */
 
@@ -25,11 +28,19 @@
  * rate. Refine to a real cycle model once the recompiler emits per-block counts. */
 #define GCN_TB_TICKS_PER_BLOCK 8u
 
+/* Monotonic device-clock cycles (Gekko core cycles, TB*12) advanced per block.
+ * This is deliberately NOT ctx->timebase: the guest can WRITE the TB (mttbl/
+ * mttbu — the IPL zeroes it during OS init), but hardware device clocks (the
+ * VI 27 MHz pixel clock) keep running through a TB write. Deriving device time
+ * from the writable TB made the beam jump backward when the IPL rebased it. */
+#define GCN_CORE_CYCLES_PER_BLOCK (GCN_TB_TICKS_PER_BLOCK * 12u)
+
 /* Own the run loop (rather than the generated static-inline dolrecomp_run_blocks)
  * so we can advance the time base between blocks — otherwise mftb reads a frozen
  * TB and firmware delay loops spin forever. */
 int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     u32 blocks = 0;
+    static u64 device_cycles = 0;   /* monotonic across nested/repeated runs */
     while (max_blocks == 0u || blocks < max_blocks) {
         /* A block that raises an exception returns with ctx->pc set to the vector
          * (e.g. 0xC00 for `sc`) and ctx->exception still set — the generated
@@ -40,6 +51,11 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * without ever executing. If the vector has no recompiled handler,
          * dolrecomp_call returns 0; restore the flag so the stop diagnostic still
          * reports the exception. The handler ends in `rfi` (pc=srr0). */
+        /* Block boundaries are the safe points for asynchronous exceptions:
+         * vector to 0x500 here if the PI has (cause & mask) and MSR[EE]. The
+         * handler entry then flows through the same pending/clear dance as any
+         * synchronous exception below. */
+        gcn_pi_deliver_external(ctx);
         gcn_ring_block(ctx->pc);   /* always-on retired-block/PC timeline */
         u32 pending = ctx->exception;
         ctx->exception = 0;
@@ -48,7 +64,10 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
             return 0;
         }
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
+        device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
         gcn_dsp_tick(GCN_DSP_CYCLES_PER_BLOCK);  /* run the DSP core in step */
+        gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
+        gcn_di_tick();                           /* complete a deferred DI command */
         /* Service the debug server between blocks: non-blocking, so it stays
          * responsive even while the guest busy-waits on unmodeled hardware. A
          * client "quit" ends the run cleanly. */

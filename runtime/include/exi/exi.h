@@ -87,6 +87,9 @@ enum {
     GCN_EXI_OP_SRAM_WRITE,
 };
 
+/* Level change on the EXI->PI interrupt line (level: 1 assert, 0 deassert). */
+typedef void (*GcnExiIrqFn)(void* user, int level);
+
 typedef struct GcnExi {
     GcnExiChannel channels[GCN_EXI_CHANNELS];
 
@@ -112,11 +115,18 @@ typedef struct GcnExi {
      * ch2 = forced 0. When memory-card modelling lands (M4), this becomes the
      * live card-inserted state; until then a menu card probe diverges loudly. */
     u8        dev_present[GCN_EXI_CHANNELS];
+
+    int         irq_level;   /* last EXI->PI line level (edge detect for the ring) */
+    GcnExiIrqFn irq;         /* sink for the EXI interrupt line (boot.c -> PI) */
+    void*       irq_user;
 } GcnExi;
 
 /* Initialise all channels (reset CSR: ch0 EXTINT; ch1 EXTINT|CS=1; ch2 idle;
  * EXT is computed on read, never latched). */
 void gcn_exi_init(GcnExi* exi);
+
+/* Register the EXI interrupt-line sink (boot.c trampoline into PI INT_CAUSE_EXI). */
+void gcn_exi_set_irq(GcnExi* exi, GcnExiIrqFn fn, void* user);
 
 /* Point the IPL/mask-ROM device at its backing image. `base` is the ROM byte
  * offset that `rom[0]` corresponds to (0 for a full 2 MB descrambled image;

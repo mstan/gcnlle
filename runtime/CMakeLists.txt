@@ -94,6 +94,8 @@ if(GCN_WITH_GENERATED)
     src/pi.c
     src/dsp.c
     src/ai.c
+    src/vi.c
+    src/di.c
     src/rings.c
     src/debug_server.c
     generated/generated.c

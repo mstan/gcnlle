@@ -49,14 +49,33 @@
 /* Power-on AICR: AIS=48kHz (AISFR) | AID=32kHz (AIDFR). */
 #define GCN_AI_CR_RESET_VALUE  (GCN_AI_CR_AISFR | GCN_AI_CR_AIDFR)   /* 0x42 */
 
+/* Level change on the AI->PI interrupt line (level: 1 assert, 0 deassert). */
+typedef void (*GcnAiIrqFn)(void* user, int level);
+
 typedef struct {
     u32 control;        /* AICR                                            */
     u32 volume;         /* AIVR                                            */
     u32 sample_counter; /* AISCNT base                                     */
     u32 int_timing;     /* AIIT                                            */
+    int irq_level;      /* last AI->PI line level (edge detect for the ring) */
+    GcnAiIrqFn irq;     /* sink for the AI interrupt line (boot.c -> PI) */
+    void*      irq_user;
 } GcnAi;
 
+/* INTERRUPT LINE (Dolphin AudioInterface.cpp UpdateInterrupts:96-99):
+ * INT_CAUSE_AI = AICR.AIINT & AICR.AIINTMSK. We model the AICR interrupt
+ * status/mask bits (AIINT is W1C, AIINTMSK/AIINTVLD are plain R/W — see ai.c
+ * write_control) and wire this line into PI. DELIBERATELY DEFERRED (loud
+ * divergence, never a silent fake — PRINCIPLES: Runtime Boundaries): the
+ * sample-counter / interrupt-timing machinery that SETS AIINT
+ * (GenerateAudioInterrupt when AISCNT crosses AIIT while PSTAT=1) is NOT
+ * modeled, so AIINT is never asserted this milestone and the line stays low.
+ * The boot path never starts AI playback, so nothing should raise it; a path
+ * that polls a playing AISCNT/AIINT will diverge loudly from the oracle — the
+ * signal to model the counter, not to fake it here. */
 void gcn_ai_init(GcnAi* ai);
+/* Register the AI interrupt-line sink (boot.c trampoline into PI INT_CAUSE_AI). */
+void gcn_ai_set_irq(GcnAi* ai, GcnAiIrqFn fn, void* user);
 u32  gcn_ai_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_ai_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 
