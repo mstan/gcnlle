@@ -9,6 +9,8 @@
 #include "generated.h"        /* DolRecomp dispatch inlines + func_ decls */
 #include "dispatch/dispatch.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
+#include "debug/rings.h"      /* always-on block/PC ring */
+#include "debug/debug_server.h" /* pumped once per block (non-blocking) */
 
 /* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP runs
  * ~1/6th of it). The DSP only acts on CPU stimuli, so a generous rate keeps its
@@ -38,6 +40,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * without ever executing. If the vector has no recompiled handler,
          * dolrecomp_call returns 0; restore the flag so the stop diagnostic still
          * reports the exception. The handler ends in `rfi` (pc=srr0). */
+        gcn_ring_block(ctx->pc);   /* always-on retired-block/PC timeline */
         u32 pending = ctx->exception;
         ctx->exception = 0;
         if (!dolrecomp_call(ctx, ctx->pc)) {   /* off-image PC / no handler */
@@ -46,6 +49,12 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         }
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
         gcn_dsp_tick(GCN_DSP_CYCLES_PER_BLOCK);  /* run the DSP core in step */
+        /* Service the debug server between blocks: non-blocking, so it stays
+         * responsive even while the guest busy-waits on unmodeled hardware. A
+         * client "quit" ends the run cleanly. */
+        gcn_debug_server_pump();
+        if (gcn_debug_server_quit_requested())
+            return 1;
         blocks++;
     }
     return 1;

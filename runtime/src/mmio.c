@@ -6,6 +6,7 @@
  */
 #include "mmio/mmio.h"
 #include "trace/trace.h"
+#include "debug/rings.h"
 
 #include <stdio.h>
 
@@ -64,6 +65,7 @@ static u64 mmio_ext_read(CPUState* cpu, u32 ea, u8 size) {
         warn_unmapped(ea, 0);
     if (gcn_trace_active())
         gcn_trace_mmio(cpu->pc, ea, value, size, 0);
+    gcn_ring_mmio(cpu->pc, ea, value, size, 0, d ? 1 : 0);
     return value;
 }
 
@@ -72,6 +74,7 @@ static void mmio_ext_write(CPUState* cpu, u32 ea, u64 value, u8 size) {
     if (gcn_trace_active())
         gcn_trace_mmio(cpu->pc, ea, (u32)value, size, 1);
     GcnMmioDevice* d = bus ? find_device(bus, ea) : NULL;
+    gcn_ring_mmio(cpu->pc, ea, (u32)value, size, 1, d ? 1 : 0);
     if (d && d->write)
         d->write(d->user, cpu, ea, (u32)value, size);
     else

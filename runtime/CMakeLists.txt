@@ -94,10 +94,13 @@ if(GCN_WITH_GENERATED)
     src/pi.c
     src/dsp.c
     src/ai.c
+    src/rings.c
+    src/debug_server.c
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )
   # generated/ for "generated.h"; include/ for cpu|memory|seed|dispatch headers.
   target_include_directories(gcn_boot PRIVATE include generated)
-  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle)
+  # ws2_32: Winsock for the TCP debug server (debug_server.c).
+  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle ws2_32)
 endif()

@@ -22,6 +22,8 @@
 #include "pi/pi.h"
 #include "dsp/dsp.h"
 #include "ai/ai.h"
+#include "debug/rings.h"
+#include "debug/debug_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,13 +140,26 @@ int main(int argc, char** argv) {
 
     gcn_trace_init();  /* emits a RUNTIME trace to $GCN_TRACE_OUT if set */
 
+    /* Observability: bring up the always-on ring buffers and (if GCN_DEBUG_PORT
+     * is set) the TCP debug query surface over them + live CPU/RAM state. */
+    gcn_rings_init();
+    GcnDebugCtx dbg = { &cpu };
+    int dbg_port = gcn_debug_server_start(&dbg);
+    /* With the debug server on, run unbounded and park on stop, so the process
+     * (and its always-on rings) stay inspectable until a client sends "quit"
+     * rather than racing to the block budget. */
+    u32 run_blocks = (dbg_port > 0) ? 0u : max_blocks;
+
     fprintf(stdout,
         "gcn boot: seeded; entering recompiled BS2 at 0x%08X (budget %u blocks)\n"
         "--- execution (unmapped-MMIO warnings below are the M0 signal) ---\n",
-        cpu.pc, max_blocks);
+        cpu.pc, dbg_port > 0 ? 0u : max_blocks);
     fflush(stdout);
 
-    int still_live = gcn_dispatch_run(&cpu, max_blocks);
+    int still_live = gcn_dispatch_run(&cpu, run_blocks);
+    if (dbg_port > 0 && !gcn_debug_server_quit_requested())
+        gcn_debug_server_park();
+    gcn_debug_server_stop();
     gcn_trace_close();
 
     const char* reason =

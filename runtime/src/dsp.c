@@ -15,6 +15,7 @@
  */
 #include "dsp/dsp.h"
 #include "dsp_lle_c.h"
+#include "debug/rings.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -59,14 +60,17 @@ static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
 
     dsp->dma_active = true;
     dsp->dma_polls_left = GCN_DSP_ARAM_DMA_NOMINAL_POLLS;
+    gcn_ring_event(GCN_EV_ARAM_DMA, (u32)to_aram, len, cpu->pc);
 }
 
 /* CPU-side CSR bits (masks, interrupt status, ARAM-DMA bit), combined with the
  * DSP-owned bits read from the real core. */
 static u32 read_csr(GcnDsp* dsp) {
     /* A DSP->CPU interrupt request from the core latches the mailbox int bit. */
-    if (dsp_lle_take_interrupt())
+    if (dsp_lle_take_interrupt()) {
         dsp->csr |= GCN_DSP_CSR_DSPINT;
+        gcn_ring_event(GCN_EV_IRQ_RAISE, /*source*/ 5u /*DSP*/, 0u, 0u);
+    }
 
     u32 v = (dsp->csr & ~GCN_DSP_CONTROL_MASK)
           | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u)
@@ -112,7 +116,9 @@ void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     u32 off = addr - GCN_DSP_BASE;
 
     switch (off) {
-    case GCN_DSP_MBOX_IN_H:  dsp_lle_write_mbox_hi((uint16_t)value); return;
+    case GCN_DSP_MBOX_IN_H:  /* CPU->DSP mail (command) — a real handshake edge */
+        gcn_ring_event(GCN_EV_DSP_MAIL, /*cpu->dsp*/ 1u, value, cpu->pc);
+        dsp_lle_write_mbox_hi((uint16_t)value); return;
     case GCN_DSP_MBOX_IN_L:  dsp_lle_write_mbox_lo((uint16_t)value); return;
     case GCN_DSP_MBOX_OUT_H: /* CPU cannot write the DSP->CPU mailbox */ return;
     case GCN_DSP_MBOX_OUT_L: return;
