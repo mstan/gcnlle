@@ -15,6 +15,7 @@
 #include "memory/memory.h"
 #include "seed/seed.h"
 #include "dispatch/dispatch.h"
+#include "trace/trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    gcn_trace_init();  /* emits a RUNTIME trace to $GCN_TRACE_OUT if set */
+
     fprintf(stdout,
         "gcn boot: seeded; entering recompiled BS2 at 0x%08X (budget %u blocks)\n"
         "--- execution (unmapped-MMIO warnings below are the M0 signal) ---\n",
@@ -59,6 +62,7 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     int still_live = gcn_dispatch_run(&cpu, max_blocks);
+    gcn_trace_close();
 
     const char* reason =
         still_live ? "block budget reached (still live — likely busy-waiting on unmodeled HW)"

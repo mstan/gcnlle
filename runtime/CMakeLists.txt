@@ -41,8 +41,11 @@ add_library(gcn_runtime_core STATIC
   src/memory.c
   src/cpu_glue.c
   src/seed.c
+  src/trace.c
 )
 target_include_directories(gcn_runtime_core PUBLIC include)
+# trace.c emits the shared oracle record format (oracle/trace_format.h).
+target_include_directories(gcn_runtime_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../oracle)
 
 # Host executable (M0: applies the seed to a supplied descrambled BS2 dump).
 add_executable(gcn_runtime

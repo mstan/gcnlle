@@ -17,6 +17,7 @@
  */
 #include "cpu/cpu.h"
 #include "memory/memory.h"
+#include "trace/trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,9 +195,14 @@ static void clear_matching_reservation(CPUState* cpu, u32 addr) {
  *                      value (PRINCIPLES: Runtime Boundaries).
  * ------------------------------------------------------------------------- */
 
-static void warn_unmapped(const char* op, u32 addr) {
-    fprintf(stderr, "gcn memory: %s unmapped 0x%08X (no device model installed)\n",
-            op, addr);
+/* Device-layer access with no model installed: record it for the oracle diff
+ * and warn loudly. We NEVER synthesize a value (reads return 0); the diff vs
+ * Dolphin is what tells us which register actually matters. */
+static void mmio_note(CPUState* cpu, u32 addr, u32 value, u8 size, int is_write) {
+    if (gcn_trace_active())
+        gcn_trace_mmio(cpu->pc, addr, value, size, is_write);
+    fprintf(stderr, "gcn memory: %s%u unmapped 0x%08X (no device model installed)\n",
+            is_write ? "write" : "read", (unsigned)(size * 8u), addr);
 }
 
 u64 mem_read64(CPUState* cpu, u32 addr) {
@@ -205,7 +211,7 @@ u64 mem_read64(CPUState* cpu, u32 addr) {
     if (!host || avail < 8) {
         if (cpu->external_read)
             return cpu->external_read(cpu, addr, 8);
-        warn_unmapped("read64", addr);
+        mmio_note(cpu, addr, 0u, 8, 0);
         return 0;
     }
     return read_be64(host);
@@ -216,7 +222,7 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 8) {
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 8); return; }
-        warn_unmapped("write64", addr);
+        mmio_note(cpu, addr, (u32)value, 8, 1);
         return;
     }
     clear_matching_reservation(cpu, addr);
@@ -229,7 +235,7 @@ u32 mem_read32(CPUState* cpu, u32 addr) {
     if (!host || avail < 4) {
         if (cpu->external_read)
             return (u32)cpu->external_read(cpu, addr, 4);
-        warn_unmapped("read32", addr);
+        mmio_note(cpu, addr, 0u, 4, 0);
         return 0;
     }
     return read_be32(host);
@@ -240,7 +246,7 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 4) {
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 4); return; }
-        warn_unmapped("write32", addr);
+        mmio_note(cpu, addr, value, 4, 1);
         return;
     }
     clear_matching_reservation(cpu, addr);
@@ -253,7 +259,7 @@ u16 mem_read16(CPUState* cpu, u32 addr) {
     if (!host || avail < 2) {
         if (cpu->external_read)
             return (u16)cpu->external_read(cpu, addr, 2);
-        warn_unmapped("read16", addr);
+        mmio_note(cpu, addr, 0u, 2, 0);
         return 0;
     }
     return read_be16(host);
@@ -264,7 +270,7 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 2) {
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 2); return; }
-        warn_unmapped("write16", addr);
+        mmio_note(cpu, addr, value, 2, 1);
         return;
     }
     clear_matching_reservation(cpu, addr);
@@ -277,7 +283,7 @@ u8 mem_read8(CPUState* cpu, u32 addr) {
     if (!host) {
         if (cpu->external_read)
             return (u8)cpu->external_read(cpu, addr, 1);
-        warn_unmapped("read8", addr);
+        mmio_note(cpu, addr, 0u, 1, 0);
         return 0;
     }
     return *host;
@@ -288,7 +294,7 @@ void mem_write8(CPUState* cpu, u32 addr, u8 value) {
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host) {
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 1); return; }
-        warn_unmapped("write8", addr);
+        mmio_note(cpu, addr, value, 1, 1);
         return;
     }
     clear_matching_reservation(cpu, addr);
