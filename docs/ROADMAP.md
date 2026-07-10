@@ -36,7 +36,8 @@ recompiled BS2 **locksteps vs Dolphin** on PC + register + low-mem/MMIO/EXI/GX
 write order (order+state+caller, not frame alignment) to a documented first
 divergence.
 
-**M1 — Real BS1 + in-CPU descrambler.** Recompile/run BS1 (`0xFFF00100`) so it
+**M1 — Real BS1 + in-CPU descrambler.** *(Dolphin can't oracle this — it HLEs
+BS1; see "Independent-oracle discipline".)* Recompile/run BS1 (`0xFFF00100`) so it
 descrambles/copies BS2 via EXI ROM reads — the faithful end-to-end boot. This
 is where the self-modifying cache/DMA descramble work lives; done after the
 menu is alive so it can't block early progress. Deliverable: boot from the real
@@ -101,6 +102,19 @@ diffed by value+order. Use Dolphin only for **event order + state targets**;
 take *implementation* from YAGCD/hardware docs (keep the oracle independent, and
 keep the GPL patch local). Reproduce by driving the menu, not by aligning
 savestates.
+
+**Caveat discovered 2026-07-09 — Dolphin HLEs BS1.** Dolphin's `Load_BS2`
+does not run the real reset vector (`0xFFF00000`) or the in-CPU BS1 descramble;
+it HLEs that and *enters BS2 directly at 0x81200150* (its own code comment calls
+this a "hack"). Consequences:
+- **Good for M0** (and everything BS2-onward): we deliberately seed at the same
+  BS2 entry, so we and Dolphin align from instruction 0 — confirmed, the first
+  7 MMIO events match by value+order+PC.
+- **Dolphin CANNOT oracle M1** (real BS1 + in-CPU descramble): it skips exactly
+  that phase. M1 must be validated another way — a real-hardware trace, a
+  different LLE-BS1 source, or by checking that our BS1's *output* (descrambled
+  BS2 in MEM1 + the post-BS1 CPU state) matches what we feed M0. This vindicates
+  the M0/M1 split (post-BS1 first) and is flagged on M1 above.
 
 ## Asset used from each investigated repo
 
