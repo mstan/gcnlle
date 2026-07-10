@@ -12,10 +12,14 @@
 
 static FILE*    g_tf  = NULL;
 static uint64_t g_seq = 0;
+static uint64_t g_max = 500000;   /* cap records so a spin on unmodeled HW can't
+                                     grow a multi-GB file; override GCN_TRACE_MAX */
 
 void gcn_trace_init(void) {
     const char* path = getenv("GCN_TRACE_OUT");
     if (!path || !*path) return;
+    const char* maxs = getenv("GCN_TRACE_MAX");
+    if (maxs && *maxs) { unsigned long long m = strtoull(maxs, NULL, 0); if (m) g_max = m; }
     g_tf = fopen(path, "wb");
     if (!g_tf) {
         fprintf(stderr, "gcn trace: cannot open %s (tracing disabled)\n", path);
@@ -62,6 +66,11 @@ static uint8_t mmio_block(u32 a) {
 
 void gcn_trace_mmio(u32 pc, u32 addr, u32 value, u8 size, int is_write) {
     if (!g_tf) return;
+    if (g_seq >= g_max) {           /* cap reached: stop growing the file */
+        fprintf(stderr, "gcn trace: record cap %llu reached; stopping trace\n",
+                (unsigned long long)g_max);
+        fclose(g_tf); g_tf = NULL; return;
+    }
     gcn_trace_record r;
     memset(&r, 0, sizeof r);           /* zero-fill union tail for stable diffs */
     r.hdr.type = (uint16_t)GCN_TR_MMIO;
