@@ -90,6 +90,42 @@ int main(int argc, char** argv) {
         describe_game(game_name, sizeof(game_name), title_id, 0);
     }
 
+    if (opts.ipl_mode) {
+        IPLFile ipl;
+        if (!ipl_load(&ipl, input_path, opts.ipl_base, opts.ipl_entry))
+            return 1;
+
+        ipl_print_info(&ipl, "GameCube IPL/BS2");
+        printf("cpu: %s\n", cpu_display_name(effective_cpu));
+
+        if (!output_arg) {
+            printf("\ngenerating code...\n");
+            output_arg = ".";
+        }
+
+        if (has_c_extension(output_arg)) {
+            output_path = output_arg;
+        } else {
+            if (!build_gamecube_output_path(output_arg, named_output_path,
+                                            sizeof(named_output_path))) {
+                ipl_free(&ipl);
+                return 1;
+            }
+            output_path = named_output_path;
+            local_chunks_dir = 1;
+        }
+
+        printf("\nwriting output to: %s\n", output_path);
+        if (!emit_ipl_split(&ipl, output_path, effective_cpu, opts.jobs,
+                            local_chunks_dir)) {
+            ipl_free(&ipl);
+            return 1;
+        }
+
+        ipl_free(&ipl);
+        return 0;
+    }
+
     if (espresso_rpx_mode) {
         if (!has_rpx_extension(input_path)) {
             fprintf(stderr, "error: espresso mode expects an .rpx input\n");

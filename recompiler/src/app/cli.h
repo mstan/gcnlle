@@ -12,9 +12,14 @@ typedef struct {
     DolRecompCPU cpu;
     u32 jobs;
     u32 rel_base;
+    u32 ipl_base;
+    u32 ipl_entry;
     int gamecube_mode;
     int cpu_explicit;
     int rel_base_set;
+    int ipl_mode;
+    int ipl_base_set;
+    int ipl_entry_set;
     int setup_mode;
     int show_help;
 } CliOptions;

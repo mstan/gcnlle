@@ -7,6 +7,7 @@
 #include "frontend/container/dol.h"
 #include "frontend/container/rel.h"
 #include "frontend/container/rpx.h"
+#include "frontend/container/ipl.h"
 #include "backend/emitter.h"
 #include "backend/dispatch.h"
 #include "backend/codegen.h"
@@ -374,6 +375,26 @@ int emit_rel_split(const RELFile* rel, const char* output_path,
                                       rel->entry_point, jobs, local_chunks_dir);
     free(sections);
     return ok;
+}
+
+int emit_ipl_split(const IPLFile* ipl, const char* output_path,
+                          DolRecompCPU cpu, u32 jobs, int local_chunks_dir) {
+    // A flat blob is exactly ONE code section spanning the whole image. We use
+    // the DOL embedded-data mode so the inline data heuristic runs (BS2 is
+    // DOL-like SDK C with interleaved constants) and so SMC analysis fires --
+    // both are handled by the generic seam keyed on EMBEDDED_DATA_DOL.
+    LoadedCodeSection section;
+    section.label = "ipl";
+    section.name = NULL;
+    section.data = ipl->file_data;
+    section.index = 0;
+    section.file_offset = 0;
+    section.address = ipl->base_address;
+    section.size = ipl->code_size;
+    section.embedded_data_mode = EMBEDDED_DATA_DOL;
+
+    return emit_code_sections_split(&section, 1, output_path, cpu,
+                                    ipl->entry_point, jobs, local_chunks_dir);
 }
 
 typedef struct {

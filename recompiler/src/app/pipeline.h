@@ -6,11 +6,14 @@
 #include "frontend/container/dol.h"
 #include "frontend/container/rel.h"
 #include "frontend/container/rpx.h"
+#include "frontend/container/ipl.h"
 
 #define REL_AUTO_BASE 0x80500000u
 #define REL_AUTO_ALIGN 0x10000u
 
 int emit_dol_split(const DOLFile* dol, const char* output_path,
+                   DolRecompCPU cpu, u32 jobs, int local_chunks_dir);
+int emit_ipl_split(const IPLFile* ipl, const char* output_path,
                    DolRecompCPU cpu, u32 jobs, int local_chunks_dir);
 int emit_rpx_split(const RPXFile* rpx, const char* output_path,
                    DolRecompCPU cpu, u32 jobs, int local_chunks_dir);

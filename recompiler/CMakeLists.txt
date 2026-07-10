@@ -60,6 +60,7 @@ add_library(dr_frontend STATIC
     src/frontend/container/dol.c
     src/frontend/container/rel.c
     src/frontend/container/rpx.c
+    src/frontend/container/ipl.c
     src/frontend/container/disc_extract.c
 )
 target_include_directories(dr_frontend PUBLIC ${DOLRECOMP_SRC})
@@ -112,6 +113,10 @@ add_test(NAME cross_check COMMAND test_cross_check)
 add_executable(test_dol tests/test_dol.c)
 target_link_libraries(test_dol PRIVATE dr_frontend)
 add_test(NAME dol COMMAND test_dol)
+
+add_executable(test_ipl tests/test_ipl.c)
+target_link_libraries(test_ipl PRIVATE dr_frontend)
+add_test(NAME ipl COMMAND test_ipl)
 
 add_executable(test_rel tests/test_rel.c)
 target_link_libraries(test_rel PRIVATE dr_frontend)

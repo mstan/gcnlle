@@ -1,4 +1,5 @@
 #include "app/cli.h"
+#include "frontend/container/ipl.h"
 #include "platform/strutil.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,11 +17,15 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  -jN                            Use N worker jobs for split C output (e.g. -j14)\n");
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
+    fprintf(stderr, "  --gamecube-ipl                 Recompile a flat descrambled BS2/IPL blob\n");
+    fprintf(stderr, "  --base <addr>                  IPL load base (default 0x81300000)\n");
+    fprintf(stderr, "  --entry <addr>                 IPL entry PC (default = base)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
     fprintf(stderr, "  --setup                        Download titles database and optionally install wit\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  GameCube:     %s --gamecube <input.dol> build\n", prog);
+    fprintf(stderr, "  GameCube IPL: %s --gamecube-ipl <bs2.bin> build\n", prog);
     fprintf(stderr, "  Wii DOL:      %s <input.dol> SUKE01 build\n", prog);
     fprintf(stderr, "  REL module:   %s <input.rel | rel_folder> SUKE01 build\n", prog);
     fprintf(stderr, "  Wii U RPX:    %s --cpu espresso <input.rpx> build\n", prog);
@@ -150,6 +155,48 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
             continue;
         }
 
+        if (strcmp(arg, "--gamecube-ipl") == 0 || strcmp(arg, "--ipl") == 0) {
+            opts->ipl_mode = 1;
+            opts->gamecube_mode = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--base") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --base needs an address\n");
+                return 0;
+            }
+            if (!parse_u32_arg(argv[++i], "--base", &opts->ipl_base))
+                return 0;
+            opts->ipl_base_set = 1;
+            continue;
+        }
+
+        if (strncmp(arg, "--base=", 7) == 0) {
+            if (!parse_u32_arg(arg + 7, "--base", &opts->ipl_base))
+                return 0;
+            opts->ipl_base_set = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--entry") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --entry needs an address\n");
+                return 0;
+            }
+            if (!parse_u32_arg(argv[++i], "--entry", &opts->ipl_entry))
+                return 0;
+            opts->ipl_entry_set = 1;
+            continue;
+        }
+
+        if (strncmp(arg, "--entry=", 8) == 0) {
+            if (!parse_u32_arg(arg + 8, "--entry", &opts->ipl_entry))
+                return 0;
+            opts->ipl_entry_set = 1;
+            continue;
+        }
+
         if (strcmp(arg, "--cpu") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "error: --cpu needs gekko, broadway, or espresso\n");
@@ -258,6 +305,16 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
         fprintf(stderr, "error: --gamecube cannot be used with espresso\n");
         return 0;
     }
+
+    if ((opts->ipl_base_set || opts->ipl_entry_set) && !opts->ipl_mode) {
+        fprintf(stderr, "error: --base/--entry require --gamecube-ipl\n");
+        return 0;
+    }
+
+    if (!opts->ipl_base_set)
+        opts->ipl_base = IPL_DEFAULT_BASE;
+    if (!opts->ipl_entry_set)
+        opts->ipl_entry = opts->ipl_base;
 
     opts->input_path = positional[0];
 
