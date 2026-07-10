@@ -59,45 +59,29 @@
 #define GCN_DSP_CSR_INITCODE 0x0400u  /* init-code state                  */
 #define GCN_DSP_CSR_INIT     0x0800u  /* DSP init                         */
 
-/* Power-on / reset CSR: DSP halted and init asserted. */
-#define GCN_DSP_CSR_RESET_VALUE  (GCN_DSP_CSR_HALT | GCN_DSP_CSR_INIT)  /* 0x0804 */
+/* CSR bits owned by the DSP core (Dolphin DSP.h DSP_CONTROL_MASK): RESET,
+ * PIINT(assert-int), HALT, INITCODE, INIT. These are read from / written to the
+ * real DSP via the dsp_lle C API; the remaining CSR bits (interrupt status +
+ * masks + the ARAM-DMA in-progress bit) are CPU-side hardware, kept here. */
+#define GCN_DSP_CONTROL_MASK  0x0C07u
 
 /* Nominal number of CSR polls the ARAM DMA stays "in progress" for. The real
  * duration is Gekko cycle timing we don't model; the poll-aware diff collapses
  * the identical poll reads, so any value >= 1 matches by value+order. */
 #define GCN_DSP_ARAM_DMA_NOMINAL_POLLS  4u
 
-/* When the guest clears DSPInit (1->0), the hardware boots the init microcode
- * and briefly reports DSPInitCode (bit 10), which self-clears ~130 time-base
- * ticks later (Dolphin DSPHLE.cpp:214-242). We hold it for a nominal number of
- * CSR polls; the poll-aware diff makes the exact count immaterial. */
-#define GCN_DSP_INITCODE_NOMINAL_POLLS  4u
-
-/* The DSP init microcode posts one boot mail to the CPU when it starts (Dolphin
- * DSPHLE INIT.cpp:21, PushMail(0x80544348)). This is the real init ucode's
- * documented boot message — a validated per-subsystem HLE replacement on the
- * LLE baseline, not a Dolphin-specific value (PRINCIPLES: HLE only as a
- * validated replacement). Bit 31 is the DSP-mail-ready flag. */
-#define GCN_DSP_INIT_BOOT_MAIL  0x80544348u
-#define GCN_DSP_MAIL_READY      0x80000000u
-
-#define GCN_ARAM_SIZE  0x01000000u    /* 16 MB auxiliary RAM (retail)     */
-
 typedef struct {
     u16   reg[GCN_DSP_SIZE / 2];      /* generic 16-bit register backing  */
-    u16   csr;                        /* control/status (bits 9/10 computed) */
+    u16   csr;                        /* CPU-side CSR bits (int status/masks) */
     bool  dma_active;                 /* ARAM DMA in flight               */
     u32   dma_polls_left;             /* CSR polls until it "completes"    */
-    bool  initcode_active;            /* init-microcode boot in progress  */
-    u32   initcode_polls_left;        /* CSR polls until DSPInitCode clears */
-    u32   mail_value;                 /* DSP->CPU mail (bit31 = ready)     */
-    bool  mail_pending;               /* a mail is queued for the CPU      */
-    u32   mail_last;                  /* last mail latched by a hi/lo read */
-    u8*   aram;                       /* 16 MB ARAM backing (owned)       */
 } GcnDsp;
 
-void gcn_dsp_init(GcnDsp* dsp);
+/* irom/coef are the raw big-endian DSP ROM bytes (dsp_rom.bin / dsp_coef.bin);
+ * mem1 is the guest MEM1 backing the DSP DMAs against. */
+void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size);
 void gcn_dsp_free(GcnDsp* dsp);
+void gcn_dsp_tick(u32 ppc_cycles);   /* advance the DSP core (called per block) */
 u32  gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 

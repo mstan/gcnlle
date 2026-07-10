@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
-project(gcnrecomp_runtime C)
+project(gcnrecomp_runtime C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# DSP LLE core (C++ static lib running the real DSP firmware). Built always so
+# the default runtime build catches breakage; linked into gcn_boot.
+add_subdirectory(dsp_lle)
 
 # ---------------------------------------------------------------------------
 # LLE runtime for the recompiled GameCube IPL.
@@ -93,5 +99,5 @@ if(GCN_WITH_GENERATED)
   )
   # generated/ for "generated.h"; include/ for cpu|memory|seed|dispatch headers.
   target_include_directories(gcn_boot PRIVATE include generated)
-  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core)
+  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle)
 endif()

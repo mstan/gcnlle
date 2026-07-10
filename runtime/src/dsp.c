@@ -1,107 +1,93 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  *
- * DSP interface + ARAM DMA model. See include/dsp/dsp.h for scope and the
- * oracle-observed boot sequence this reproduces.
+ * DSP interface model. The 0xCC005000 block splits two ways:
+ *   - mailboxes (0x00-0x06) and the control register's DSP-owned bits
+ *     (DSP_CONTROL_MASK) route to the REAL DSP running its firmware, via the
+ *     dsp_lle C API (runtime/dsp_lle/ — Dolphin's DSP-LLE interpreter + our
+ *     Host binding). No HLE: the DSP boots its IROM and runs the ucode the IPL
+ *     uploads, posting real mail.
+ *   - the CPU-side CSR bits (interrupt status/masks, ARAM-DMA in-progress) and
+ *     the AR/AI DMA engine (0x12/0x20/0x24/0x28) are Flipper hardware, modeled
+ *     here. The AR DMA moves bytes between MEM1 and the 16 MB ARAM for real.
+ *
+ * CSR read/write mirror Dolphin's DSP.cpp: the DSP-owned bits come from the core
+ * (dsp_lle_read_control), the rest from this CPU-side state.
  */
 #include "dsp/dsp.h"
+#include "dsp_lle_c.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-void gcn_dsp_init(GcnDsp* dsp) {
+void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size) {
     memset(dsp, 0, sizeof *dsp);
-    dsp->csr = GCN_DSP_CSR_RESET_VALUE;   /* power-on: HALT | INIT (0x0804) */
-    dsp->aram = (u8*)calloc(1, GCN_ARAM_SIZE);
+    dsp_lle_init(irom, coef, mem1, mem1_size);   /* brings up the core + ARAM */
 }
 
 void gcn_dsp_free(GcnDsp* dsp) {
-    free(dsp->aram);
-    dsp->aram = NULL;
+    (void)dsp;
+    dsp_lle_shutdown();   /* frees the shared ARAM */
+}
+
+void gcn_dsp_tick(u32 ppc_cycles) {
+    if (getenv("GCN_DSP_NOTICK")) return;   /* bisect guard */
+    dsp_lle_update((int)ppc_cycles);
 }
 
 static u16 idx16(u32 off) { return (u16)(off >> 1); }
 
-/* Perform the ARAM DMA the guest just kicked. AR_CNT (0x28) holds the length in
- * its low bits; bit 31 selects direction (0: MRAM->ARAM, 1: ARAM->MRAM). MMADDR
- * is a physical MEM1 offset. The transfer is done for real; DSPDMA then reads
- * as in-progress for a nominal number of CSR polls (see header). */
+/* Perform the ARAM DMA the guest just kicked (Flipper AR engine, CPU-side). See
+ * the header for the register layout; direction bit 31 of AR_CNT. */
 static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
     u32 mmaddr = ((u32)dsp->reg[idx16(GCN_DSP_AR_MMADDR)]     << 16) |
                   (u32)dsp->reg[idx16(GCN_DSP_AR_MMADDR) + 1];
     u32 araddr = ((u32)dsp->reg[idx16(GCN_DSP_AR_ARADDR)]     << 16) |
                   (u32)dsp->reg[idx16(GCN_DSP_AR_ARADDR) + 1];
     u32 len    = cnt & 0x03FFFFFFu;
-    int to_aram = ((cnt & 0x80000000u) == 0);   /* 0 => write into ARAM */
+    int to_aram = ((cnt & 0x80000000u) == 0);
+    u8* aram = dsp_lle_aram();          /* shared with the DSP accelerator */
+    u32 aram_size = dsp_lle_aram_size();
 
-    if (dsp->aram && len &&
+    if (aram && len &&
         (u64)mmaddr + len <= cpu->ram_size &&
-        (u64)araddr + len <= GCN_ARAM_SIZE) {
+        (u64)araddr + len <= aram_size) {
         if (to_aram)
-            memcpy(dsp->aram + araddr, cpu->ram + mmaddr, len);
+            memcpy(aram + araddr, cpu->ram + mmaddr, len);
         else
-            memcpy(cpu->ram + mmaddr, dsp->aram + araddr, len);
+            memcpy(cpu->ram + mmaddr, aram + araddr, len);
     }
 
     dsp->dma_active = true;
     dsp->dma_polls_left = GCN_DSP_ARAM_DMA_NOMINAL_POLLS;
 }
 
+/* CPU-side CSR bits (masks, interrupt status, ARAM-DMA bit), combined with the
+ * DSP-owned bits read from the real core. */
 static u32 read_csr(GcnDsp* dsp) {
-    u32 v = dsp->csr | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u)
-                     | (dsp->initcode_active ? GCN_DSP_CSR_INITCODE : 0u);
+    /* A DSP->CPU interrupt request from the core latches the mailbox int bit. */
+    if (dsp_lle_take_interrupt())
+        dsp->csr |= GCN_DSP_CSR_DSPINT;
+
+    u32 v = (dsp->csr & ~GCN_DSP_CONTROL_MASK)
+          | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u)
+          | ((u32)dsp_lle_read_control() & GCN_DSP_CONTROL_MASK);
+
     if (dsp->dma_active && --dsp->dma_polls_left == 0) {
         dsp->dma_active = false;
-        dsp->csr |= GCN_DSP_CSR_ARINT;   /* DMA complete raises the ARAM int */
+        dsp->csr |= GCN_DSP_CSR_ARINT;   /* AR DMA complete raises the ARAM int */
     }
-    if (dsp->initcode_active && --dsp->initcode_polls_left == 0)
-        dsp->initcode_active = false;    /* init microcode boot window ends */
     return v;
 }
 
 static void write_csr(GcnDsp* dsp, u16 w) {
-    bool init_was_set = (dsp->csr & GCN_DSP_CSR_INIT) != 0;
-    /* write-1-to-clear the interrupt status bits */
+    /* DSP-owned bits (reset/halt/init) drive the real core. */
+    dsp_lle_write_control((uint16_t)(w & GCN_DSP_CONTROL_MASK));
+
+    /* CPU-side interrupt status is write-1-to-clear. */
     dsp->csr &= (u16)~(w & (GCN_DSP_CSR_AIDINT | GCN_DSP_CSR_ARINT | GCN_DSP_CSR_DSPINT));
-    /* update the read/write control bits from the write. INITCODE (bit 10) is
-     * hardware-driven (not guest-writable) and DMA (bit 9) is read-only — both
-     * are computed on read, never stored. */
-    const u16 CTRL = GCN_DSP_CSR_PIINT | GCN_DSP_CSR_HALT |
-                     GCN_DSP_CSR_AIDMASK | GCN_DSP_CSR_ARMASK | GCN_DSP_CSR_DSPMASK |
-                     GCN_DSP_CSR_INIT;
-    dsp->csr = (u16)((dsp->csr & ~CTRL) | (w & CTRL));
-    /* RES (auto-clears) is never stored. A reset restarts the ROM microcode,
-     * discarding any queued DSP->CPU mail (Dolphin ClearPending on SetUCode). */
-    if (w & GCN_DSP_CSR_RES)
-        dsp->mail_pending = false;
-    /* Clearing DSPInit (1->0) boots the init microcode; DSPInitCode reports set
-     * for a short window afterward (Dolphin DSPHLE.cpp:214-227). */
-    if (init_was_set && !(w & GCN_DSP_CSR_INIT)) {
-        dsp->initcode_active = true;
-        dsp->initcode_polls_left = GCN_DSP_INITCODE_NOMINAL_POLLS;
-        /* The init microcode posts its boot mail to the CPU (INIT.cpp:21). */
-        dsp->mail_value = GCN_DSP_INIT_BOOT_MAIL;
-        dsp->mail_pending = true;
-    }
-}
-
-/* DSP->CPU mailbox reads (Dolphin CMailHandler). Mail is visible only when the
- * DSP is not halted; the CPU reads the high word (peek) then the low word (which
- * consumes the mail and clears the ready bit for subsequent high reads). */
-static u16 read_mbox_out_hi(GcnDsp* dsp) {
-    bool halted = (dsp->csr & GCN_DSP_CSR_HALT) != 0;
-    if (!halted && dsp->mail_pending)
-        dsp->mail_last = dsp->mail_value;
-    return (u16)(dsp->mail_last >> 16);
-}
-
-static u16 read_mbox_out_lo(GcnDsp* dsp) {
-    bool halted = (dsp->csr & GCN_DSP_CSR_HALT) != 0;
-    if (!halted && dsp->mail_pending) {
-        dsp->mail_last = dsp->mail_value;
-        dsp->mail_pending = false;          /* mail consumed */
-    }
-    dsp->mail_last &= ~GCN_DSP_MAIL_READY;  /* clear ready bit after low read */
-    return (u16)(dsp->mail_last & 0xFFFFu);
+    /* CPU-side interrupt masks are stored. */
+    const u16 MASKS = GCN_DSP_CSR_AIDMASK | GCN_DSP_CSR_ARMASK | GCN_DSP_CSR_DSPMASK;
+    dsp->csr = (u16)((dsp->csr & ~MASKS) | (w & MASKS));
 }
 
 u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
@@ -109,9 +95,11 @@ u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     GcnDsp* dsp = (GcnDsp*)user;
     u32 off = addr - GCN_DSP_BASE;
     switch (off) {
+    case GCN_DSP_MBOX_IN_H:  return dsp_lle_read_mbox_hi(1);  /* CPU->DSP box */
+    case GCN_DSP_MBOX_IN_L:  return dsp_lle_read_mbox_lo(1);
+    case GCN_DSP_MBOX_OUT_H: return dsp_lle_read_mbox_hi(0);  /* DSP->CPU box */
+    case GCN_DSP_MBOX_OUT_L: return dsp_lle_read_mbox_lo(0);
     case GCN_DSP_CSR:        return read_csr(dsp);
-    case GCN_DSP_MBOX_OUT_H: return read_mbox_out_hi(dsp);
-    case GCN_DSP_MBOX_OUT_L: return read_mbox_out_lo(dsp);
     default: break;
     }
     if (size == 4)
@@ -123,7 +111,14 @@ void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     GcnDsp* dsp = (GcnDsp*)user;
     u32 off = addr - GCN_DSP_BASE;
 
-    if (off == GCN_DSP_CSR) { write_csr(dsp, (u16)value); return; }
+    switch (off) {
+    case GCN_DSP_MBOX_IN_H:  dsp_lle_write_mbox_hi((uint16_t)value); return;
+    case GCN_DSP_MBOX_IN_L:  dsp_lle_write_mbox_lo((uint16_t)value); return;
+    case GCN_DSP_MBOX_OUT_H: /* CPU cannot write the DSP->CPU mailbox */ return;
+    case GCN_DSP_MBOX_OUT_L: return;
+    case GCN_DSP_CSR:        write_csr(dsp, (u16)value); return;
+    default: break;
+    }
 
     /* store into the generic 16-bit backing (32-bit writes fill two halves) */
     if (size == 4) {

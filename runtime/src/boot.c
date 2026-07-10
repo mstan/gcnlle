@@ -108,9 +108,23 @@ int main(int argc, char** argv) {
     gcn_mmio_register(&bus, "PI", GCN_PI_BASE, GCN_PI_SIZE,
                       gcn_pi_read, gcn_pi_write, &pi);
 
-    /* DSP + ARAM DMA: the menu resets the DSP and runs an ARAM DMA at stage-2. */
+    /* DSP: the REAL DSP core runs its firmware (IROM + uploaded ucode). Load the
+     * DSP ROM dumps (GCN_DSP_ROM / GCN_DSP_COEF, default bios/dsp_{rom,coef}.bin).
+     * The Flipper AR/AI DMA engine is modeled inside the DSP device itself. */
     static GcnDsp dsp;
-    gcn_dsp_init(&dsp);
+    u8* dsp_rom = NULL; u32 dsp_rom_size = 0;
+    u8* dsp_coef = NULL; u32 dsp_coef_size = 0;
+    const char* dsp_rom_path  = getenv("GCN_DSP_ROM");
+    const char* dsp_coef_path = getenv("GCN_DSP_COEF");
+    if (!dsp_rom_path  || !*dsp_rom_path)  dsp_rom_path  = "bios/dsp_rom.bin";
+    if (!dsp_coef_path || !*dsp_coef_path) dsp_coef_path = "bios/dsp_coef.bin";
+    if (!gcn_seed_read_file(dsp_rom_path, &dsp_rom, &dsp_rom_size) ||
+        !gcn_seed_read_file(dsp_coef_path, &dsp_coef, &dsp_coef_size)) {
+        fprintf(stderr, "gcn boot: DSP ROM load failed (%s / %s) — set GCN_DSP_ROM/GCN_DSP_COEF\n",
+                dsp_rom_path, dsp_coef_path);
+        cpu_free(&cpu); free(payload); return 1;
+    }
+    gcn_dsp_init(&dsp, dsp_rom, dsp_coef, cpu.ram, cpu.ram_size);
     gcn_mmio_register(&bus, "DSP", GCN_DSP_BASE, GCN_DSP_SIZE,
                       gcn_dsp_read, gcn_dsp_write, &dsp);
 

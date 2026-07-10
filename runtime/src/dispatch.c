@@ -8,6 +8,13 @@
  */
 #include "generated.h"        /* DolRecomp dispatch inlines + func_ decls */
 #include "dispatch/dispatch.h"
+#include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
+
+/* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP runs
+ * ~1/6th of it). The DSP only acts on CPU stimuli, so a generous rate keeps its
+ * IROM/ucode responsive without racing; exact timing is absorbed by the
+ * poll-aware oracle diff. */
+#define GCN_DSP_CYCLES_PER_BLOCK 600u
 
 /* Guest time-base ticks advanced per executed block. The real Gekko TB runs at
  * bus/4; we don't have per-block instruction counts here, so M0 uses a fixed
@@ -38,6 +45,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
             return 0;
         }
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
+        gcn_dsp_tick(GCN_DSP_CYCLES_PER_BLOCK);  /* run the DSP core in step */
         blocks++;
     }
     return 1;
