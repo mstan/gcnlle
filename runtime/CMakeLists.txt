@@ -57,4 +57,29 @@ enable_testing()
 
 add_executable(test_seed tests/test_seed.c)
 target_link_libraries(test_seed PRIVATE gcn_runtime_core)
-add_test(NAME seed_contract COMMAND test_seed)
+add_test(NAME seed_contract COMMAND $<TARGET_FILE:test_seed>)
+
+# ---------------------------------------------------------------------------
+# M0 execution target: link Track A's recompiled BS2 and run it.
+#
+# Off by default because it requires runtime/generated/ to be populated first
+# (run `runtime/generate.sh`, which needs bios/ipl.bin + the built recompiler).
+# Enable with -DGCN_WITH_GENERATED=ON.
+# ---------------------------------------------------------------------------
+option(GCN_WITH_GENERATED "Build gcn_boot with the recompiled BS2 (needs runtime/generated/)" OFF)
+if(GCN_WITH_GENERATED)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/generated/generated.h)
+    message(FATAL_ERROR "GCN_WITH_GENERATED=ON but runtime/generated/ is empty. Run runtime/generate.sh first.")
+  endif()
+  file(GLOB GCN_GENERATED_CHUNKS CONFIGURE_DEPENDS
+       ${CMAKE_CURRENT_SOURCE_DIR}/generated/chunks/*.c)
+  add_executable(gcn_boot
+    src/boot.c
+    src/dispatch.c
+    generated/generated.c
+    ${GCN_GENERATED_CHUNKS}
+  )
+  # generated/ for "generated.h"; include/ for cpu|memory|seed|dispatch headers.
+  target_include_directories(gcn_boot PRIVATE include generated)
+  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core)
+endif()
