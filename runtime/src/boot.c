@@ -120,8 +120,11 @@ int main(int argc, char** argv) {
         "  reason      : %s\n"
         "  final pc    : 0x%08X\n"
         "  exception   : 0x%08X\n"
-        "  lr          : 0x%08X\n",
-        reason, cpu.pc, cpu.exception, cpu.lr);
+        "  lr          : 0x%08X\n"
+        "  srr0(fault) : 0x%08X\n"
+        "  dar (addr)  : 0x%08X\n"
+        "  dsisr       : 0x%08X\n",
+        reason, cpu.pc, cpu.exception, cpu.lr, cpu.srr0, cpu.dar, cpu.dsisr);
 
     cpu_free(&cpu);
     free(payload);
