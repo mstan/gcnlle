@@ -85,6 +85,9 @@ if(GCN_WITH_GENERATED)
     src/mmio.c
     src/exi.c
     src/si.c
+    src/pi.c
+    src/dsp.c
+    src/ai.c
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )

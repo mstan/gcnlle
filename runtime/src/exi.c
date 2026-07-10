@@ -31,12 +31,21 @@ static bool decode(u32 addr, u32* ch, u32* off) {
 
 void gcn_exi_init(GcnExi* exi) {
     memset(exi, 0, sizeof(*exi));
-    /* Channels 0 and 1 present a device: EXT (bit 12) + EXTINT (bit 11) latched.
-     * The Dolphin oracle reads ch0 CSR as 0x1950/0x1958/0x1808 — all require EXT
-     * set, which GXRuntime's init (EXTINT only) does NOT produce. See exi.h. */
-    exi->channels[0].csr = GCN_EXI_CSR_EXT | GCN_EXI_CSR_EXTINT;
-    exi->channels[1].csr = GCN_EXI_CSR_EXT | GCN_EXI_CSR_EXTINT;
+    /* Reset CSR values, transcribed from Dolphin's CEXIChannel constructor
+     * (our independent oracle): ch0/1 latch EXTINT (bit 11); ch1 additionally
+     * powers up with CHIP_SELECT = 1 (bit 7). EXT (bit 12) is NOT latched here —
+     * it is recomputed on every CSR read from dev_present[] (see gcn_exi_read),
+     * exactly as Dolphin does (m_status.EXT = GetDevice(1)->IsPresent()). */
+    exi->channels[0].csr = GCN_EXI_CSR_EXTINT;
+    exi->channels[1].csr = GCN_EXI_CSR_EXTINT | GCN_EXI_CSR_CS_DEV0;
     /* Channel 2 is the AD16 dev-probe target: idle, no EXT. */
+
+    /* Device-present at chip-select 1 per channel (drives EXT on read). The
+     * Dolphin oracle boots with slot A occupied and slot B empty, so ch0 EXT
+     * reads 1 and ch1 EXT reads 0; ch2 is forced 0. See exi.h. */
+    exi->dev_present[0] = 1;
+    exi->dev_present[1] = 0;
+    exi->dev_present[2] = 0;
 }
 
 void gcn_exi_set_rom(GcnExi* exi, const u8* rom, u32 size, u32 base) {
@@ -230,7 +239,12 @@ u32 gcn_exi_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     if (!decode(addr, &ch, &off)) return 0;
     GcnExiChannel* c = &exi->channels[ch];
     switch (off) {
-    case GCN_EXI_CSR_OFF:  return c->csr;
+    case GCN_EXI_CSR_OFF:
+        /* EXT reflects device presence at chip-select 1, computed on read (never
+         * stored); ch2 is always 0 (Dolphin forces it). */
+        if (ch < 2u && exi->dev_present[ch])
+            return c->csr | GCN_EXI_CSR_EXT;
+        return c->csr & ~GCN_EXI_CSR_EXT;
     case GCN_EXI_MAR_OFF:  return c->mar;
     case GCN_EXI_LEN_OFF:  return c->len;
     case GCN_EXI_CR_OFF:   return c->cr;

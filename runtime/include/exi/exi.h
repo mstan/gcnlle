@@ -54,9 +54,10 @@ extern "C" {
 #define GCN_EXI_CSR_TCINT       0x00000008u  /* w1c, set on transfer complete */
 #define GCN_EXI_CSR_CLK_MASK    0x00000070u
 #define GCN_EXI_CSR_CS_MASK     0x00000380u  /* one-hot chip select, bits 7-9 */
+#define GCN_EXI_CSR_CS_DEV0     0x00000080u  /* chip-select field = 1 (device 0) */
 #define GCN_EXI_CSR_EXTINTMASK  0x00000400u
 #define GCN_EXI_CSR_EXTINT      0x00000800u  /* w1c, ch0/1 only */
-#define GCN_EXI_CSR_EXT         0x00001000u  /* device present (read-only) */
+#define GCN_EXI_CSR_EXT         0x00001000u  /* device present (read-only, on read) */
 #define GCN_EXI_CSR_ROMDIS      0x00002000u  /* ch0 only: unmap internal ROM */
 
 /* CR bit fields. */
@@ -103,9 +104,18 @@ typedef struct GcnExi {
     u32       dev_pos[GCN_EXI_CHANNELS];     /* byte position within RTC/SRAM */
     u8        prev_cs[GCN_EXI_CHANNELS];     /* last chip-select, for select edge */
     int       have_cmd[GCN_EXI_CHANNELS];    /* command word latched this xact */
+
+    /* EXT (device-present) is computed on each CSR read from the presence of the
+     * device at chip-select 1 (Dolphin: GetDevice(1)->IsPresent()), not latched.
+     * This flag is that presence per channel: ch0 = a device occupies slot A (as
+     * in the Dolphin oracle's config, EXT reads 1), ch1 = slot B empty (EXT 0),
+     * ch2 = forced 0. When memory-card modelling lands (M4), this becomes the
+     * live card-inserted state; until then a menu card probe diverges loudly. */
+    u8        dev_present[GCN_EXI_CHANNELS];
 } GcnExi;
 
-/* Initialise all channels (ch0/1 present with EXT|EXTINT; ch2 idle). */
+/* Initialise all channels (reset CSR: ch0 EXTINT; ch1 EXTINT|CS=1; ch2 idle;
+ * EXT is computed on read, never latched). */
 void gcn_exi_init(GcnExi* exi);
 
 /* Point the IPL/mask-ROM device at its backing image. `base` is the ROM byte

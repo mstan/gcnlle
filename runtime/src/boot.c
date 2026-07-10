@@ -19,6 +19,9 @@
 #include "mmio/mmio.h"
 #include "exi/exi.h"
 #include "si/si.h"
+#include "pi/pi.h"
+#include "dsp/dsp.h"
+#include "ai/ai.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +100,25 @@ int main(int argc, char** argv) {
     gcn_mmio_register(&bus, "SI", GCN_SI_BASE, GCN_SI_SIZE,
                       gcn_si_read, gcn_si_write, &si);
 
+    /* PI: R/W register file + read-only chipset-revision register (0x2C). The
+     * menu reads the revision at stage-2 pc 0x813004B0. */
+    static GcnPi pi;
+    gcn_pi_init(&pi);
+    gcn_mmio_register(&bus, "PI", GCN_PI_BASE, GCN_PI_SIZE,
+                      gcn_pi_read, gcn_pi_write, &pi);
+
+    /* DSP + ARAM DMA: the menu resets the DSP and runs an ARAM DMA at stage-2. */
+    static GcnDsp dsp;
+    gcn_dsp_init(&dsp);
+    gcn_mmio_register(&bus, "DSP", GCN_DSP_BASE, GCN_DSP_SIZE,
+                      gcn_dsp_read, gcn_dsp_write, &dsp);
+
+    /* AI: audio-interface control register (menu reads/writes it during init). */
+    static GcnAi ai;
+    gcn_ai_init(&ai);
+    gcn_mmio_register(&bus, "AI", GCN_AI_BASE, GCN_AI_SIZE,
+                      gcn_ai_read, gcn_ai_write, &ai);
+
     gcn_mmio_install(&bus, &cpu);
 
     gcn_trace_init();  /* emits a RUNTIME trace to $GCN_TRACE_OUT if set */
@@ -145,6 +167,7 @@ int main(int argc, char** argv) {
         } else fprintf(stderr, "gcn boot: bad/out-of-range GCN_MEM_DUMP\n");
     }
 
+    gcn_dsp_free(&dsp);
     cpu_free(&cpu);
     free(payload);
     return 0;
