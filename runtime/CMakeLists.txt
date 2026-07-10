@@ -13,23 +13,48 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Dolphin SDK. HLE is only ever a *validated* per-subsystem replacement on top
 # of this baseline (see ../PRINCIPLES.md).
 #
-# Device modules to grow here (cf. psxrecomp runtime/src, reshine runtime/src,
-# and GXRuntime's C device models which we harvest under GPL-3.0):
-#   memory.c    flat big-endian MEM1 (24MB) + MEM2 stub, bus primitives
-#   cpu_glue.c  PPCContext <-> recompiled code entry/exit, exceptions, rfi
-#   exi.c       EXI channels: RTC (date/time) + SRAM (settings) + memory cards
-#   vi.c        Video Interface: framebuffer scanout / XFB -> host window
-#   gx.c        Flipper GX FIFO command processor -> host renderer
-#   dsp.c/ai.c  DSP + Audio Interface (boot chime, menu sound)
-#   di.c        Disc Interface (disc-load screen; stubbed until disc phase)
-#   si.c        Serial Interface (controller input in the menu)
-#   dispatch.c  block dispatch loop + host-intercept table
+# M0 (declarative seed contract) modules that exist now:
+#   src/memory.c    flat big-endian MEM1 (24MB) + uncached mirror + DolRecomp
+#                   bus primitives (mem_read/write 8/16/32/64) + lifecycle.
+#   src/cpu_glue.c  the ppc_* semantic helper family the generated C links
+#                   against (exceptions, SPR/TB, psq, fma, fctiw, fres/frsqrte).
+#   src/seed.c      the M0 declarative seed loader (BS2 payload + entry PC +
+#                   MEM1 reset image + EXI SRAM/RTC fixtures, every field with
+#                   a provenance tag). See ../runtime/ABI.md for the DolRecomp
+#                   codegen ABI these target and how Track A's output reconciles.
 #
-# For now this target is a skeleton that compiles a placeholder so the tree
-# builds green end-to-end. Replace src/main.c as real modules land.
+# Device models to grow here in later milestones (cf. reshine runtime/src and
+# GXRuntime's C device models which we harvest under GPL-3.0):
+#   exi.c   EXI channels: RTC (date/time) + SRAM (settings) + memory cards
+#   vi.c    Video Interface: framebuffer scanout / XFB -> host window
+#   gx.c    Flipper GX FIFO command processor -> host renderer
+#   dsp.c/ai.c  DSP + Audio Interface (boot chime, menu sound)
+#   di.c    Disc Interface (disc-load screen; stubbed until disc phase)
+#   si.c    Serial Interface (controller input in the menu)
+#   gcn_dispatch.c  block dispatch loop over Track A's generated func_* table
 # ---------------------------------------------------------------------------
 
+# Core runtime library: the ABI implementation + seed. Kept separate so both the
+# executable and the unit test link the same objects (and so future generated C
+# links against exactly these symbols).
+add_library(gcn_runtime_core STATIC
+  src/memory.c
+  src/cpu_glue.c
+  src/seed.c
+)
+target_include_directories(gcn_runtime_core PUBLIC include)
+
+# Host executable (M0: applies the seed to a supplied descrambled BS2 dump).
 add_executable(gcn_runtime
   src/main.c
 )
-target_include_directories(gcn_runtime PRIVATE include)
+target_link_libraries(gcn_runtime PRIVATE gcn_runtime_core)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+enable_testing()
+
+add_executable(test_seed tests/test_seed.c)
+target_link_libraries(test_seed PRIVATE gcn_runtime_core)
+add_test(NAME seed_contract COMMAND test_seed)
