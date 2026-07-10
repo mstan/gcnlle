@@ -1,0 +1,10 @@
+# Build artifacts from the trace-format compile-check.
+build/
+/tfcheck
+/tfcheck.exe
+
+# Demo / captured trace streams — regenerate with make_sample_traces.py.
+*.trace
+
+# Python bytecode cache.
+__pycache__/
