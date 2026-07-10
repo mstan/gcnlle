@@ -82,6 +82,8 @@ if(GCN_WITH_GENERATED)
   add_executable(gcn_boot
     src/boot.c
     src/dispatch.c
+    src/mmio.c
+    src/exi.c
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )

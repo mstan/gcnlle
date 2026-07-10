@@ -16,6 +16,8 @@
 #include "seed/seed.h"
 #include "dispatch/dispatch.h"
 #include "trace/trace.h"
+#include "mmio/mmio.h"
+#include "exi/exi.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +54,42 @@ int main(int argc, char** argv) {
         free(payload);
         return 1;
     }
+
+    /* ---- MMIO device-dispatch layer + EXI model ----
+     * Route non-RAM (0xCC00xxxx) accesses through a general device-dispatch bus
+     * and register the EXI model on it. Every future device (VI/GX/DSP/DI/SI)
+     * registers on this same bus. */
+    static GcnMmioBus bus;   /* static: outlives main's scope for the callbacks */
+    static GcnExi     exi;
+    gcn_mmio_bus_init(&bus);
+    gcn_exi_init(&exi);
+
+    /* EXI mask-ROM backing: prefer a full descrambled IPL image via
+     * GCN_IPL_ROM (offset 0 = ROM offset 0); otherwise reuse the descrambled
+     * BS2 payload already loaded, whose byte k IS ROM offset (load_off + k). The
+     * IPL font/ROM DMA reads offsets 0x800..0x170800, all within that slice, so
+     * both backings serve identical bytes. */
+    u8* rom_file = NULL;
+    u32 rom_size = 0;
+    const char* rom_path = getenv("GCN_IPL_ROM");
+    if (rom_path && *rom_path && gcn_seed_read_file(rom_path, &rom_file, &rom_size)) {
+        gcn_exi_set_rom(&exi, rom_file, rom_size, 0u);
+        fprintf(stdout, "gcn boot: EXI mask-ROM backed by %s (%u bytes)\n",
+                rom_path, rom_size);
+    } else {
+        /* load_addr is guest 0x8120_0000; ROM offset of payload[0] is the file
+         * offset the descramble started at (0x100 for USA). Derive it from the
+         * documented load contract: payload[0] == descrambled IPL[0x100]. */
+        gcn_exi_set_rom(&exi, payload, size, 0x100u);
+        fprintf(stdout, "gcn boot: EXI mask-ROM backed by BS2 payload window "
+                "(ROM base 0x100, %u bytes)\n", size);
+    }
+    gcn_exi_set_sram(&exi, devices.sram);
+    gcn_exi_set_rtc(&exi, devices.rtc_counter);
+
+    gcn_mmio_register(&bus, "EXI", GCN_EXI_BASE, GCN_EXI_REGISTER_BYTES,
+                      gcn_exi_read, gcn_exi_write, &exi);
+    gcn_mmio_install(&bus, &cpu);
 
     gcn_trace_init();  /* emits a RUNTIME trace to $GCN_TRACE_OUT if set */
 
