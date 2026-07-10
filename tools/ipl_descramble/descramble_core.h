@@ -17,10 +17,17 @@
  */
 void ipl_descramble(uint8_t *data, size_t size);
 
-/* Documented IPL image layout (see README.md). */
-#define IPL_SCRAMBLE_START 0x100u      /* first scrambled byte                */
-#define IPL_SCRAMBLE_END   0x1AFF00u   /* one past the last scrambled byte    */
-#define IPL_BS2_FILE_OFF   0x820u      /* plaintext BS2 begins here (post-de) */
-#define IPL_BS2_LOAD_ADDR  0x81300000u /* BS1 copies BS2 here and enters it   */
+/* IPL image layout. The BS2 load base and file offset below were CORRECTED
+ * against the Dolphin oracle (2026-07-09): Dolphin's first boot code executes
+ * at guest 0x81200150, which is descrambled file offset 0x250 — so descrambled
+ * offset 0x100 maps to guest 0x81200000, and [0,0x100) is the copyright header
+ * (an ASCII string, not a DOL header). The earlier 0x820 -> 0x81300000 values
+ * (from a third-party summary) were wrong for this IPL and made every absolute
+ * pointer land 0x100000 too high. */
+#define IPL_SCRAMBLE_START 0x100u      /* first scrambled byte                 */
+#define IPL_SCRAMBLE_END   0x1AFF00u   /* one past the last scrambled byte     */
+#define IPL_BS2_FILE_OFF   0x100u      /* code image begins here (after (C) hdr)*/
+#define IPL_BS2_LOAD_ADDR  0x81200000u /* descrambled 0x100 loads here         */
+#define IPL_BS2_ENTRY      0x81200150u /* first instruction Dolphin executes   */
 
 #endif /* IPL_DESCRAMBLE_CORE_H */

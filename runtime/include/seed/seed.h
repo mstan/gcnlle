@@ -25,15 +25,19 @@ extern "C" {
 
 /* ---- fixed contract constants (see seed.c for provenance) ---- */
 
-/* [ROM] Guest load address AND entry PC of the descrambled BS2 payload. The
- * real IPL descrambles/copies BS2 to 0x81300000 and jumps there; we load the
- * offline-descrambled payload at the same address and enter at its start. */
-#define GCN_BS2_LOAD_ADDR   0x81300000u
-#define GCN_BS2_ENTRY_PC    0x81300000u
+/* [ORACLE] Guest load address and entry PC of the descrambled BS2 payload,
+ * corrected against Dolphin (2026-07-09): the descrambled body (from file
+ * offset 0x100) loads at 0x81200000 and boot begins at 0x81200150. The earlier
+ * 0x81300000 was wrong — it placed the image 0x100000 too high, so every
+ * absolute pointer missed and BS2 derailed into an `sc` almost immediately. */
+#define GCN_BS2_LOAD_ADDR   0x81200000u
+#define GCN_BS2_ENTRY_PC    0x81200150u
 
-/* [ROM] Exact size of the USA BS2 payload (0x1AF6E0 bytes). A loaded payload of
- * any other size is a mismatch the seed rejects. */
-#define GCN_BS2_USA_SIZE    0x001AF6E0u
+/* [ROM] Exact size of the USA BS2 payload = descrambled [0x100, 0x1AFF00) =
+ * 0x1AFE00 bytes (oracle-corrected: the code image begins at file offset 0x100,
+ * after the copyright header, not 0x820). A payload of any other size is a
+ * mismatch the seed rejects. */
+#define GCN_BS2_USA_SIZE    0x001AFE00u
 
 /* [DEFAULT] MEM1 reset fill. 0x00000000 matches Dolphin's zero-initialised
  * MEM1, which keeps the oracle low-mem diff clean; flip to a poison pattern

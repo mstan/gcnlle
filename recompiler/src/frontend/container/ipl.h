@@ -13,8 +13,11 @@
 //
 // Default load base / entry for a USA BS2 payload. Both are overridable so
 // the same path serves other regions/revisions and future flat images.
-#define IPL_DEFAULT_BASE  0x81300000u
-#define IPL_DEFAULT_ENTRY 0x81300000u
+// Corrected against the Dolphin oracle (2026-07-09): the descrambled body
+// (from file offset 0x100) loads at 0x81200000 and boot begins at 0x81200150,
+// NOT 0x81300000 (which put every absolute pointer 0x100000 too high).
+#define IPL_DEFAULT_BASE  0x81200000u
+#define IPL_DEFAULT_ENTRY 0x81200150u
 
 typedef struct {
     u8*  file_data;     // owned raw image bytes

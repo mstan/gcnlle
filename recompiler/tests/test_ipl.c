@@ -30,7 +30,9 @@ static void fill_code(u8* buf, size_t size) {
 
 static int test_valid_default(void) {
     const char* path = "test_ipl_valid.bin";
-    u8 buf[64];
+    /* Must exceed the default entry offset (IPL_DEFAULT_ENTRY - IPL_DEFAULT_BASE
+     * = 0x150) so the entry-in-range check passes. */
+    u8 buf[0x200];
     memset(buf, 0, sizeof(buf));
     fill_code(buf, sizeof(buf));
     CHECK(write_blob(path, buf, sizeof(buf)), "failed to write blob");

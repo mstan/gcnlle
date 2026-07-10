@@ -24,8 +24,8 @@ trap 'rm -rf "$TMP"' EXIT
 echo "[1/3] descrambling IPL -> plaintext BS2"
 "$DESC" "$IPL" --bs2 "$TMP/bs2.bin"
 
-echo "[2/3] recompiling BS2 -> split C"
-"$DOL" --gamecube-ipl "$TMP/bs2.bin" "$TMP/out" -j8
+echo "[2/3] recompiling BS2 -> split C (base/entry oracle-corrected)"
+"$DOL" --gamecube-ipl "$TMP/bs2.bin" "$TMP/out" --base 0x81200000 --entry 0x81200150 -j8
 
 echo "[3/3] installing into runtime/generated/"
 GENDIR="$(dirname "$(find "$TMP/out" -name generated.h | head -1)")"
