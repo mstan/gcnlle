@@ -23,10 +23,12 @@ for f in "$DESC" "$DOL" "$BOOT" "$IPL"; do
   [ -f "$f" ] || { echo "error: missing $f (build phase-1 first: build.sh, generate.sh, then -DGCN_WITH_GENERATED build)"; exit 1; }
 done
 
-# /x/path -> X:/path so the Windows exe's fopen accepts the dump path.
-to_win() { echo "$1" | sed -E 's|^/([a-z])/|\U\1:/|'; }
-
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# The mingw exes (dolrecomp / gcn_boot) fopen native Windows paths, not git-bash
+# mounts like /tmp/... — so make the work dir a real Windows-form path (via
+# cygpath) and hand it to every tool verbatim. rm from git-bash accepts it too.
+TMP_UNIX="$(mktemp -d)"
+TMP="$(cygpath -w "$TMP_UNIX" | sed 's|\\|/|g')"
+trap 'rm -rf "$TMP_UNIX"' EXIT
 
 echo "[1/4] descramble IPL (full image + BS2 payload)"
 "$DESC" "$IPL" -o "$TMP/descr.bin" --bs2 "$TMP/bs2.bin"
@@ -35,9 +37,9 @@ echo "[2/4] run stage-1 to DMA stage-2, dump post-DMA image + low-mem handlers"
 # Two regions: the DMA-loaded stage-2 (0x81200000) AND the BS2 exception handlers
 # BS2 installs in low memory (0x80000000..0x80003000) before the first `sc`. The
 # runtime stops at that `sc`, at which point both are present in MEM1.
-GCN_IPL_ROM="$(to_win "$TMP/descr.bin")" \
-GCN_MEM_DUMP="0x81200000:0x270000:$(to_win "$TMP/postdma.bin");0x80000000:0x3000:$(to_win "$TMP/lowmem.bin")" \
-  "$BOOT" "$TMP/bs2.bin" 5000000 >/dev/null 2>&1 || true   # stops at first sc; that's fine
+GCN_IPL_ROM="$TMP/descr.bin" \
+GCN_MEM_DUMP="0x81200000:0x270000:$TMP/postdma.bin;0x80000000:0x3000:$TMP/lowmem.bin" \
+  "$BOOT" "$TMP/bs2.bin" 5000000 >/dev/null 2>&1 || true   # runs through the sc to the block budget
 [ -f "$TMP/postdma.bin" ] || { echo "error: no post-DMA dump produced"; exit 1; }
 [ -f "$TMP/lowmem.bin" ]  || { echo "error: no low-mem dump produced"; exit 1; }
 
