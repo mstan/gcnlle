@@ -32,6 +32,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   di.c    Disc Interface (disc-load screen; stubbed until disc phase)
 #   si.c    Serial Interface (controller input in the menu)
 #   gcn_dispatch.c  block dispatch loop over Track A's generated func_* table
+#   debug_server.c  TCP debug surface + always-on ring buffers (MMIO/PC/event),
+#                   screenshot, state queries, input injection — cross-cutting,
+#                   stood up before M2 (see docs/ROADMAP.md "Observability").
 # ---------------------------------------------------------------------------
 
 # Core runtime library: the ABI implementation + seed. Kept separate so both the

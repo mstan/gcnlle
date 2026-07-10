@@ -179,6 +179,11 @@ gcnrecomp/
                   dsp.c/ai.c  audio (startup chime, menu sound)
                   di.c        Disc Interface (stub until disc phase)
                   si.c        Serial Interface (controller input)
+                  debug_server.c  TCP debug surface + ALWAYS-ON ring buffers
+                                  (MMIO/PC/event/device-write rings),
+                                  screenshot, state queries, input injection —
+                                  cross-cutting, must exist before M2
+                                  (mirror psxrecomp debug_server.c/TCP_COMMANDS.md)
   oracle/       Dolphin trace frontend (mirror psxrecomp's beetle_libretro):
                 boot the real IPL, log PC/registers/low-mem writes as JSONL in
                 the same shape the runtime emits; diff by value + order.
@@ -256,11 +261,21 @@ cache/DMA descramble** work lives — tackled only *after* the menu is alive, so
 it can't block early progress. *Deliverable:* boot from real scrambled ROM with
 no offline pre-descramble, matching Dolphin from reset.
 
+**Observability (cross-cutting; stand up before M2).** A runtime **TCP debug
+server + always-on ring buffers** (MMIO/PC/event/device-write), plus
+`screenshot`, state queries, and input injection — mirroring psxrecomp's
+`debug_server.c`/`TCP_COMMANDS.md`. Not a phase that "finishes": it is standing
+infrastructure every later milestone leans on, and it MUST exist before M2
+because "reached the logo / at the card manager" claims have to come from
+captured pixels (PRINCIPLES: screenshot-before-asserting; always-on rings;
+never arm-then-time). The `GCN_TRACE_OUT` file trace stays for the deterministic
+first-boot lockstep; rings+TCP carry rendering and the interactive menus.
+
 **M2 — VI + GX FIFO recorder → rolling-cube logo.** Model VI scanout (XFB →
 host window). Build the **GX FIFO recorder first**, inventory the exact CP/BP/XF
 packets + primitives + texture formats the IPL emits, then implement only that
 subset (harvest reshine's GX-FIFO→GL path). *Deliverable:* a **screenshot of
-the GameCube logo**.
+the GameCube logo** (captured via the debug server above).
 
 **M3 — EXI: RTC + SRAM → date/time & settings.** Model the EXI RTC and SRAM.
 *Deliverable:* the menu shows and **sets date & time** and sound/screen/

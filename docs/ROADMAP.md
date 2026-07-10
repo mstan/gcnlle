@@ -60,6 +60,35 @@ view, copy, delete** save blocks in the IPL's card manager.
 screen. No game loading yet — that's a later phase. Deliverable: menu →
 disc screen transition.
 
+## Observability (cross-cutting — must be in place before M2)
+
+This is **not a phase you finish**; it is always-on infrastructure every
+milestone leans on, so it is built as a standing surface, not bolted on late
+(PRINCIPLES: "extend the structured debug surface", "always-on ring buffers",
+"screenshot before asserting visible state"). It must exist **before M2**,
+because the moment we render, claims about visible state have to be made from
+captured pixels, not from memory.
+
+Mirror psxrecomp's `debug_server.c` + `TCP_COMMANDS.md`. The runtime exposes a
+**TCP debug server** with:
+
+- **Always-on ring buffers**, recording continuously from runtime start (Release
+  too; bounded by eviction): an MMIO ring, a retired-PC/block ring, an
+  event ring (interrupts/EXI/DMA/GX/VI), and a device-write ring. Probes
+  **query** the ring for a window — they never arm-then-run-then-hope
+  (the arm-and-time anti-pattern is banned).
+- **`screenshot` / `screenshot_file`** — capture the framebuffer through the
+  debug surface (never by stealing focus), so every "reached the logo / at the
+  card manager / black screen" claim is made from real pixels.
+- **State queries** — CPU regs, low-mem globals, SRAM/RTC, device state.
+- **Input injection** — drive the menu (D-pad/A/B/START) deterministically, so
+  interactive milestones (M3 date/time, M4 card manager) are scriptable and
+  re-runnable without a human at the pad.
+
+The current file-based oracle trace (`GCN_TRACE_OUT`) stays for the deterministic
+first-boot lockstep; the ring/TCP surface is what carries us through rendering
+and the interactive menus.
+
 ## Independent-oracle discipline
 
 Dolphin is a separately-authored emulator, so it can arbitrate shared-layer
