@@ -69,18 +69,39 @@ static void write_csr(GcnDsp* dsp, u16 w) {
                      GCN_DSP_CSR_AIDMASK | GCN_DSP_CSR_ARMASK | GCN_DSP_CSR_DSPMASK |
                      GCN_DSP_CSR_INIT;
     dsp->csr = (u16)((dsp->csr & ~CTRL) | (w & CTRL));
-    /* RES (auto-clears) is never stored. No microcode runs, so a reset has no
-     * observable state beyond clearing the mailboxes. */
-    if (w & GCN_DSP_CSR_RES) {
-        dsp->reg[idx16(GCN_DSP_MBOX_OUT_H)] = 0;
-        dsp->reg[idx16(GCN_DSP_MBOX_OUT_L)] = 0;
-    }
+    /* RES (auto-clears) is never stored. A reset restarts the ROM microcode,
+     * discarding any queued DSP->CPU mail (Dolphin ClearPending on SetUCode). */
+    if (w & GCN_DSP_CSR_RES)
+        dsp->mail_pending = false;
     /* Clearing DSPInit (1->0) boots the init microcode; DSPInitCode reports set
      * for a short window afterward (Dolphin DSPHLE.cpp:214-227). */
     if (init_was_set && !(w & GCN_DSP_CSR_INIT)) {
         dsp->initcode_active = true;
         dsp->initcode_polls_left = GCN_DSP_INITCODE_NOMINAL_POLLS;
+        /* The init microcode posts its boot mail to the CPU (INIT.cpp:21). */
+        dsp->mail_value = GCN_DSP_INIT_BOOT_MAIL;
+        dsp->mail_pending = true;
     }
+}
+
+/* DSP->CPU mailbox reads (Dolphin CMailHandler). Mail is visible only when the
+ * DSP is not halted; the CPU reads the high word (peek) then the low word (which
+ * consumes the mail and clears the ready bit for subsequent high reads). */
+static u16 read_mbox_out_hi(GcnDsp* dsp) {
+    bool halted = (dsp->csr & GCN_DSP_CSR_HALT) != 0;
+    if (!halted && dsp->mail_pending)
+        dsp->mail_last = dsp->mail_value;
+    return (u16)(dsp->mail_last >> 16);
+}
+
+static u16 read_mbox_out_lo(GcnDsp* dsp) {
+    bool halted = (dsp->csr & GCN_DSP_CSR_HALT) != 0;
+    if (!halted && dsp->mail_pending) {
+        dsp->mail_last = dsp->mail_value;
+        dsp->mail_pending = false;          /* mail consumed */
+    }
+    dsp->mail_last &= ~GCN_DSP_MAIL_READY;  /* clear ready bit after low read */
+    return (u16)(dsp->mail_last & 0xFFFFu);
 }
 
 u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
@@ -89,8 +110,8 @@ u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     u32 off = addr - GCN_DSP_BASE;
     switch (off) {
     case GCN_DSP_CSR:        return read_csr(dsp);
-    case GCN_DSP_MBOX_OUT_H: /* fallthrough */
-    case GCN_DSP_MBOX_OUT_L: return 0;   /* no microcode -> DSP posts no mail */
+    case GCN_DSP_MBOX_OUT_H: return read_mbox_out_hi(dsp);
+    case GCN_DSP_MBOX_OUT_L: return read_mbox_out_lo(dsp);
     default: break;
     }
     if (size == 4)

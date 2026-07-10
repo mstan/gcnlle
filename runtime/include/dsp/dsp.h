@@ -73,6 +73,14 @@
  * CSR polls; the poll-aware diff makes the exact count immaterial. */
 #define GCN_DSP_INITCODE_NOMINAL_POLLS  4u
 
+/* The DSP init microcode posts one boot mail to the CPU when it starts (Dolphin
+ * DSPHLE INIT.cpp:21, PushMail(0x80544348)). This is the real init ucode's
+ * documented boot message — a validated per-subsystem HLE replacement on the
+ * LLE baseline, not a Dolphin-specific value (PRINCIPLES: HLE only as a
+ * validated replacement). Bit 31 is the DSP-mail-ready flag. */
+#define GCN_DSP_INIT_BOOT_MAIL  0x80544348u
+#define GCN_DSP_MAIL_READY      0x80000000u
+
 #define GCN_ARAM_SIZE  0x01000000u    /* 16 MB auxiliary RAM (retail)     */
 
 typedef struct {
@@ -82,6 +90,9 @@ typedef struct {
     u32   dma_polls_left;             /* CSR polls until it "completes"    */
     bool  initcode_active;            /* init-microcode boot in progress  */
     u32   initcode_polls_left;        /* CSR polls until DSPInitCode clears */
+    u32   mail_value;                 /* DSP->CPU mail (bit31 = ready)     */
+    bool  mail_pending;               /* a mail is queued for the CPU      */
+    u32   mail_last;                  /* last mail latched by a hi/lo read */
     u8*   aram;                       /* 16 MB ARAM backing (owned)       */
 } GcnDsp;
 
