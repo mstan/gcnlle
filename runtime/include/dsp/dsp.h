@@ -67,13 +67,21 @@
  * the identical poll reads, so any value >= 1 matches by value+order. */
 #define GCN_DSP_ARAM_DMA_NOMINAL_POLLS  4u
 
+/* When the guest clears DSPInit (1->0), the hardware boots the init microcode
+ * and briefly reports DSPInitCode (bit 10), which self-clears ~130 time-base
+ * ticks later (Dolphin DSPHLE.cpp:214-242). We hold it for a nominal number of
+ * CSR polls; the poll-aware diff makes the exact count immaterial. */
+#define GCN_DSP_INITCODE_NOMINAL_POLLS  4u
+
 #define GCN_ARAM_SIZE  0x01000000u    /* 16 MB auxiliary RAM (retail)     */
 
 typedef struct {
     u16   reg[GCN_DSP_SIZE / 2];      /* generic 16-bit register backing  */
-    u16   csr;                        /* control/status (bit 9 computed)  */
+    u16   csr;                        /* control/status (bits 9/10 computed) */
     bool  dma_active;                 /* ARAM DMA in flight               */
     u32   dma_polls_left;             /* CSR polls until it "completes"    */
+    bool  initcode_active;            /* init-microcode boot in progress  */
+    u32   initcode_polls_left;        /* CSR polls until DSPInitCode clears */
     u8*   aram;                       /* 16 MB ARAM backing (owned)       */
 } GcnDsp;
 

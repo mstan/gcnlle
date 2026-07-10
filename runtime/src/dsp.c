@@ -47,27 +47,39 @@ static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
 }
 
 static u32 read_csr(GcnDsp* dsp) {
-    u32 v = dsp->csr | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u);
+    u32 v = dsp->csr | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u)
+                     | (dsp->initcode_active ? GCN_DSP_CSR_INITCODE : 0u);
     if (dsp->dma_active && --dsp->dma_polls_left == 0) {
         dsp->dma_active = false;
         dsp->csr |= GCN_DSP_CSR_ARINT;   /* DMA complete raises the ARAM int */
     }
+    if (dsp->initcode_active && --dsp->initcode_polls_left == 0)
+        dsp->initcode_active = false;    /* init microcode boot window ends */
     return v;
 }
 
 static void write_csr(GcnDsp* dsp, u16 w) {
+    bool init_was_set = (dsp->csr & GCN_DSP_CSR_INIT) != 0;
     /* write-1-to-clear the interrupt status bits */
     dsp->csr &= (u16)~(w & (GCN_DSP_CSR_AIDINT | GCN_DSP_CSR_ARINT | GCN_DSP_CSR_DSPINT));
-    /* update the read/write control bits from the write */
+    /* update the read/write control bits from the write. INITCODE (bit 10) is
+     * hardware-driven (not guest-writable) and DMA (bit 9) is read-only — both
+     * are computed on read, never stored. */
     const u16 CTRL = GCN_DSP_CSR_PIINT | GCN_DSP_CSR_HALT |
                      GCN_DSP_CSR_AIDMASK | GCN_DSP_CSR_ARMASK | GCN_DSP_CSR_DSPMASK |
-                     GCN_DSP_CSR_INITCODE | GCN_DSP_CSR_INIT;
+                     GCN_DSP_CSR_INIT;
     dsp->csr = (u16)((dsp->csr & ~CTRL) | (w & CTRL));
-    /* RES (auto-clears) and DMA (read-only) are never stored. No microcode runs,
-     * so a reset has no observable state beyond clearing the mailboxes. */
+    /* RES (auto-clears) is never stored. No microcode runs, so a reset has no
+     * observable state beyond clearing the mailboxes. */
     if (w & GCN_DSP_CSR_RES) {
         dsp->reg[idx16(GCN_DSP_MBOX_OUT_H)] = 0;
         dsp->reg[idx16(GCN_DSP_MBOX_OUT_L)] = 0;
+    }
+    /* Clearing DSPInit (1->0) boots the init microcode; DSPInitCode reports set
+     * for a short window afterward (Dolphin DSPHLE.cpp:214-227). */
+    if (init_was_set && !(w & GCN_DSP_CSR_INIT)) {
+        dsp->initcode_active = true;
+        dsp->initcode_polls_left = GCN_DSP_INITCODE_NOMINAL_POLLS;
     }
 }
 
