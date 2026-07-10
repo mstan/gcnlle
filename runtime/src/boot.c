@@ -18,6 +18,7 @@
 #include "trace/trace.h"
 #include "mmio/mmio.h"
 #include "exi/exi.h"
+#include "si/si.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +90,13 @@ int main(int argc, char** argv) {
 
     gcn_mmio_register(&bus, "EXI", GCN_EXI_BASE, GCN_EXI_REGISTER_BYTES,
                       gcn_exi_read, gcn_exi_write, &exi);
+
+    /* SI: minimal read-back register file (early boot touches only SIEXILK). */
+    static GcnSi si;
+    gcn_si_init(&si);
+    gcn_mmio_register(&bus, "SI", GCN_SI_BASE, GCN_SI_SIZE,
+                      gcn_si_read, gcn_si_write, &si);
+
     gcn_mmio_install(&bus, &cpu);
 
     gcn_trace_init();  /* emits a RUNTIME trace to $GCN_TRACE_OUT if set */
