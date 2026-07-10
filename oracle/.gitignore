@@ -8,3 +8,7 @@ build/
 
 # Python bytecode cache.
 __pycache__/
+
+# Local Dolphin oracle user dir + build log (regenerable).
+dolphin-user/
+build_dolphin.log
