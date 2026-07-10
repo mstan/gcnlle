@@ -6,6 +6,7 @@
 #include "dsp_lle_c.h"
 
 #include "Core/DSP/DSPCore.h"
+#include "Core/DSP/DSPTables.h"
 #include "Core/DSP/Interpreter/DSPInterpreter.h"
 
 #include <cstdlib>
@@ -46,6 +47,13 @@ void dsp_lle_init(const uint8_t* irom_be, const uint8_t* coef_be,
 
   g_core->Initialize(opts);
   g_core->Reset();
+  // Build the DSPOPCTemplate opcode dispatch table (s_op_table in DSPTables.cpp).
+  // Dolphin's HW/DSPLLE/DSPLLE.cpp does this right after Reset(); our C-API port
+  // replaced that driver, so the call has to live here. Without it GetOpTemplate()
+  // returns null and the first executed DSP instruction null-derefs in
+  // ExecuteInstruction(). (The interpreter's own function-pointer tables are a
+  // separate array initialized by the Interpreter ctor.)
+  InitInstructionTable();
   g_core->SetState(State::Running);
 }
 
