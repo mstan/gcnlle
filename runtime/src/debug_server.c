@@ -13,6 +13,7 @@
 #include "debug/rings.h"
 #include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
+#include "si/si.h"         /* set_input: injected pad-report surface */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -260,6 +261,41 @@ static void handle_line(Client* c, const char* line) {
                     path, fb_w, fb_h, fb_addr,
                     (double)luma_sum / ((double)fb_w * fb_h));
             }
+        }
+    }
+    else if (!strcmp(cmd, "set_input")) {
+        /* Debug-surface pad injection (ROADMAP M3/M4): drives the menu through
+         * the SI model instead of the hardcoded-neutral report. Every field is
+         * optional — unspecified means "leave unchanged" — except "reset":1,
+         * which snaps back to the power-on-neutral report (buttons=0, sticks
+         * centered 0x80, triggers 0) and ignores every other field. Applies to
+         * the single SI instance registered by gcn_si_init (boot.c's GcnSi). */
+        u32 buttons = 0, stick_x = 0, stick_y = 0, substick_x = 0, substick_y = 0;
+        u32 trigger_l = 0, trigger_r = 0, reset = 0;
+        int have_buttons    = json_uint(line, "buttons", &buttons);
+        int have_stick_x    = json_uint(line, "stick_x", &stick_x);
+        int have_stick_y    = json_uint(line, "stick_y", &stick_y);
+        int have_substick_x = json_uint(line, "substick_x", &substick_x);
+        int have_substick_y = json_uint(line, "substick_y", &substick_y);
+        int have_trigger_l  = json_uint(line, "trigger_l", &trigger_l);
+        int have_trigger_r  = json_uint(line, "trigger_r", &trigger_r);
+        json_uint(line, "reset", &reset);
+
+        if (!gcn_si_debug_set_input(have_buttons, buttons, have_stick_x, stick_x,
+                                     have_stick_y, stick_y, have_substick_x, substick_x,
+                                     have_substick_y, substick_y, have_trigger_l, trigger_l,
+                                     have_trigger_r, trigger_r, (int)reset)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"SI not initialized yet\"}\n");
+        } else {
+            GcnSiPadInput cur;
+            gcn_si_debug_get_input(&cur);
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"buttons\":%u,\"stick_x\":%u,\"stick_y\":%u,"
+                "\"substick_x\":%u,\"substick_y\":%u,\"trigger_l\":%u,\"trigger_r\":%u}\n",
+                (unsigned)cur.buttons, (unsigned)cur.stick_x, (unsigned)cur.stick_y,
+                (unsigned)cur.substick_x, (unsigned)cur.substick_y,
+                (unsigned)cur.trigger_l, (unsigned)cur.trigger_r);
         }
     }
     else if (!strcmp(cmd, "quit")) {

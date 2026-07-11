@@ -48,6 +48,7 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `event_dump` | opt `count` | newest N device edges |
 | `screenshot` (`screenshot_file`) | opt `path` (default `_work/screenshot.ppm`) | decode the XFB the VI is scanning out to a PPM: geometry from the guest-programmed VI regs (`gcn_vi_xfb_info`), YUY2→RGB via inverse BT.601 exactly as Dolphin's XFB decode (TextureConversionShader.cpp:1009). Returns `{path, width, height, xfb_addr, mean_luma}` — `mean_luma` ≈16 means black. Errors honestly if the guest has no XFB programmed. |
 | `dsp_state` | — | live DSP-LLE core state: `pc`, `control`, non-consuming peeks of both mailboxes (bit 31 = mail pending). For diagnosing CPU↔DSP handshake stalls. |
+| `set_input` | opt `buttons`, `stick_x`, `stick_y`, `substick_x`, `substick_y`, `trigger_l`, `trigger_r` (ints, unspecified = leave unchanged); opt `reset`:1 (snap to neutral, ignoring every other field) | Drive the SI model's injected GC-controller pad report (ROADMAP M3/M4 input-injection surface) — the menu polls this every frame through `si.c`. `buttons` is the raw OR of GC pad bits (LEFT 0x0001, RIGHT 0x0002, DOWN 0x0004, UP 0x0008, Z 0x0010, R 0x0020, L 0x0040, A 0x0100, B 0x0200, X 0x0400, Y 0x0800, START 0x1000 — `PAD_USE_ORIGIN` 0x0080 is ORed in unconditionally by the model, never passed here); sticks/substick/triggers are raw bytes, 0x80 = centered. Echoes the resulting state. Hold a direction/button for 30-60 frames of guest time (PAD lib debounces a single poll) before releasing. |
 | `quit` | — | end the run + shut the server down cleanly |
 
 ### Examples
@@ -57,13 +58,13 @@ python tools/gcn_debug_client.py regs
 python tools/gcn_debug_client.py read_ram addr=0x80000034 len=8
 python tools/gcn_debug_client.py mmio_dump addr=0xCC00202C count=8   # watch a poll
 python tools/gcn_debug_client.py event_dump count=16
+python tools/gcn_debug_client.py set_input buttons=0x0008   # hold D-pad UP
+python tools/gcn_debug_client.py set_input reset=1          # release back to neutral
 python tools/gcn_debug_client.py quit
 ```
 
 ## Not yet wired (grows with the milestones)
 
-- **Input injection** (`set_input`) — deferred until the menu is reachable and
-  something consumes pad input (M3/M4); wiring it before then would be untestable.
 - **`device_state`** — per-device register snapshots, added as each device model
   grows a reason to expose one (`dsp_state` is the first).
 

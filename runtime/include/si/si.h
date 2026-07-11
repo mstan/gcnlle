@@ -81,6 +81,45 @@
 /* Controller mode (SI_DeviceGCController.h:49): default 3. */
 #define GCN_SI_CTRL_MODE_DEFAULT 3u
 
+/* GC pad button bits (SI_DeviceGCController.h PadButton / GCPadStatus.h,
+ * verified against oracle/dolphin/Source/Core/InputCommon/GCPadStatus.h). ORed
+ * with PAD_USE_ORIGIN (0x0080) by MapPadStatus regardless of which of these
+ * are set — see GCN_SI_PAD_USE_ORIGIN below. */
+#define GCN_SI_PAD_LEFT   0x0001u
+#define GCN_SI_PAD_RIGHT  0x0002u
+#define GCN_SI_PAD_DOWN   0x0004u
+#define GCN_SI_PAD_UP     0x0008u
+#define GCN_SI_PAD_Z      0x0010u
+#define GCN_SI_PAD_R      0x0020u
+#define GCN_SI_PAD_L      0x0040u
+#define GCN_SI_PAD_A      0x0100u
+#define GCN_SI_PAD_B      0x0200u
+#define GCN_SI_PAD_X      0x0400u
+#define GCN_SI_PAD_Y      0x0800u
+#define GCN_SI_PAD_START  0x1000u
+/* PAD_USE_ORIGIN (GCPadStatus.h): MapPadStatus ORs this into the button word
+ * unconditionally (SI_DeviceGCController.cpp:234) — it coexists with every
+ * real button bit above, it is never itself a "button pressed" signal. */
+#define GCN_SI_PAD_USE_ORIGIN 0x0080u
+
+/* Injectable pad state for one (the only currently-modeled) connected GC
+ * controller — the Observability "input injection" surface (ROADMAP M3/M4).
+ * Defaults to the power-on-neutral report: no buttons, sticks centered,
+ * triggers released (GCPadStatus.h MAIN/C_STICK_CENTER = 0x80). si_pad_report
+ * packs these into the SI_DeviceGCController mode-3 hi/lo words exactly as
+ * MapPadStatus/GetData do (SI_DeviceGCController.cpp:178-236). */
+typedef struct {
+    u16 buttons;      /* raw GCN_SI_PAD_* bits, no PAD_USE_ORIGIN (added at report time) */
+    u8  stick_x;      /* main stick X, default 0x80 (centered)       */
+    u8  stick_y;      /* main stick Y, default 0x80 (centered)       */
+    u8  substick_x;   /* C-stick X, default 0x80 (centered)          */
+    u8  substick_y;   /* C-stick Y, default 0x80 (centered)          */
+    u8  trigger_l;    /* analog L, default 0 (released)              */
+    u8  trigger_r;    /* analog R, default 0 (released)               */
+} GcnSiPadInput;
+
+#define GCN_SI_PAD_INPUT_NEUTRAL { 0, 0x80, 0x80, 0x80, 0x80, 0, 0 }
+
 typedef struct {
     u32 out;         /* SI_CHANNEL_n_OUT  (poll/command word)      */
     u32 in_hi;       /* SI_CHANNEL_n_IN_HI                          */
@@ -103,6 +142,7 @@ typedef struct {
     int irq_level;   /* last SI->PI line level (edge detect for the ring) */
     GcnSiIrqFn irq;  /* sink for the SI interrupt line (boot.c -> PI) */
     void*      irq_user;
+    GcnSiPadInput input; /* debug-surface-injected report (see gcn_si_set_input) */
 } GcnSi;
 
 void gcn_si_init(GcnSi* si);
@@ -110,5 +150,29 @@ void gcn_si_init(GcnSi* si);
 void gcn_si_set_irq(GcnSi* si, GcnSiIrqFn fn, void* user);
 u32  gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_si_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
+
+/* Replace the whole injected pad state (debug-surface setter). */
+void gcn_si_set_input(GcnSi* si, const GcnSiPadInput* input);
+/* Reset the injected pad state to the power-on-neutral report. */
+void gcn_si_reset_input(GcnSi* si);
+
+/* ---- debug-server singleton accessors (mirrors vi.c's s_vi / gcn_vi_xfb_info:
+ * the debug server has no other handle to the live SI instance boot.c owns) ---- */
+/* Apply a partial patch to the registered SI instance's injected pad state:
+ * each `have_*` flag selects whether the matching field is overwritten (0 =
+ * leave unchanged). `reset` (if set) restores neutral and ignores every other
+ * argument. Returns 0 if no SI is registered yet (server queried before boot
+ * wired it up), else 1. */
+int gcn_si_debug_set_input(int have_buttons, u32 buttons,
+                            int have_stick_x, u32 stick_x,
+                            int have_stick_y, u32 stick_y,
+                            int have_substick_x, u32 substick_x,
+                            int have_substick_y, u32 substick_y,
+                            int have_trigger_l, u32 trigger_l,
+                            int have_trigger_r, u32 trigger_r,
+                            int reset);
+/* Current injected pad state of the registered SI instance. Returns 0 (out
+ * left neutral) if none is registered yet. */
+int gcn_si_debug_get_input(GcnSiPadInput* out);
 
 #endif /* GCN_SI_SI_H */
