@@ -1352,6 +1352,22 @@ static const u8* array_ptr(const GxCpState* cp, u32 arr, u32 index, u32 need) {
     return s_cpu->ram + addr;
 }
 
+/* Direct-attribute component read (VertexLoader_{Position,TextCoord}.cpp
+ * Pos_ReadDirect<T>/TexCoord_ReadDirect<T>): raw value in `fmt`'s ComponentFormat
+ * (0 u8 / 1 s8 / 2 u16 / 3 s16 / 4..7 float), advances *off by GetElementSize
+ * (CPMemory.h:142-161: 0/1->1, 2/3->2, 4..7->4). Returns the RAW value —
+ * PosScale/TCScale's dequant multiply (applied to every non-float format,
+ * skipped for float) is the caller's job, same as the indexed paths below. */
+static float read_direct_elem(const u8* v, u32* off, u32 fmt) {
+    switch (fmt & 7u) {
+    case 0: { u32 x = v[*off]; *off += 1; return (float)x; }             /* u8  */
+    case 1: { s8  x = (s8)v[*off]; *off += 1; return (float)x; }         /* s8  */
+    case 2: { u32 x = be_u16(&v[*off]); *off += 2; return (float)x; }    /* u16 */
+    case 3: { s16 x = be_s16(&v[*off]); *off += 2; return (float)x; }    /* s16 */
+    default: { float x = be_f32(&v[*off]); *off += 4; return x; }        /* float family */
+    }
+}
+
 static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, InVtx* out) {
     u32 low = cp->vtx_desc_lo, high = cp->vtx_desc_hi;
     u32 g0 = cp->vat_g0[vat];
@@ -1367,13 +1383,22 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
         else out->texMtx[tt] = (u8)bits(cp->matrix_index_b, (tt - 4) * 6, 6);
     }
 
-    /* position (Index only; float XYZ) */
+    /* position: Direct (VertexLoader_Position.cpp Pos_ReadDirect) or Index
+     * (Pos_ReadIndex) — float XYZ is the only indexed case exercised so far;
+     * Direct short/byte formats are dequantized by PosScale = 1/2^PosFrac
+     * (VertexLoader.cpp:73), applied to every non-float format alike. */
     u32 postype = (low >> 9) & 3;
     u32 posfmt = (g0 >> 1) & 7, poselem = g0 & 1;
+    u32 posfrac = (g0 >> 4) & 0x1f;
     if (postype == VCF_NONE) { TRAP(nopos, "vertex without position"); return 0; }
-    if (postype == VCF_DIRECT) { TRAP(directpos, "direct position attribute"); return 0; }
-    if (posfmt != 4) { TRAP(posfmt, "position format != float"); return 0; }
-    {
+    if (postype == VCF_DIRECT) {
+        u32 n = poselem ? 3 : 2;
+        float scale = ((posfmt & 7u) < 4u) ? 1.0f / (float)(1u << posfrac) : 1.0f;
+        float p[3] = {0.0f, 0.0f, 0.0f};
+        for (u32 i = 0; i < n; i++) p[i] = read_direct_elem(v, &off, posfmt) * scale;
+        out->position[0] = p[0]; out->position[1] = p[1]; out->position[2] = p[2];
+    } else {
+        if (posfmt != 4) { TRAP(posfmt, "indexed position format != float"); return 0; }
         u32 idx = read_index(v, &off, postype);
         u32 n = poselem ? 3 : 2;
         const u8* p = array_ptr(cp, 0, idx, n * 4);
@@ -1402,23 +1427,30 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
     if (((low >> 13) & 3) != VCF_NONE) { TRAP(color0, "color0 attribute present"); return 0; }
     if (((low >> 15) & 3) != VCF_NONE) { TRAP(color1, "color1 attribute present"); return 0; }
 
-    /* tex coords (Index only; short * tcScale) */
+    /* tex coords: Direct (TexCoord_ReadDirect) or Index (TexCoord_ReadIndex),
+     * both scaled by TCScale = 1/2^frac (VertexLoader_TextCoord.cpp), applied
+     * to every non-float format alike; float passes through unscaled. */
     for (int tc = 0; tc < 8; tc++) {
         u32 tctype = (high >> (2 * tc)) & 3;
         if (tctype == VCF_NONE) continue;
-        if (tctype == VCF_DIRECT) { TRAP(directtc, "direct texcoord attribute"); return 0; }
         /* VAT tex fields (only tc0 in scope). */
         u32 fmt, elem, frac;
         if (tc == 0) { elem = (g0 >> 21) & 1; fmt = (g0 >> 22) & 7; frac = (g0 >> 25) & 0x1f; }
         else { TRAP(tcgt0, "texcoord index > 0"); return 0; }
-        if (fmt != 3) { TRAP(tcfmt, "texcoord format != short"); return 0; }
         u32 n = elem ? 2 : 1;
-        float scale = 1.0f / (float)(1u << frac);
-        u32 idx = read_index(v, &off, tctype);
-        const u8* p = array_ptr(cp, 4 + tc, idx, n * 2);
-        if (!p) { TRAP(tcoob, "texcoord array out of MEM1"); return 0; }
-        out->texCoords[tc][0] = be_s16(p) * scale;
-        out->texCoords[tc][1] = (n == 2) ? be_s16(p + 2) * scale : 0.0f;
+        float scale = ((fmt & 7u) < 4u) ? 1.0f / (float)(1u << frac) : 1.0f;
+        if (tctype == VCF_DIRECT) {
+            float t[2] = {0.0f, 0.0f};
+            for (u32 i = 0; i < n; i++) t[i] = read_direct_elem(v, &off, fmt) * scale;
+            out->texCoords[tc][0] = t[0]; out->texCoords[tc][1] = t[1];
+        } else {
+            if (fmt != 3) { TRAP(tcfmt, "indexed texcoord format != short"); return 0; }
+            u32 idx = read_index(v, &off, tctype);
+            const u8* p = array_ptr(cp, 4 + tc, idx, n * 2);
+            if (!p) { TRAP(tcoob, "texcoord array out of MEM1"); return 0; }
+            out->texCoords[tc][0] = be_s16(p) * scale;
+            out->texCoords[tc][1] = (n == 2) ? be_s16(p + 2) * scale : 0.0f;
+        }
     }
 
     (void)vstride;
@@ -1477,16 +1509,20 @@ static void recompute_scissor(void) {
 
 void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
                     const u8* verts, u32 nverts, u32 vstride) {
-    if (prim != 4) { TRAP(nonfan, "primitive != TRIANGLE_FAN"); return; }
+    /* prim 0/1 = GX_DRAW_QUADS / GX_DRAW_QUADS_2 (SetupUnit.cpp:34-40 routes
+     * both to SetupQuad — Dolphin itself treats QUADS_2 as a non-standard
+     * alias, not a distinct assembly). prim 4 = GX_DRAW_TRIANGLE_FAN. */
+    int is_quad = (prim == 0 || prim == 1);
+    if (!is_quad && prim != 4) { TRAP(nonfan, "primitive != TRIANGLE_FAN/QUADS"); return; }
     if (vat != 0)  { TRAP(nonvat0, "VAT index != 0"); }
     if (nverts < 3) return;
 
     recompute_scissor();
     tev_load_registers(&s_tev);
 
-    /* SetupUnit triangle-fan assembly (SetupUnit.cpp:12-130), transcribed with
-     * the same VertPointer juggling: v0 stays fixed, pv[1]/pv[2] alternate. The
-     * write pointer receives the freshly transformed vertex before SetupVertex. */
+    /* SetupUnit vertex assembly (SetupUnit.cpp:12-130): v0 stays in store[0]
+     * for the whole call (its slot is never reassigned by either path); only
+     * pv[1]/pv[2] and the write pointer are juggled per triangle. */
     OutVtx store[3];
     OutVtx* pv[3] = { &store[0], &store[1], &store[2] };
     OutVtx* writep = pv[0];
@@ -1502,13 +1538,29 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
         tf_color(&in, writep);
         tf_texcoord(&in, writep);
 
-        /* SetupTriFan (SetupUnit.cpp:114-130). */
-        if (counter < 2) { counter++; writep = pv[counter]; continue; }
-        process_triangle(&s_tev, pv[0], pv[1], pv[2]);
-        counter++;
-        pv[1] = pv[2];
-        pv[2] = &store[2 - (counter & 1)];
-        writep = pv[2];
+        if (is_quad) {
+            /* SetupQuad (SetupUnit.cpp:62-79): triangle 1 = (v0,v1,v2), then
+             * triangle 2 = (v0,v2,v3) — the VertPointer/counter/write-pointer
+             * state returns to its initial layout every 4 vertices (traced by
+             * hand against the transcribed steps below), so additional quads
+             * in the same draw call repeat identically. */
+            if (counter < 2) { counter++; writep = pv[counter]; continue; }
+            process_triangle(&s_tev, pv[0], pv[1], pv[2]);
+            counter++;
+            counter &= 3;
+            writep = &store[counter & 1];
+            OutVtx* temp = pv[1];
+            pv[1] = pv[2];
+            pv[2] = temp;
+        } else {
+            /* SetupTriFan (SetupUnit.cpp:114-130). */
+            if (counter < 2) { counter++; writep = pv[counter]; continue; }
+            process_triangle(&s_tev, pv[0], pv[1], pv[2]);
+            counter++;
+            pv[1] = pv[2];
+            pv[2] = &store[2 - (counter & 1)];
+            writep = pv[2];
+        }
     }
 }
 

@@ -81,6 +81,9 @@ typedef struct {
     u8  buf[GX_BUF_CAP];             /* linear staging (Fifo.cpp video buffer) */
     u32 buf_len;
     int dl_depth;                    /* display-list recursion guard */
+    u32 cur_dl_addr;                 /* guest addr of the DL currently executing, else 0
+                                      * (context for one-time draw logs — which DL a
+                                      * primitive lives in, not just the gather-pipe pc) */
 
     /* one-time-log bitsets (report which regs/opcodes the IPL exercised) */
     u8 seen_opcode[256];
@@ -409,7 +412,9 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
         if (cpu && cpu->ram && size > 0u &&
             (u64)phys + (u64)size <= (u64)cpu->ram_size) {
             gx->dl_depth++;
+            gx->cur_dl_addr = addr;
             gx_run(gx, cpu->ram + phys, size);
+            gx->cur_dl_addr = 0;
             gx->dl_depth--;
         } else if (size > 0u) {
             static int warned = 0;
@@ -470,8 +475,13 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
 
             if (note_once(&gx->seen_prim[prim]))
                 fprintf(stderr, "gx: primitive type %u (opcode 0x%02X) first drawn "
-                                "(%u verts x %u bytes, vat %u)\n",
-                        prim, op, nverts, vsize, vat);
+                                "(%u verts x %u bytes, vat %u) pc=0x%08X dl=0x%08X "
+                                "vcd_lo=0x%08X vcd_hi=0x%08X vat_g0=0x%08X vat_g1=0x%08X "
+                                "vat_g2=0x%08X\n",
+                        prim, op, nverts, vsize, vat,
+                        gx->cpu ? gx->cpu->pc : 0u, gx->cur_dl_addr,
+                        gx->cpst.vtx_desc_lo, gx->cpst.vtx_desc_hi,
+                        gx->cpst.vat_g0[vat], gx->cpst.vat_g1[vat], gx->cpst.vat_g2[vat]);
             /* Rasterize (SWVertexLoader -> TransformUnit -> Clipper ->
              * Rasterizer -> Tev). The payload is contiguous in `data`. */
             gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
