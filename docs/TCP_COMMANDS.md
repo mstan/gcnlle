@@ -46,7 +46,8 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `mmio_dump` | opt `addr`, `rw`, `count` | newest N MMIO entries; `addr`/`rw` filter over the **full** ring before the cap |
 | `block_dump` | opt `count` | newest N retired-block PCs |
 | `event_dump` | opt `count` | newest N device edges |
-| `screenshot` (`screenshot_file`) | opt `path` | **stub until VI/XFB (M2)** — returns a clear "no framebuffer yet" error, never a fake image |
+| `screenshot` (`screenshot_file`) | opt `path` (default `_work/screenshot.ppm`) | decode the XFB the VI is scanning out to a PPM: geometry from the guest-programmed VI regs (`gcn_vi_xfb_info`), YUY2→RGB via inverse BT.601 exactly as Dolphin's XFB decode (TextureConversionShader.cpp:1009). Returns `{path, width, height, xfb_addr, mean_luma}` — `mean_luma` ≈16 means black. Errors honestly if the guest has no XFB programmed. |
+| `dsp_state` | — | live DSP-LLE core state: `pc`, `control`, non-consuming peeks of both mailboxes (bit 31 = mail pending). For diagnosing CPU↔DSP handshake stalls. |
 | `quit` | — | end the run + shut the server down cleanly |
 
 ### Examples
@@ -61,8 +62,11 @@ python tools/gcn_debug_client.py quit
 
 ## Not yet wired (grows with the milestones)
 
-- **`screenshot`** — needs VI/XFB scanout (M2). Command exists; returns "not yet".
 - **Input injection** (`set_input`) — deferred until the menu is reachable and
   something consumes pad input (M3/M4); wiring it before then would be untestable.
 - **`device_state`** — per-device register snapshots, added as each device model
-  grows a reason to expose one.
+  grows a reason to expose one (`dsp_state` is the first).
+
+Note the screenshot shows whatever the XFB holds — until the GX command
+processor is modeled the menu never draws, so a valid all-black image
+(`mean_luma` ≈ 16) is the *correct* current output, not a bug.

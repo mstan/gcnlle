@@ -115,6 +115,14 @@ void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user);
 /* Advance the beam to `core_cycles` — the monotonic device clock from the
  * dispatch loop (called per block). MUST be monotonic; never the guest TB. */
 void gcn_vi_tick(u64 core_cycles);
+
+/* Current scanout geometry, for the debug-surface screenshot (Dolphin
+ * GetXFBAddressTop + OutputField): top-field XFB physical address (FBB,
+ * <<5 when POFF), width = WPL*16 px, height = ACV lines, stride = STD*16*2
+ * bytes/line. Returns 0 (and zeros) until the guest has programmed an XFB
+ * base and a nonzero active-video height — i.e. "nothing is being scanned
+ * out", which the caller must report rather than fake. */
+int gcn_vi_xfb_info(u32* addr, u32* width, u32* height, u32* stride);
 u32  gcn_vi_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_vi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 

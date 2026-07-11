@@ -123,6 +123,29 @@ void gcn_vi_tick(u64 core_cycles) {
         vi_update(s_vi, core_cycles);
 }
 
+int gcn_vi_xfb_info(u32* addr, u32* width, u32* height, u32* stride) {
+    *addr = *width = *height = *stride = 0;
+    GcnVi* vi = s_vi;
+    if (!vi)
+        return 0;
+    /* XFB top-field base (VideoInterface.cpp GetXFBAddressTop:450-456): the
+     * FB_LEFT_TOP u32 holds FBB[23:0] + XOFF + POFF (bit 28); POFF means the
+     * stored address is >>5. */
+    u32 fb_hi = vi->reg[GCN_VI_FB_LEFT_TOP_HI >> 1];
+    u32 fb_lo = vi->reg[(GCN_VI_FB_LEFT_TOP_HI + 2u) >> 1];
+    u32 fb    = ((fb_hi << 16) | fb_lo);
+    u32 fbb   = fb & 0x00FFFFFFu;
+    u32 poff  = (fb >> 28) & 1u;
+    *addr = poff ? (fbb << 5) : fbb;
+    /* Geometry (OutputField:814-816): width = WPL*16, height = ACV,
+     * stride = STD*16*2 bytes (picture-config reg 0x48: STD[7:0], WPL[14:8]). */
+    u32 pcfg = vi->reg[0x48 >> 1];
+    *width  = ((pcfg >> 8) & 0x7Fu) * 16u;
+    *height = (vi->reg[GCN_VI_VTR >> 1] >> 4) & 0x3FFu;
+    *stride = (pcfg & 0xFFu) * 16u * 2u;
+    return (*addr != 0 && *width != 0 && *height != 0) ? 1 : 0;
+}
+
 void gcn_vi_init(GcnVi* vi) {
     memset(vi, 0, sizeof *vi);
 

@@ -12,6 +12,7 @@
 #include "debug/debug_server.h"
 #include "debug/rings.h"
 #include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
+#include "vi/vi.h"         /* screenshot: XFB scanout geometry */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -202,11 +203,59 @@ static void handle_line(Client* c, const char* line) {
             (unsigned)dsp_lle_peek_mbox_dsp(), (unsigned)dsp_lle_peek_mbox_cpu());
     }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
-        /* No framebuffer until VI/XFB scanout exists (M2). The command is part
-         * of the protocol now so tooling can be written against it; it returns
-         * a clear "not yet" rather than a fake image. */
-        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
-            "{\"ok\":false,\"error\":\"no framebuffer yet (VI/XFB unmodeled — M2)\"}\n");
+        /* Decode the XFB the VI is scanning out into a PPM on disk. Geometry
+         * comes from the guest-programmed VI registers (gcn_vi_xfb_info); the
+         * XFB pixel format is YUY2 — 4 bytes [Y0,U,Y1,V] per 2 px — converted
+         * with the inverse BT.601 matrix exactly as Dolphin's XFB decode
+         * (TextureConversionShader.cpp:1009-1035). If the guest has not
+         * programmed an XFB, report that honestly (no fake image). */
+        u32 fb_addr, fb_w, fb_h, fb_stride;
+        char path[512] = {0};
+        if (!json_str(line, "path", path, sizeof path))
+            snprintf(path, sizeof path, "_work/screenshot.ppm");
+        if (!gcn_vi_xfb_info(&fb_addr, &fb_w, &fb_h, &fb_stride)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"VI has no XFB programmed (base/width/ACV zero)\"}\n");
+        } else if (!cpu || !cpu->ram ||
+                   (u64)fb_addr + (u64)fb_stride * fb_h > cpu->ram_size) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"XFB out of MEM1 range\",\"addr\":%u}\n", fb_addr);
+        } else {
+            FILE* f = fopen(path, "wb");
+            if (!f) {
+                n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                    "{\"ok\":false,\"error\":\"cannot open output path\"}\n");
+            } else {
+                fprintf(f, "P6\n%u %u\n255\n", fb_w, fb_h);
+                u64 luma_sum = 0;
+                for (u32 y = 0; y < fb_h; y++) {
+                    const u8* row = cpu->ram + fb_addr + (u64)y * fb_stride;
+                    for (u32 x = 0; x < fb_w; x++) {
+                        const u8* px = row + (x / 2u) * 4u;
+                        double Y = (x & 1u) ? px[2] : px[0];
+                        double U = px[1], V = px[3];
+                        double yc = 1.164 * (Y - 16.0);
+                        double r = yc + 1.596 * (V - 128.0);
+                        double g = yc - 0.813 * (V - 128.0) - 0.391 * (U - 128.0);
+                        double b = yc + 2.018 * (U - 128.0);
+                        u8 rgb[3];
+                        rgb[0] = (u8)(r < 0 ? 0 : r > 255 ? 255 : r);
+                        rgb[1] = (u8)(g < 0 ? 0 : g > 255 ? 255 : g);
+                        rgb[2] = (u8)(b < 0 ? 0 : b > 255 ? 255 : b);
+                        fwrite(rgb, 1, 3, f);
+                        luma_sum += (u8)Y;
+                    }
+                }
+                fclose(f);
+                /* mean_luma lets a client assert non-black without fetching
+                 * the image (16 = XFB black level). */
+                n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                    "{\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u,"
+                    "\"xfb_addr\":%u,\"mean_luma\":%.1f}\n",
+                    path, fb_w, fb_h, fb_addr,
+                    (double)luma_sum / ((double)fb_w * fb_h));
+            }
+        }
     }
     else if (!strcmp(cmd, "quit")) {
         s_quit = 1;
