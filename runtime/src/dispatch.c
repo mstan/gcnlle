@@ -9,6 +9,7 @@
 #include "generated.h"        /* DolRecomp dispatch inlines + func_ decls */
 #include "dispatch/dispatch.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
+#include "ai/ai.h"            /* advance the AI sample counter/AIINT per block */
 #include "vi/vi.h"            /* advance the VI beam counter per block       */
 #include "di/di.h"            /* complete deferred DI drive commands per block */
 #include "gx/gx.h"            /* drain the GX FIFO + execute commands per block */
@@ -67,6 +68,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
         device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
         gcn_dsp_tick(GCN_DSP_CYCLES_PER_BLOCK);  /* run the DSP core in step */
+        gcn_ai_tick();                            /* pace AISCNT / AIINT while PSTAT=1 */
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
         gcn_di_tick();                           /* complete a deferred DI command */
         gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */

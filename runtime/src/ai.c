@@ -8,6 +8,9 @@
 
 #include <string.h>
 
+/* The dispatch loop ticks one AI (like the one VI/DSP); registered at init. */
+static GcnAi* s_ai = NULL;
+
 void gcn_ai_set_irq(GcnAi* ai, GcnAiIrqFn fn, void* user) {
     ai->irq = fn;
     ai->irq_user = user;
@@ -16,14 +19,14 @@ void gcn_ai_set_irq(GcnAi* ai, GcnAiIrqFn fn, void* user) {
 void gcn_ai_init(GcnAi* ai) {
     memset(ai, 0, sizeof *ai);
     ai->control = GCN_AI_CR_RESET_VALUE;   /* AIS=48kHz | AID=32kHz (0x42) */
+    s_ai = ai;
 }
 
-/* ---- interrupt line (AudioInterface.cpp UpdateInterrupts:96-99) ----
+/* ---- interrupt line (AudioInterface.cpp UpdateInterrupts:96-100) ----
  * INT_CAUSE_AI = AICR.AIINT & AICR.AIINTMSK. Pushed to PI on EVERY evaluation
- * (PI INTSR is W1C, so a still-asserted level must re-appear). AIINT is only
- * ever cleared this milestone (the sample counter that would set it is deferred
- * — see ai.h), so the line stays low; the wiring is present so it asserts the
- * instant that machinery lands. */
+ * (PI INTSR is W1C, so a still-asserted level must re-appear). AIINT is set by
+ * gcn_ai_tick's sample-counter/AIIT compare (GenerateAudioInterrupt) and
+ * cleared by a guest W1C write (write_control). */
 static void ai_update_interrupts(GcnAi* ai) {
     int level = (ai->control & GCN_AI_CR_AIINT) && (ai->control & GCN_AI_CR_AIINTMSK);
     if (ai->irq)
@@ -43,7 +46,17 @@ static void write_control(GcnAi* ai, u32 val) {
     u32 nv = (ai->control & ~CTRL) | (val & CTRL);
     if (val & GCN_AI_CR_AIINT)    nv &= ~GCN_AI_CR_AIINT;   /* W1C interrupt   */
     nv &= ~GCN_AI_CR_SCRESET;                               /* trigger, reads 0 */
-    if (val & GCN_AI_CR_SCRESET)  ai->sample_counter = 0;
+    /* PSTAT edge rebases Dolphin's timing anchor (RegisterMMIO AICR
+     * ComplexWrite:250-259: "ai.m_last_cpu_time = core_timing.GetTicks()" on
+     * ANY PSTAT value change, start or stop) — our equivalent is zeroing the
+     * tick accumulator so a stale partial sample period never carries across
+     * a play/stop transition. */
+    if ((val & GCN_AI_CR_PSTAT) != (ai->control & GCN_AI_CR_PSTAT))
+        ai->tick_accum = 0;
+    if (val & GCN_AI_CR_SCRESET) {
+        ai->sample_counter = 0;   /* RegisterMMIO :268-275 */
+        ai->tick_accum = 0;
+    }
     ai->control = nv;
     /* AIINT W1C ack and AIINTMSK change both move the line (AudioInterface.cpp
      * AICR write handler ends in UpdateInterrupts:277). */
@@ -56,7 +69,7 @@ u32 gcn_ai_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     switch (addr - GCN_AI_BASE) {
     case GCN_AI_CONTROL:   return ai->control;
     case GCN_AI_VOLUME:    return ai->volume;
-    case GCN_AI_SAMPLECNT: return ai->sample_counter;  /* idle: PSTAT=0 */
+    case GCN_AI_SAMPLECNT: return ai->sample_counter;  /* live while PSTAT=1, gcn_ai_tick */
     case GCN_AI_INTTIMING: return ai->int_timing;
     default:               return 0;
     }
@@ -68,8 +81,52 @@ void gcn_ai_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     switch (addr - GCN_AI_BASE) {
     case GCN_AI_CONTROL:   write_control(ai, value); break;
     case GCN_AI_VOLUME:    ai->volume = value; break;
-    case GCN_AI_SAMPLECNT: ai->sample_counter = value; break;
+    case GCN_AI_SAMPLECNT:
+        /* Rebase the timing anchor on a direct counter write, mirroring
+         * RegisterMMIO AI_SAMPLE_COUNTER ComplexWrite:297-304
+         * ("ai.m_last_cpu_time = core_timing.GetTicks()"). */
+        ai->sample_counter = value;
+        ai->tick_accum = 0;
+        break;
     case GCN_AI_INTTIMING: ai->int_timing = value; break;
     default: break;
     }
+}
+
+/* ---- sample counter / AIINT pacing (AudioInterface.cpp IncreaseSampleCount /
+ * GenerateAudioInterrupt:102-123) ----
+ * Called once per executed block from dispatch.c (after gcn_dsp_tick), same
+ * singleton-tick pattern as gcn_vi_tick/gcn_dsp_tick. No-op while PSTAT=0
+ * (IsPlaying() gate). While playing, accumulates ticks until one AIS sample
+ * period (rate-selected threshold, ai.h) elapses, then advances AISCNT by
+ * exactly one sample and re-runs Dolphin's wraparound-safe compare:
+ *   old = sample_counter(before) + 1
+ *   new = sample_counter(before) + amount     (amount == 1 here)
+ *   fire if (int_timing - old) <= (new - old)
+ * With amount == 1, (new - old) == 0, so this reduces to firing exactly when
+ * int_timing == sample_counter(after) — i.e. AIINT latches the tick AISCNT
+ * reaches AIIT, and (per ai.h) unconditionally of AIINTVLD, exactly as
+ * Dolphin's IncreaseSampleCount does. */
+static void ai_tick_once(GcnAi* ai) {
+    if (!(ai->control & GCN_AI_CR_PSTAT))
+        return;   /* Update():142 / IsPlaying():323-326 */
+
+    u32 ticks_per_sample = (ai->control & GCN_AI_CR_AISFR)
+                               ? GCN_AI_TICKS_PER_SAMPLE_48KHZ
+                               : GCN_AI_TICKS_PER_SAMPLE_32KHZ;
+    if (++ai->tick_accum < ticks_per_sample)
+        return;
+    ai->tick_accum = 0;
+
+    u32 old = ai->sample_counter + 1;          /* IncreaseSampleCount:113 */
+    ai->sample_counter += 1;                   /* amount = 1 sample/tick  */
+    if ((ai->int_timing - old) <= (ai->sample_counter - old)) {
+        ai->control |= GCN_AI_CR_AIINT;        /* GenerateAudioInterrupt():102-106 */
+        ai_update_interrupts(ai);
+    }
+}
+
+void gcn_ai_tick(void) {
+    if (s_ai)
+        ai_tick_once(s_ai);
 }
