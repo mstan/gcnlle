@@ -33,6 +33,7 @@ extern "C" {
 #define GCN_MMIO_RING_CAP  (1u << 18)
 #define GCN_BLOCK_RING_CAP (1u << 18)
 #define GCN_EVENT_RING_CAP (1u << 16)
+#define GCN_FIFO_RING_CAP  (1u << 16)   /* GX gather-pipe bursts (32 bytes each) */
 
 /* Event kinds recorded in the event ring (interrupt/DMA/DSP/EXI edges). */
 typedef enum {
@@ -60,6 +61,11 @@ void gcn_ring_block(u32 pc);
 /* One device/timeline edge (see GcnEventKind). Stamped with the block index. */
 void gcn_ring_event(u16 kind, u32 detail, u32 aux, u32 pc);
 
+/* One 32-byte GX gather-pipe burst: the producing pc, the FIFO write pointer it
+ * was DMA'd to, and the 32 raw bytes. Stamped with the block index. This is
+ * ROADMAP M2's "GX FIFO recorder" — the packet inventory for the interpreter. */
+void gcn_ring_fifo(u32 pc, u32 wptr, const u8* data32);
+
 /* Current monotonic block index (number of blocks retired so far). */
 u64  gcn_ring_block_index(void);
 
@@ -73,6 +79,7 @@ int gcn_ring_mmio_json(char* out, int cap, int max_entries,
                        u32 addr_filter, int have_filter, int rw_filter);
 int gcn_ring_block_json(char* out, int cap, int max_entries);
 int gcn_ring_event_json(char* out, int cap, int max_entries);
+int gcn_ring_fifo_json(char* out, int cap, int max_entries);
 
 #ifdef __cplusplus
 }

@@ -192,6 +192,11 @@ static void handle_line(Client* c, const char* line) {
         u32 count = 256; json_uint(line, "count", &count);
         n = gcn_ring_event_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
     }
+    else if (!strcmp(cmd, "fifo_dump")) {
+        /* GX gather-pipe burst recorder (ROADMAP M2 packet inventory). */
+        u32 count = 64; json_uint(line, "count", &count);
+        n = gcn_ring_fifo_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
+    }
     else if (!strcmp(cmd, "dsp_state")) {
         /* Live DSP-LLE core state: pc, control reg, and non-consuming peeks of
          * both mailboxes (bit 31 = mail pending). Diagnoses CPU<->DSP task

@@ -24,6 +24,10 @@
 #include "ai/ai.h"
 #include "vi/vi.h"
 #include "di/di.h"
+#include "mi/mi.h"
+#include "pe/pe.h"
+#include "cp/cp.h"
+#include "gp/gp.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
 
@@ -59,6 +63,18 @@ static void si_irq_to_pi(void* user, int level) {
 /* AI (streaming) interrupt line -> PI interrupt cause. */
 static void ai_irq_to_pi(void* user, int level) {
     gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_AI, level);
+}
+
+/* PE token/finish lines -> PI interrupt cause. The PE passes the PI cause bit
+ * (GCN_PE_INT_TOKEN=0x200 / GCN_PE_INT_FINISH=0x400) as cause_mask, mirroring
+ * Dolphin UpdateInterrupts' two independent SetInterrupt calls. */
+static void pe_irq_to_pi(void* user, u32 cause_mask, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, cause_mask, level);
+}
+
+/* CP watermark/breakpoint interrupt line -> PI interrupt cause. */
+static void cp_irq_to_pi(void* user, int level) {
+    gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_CP, level);
 }
 
 int main(int argc, char** argv) {
@@ -196,6 +212,42 @@ int main(int argc, char** argv) {
     gcn_di_set_irq(&di, di_irq_to_pi, &pi);
     gcn_mmio_register(&bus, "DI", GCN_DI_BASE, GCN_DI_SIZE,
                       gcn_di_read, gcn_di_write, &di);
+
+    /* MI: pure u16 register file (memory-controller face). No interrupts this
+     * increment; the IPL's observed traffic is a single MI_IRQMASK write. */
+    static GcnMi mi;
+    gcn_mi_init(&mi);
+    gcn_mmio_register(&bus, "MI", GCN_MI_BASE, GCN_MI_SIZE,
+                      gcn_mi_read, gcn_mi_write, &mi);
+
+    /* PE: pixel-engine config + token/finish interrupt latches. The GX-init
+     * path reads CTRL back at 0xCC00100A. The two PE->PI lines stay dormant
+     * (no FIFO parser raises token/finish; the menu masks them). */
+    static GcnPe pe;
+    gcn_pe_init(&pe);
+    gcn_pe_set_irq(&pe, pe_irq_to_pi, &pi);
+    gcn_mmio_register(&bus, "PE", GCN_PE_BASE, GCN_PE_SIZE,
+                      gcn_pe_read, gcn_pe_write, &pe);
+
+    /* CP: GX command-FIFO front-end. STATUS is computed from live pointer
+     * state; the CPU-side watermark evaluation drives INT_CAUSE_CP (the line
+     * the menu unmasks at 0x9FC once GX init completes). */
+    static GcnCp cp;
+    gcn_cp_init(&cp);
+    gcn_cp_set_irq(&cp, cp_irq_to_pi, &pi);
+    gcn_mmio_register(&bus, "CP", GCN_CP_BASE, GCN_CP_SIZE,
+                      gcn_cp_read, gcn_cp_write, &cp);
+
+    /* GP: the 32-byte gather pipe. Each full burst DMAs to guest RAM at the PI
+     * FIFO write pointer, advances it (wrap END->BASE), runs the CP burst
+     * handler, and is recorded into the always-on FIFO ring. Needs PI + CP. */
+    static GcnGp gp;
+    gcn_gp_init(&gp, &pi, &cp);
+    gcn_mmio_register(&bus, "GP", GCN_GP_BASE, GCN_GP_SIZE,
+                      gcn_gp_read, gcn_gp_write, &gp);
+    /* PI_FIFO_RESET (GXAbortFrame) resets the gather-pipe staging via this hook
+     * (keeps pi.c free of a gp.h dependency). */
+    gcn_pi_set_fifo_reset_hook(&pi, gcn_gp_reset);
 
     gcn_mmio_install(&bus, &cpu);
 

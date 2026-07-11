@@ -27,6 +27,10 @@ static u32 pi_index(u32 addr) {
     return (addr - GCN_PI_BASE) >> 2;   /* bus guarantees addr in [base, base+size) */
 }
 
+void gcn_pi_set_fifo_reset_hook(GcnPi* pi, GcnPiFifoResetFn fn) {
+    pi->fifo_reset_hook = fn;
+}
+
 void gcn_pi_set_interrupt(GcnPi* pi, u32 cause_mask, int set) {
     if (set)
         pi->intsr |= cause_mask;
@@ -72,6 +76,14 @@ void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     u32 off = addr - GCN_PI_BASE;
     if (off == GCN_PI_INTSR) {
         pi->intsr &= ~value;            /* write-1-to-clear; level sources re-assert */
+        return;
+    }
+    if (off == GCN_PI_FIFO_RESET) {
+        /* ProcessorInterface.cpp:112-119 (GXAbortFrame): bit 0 resets the
+         * gather pipe. Read-only register otherwise (InvalidRead). */
+        pi->reg[pi_index(addr)] = value;
+        if ((value & 1u) && pi->fifo_reset_hook)
+            pi->fifo_reset_hook();
         return;
     }
     pi->reg[pi_index(addr)] = value;

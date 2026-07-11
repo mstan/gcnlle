@@ -39,20 +39,31 @@ typedef struct {
     u16 _pad;
 } EventEntry;
 
+typedef struct {
+    u64 seq;
+    u64 block;
+    u32 pc;
+    u32 wptr;
+    u8  data[32];
+} FifoEntry;
+
 static MmioEntry  s_mmio[GCN_MMIO_RING_CAP];
 static BlockEntry s_block[GCN_BLOCK_RING_CAP];
 static EventEntry s_event[GCN_EVENT_RING_CAP];
+static FifoEntry  s_fifo[GCN_FIFO_RING_CAP];
 
 static u64 s_mmio_count;   /* total ever recorded (also the next write index)   */
 static u64 s_block_count;
 static u64 s_event_count;
+static u64 s_fifo_count;
 static u64 s_block_index;  /* monotonic retired-block counter (timeline stamp)  */
 
 void gcn_rings_init(void) {
     memset(s_mmio, 0, sizeof s_mmio);
     memset(s_block, 0, sizeof s_block);
     memset(s_event, 0, sizeof s_event);
-    s_mmio_count = s_block_count = s_event_count = 0;
+    memset(s_fifo, 0, sizeof s_fifo);
+    s_mmio_count = s_block_count = s_event_count = s_fifo_count = 0;
     s_block_index = 0;
 }
 
@@ -77,6 +88,14 @@ void gcn_ring_event(u16 kind, u32 detail, u32 aux, u32 pc) {
     e->block = s_block_index;
     e->pc = pc; e->detail = detail; e->aux = aux;
     e->kind = kind; e->_pad = 0;
+}
+
+void gcn_ring_fifo(u32 pc, u32 wptr, const u8* data32) {
+    FifoEntry* e = &s_fifo[s_fifo_count & (GCN_FIFO_RING_CAP - 1)];
+    e->seq = s_fifo_count++;
+    e->block = s_block_index;
+    e->pc = pc; e->wptr = wptr;
+    memcpy(e->data, data32, 32);
 }
 
 u64 gcn_ring_block_index(void) { return s_block_index; }
@@ -141,6 +160,33 @@ int gcn_ring_block_json(char* out, int cap, int max_entries) {
             (unsigned long long)e->seq, e->pc);
         if (w < 0 || n + w >= cap - 4) break;
         n += w; first = 0; emitted++;
+    }
+    n += snprintf(out + n, (size_t)(cap - n), "],\"count\":%d}\n", emitted);
+    return n;
+}
+
+int gcn_ring_fifo_json(char* out, int cap, int max_entries) {
+    static const char hexd[] = "0123456789abcdef";
+    int n = (int)emit_prefix(out, cap, "fifo", s_fifo_count);
+    if (n < 0 || n >= cap) return n;
+    u64 avail = s_fifo_count < GCN_FIFO_RING_CAP ? s_fifo_count : GCN_FIFO_RING_CAP;
+    if ((u64)max_entries < avail) avail = (u64)max_entries;
+    u64 start = s_fifo_count - avail;
+    int emitted = 0, first = 1;
+    for (u64 s = start; s < s_fifo_count; s++) {
+        FifoEntry* e = &s_fifo[s & (GCN_FIFO_RING_CAP - 1)];
+        int w = snprintf(out + n, (size_t)(cap - n),
+            "%s{\"seq\":%llu,\"block\":%llu,\"pc\":%u,\"wptr\":%u,\"data\":\"",
+            first ? "" : ",", (unsigned long long)e->seq,
+            (unsigned long long)e->block, e->pc, e->wptr);
+        if (w < 0 || n + w >= cap - 80) break;   /* leave room for 64 hex + closer */
+        n += w;
+        for (int i = 0; i < 32; i++) {
+            out[n++] = hexd[e->data[i] >> 4];
+            out[n++] = hexd[e->data[i] & 0xF];
+        }
+        n += snprintf(out + n, (size_t)(cap - n), "\"}");
+        first = 0; emitted++;
     }
     n += snprintf(out + n, (size_t)(cap - n), "],\"count\":%d}\n", emitted);
     return n;

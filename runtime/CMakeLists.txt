@@ -96,6 +96,10 @@ if(GCN_WITH_GENERATED)
     src/ai.c
     src/vi.c
     src/di.c
+    src/mi.c
+    src/pe.c
+    src/cp.c
+    src/gp.c
     src/rings.c
     src/debug_server.c
     generated/generated.c

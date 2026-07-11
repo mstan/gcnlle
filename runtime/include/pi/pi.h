@@ -57,6 +57,7 @@
 #define GCN_PI_FIFO_BASE  0x0Cu       /* GP FIFO base start              */
 #define GCN_PI_FIFO_END   0x10u       /* GP FIFO base end                */
 #define GCN_PI_FIFO_WPTR  0x14u       /* GP FIFO current write pointer   */
+#define GCN_PI_FIFO_RESET 0x18u       /* GP FIFO reset (GXAbortFrame)    */
 #define GCN_PI_RESETCODE  0x24u       /* reset code / reset sequencing   */
 #define GCN_PI_REVISION   0x2Cu       /* chipset revision (read-only)    */
 
@@ -82,12 +83,20 @@
 #define GCN_PI_INT_HSP         0x02000u
 #define GCN_PI_INT_RST_BUTTON  0x10000u   /* 1 = reset button NOT pressed   */
 
+/* PI_FIFO_RESET write hook (ProcessorInterface.cpp:112-119). Set from boot.c to
+ * gp.c's gcn_gp_reset so pi.c never takes a dependency on gp.h — the same
+ * dependency direction as the irq trampolines. */
+typedef void (*GcnPiFifoResetFn)(void);
+
 typedef struct {
     u32 reg[GCN_PI_SIZE / 4];
     u32 intsr;                  /* live interrupt-cause word (not in reg[]) */
+    GcnPiFifoResetFn fifo_reset_hook;  /* gather-pipe reset (PI_FIFO_RESET) */
 } GcnPi;
 
 void gcn_pi_init(GcnPi* pi);
+/* Register the gather-pipe reset hook fired on a PI_FIFO_RESET write. */
+void gcn_pi_set_fifo_reset_hook(GcnPi* pi, GcnPiFifoResetFn fn);
 u32  gcn_pi_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 
