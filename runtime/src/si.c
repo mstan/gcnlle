@@ -216,6 +216,18 @@ u32 gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size) {
         return v;
     }
     case GCN_SI_SISR: {
+        /* SISR is a poll-observation point exactly like SICOMCSR. Dolphin's VI
+         * beam calls UpdateDevices every 2*SIPOLL.X half-lines, unconditionally
+         * and independent of any SI register read (VideoInterface.cpp:950-960);
+         * each poll re-latches RDST and re-deposits the pad report for every
+         * connected channel (SI.cpp:529-548). SISR itself is a DirectRead of
+         * m_status_reg (SI.cpp:393), so on the oracle a SISR read observes
+         * RDST0=1 whenever a poll ran since the last input-buffer read — the
+         * steady state. The IPL's PAD path tests RDST0 through SISR ONLY
+         * (SIGetResponseRaw: read SISR -> RDST set? -> read in_hi/in_lo), never
+         * through SICOMCSR, so the timing-free replay must run here too or
+         * RDST0 stays 0 after the first input read and pad data never flows. */
+        si_poll(si);
         /* Per-channel status, derived live from the continuous poll (SI.cpp
          * UpdateDevices:529-548): a connected channel reports RDST while its
          * read-status latch is set; a disconnected channel's GetData returns
@@ -233,6 +245,7 @@ u32 gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size) {
                 v |= GCN_SI_NOREP_BIT(n);
             }
         }
+        si_update_interrupts(si);   /* UpdateDevices ends in UpdateInterrupts (SI.cpp:550) */
         return v;
     }
     case GCN_SI_EXILK: return si->exilk;

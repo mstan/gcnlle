@@ -18,9 +18,14 @@
  *
  * Timing-free poll model (PRINCIPLES: diff by value+order, never by timing): we
  * do NOT model the VI poll clock. Instead we exploit its invariant — SI.cpp
- * UpdateDevices runs GetData on EVERY channel on every poll, and polls happen
- * continuously — so we replay one poll's steady-state effect wherever a poll
- * would certainly have run (init + each SICOMCSR read). Per SI.cpp:529-548:
+ * UpdateDevices runs GetData on EVERY channel on every poll (scheduled by the
+ * VI beam every 2*SIPOLL.X half-lines, VideoInterface.cpp:950-960, independent
+ * of any SI register read), and polls happen continuously — so we replay one
+ * poll's steady-state effect at every poll-observation point: init, each
+ * SICOMCSR read (RDSTINT is derived from the RDST bits), and each SISR read
+ * (the per-channel RDST bits are directly visible there; the IPL's PAD path —
+ * SIGetResponseRaw — tests RDST0 through SISR only, never through SICOMCSR).
+ * Per SI.cpp:529-548:
  *   - a connected controller answers GetData()==Success: latch RDST and deposit
  *     its pad report into that channel's in_hi/in_lo (SI.cpp:536, the same
  *     neutral bytes CMD_DIRECT returns — factored into si_pad_report so the
