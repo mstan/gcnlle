@@ -16,17 +16,26 @@
  *     a connected controller's GetData() returns Success (SI.cpp:536) and cleared
  *     by reading that channel's input buffer (SI.cpp:344-357).
  *
- * Timing-free RDST model (PRINCIPLES: diff by value+order, never by timing): we
- * do NOT model the VI poll clock. Instead we exploit its invariant — a connected
- * controller returns Success on every poll, and polls happen continuously — so a
- * connected channel's RDST reads 1 at every SICOMCSR check, and is only
- * transiently 0 between an input-buffer read and the next check. We latch RDST
- * for connected channels, clear it on an input-buffer read, and re-arm it on the
- * next SICOMCSR read (a poll would certainly have run in between). Dolphin's
- * default config connects a standard controller on channel 0 only, so ch0 reads
- * RDST=1 (=> RDSTINT) and ch1-3 read 0. A wrong controller-presence choice
- * diverges loudly from the oracle — presence here is the modeled hardware state,
- * never a fudge.
+ * Timing-free poll model (PRINCIPLES: diff by value+order, never by timing): we
+ * do NOT model the VI poll clock. Instead we exploit its invariant — SI.cpp
+ * UpdateDevices runs GetData on EVERY channel on every poll, and polls happen
+ * continuously — so we replay one poll's steady-state effect wherever a poll
+ * would certainly have run (init + each SICOMCSR read). Per SI.cpp:529-548:
+ *   - a connected controller answers GetData()==Success: latch RDST and deposit
+ *     its pad report into that channel's in_hi/in_lo (SI.cpp:536, the same
+ *     neutral bytes CMD_DIRECT returns — factored into si_pad_report so the
+ *     polled and direct-command paths cannot drift). RDST is transiently 0
+ *     between an input-buffer read and the next re-arm.
+ *   - a channel with no device answers GetData()==ErrorNoResponse (SI_DeviceNull
+ *     .cpp:20): SetNoResponse latches NOREP for that channel (SI.cpp:538-539).
+ *     Like RDST this is a continuous-poll effect, so the SISR read DERIVES NOREP
+ *     live for every disconnected channel (a guest W1C-clear is re-set by the
+ *     next poll — confirmed against the oracle, which re-shows NOREP one read
+ *     after the clear).
+ * Dolphin's default config connects a standard controller on channel 0 only, so
+ * ch0 reads RDST=1 (=> RDSTINT) with the neutral report, and ch1-3 read NOREP.
+ * A wrong controller-presence choice diverges loudly from the oracle — presence
+ * here is the modeled hardware state, never a fudge.
  */
 #ifndef GCN_SI_SI_H
 #define GCN_SI_SI_H
@@ -65,6 +74,9 @@
 #define GCN_SI_SR_WR          0x80000000u
 /* RDST bit for channel n (SI.cpp GetRDSTBit): ch0=0x20000000 .. ch3=0x20. */
 #define GCN_SI_RDST_BIT(n)    (0x20000000u >> ((n) * 8u))
+/* NOREP (no-response error) bit for channel n (SI.h USIStatusReg NOREP0..3:
+ * bit27,19,11,3): ch0=0x08000000 .. ch3=0x08 — 0x08 in each per-channel byte. */
+#define GCN_SI_NOREP_BIT(n)   (0x08000000u >> ((n) * 8u))
 
 /* Controller mode (SI_DeviceGCController.h:49): default 3. */
 #define GCN_SI_CTRL_MODE_DEFAULT 3u

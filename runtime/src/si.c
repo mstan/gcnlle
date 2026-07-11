@@ -13,15 +13,44 @@ void gcn_si_set_irq(GcnSi* si, GcnSiIrqFn fn, void* user) {
     si->irq_user = user;
 }
 
+/* Neutral standard-controller pad report (SI_DeviceGCController.cpp:168-236,
+ * reporting mode 3 = the power-on default, SI_DeviceGCController.h). MapPadStatus
+ * packs the high word as (button|PAD_USE_ORIGIN)<<16 | stickX<<8 | stickY with
+ * all sticks centered at 0x80 (GCPadStatus.h MAIN/C_STICK_CENTER) and no buttons
+ * pressed (PAD_USE_ORIGIN=0x0080); mode-3 GetData packs the low word as
+ * substickX<<24 | substickY<<16 | triggerLeft<<8 | triggerRight, triggers
+ * released. Single source for both the polled channel registers and the
+ * CMD_DIRECT buffer so they cannot drift (real input arrives via the
+ * Observability input-injection surface). */
+static void si_pad_report(u32* hi, u32* lo) {
+    *hi = 0x00808080u;   /* (0|PAD_USE_ORIGIN)<<16 | stickX(0x80)<<8 | stickY(0x80) */
+    *lo = 0x80800000u;   /* substickX(0x80)<<24 | substickY(0x80)<<16 | trigL(0)<<8 | trigR(0) */
+}
+
+/* Replay one VI-driven SI poll's steady-state effect on the CONNECTED channels
+ * (SI.cpp UpdateDevices:529-548): each connected controller answers Success, so
+ * we latch RDST and deposit its pad report into in_hi/in_lo. Disconnected
+ * channels' NOREP is derived live in the SISR read path (see the header). Called
+ * wherever a poll would certainly have run: init and every SICOMCSR read. */
+static void si_poll(GcnSi* si) {
+    for (u32 n = 0; n < GCN_SI_CHANNELS; n++) {
+        if (si->ch[n].connected) {
+            si->ch[n].rdst = 1;
+            si_pad_report(&si->ch[n].in_hi, &si->ch[n].in_lo);
+        }
+    }
+}
+
 void gcn_si_init(GcnSi* si) {
     memset(si, 0, sizeof *si);
     for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
         si->ch[n].mode = (u8)GCN_SI_CTRL_MODE_DEFAULT;
     /* Dolphin's default config connects a standard GC controller on channel 0
-     * only (MainSettings.cpp:171-172). Its continuous VI poll latches RDST0 long
-     * before the IPL first reads SICOMCSR, so ch0 powers up read-status-ready. */
+     * only (MainSettings.cpp:171-172). Its continuous VI poll latches RDST0 and
+     * deposits the pad report long before the IPL first reads SICOMCSR, so ch0
+     * powers up read-status-ready with its input registers already filled. */
     si->ch[0].connected = 1;
-    si->ch[0].rdst = 1;
+    si_poll(si);
 }
 
 static u32 si_any_rdst(const GcnSi* si) {
@@ -66,8 +95,10 @@ static void si_run_buffer(GcnSi* si) {
     si->comcsr &= ~GCN_SI_CSR_TSTART;      /* completes synchronously */
 
     if (!c->connected) {
-        /* No device: Dolphin returns -1 -> COMERR (+ NOREP in SISR, whose exact
-         * bit we leave unmodeled until the oracle exercises it). */
+        /* No device: Dolphin's RunSIBuffer gets actual_response_length < 0, sets
+         * COMERR and calls SetNoResponse (SI.cpp:189-193). We latch COMERR here;
+         * the channel's NOREP is derived live in the SISR read path (a
+         * disconnected channel reports NOREP on every poll, see the header). */
         si->comcsr |= GCN_SI_CSR_COMERR | GCN_SI_CSR_TCINT;
         return;
     }
@@ -80,8 +111,8 @@ static void si_run_buffer(GcnSi* si) {
         si->iobuf[0] = 0x09; si->iobuf[1] = 0x00; si->iobuf[2] = 0x00;
         break;
     case 0x40: {                            /* CMD_DIRECT: 8-byte pad report */
-        u32 hi = 0x00808080u;               /* button|PAD_USE_ORIGIN, stickX, stickY (neutral) */
-        u32 lo = 0x80800000u;               /* substickX, substickY, triggerL, triggerR (neutral) */
+        u32 hi, lo;
+        si_pad_report(&hi, &lo);            /* same neutral report the VI poll deposits */
         si->iobuf[0] = (u8)(hi >> 24); si->iobuf[1] = (u8)(hi >> 16);
         si->iobuf[2] = (u8)(hi >> 8);  si->iobuf[3] = (u8)hi;
         si->iobuf[4] = (u8)(lo >> 24); si->iobuf[5] = (u8)(lo >> 16);
@@ -122,21 +153,34 @@ u32 gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     switch (off) {
     case GCN_SI_POLL:  return si->poll;
     case GCN_SI_COMCSR: {
-        /* Timing-free RDST: a VI poll would have re-latched RDST for every
-         * connected channel since the last input read (see header). RDSTINT is
-         * then derived from the live RDST bits (SI.cpp:98-108). */
-        for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
-            if (si->ch[n].connected) si->ch[n].rdst = 1;
+        /* Timing-free poll: a VI poll would have re-latched RDST and re-deposited
+         * the pad report for every connected channel since the last input read
+         * (see header). RDSTINT is then derived from the live RDST bits
+         * (SI.cpp:98-108). */
+        si_poll(si);
         u32 v = si->comcsr & ~GCN_SI_CSR_RDSTINT;
         if (si_any_rdst(si)) v |= GCN_SI_CSR_RDSTINT;
         si_update_interrupts(si);   /* the re-armed RDST just moved the line */
         return v;
     }
     case GCN_SI_SISR: {
-        u32 v = si->sisr & ~(GCN_SI_RDST_BIT(0) | GCN_SI_RDST_BIT(1) |
-                             GCN_SI_RDST_BIT(2) | GCN_SI_RDST_BIT(3));
+        /* Per-channel status, derived live from the continuous poll (SI.cpp
+         * UpdateDevices:529-548): a connected channel reports RDST while its
+         * read-status latch is set; a disconnected channel's GetData returns
+         * ErrorNoResponse every poll, latching NOREP (re-set after any W1C clear
+         * by the next poll — the header's timing-free invariant). The stored
+         * si->sisr keeps only the non-derived error bits (COLL/OVRUN/UNRUN, W1C). */
+        u32 derived = 0;
         for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
-            if (si->ch[n].rdst) v |= GCN_SI_RDST_BIT(n);
+            derived |= GCN_SI_RDST_BIT(n) | GCN_SI_NOREP_BIT(n);
+        u32 v = si->sisr & ~derived;
+        for (u32 n = 0; n < GCN_SI_CHANNELS; n++) {
+            if (si->ch[n].connected) {
+                if (si->ch[n].rdst) v |= GCN_SI_RDST_BIT(n);
+            } else {
+                v |= GCN_SI_NOREP_BIT(n);
+            }
+        }
         return v;
     }
     case GCN_SI_EXILK: return si->exilk;
