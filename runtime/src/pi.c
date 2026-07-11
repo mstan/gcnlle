@@ -40,6 +40,20 @@ void gcn_pi_set_interrupt(GcnPi* pi, u32 cause_mask, int set) {
 
 #define PI_MSR_EE 0x00008000u   /* MSR[EE] (PPC bit 16), mirror of cpu_glue.c */
 
+/* PI gather-pipe FIFO pointer mask. The base/end/write-pointer registers ignore
+ * the upper address bits AND the low 5 bits (32-byte / GATHER_PIPE_SIZE
+ * alignment) in hardware, so a burst-advanced write pointer reaches `end`
+ * EXACTLY and the END->BASE wrap in gp.c fires. Transcribed from Dolphin
+ * ProcessorInterface.cpp:91-110 (PI_FIFO_BASE/END/WPTR write handlers), where
+ *   mask = CommandProcessor::GetPhysicalAddressMask(IsWii) & 0xFFFFFFE0.
+ * GameCube (Flipper) physical-address mask is 0x03FFFFFF (CommandProcessor.h:155),
+ * so the effective mask is 0x03FFFFE0. Without it the guest-written END
+ * (0x0098307C = base+size-4, low bits set) is stored raw, the write-pointer wrap
+ * `wptr == end` never matches a 32-aligned pointer, the write pointer marches
+ * past the buffer while the read side (cp.c, masked to 0xFFE0) wraps at the
+ * aligned end, and the GX reader picks up stale FIFO-buffer-start data. */
+#define PI_FIFO_PTR_MASK 0x03FFFFE0u
+
 void gcn_pi_deliver_external(CPUState* cpu) {
     if (!s_pi)
         return;
@@ -84,6 +98,14 @@ void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
         pi->reg[pi_index(addr)] = value;
         if ((value & 1u) && pi->fifo_reset_hook)
             pi->fifo_reset_hook();
+        return;
+    }
+    if (off == GCN_PI_FIFO_BASE || off == GCN_PI_FIFO_END ||
+        off == GCN_PI_FIFO_WPTR) {
+        /* Gather-pipe FIFO pointers: hardware ignores upper + low-5 bits so the
+         * burst-advanced write pointer lands on `end` exactly and wraps
+         * (ProcessorInterface.cpp:91-110). See PI_FIFO_PTR_MASK. */
+        pi->reg[pi_index(addr)] = value & PI_FIFO_PTR_MASK;
         return;
     }
     pi->reg[pi_index(addr)] = value;
