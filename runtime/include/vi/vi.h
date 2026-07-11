@@ -41,6 +41,14 @@
  * XFB scanout to pixels, the debug-server screenshot, and CPU delivery of the
  * external-interrupt exception (the PI cause/mask word is modeled; delivery is
  * the next wall — see pi.h).
+ *
+ * The beam also schedules the SI poll (VideoInterface.cpp:950-968): every
+ * halfline, vi_advance_halfline fires the si_poll_hook with the current
+ * half_line_count and a field-boundary flag, unconditionally, BEFORE
+ * incrementing/wrapping half_line_count (matching Dolphin's Update(), which
+ * checks/reschedules against the pre-increment count and only increments at
+ * the end). si.c owns the actual schedule compare + reschedule + the poll
+ * itself (see si.h) so this header stays free of any si.h dependency.
  */
 #ifndef GCN_VI_VI_H
 #define GCN_VI_VI_H
@@ -99,6 +107,15 @@
 /* Level change on the VI->PI interrupt line (level: 1 assert, 0 deassert). */
 typedef void (*GcnViIrqFn)(void* user, int level);
 
+/* Per-halfline SI-poll scheduling hook (VideoInterface.cpp:950-968). vi.c
+ * fires this unconditionally on every halfline advance, carrying the current
+ * (pre-increment) half_line_count and whether this halfline is a field
+ * boundary; it does NOT decide whether a poll is due — that schedule state
+ * (m_half_line_of_next_si_poll in Dolphin) lives entirely on the SI side (see
+ * si.h) so vi.c never takes a dependency on si.h, mirroring the
+ * GcnPiFifoResetFn / irq-trampoline pattern (boot.c wires the two together). */
+typedef void (*GcnViSiPollFn)(void* user, u32 half_line_count, int is_at_field_boundary);
+
 typedef struct {
     u16 reg[GCN_VI_SIZE / 2];     /* 16-bit register backing (off >> 1)       */
     u32 half_line_count;          /* halflines into the current frame         */
@@ -108,10 +125,14 @@ typedef struct {
     int irq_level;                /* last VI->PI line level (edge detect for the event ring) */
     GcnViIrqFn irq;               /* sink for the VI interrupt line (boot.c -> PI) */
     void*      irq_user;
+    GcnViSiPollFn si_poll_hook;    /* sink for the per-halfline SI poll schedule (boot.c -> si.c) */
+    void*         si_poll_user;
 } GcnVi;
 
 void gcn_vi_init(GcnVi* vi);
 void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user);
+/* Register the per-halfline SI-poll scheduling hook fired from vi_advance_halfline. */
+void gcn_vi_set_si_poll_hook(GcnVi* vi, GcnViSiPollFn fn, void* user);
 /* Advance the beam to `core_cycles` — the monotonic device clock from the
  * dispatch loop (called per block). MUST be monotonic; never the guest TB. */
 void gcn_vi_tick(u64 core_cycles);

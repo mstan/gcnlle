@@ -19,6 +19,11 @@ void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user) {
     vi->irq_user = user;
 }
 
+void gcn_vi_set_si_poll_hook(GcnVi* vi, GcnViSiPollFn fn, void* user) {
+    vi->si_poll_hook = fn;
+    vi->si_poll_user = user;
+}
+
 /* ---- derived timing (VideoInterface.cpp GetTicksPerSample /
  *      GetTicksPerHalfLine / GetHalfLinesPer{Odd,Even}Field) ---- */
 
@@ -69,6 +74,20 @@ static void vi_update_interrupts(GcnVi* vi) {
 
 static void vi_advance_halfline(GcnVi* vi) {
     u32 total = vi_halflines_per_frame(vi);
+
+    /* VideoInterface.cpp:911-912,950-968: the field-boundary check and the
+     * SI-poll schedule both key off the CURRENT (pre-increment) half_line_count
+     * — the increment/wrap below happens only afterward (VideoInterface.cpp:
+     * 974-978). Fire the SI-poll hook here, before advancing, so si.c observes
+     * the same halfline Dolphin's Update() would. even_field_begin is
+     * GetHalfLinesPerOddField() — the same odd-field halfline count folded
+     * into vi_halflines_per_frame below, just not summed with the even field. */
+    u32 old_hl = vi->half_line_count;
+    u32 even_field_begin = vi_halflines_field(vi, GCN_VI_VTO_HI, GCN_VI_VTO_LO);
+    int is_at_field_boundary = (old_hl == 0u) || (old_hl == even_field_begin);
+    if (vi->si_poll_hook)
+        vi->si_poll_hook(vi->si_poll_user, old_hl, is_at_field_boundary);
+
     vi->half_line_count++;
     if (total == 0 || vi->half_line_count >= total)
         vi->half_line_count = 0;

@@ -16,31 +16,59 @@
  *     a connected controller's GetData() returns Success (SI.cpp:536) and cleared
  *     by reading that channel's input buffer (SI.cpp:344-357).
  *
- * Timing-free poll model (PRINCIPLES: diff by value+order, never by timing): we
- * do NOT model the VI poll clock. Instead we exploit its invariant — SI.cpp
- * UpdateDevices runs GetData on EVERY channel on every poll (scheduled by the
- * VI beam every 2*SIPOLL.X half-lines, VideoInterface.cpp:950-960, independent
- * of any SI register read), and polls happen continuously — so we replay one
- * poll's steady-state effect at every poll-observation point: init, each
- * SICOMCSR read (RDSTINT is derived from the RDST bits), and each SISR read
- * (the per-channel RDST bits are directly visible there; the IPL's PAD path —
- * SIGetResponseRaw — tests RDST0 through SISR only, never through SICOMCSR).
- * Per SI.cpp:529-548:
+ * Beam-scheduled poll model (retires the earlier timing-free replay). Dolphin
+ * does NOT poll on register reads: SICOMCSR and SISR are plain DirectReads of
+ * stored state (SI.cpp:364,393) — a read never mutates anything. The poll
+ * itself is scheduled off the VI beam (VideoInterface.cpp:950-968), which we
+ * already model (vi.c half_line_count / vi_advance_halfline):
+ *   - Every halfline, vi.c fires its si_poll_hook (vi.h GcnViSiPollFn) with the
+ *     CURRENT (pre-increment) half_line_count and whether this halfline is a
+ *     field boundary — unconditionally, independent of any SI register access.
+ *     gcn_si_beam_poll (below) is that hook.
+ *   - If half_line_count == next_poll_halfline: run one poll (si_poll: GetData
+ *     on every channel, SI.cpp:529-548) then end in UpdateInterrupts
+ *     (SI.cpp:550, our si_update_interrupts), then reschedule
+ *     next_poll_halfline += 2*SIPOLL.X halflines (VideoInterface.cpp:959,
+ *     SI.cpp GetPollXLines — SIPOLL.X is USIPoll bits 16-25, GCN_SI_POLL_X_*
+ *     below; EN0-3 do NOT gate this poll, they only gate SendCommand on an
+ *     SISR.WR write). X multiplies rather than divides, so X==0 just parks the
+ *     schedule at the current halfline (next matched only by the field-
+ *     boundary reset below) — never a div-by-zero or a spin.
+ *   - If this halfline is a field boundary: next_poll_halfline is
+ *     unconditionally reset to half_line_count + GCN_SI_NUM_HALF_LINES_FOR_POLL
+ *     (VideoInterface.cpp:968, "first results start at vsync"), overriding
+ *     whatever the periodic reschedule above just computed — checked in that
+ *     order, matching Update()'s statement order exactly.
+ * Dolphin keeps this schedule state (m_half_line_of_next_si_poll) on the VI
+ * object, but nothing feeds it besides half_line_count and the boundary flag
+ * (both passed into the hook), so it lives here (next_poll_halfline, below)
+ * instead — vi.c stays free of any si.h dependency, mirroring the
+ * GcnPiFifoResetFn / irq-trampoline pattern. Per SI.cpp:529-548, one poll:
  *   - a connected controller answers GetData()==Success: latch RDST and deposit
  *     its pad report into that channel's in_hi/in_lo (SI.cpp:536, the same
  *     neutral bytes CMD_DIRECT returns — factored into si_pad_report so the
  *     polled and direct-command paths cannot drift). RDST is transiently 0
- *     between an input-buffer read and the next re-arm.
+ *     between an input-buffer read and the next poll that re-arms it.
  *   - a channel with no device answers GetData()==ErrorNoResponse (SI_DeviceNull
- *     .cpp:20): SetNoResponse latches NOREP for that channel (SI.cpp:538-539).
- *     Like RDST this is a continuous-poll effect, so the SISR read DERIVES NOREP
- *     live for every disconnected channel (a guest W1C-clear is re-set by the
- *     next poll — confirmed against the oracle, which re-shows NOREP one read
- *     after the clear).
+ *     .cpp:20): SetNoResponse latches NOREP for that channel (SI.cpp:538-539) —
+ *     a genuine per-channel latch (GcnSiChannel.norep), same lifecycle as RDST:
+ *     set at poll time, cleared by a SISR W1C write (SI.cpp:398-433, mirrored
+ *     in gcn_si_write), and re-set only by the NEXT scheduled poll — no longer
+ *     re-derived from `connected` on every read (that would show NOREP live
+ *     regardless of the beam schedule, which is not what Dolphin does). TSTART
+ *     against a disconnected channel latches it too (RunSIBuffer's negative-
+ *     response path also calls SetNoResponse, SI.cpp:191-192) — si_run_buffer
+ *     mirrors that.
  * Dolphin's default config connects a standard controller on channel 0 only, so
- * ch0 reads RDST=1 (=> RDSTINT) with the neutral report, and ch1-3 read NOREP.
- * A wrong controller-presence choice diverges loudly from the oracle — presence
- * here is the modeled hardware state, never a fudge.
+ * ch0 reads RDST=1 (=> RDSTINT) with the neutral report once a poll has run,
+ * and ch1-3 read NOREP. A wrong controller-presence choice diverges loudly
+ * from the oracle — presence here is the modeled hardware state, never a fudge.
+ * gcn_si_init seeds next_poll_halfline = GCN_SI_NUM_HALF_LINES_FOR_POLL (the
+ * same "first sampling starts at vsync" Dolphin seeds at Preset — VI.cpp:175)
+ * WITHOUT an extra manual poll call: the beam reaches that halfline (and any
+ * SIPOLL-default periodic polls after it, SI.cpp:275-276 default X=492, also
+ * modeled at init below) well before the IPL's first SISR read deep into BS2
+ * init, so RDST0 is genuinely poll-latched by then — not special-cased.
  */
 #ifndef GCN_SI_SI_H
 #define GCN_SI_SI_H
@@ -58,6 +86,17 @@
 #define GCN_SI_SISR      0x38u         /* SISR: status (per-channel RDST + errors) */
 #define GCN_SI_EXILK     0x3Cu         /* SIEXILK: SI/EXI clock lock */
 #define GCN_SI_IOBUF     0x80u         /* SI I/O buffer (128 bytes) */
+
+/* SIPOLL bits (SI.h USIPoll:137-153). X is "polls per X lines" — GetPollXLines
+ * returns it raw, un-gated by EN0-3 (those only gate SendCommand on WR). */
+#define GCN_SI_POLL_X_SHIFT   16u
+#define GCN_SI_POLL_X_MASK    0x3FFu   /* BitField<16,10,u32> */
+/* Dolphin's power-on default (SI.cpp Init:275-276), before the IPL ever
+ * writes SIPOLL: X=492 polls-per-line period, all EN/VBCPY/Y bits 0. */
+#define GCN_SI_POLL_DEFAULT   (492u << GCN_SI_POLL_X_SHIFT)
+/* VideoInterface.cpp:56: NUM_HALF_LINES_FOR_SI_POLL = (7*2)+1 — halflines from
+ * a field boundary to that field's first scheduled poll. */
+#define GCN_SI_NUM_HALF_LINES_FOR_POLL 15u
 
 /* SICOMCSR bits (raw u32; SI.h:156-180). */
 #define GCN_SI_CSR_TSTART     0x00000001u
@@ -131,6 +170,10 @@ typedef struct {
     u32 in_lo;       /* SI_CHANNEL_n_IN_LO                          */
     u8  connected;   /* 1 = standard GC controller present          */
     u8  rdst;        /* latched read-status for this channel        */
+    u8  norep;       /* latched no-response (SetNoResponse, SI.cpp:70-87):
+                       * set on a poll/TSTART that finds no device, cleared by
+                       * a SISR W1C write, re-set by the NEXT poll — a real
+                       * latch, not re-derived from `connected` on every read */
     u8  mode;        /* controller reporting mode                   */
 } GcnSiChannel;
 
@@ -148,6 +191,9 @@ typedef struct {
     GcnSiIrqFn irq;  /* sink for the SI interrupt line (boot.c -> PI) */
     void*      irq_user;
     GcnSiPadInput input; /* debug-surface-injected report (see gcn_si_set_input) */
+    u32 next_poll_halfline; /* beam halfline the next SI poll is scheduled for
+                              * (Dolphin's m_half_line_of_next_si_poll, parked
+                              * here — see the header's beam-schedule doc) */
 } GcnSi;
 
 void gcn_si_init(GcnSi* si);
@@ -155,6 +201,11 @@ void gcn_si_init(GcnSi* si);
 void gcn_si_set_irq(GcnSi* si, GcnSiIrqFn fn, void* user);
 u32  gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_si_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
+/* VI-beam per-halfline hook (GcnViSiPollFn, vi.h): matches the Update() schedule
+ * transcribed in the header doc above. Wired in boot.c via
+ * gcn_vi_set_si_poll_hook(&vi, gcn_si_beam_poll, &si) so vi.c never includes
+ * si.h. `user` is the GcnSi*. */
+void gcn_si_beam_poll(void* user, u32 half_line_count, int is_at_field_boundary);
 
 /* Replace the whole injected pad state (debug-surface setter). */
 void gcn_si_set_input(GcnSi* si, const GcnSiPadInput* input);

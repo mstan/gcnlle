@@ -200,6 +200,11 @@ int main(int argc, char** argv) {
     static GcnVi vi;
     gcn_vi_init(&vi);
     gcn_vi_set_irq(&vi, vi_irq_to_pi, &pi);
+    /* The SI poll is scheduled off the VI beam (VideoInterface.cpp:950-968);
+     * wire vi's per-halfline hook straight to si.c's beam-poll entry point so
+     * vi.c never takes a dependency on si.h (same pattern as PI_FIFO_RESET's
+     * hook into gp.c). */
+    gcn_vi_set_si_poll_hook(&vi, gcn_si_beam_poll, &si);
     gcn_mmio_register(&bus, "VI", GCN_VI_BASE, GCN_VI_SIZE,
                       gcn_vi_read, gcn_vi_write, &vi);
 

@@ -35,16 +35,19 @@ static void si_pad_report(const GcnSi* si, u32* hi, u32* lo) {
           ((u32)in->substick_y << 16) | ((u32)in->substick_x << 24);
 }
 
-/* Replay one VI-driven SI poll's steady-state effect on the CONNECTED channels
- * (SI.cpp UpdateDevices:529-548): each connected controller answers Success, so
- * we latch RDST and deposit its pad report into in_hi/in_lo. Disconnected
- * channels' NOREP is derived live in the SISR read path (see the header). Called
- * wherever a poll would certainly have run: init and every SICOMCSR read. */
+/* One VI-scheduled SI poll (SI.cpp UpdateDevices:529-548): each connected
+ * controller answers Success, so we latch RDST and deposit its pad report
+ * into in_hi/in_lo; each disconnected channel answers ErrorNoResponse, so we
+ * latch NOREP (SetNoResponse, SI.cpp:538-539) — both real per-channel latches,
+ * not values re-derived on read. Called only from gcn_si_beam_poll, the beam-
+ * scheduled hook (see the header doc). */
 static void si_poll(GcnSi* si) {
     for (u32 n = 0; n < GCN_SI_CHANNELS; n++) {
         if (si->ch[n].connected) {
             si->ch[n].rdst = 1;
             si_pad_report(si, &si->ch[n].in_hi, &si->ch[n].in_lo);
+        } else {
+            si->ch[n].norep = 1;
         }
     }
 }
@@ -54,12 +57,19 @@ void gcn_si_init(GcnSi* si) {
     for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
         si->ch[n].mode = (u8)GCN_SI_CTRL_MODE_DEFAULT;
     /* Dolphin's default config connects a standard GC controller on channel 0
-     * only (MainSettings.cpp:171-172). Its continuous VI poll latches RDST0 and
-     * deposits the pad report long before the IPL first reads SICOMCSR, so ch0
-     * powers up read-status-ready with its input registers already filled. */
+     * only (MainSettings.cpp:171-172). */
     si->ch[0].connected = 1;
     si->input = (GcnSiPadInput)GCN_SI_PAD_INPUT_NEUTRAL;
-    si_poll(si);
+    /* SI.cpp Init:275-276 default poll period (before the IPL ever writes
+     * SIPOLL), and VideoInterface.cpp:175 "first sampling starts at vsync" —
+     * seed the schedule from beam zero rather than a special-case poll here.
+     * The beam (vi.c, ticking from cycle 0 alongside the CPU) reaches
+     * next_poll_halfline, and any further default-period polls after it, well
+     * before BS2's own init code reaches its first SISR read — so RDST0 ends
+     * up genuinely poll-latched by then, matching Dolphin's continuous
+     * background poll without faking the result here. */
+    si->poll = GCN_SI_POLL_DEFAULT;
+    si->next_poll_halfline = GCN_SI_NUM_HALF_LINES_FOR_POLL;
     s_si = si;   /* register for the debug-surface set_input/get_input accessors */
 }
 
@@ -114,11 +124,11 @@ static u32 si_any_rdst(const GcnSi* si) {
  * Dolphin derives RDSTINT = OR of the live per-channel RDST bits, then raises
  * the line on (RDSTINT & RDSTINTMSK) || (TCINT & TCINTMSK). We mirror the
  * derivation here from the same live RDST bits gcn_si_read exposes (never a
- * stored RDSTINT), so the line matches what a SICOMCSR read would return. The
- * continuous-VI-poll re-arm of RDST stays a SICOMCSR-read side effect (see the
- * header's timing-free model); this evaluation reads the current bits, so an
+ * stored RDSTINT), so the line matches what a SICOMCSR read would return. RDST
+ * is re-armed only by a scheduled beam poll (gcn_si_beam_poll) now, never by a
+ * register read; this evaluation reads whatever the current bits are, so an
  * input-buffer read that clears RDST correctly drops the line until the next
- * SICOMCSR read re-arms it. Pushed to PI on EVERY evaluation (PI INTSR is W1C). */
+ * scheduled poll re-arms it. Pushed to PI on EVERY evaluation (PI INTSR is W1C). */
 static void si_update_interrupts(GcnSi* si) {
     int rdstint = si_any_rdst(si);
     int level = (rdstint && (si->comcsr & GCN_SI_CSR_RDSTINTMSK)) ||
@@ -131,6 +141,26 @@ static void si_update_interrupts(GcnSi* si) {
                        0u, 0u);
         si->irq_level = level;
     }
+}
+
+/* VI-beam per-halfline hook (vi.h GcnViSiPollFn), fired unconditionally by
+ * vi_advance_halfline for EVERY halfline (not just when a poll is due — the
+ * due-check happens here). Transcribes VideoInterface.cpp:950-968 exactly,
+ * including the statement order (poll-and-reschedule, THEN the field-boundary
+ * override) — see the si.h header doc for the full citation. Needs
+ * si_update_interrupts, hence sits after it. */
+void gcn_si_beam_poll(void* user, u32 half_line_count, int is_at_field_boundary) {
+    GcnSi* si = (GcnSi*)user;
+
+    if (half_line_count == si->next_poll_halfline) {
+        si_poll(si);
+        si_update_interrupts(si);   /* UpdateDevices ends in UpdateInterrupts, SI.cpp:550 */
+        u32 x = (si->poll >> GCN_SI_POLL_X_SHIFT) & GCN_SI_POLL_X_MASK;
+        si->next_poll_halfline += 2u * x;
+    }
+
+    if (is_at_field_boundary)
+        si->next_poll_halfline = half_line_count + GCN_SI_NUM_HALF_LINES_FOR_POLL;
 }
 
 /* Synchronous SI transfer (mirror of Dolphin RunSIBuffer, SI.cpp:146-201). The
@@ -148,10 +178,10 @@ static void si_run_buffer(GcnSi* si) {
 
     if (!c->connected) {
         /* No device: Dolphin's RunSIBuffer gets actual_response_length < 0, sets
-         * COMERR and calls SetNoResponse (SI.cpp:189-193). We latch COMERR here;
-         * the channel's NOREP is derived live in the SISR read path (a
-         * disconnected channel reports NOREP on every poll, see the header). */
+         * COMERR and calls SetNoResponse (SI.cpp:189-193) — latch NOREP here too,
+         * the same per-channel latch a beam poll sets (si_poll). */
         si->comcsr |= GCN_SI_CSR_COMERR | GCN_SI_CSR_TCINT;
+        c->norep = 1;
         return;
     }
 
@@ -205,47 +235,35 @@ u32 gcn_si_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     switch (off) {
     case GCN_SI_POLL:  return si->poll;
     case GCN_SI_COMCSR: {
-        /* Timing-free poll: a VI poll would have re-latched RDST and re-deposited
-         * the pad report for every connected channel since the last input read
-         * (see header). RDSTINT is then derived from the live RDST bits
-         * (SI.cpp:98-108). */
-        si_poll(si);
+        /* Pure DirectRead (SI.cpp:364): RDST/RDSTINT are re-armed ONLY by a
+         * scheduled beam poll (gcn_si_beam_poll) now, never by a register read.
+         * RDSTINT is derived from the live RDST bits on every read (SI.cpp:
+         * 98-108) but that derivation has no side effect — it just reflects
+         * whatever the last poll (or input-buffer read) left behind. */
         u32 v = si->comcsr & ~GCN_SI_CSR_RDSTINT;
         if (si_any_rdst(si)) v |= GCN_SI_CSR_RDSTINT;
-        si_update_interrupts(si);   /* the re-armed RDST just moved the line */
         return v;
     }
     case GCN_SI_SISR: {
-        /* SISR is a poll-observation point exactly like SICOMCSR. Dolphin's VI
-         * beam calls UpdateDevices every 2*SIPOLL.X half-lines, unconditionally
-         * and independent of any SI register read (VideoInterface.cpp:950-960);
-         * each poll re-latches RDST and re-deposits the pad report for every
-         * connected channel (SI.cpp:529-548). SISR itself is a DirectRead of
-         * m_status_reg (SI.cpp:393), so on the oracle a SISR read observes
-         * RDST0=1 whenever a poll ran since the last input-buffer read — the
-         * steady state. The IPL's PAD path tests RDST0 through SISR ONLY
-         * (SIGetResponseRaw: read SISR -> RDST set? -> read in_hi/in_lo), never
-         * through SICOMCSR, so the timing-free replay must run here too or
-         * RDST0 stays 0 after the first input read and pad data never flows. */
-        si_poll(si);
-        /* Per-channel status, derived live from the continuous poll (SI.cpp
-         * UpdateDevices:529-548): a connected channel reports RDST while its
-         * read-status latch is set; a disconnected channel's GetData returns
-         * ErrorNoResponse every poll, latching NOREP (re-set after any W1C clear
-         * by the next poll — the header's timing-free invariant). The stored
-         * si->sisr keeps only the non-derived error bits (COLL/OVRUN/UNRUN, W1C). */
+        /* Pure DirectRead of m_status_reg (SI.cpp:393): no side effect. RDST and
+         * NOREP are both real per-channel latches (GcnSiChannel.rdst/.norep):
+         * RDST is latched by gcn_si_beam_poll (scheduled off the VI beam,
+         * VideoInterface.cpp:950-968 / SI.cpp:529-548) and cleared by reading
+         * that channel's input buffer; NOREP is latched the same way (or by a
+         * disconnected-channel TSTART, si_run_buffer) and cleared by a SISR W1C
+         * write (gcn_si_write). A read here only OBSERVES the current latches,
+         * it never re-polls. The IPL's PAD path tests RDST0 through SISR only
+         * (SIGetResponseRaw: read SISR -> RDST set? -> read in_hi/in_lo); it now
+         * genuinely sees RDST0 only once the beam's next scheduled poll has
+         * actually run, not on every read. */
         u32 derived = 0;
         for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
             derived |= GCN_SI_RDST_BIT(n) | GCN_SI_NOREP_BIT(n);
         u32 v = si->sisr & ~derived;
         for (u32 n = 0; n < GCN_SI_CHANNELS; n++) {
-            if (si->ch[n].connected) {
-                if (si->ch[n].rdst) v |= GCN_SI_RDST_BIT(n);
-            } else {
-                v |= GCN_SI_NOREP_BIT(n);
-            }
+            if (si->ch[n].rdst)  v |= GCN_SI_RDST_BIT(n);
+            if (si->ch[n].norep) v |= GCN_SI_NOREP_BIT(n);
         }
-        si_update_interrupts(si);   /* UpdateDevices ends in UpdateInterrupts (SI.cpp:550) */
         return v;
     }
     case GCN_SI_EXILK: return si->exilk;
@@ -292,10 +310,14 @@ void gcn_si_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
         si_update_interrupts(si);
         return;
     case GCN_SI_SISR:
-        /* Error bits are write-1-to-clear; WR triggers per-channel SendCommand
-         * (mode/rumble) and self-clears. The IPL boot path does not use WR yet,
-         * so we clear it and defer SendCommand until the oracle shows it. */
+        /* Error bits are write-1-to-clear; NOREP is the same W1C shape but
+         * lives per-channel (SI.cpp:398-433) rather than in si->sisr. WR
+         * triggers per-channel SendCommand (mode/rumble) and self-clears. The
+         * IPL boot path does not use WR yet, so we clear it and defer
+         * SendCommand until the oracle shows it. */
         si->sisr &= ~(value & 0x0FFFFFFFu);
+        for (u32 n = 0; n < GCN_SI_CHANNELS; n++)
+            if (value & GCN_SI_NOREP_BIT(n)) si->ch[n].norep = 0;
         si_update_interrupts(si);       /* SI.cpp:355 SISR write -> UpdateInterrupts */
         return;
     case GCN_SI_EXILK: si->exilk = value; return;
