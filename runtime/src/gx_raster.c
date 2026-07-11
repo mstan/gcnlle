@@ -27,6 +27,25 @@ static int trap_once(int* flag, const char* what) {
 }
 #define TRAP(field, msg) do { static int field = 0; trap_once(&field, msg); } while (0)
 
+/* Same one-time gate as TRAP, but logs the FULL parameters (register values,
+ * VCD/VAT, draw context) that led to the trap, not just the label — so a
+ * single capture run tells us exactly what to add next (PRINCIPLES: make
+ * misses loud, transcribe never guess). */
+#define TRAPF(field, fmt, ...) do { \
+        static int field = 0; \
+        if (!field) { \
+            field = 1; \
+            fprintf(stderr, "gx_raster: UNIMPLEMENTED/out-of-scope: " fmt \
+                    " — trapped once\n", __VA_ARGS__); \
+        } \
+    } while (0)
+
+/* Draw-call context for trap logs (set once per gx_raster_draw call so the
+ * per-vertex/per-pixel trap sites below can report which draw triggered
+ * them without threading extra parameters through every callee). */
+static const GxCpState* s_trap_cp;
+static u32 s_trap_vat, s_trap_prim;
+
 /* ---- bound state ---------------------------------------------------------- */
 static CPUState* s_cpu;
 static const u32* s_bp;    /* u32[256] BP register file (raw written values) */
@@ -65,16 +84,25 @@ enum { PF_RGB8_Z24 = 0, PF_RGBA6_Z24 = 1, PF_RGB565_Z16 = 2, PF_Z24 = 3 };
 static u32 pixel_format(void) { return bits(s_bp[0x43], 0, 3); }
 
 static inline u8 Convert6To8(u8 v) { return (u8)((v << 2) | (v >> 4)); }
+/* LookUpTables.h: same N->8 bit replication for the other widths the vertex
+ * color formats need. */
+static inline u8 Convert3To8(u8 v) { return (u8)((v << 5) | (v << 2) | (v >> 1)); }
+static inline u8 Convert4To8(u8 v) { return (u8)((v << 4) | v); }
+static inline u8 Convert5To8(u8 v) { return (u8)((v << 3) | (v >> 2)); }
 
 /* ============================================================================
- * EFB pixel access (SWEfbInterface.cpp). RGB8_Z24 and RGBA6_Z24 are the two
- * formats the IPL uses; other formats trap.
+ * EFB pixel access (SWEfbInterface.cpp). RGB8_Z24, RGBA6_Z24 and RGB565_Z16
+ * (menu-observed: a transient PEControl switch during the boot animation) are
+ * handled; Z24-only (depth-only rendering) stays a trap — never observed.
  * ==========================================================================*/
 static u32 GetPixelColor(u32 off) {
     u32 src = s_efb_color[off];
     switch (pixel_format()) {
     case PF_RGB8_Z24:
     case PF_Z24:
+    case PF_RGB565_Z16:   /* SWEfbInterface.cpp:164-166 — Dolphin itself treats this
+                           * identically to RGB8_Z24 ("not supported correctly yet");
+                           * transcribed as-is so we match the oracle exactly. */
         return 0xffu | ((src & 0x00ffffffu) << 8);
     case PF_RGBA6_Z24:
         return (u32)Convert6To8(src & 0x3f) |
@@ -82,7 +110,9 @@ static u32 GetPixelColor(u32 off) {
                ((u32)Convert6To8((src >> 12) & 0x3f) << 16) |
                ((u32)Convert6To8((src >> 18) & 0x3f) << 24);
     default:
-        TRAP(pf_getcolor, "EFB GetPixelColor pixel_format (only RGB8_Z24/RGBA6_Z24)");
+        TRAPF(pf_getcolor, "EFB GetPixelColor pixel_format %u (only RGB8_Z24=0/RGBA6_Z24=1 "
+              "in scope; raw ZCOMPARE/PEControl bp[0x43]=0x%06X)",
+              pixel_format(), s_bp[0x43]);
         return 0xffu | ((src & 0x00ffffffu) << 8);
     }
 }
@@ -100,7 +130,10 @@ static void SetPixelColorOnly(u32 off, const u8* rgb) {
         s_efb_color[off] = val;
         break;
     }
-    default: TRAP(pf_setcolor, "EFB SetPixelColorOnly pixel_format"); break;
+    default:
+        TRAPF(pf_setcolor, "EFB SetPixelColorOnly pixel_format %u (raw bp[0x43]=0x%06X)",
+              pixel_format(), s_bp[0x43]);
+        break;
     }
 }
 static void SetPixelAlphaColor(u32 off, const u8* color) {
@@ -118,7 +151,10 @@ static void SetPixelAlphaColor(u32 off, const u8* color) {
         s_efb_color[off] = val;
         break;
     }
-    default: TRAP(pf_setalpha, "EFB SetPixelAlphaColor pixel_format"); break;
+    default:
+        TRAPF(pf_setalpha, "EFB SetPixelAlphaColor pixel_format %u (raw bp[0x43]=0x%06X)",
+              pixel_format(), s_bp[0x43]);
+        break;
     }
 }
 static void SetPixelAlphaOnly(u32 off, u8 a) {
@@ -277,10 +313,16 @@ static void BlendTev(u16 x, u16 y, u8* color) {
 }
 
 /* ============================================================================
- * Texture sampler — unit 0, I8, from MEM1 (TextureSampler.cpp + I8 decode
- * TextureDecoder_Common.cpp:417-433). No TMEM cache, no mipmaps (trapped).
+ * Texture sampler — unit 0, from MEM1 (TextureSampler.cpp + per-format decode
+ * TextureDecoder_Common.cpp:300-640). Formats the menu-frame inventory shows:
+ * I4/I8/IA4/IA8/RGB565/RGB5A3/RGBA8/CMPR. Paletted C4/C8/C14X2 need a TLUT
+ * model we haven't built (never observed) and trap. No TMEM cache (we always
+ * read straight from MEM1, matching Dolphin's non-"cache_manually_managed"
+ * path), no mipmaps beyond LOD selection (mip levels themselves trap).
  * ==========================================================================*/
-enum { TEXFMT_I8 = 1 };
+enum { TEXFMT_I4 = 0x0, TEXFMT_I8 = 0x1, TEXFMT_IA4 = 0x2, TEXFMT_IA8 = 0x3,
+       TEXFMT_RGB565 = 0x4, TEXFMT_RGB5A3 = 0x5, TEXFMT_RGBA8 = 0x6,
+       TEXFMT_C4 = 0x8, TEXFMT_C8 = 0x9, TEXFMT_C14X2 = 0xA, TEXFMT_CMPR = 0xE };
 enum { WRAP_CLAMP = 0, WRAP_REPEAT = 1, WRAP_MIRROR = 2 };
 
 /* Per-unit BP register base: unit 0 lives at 0x80.. (BPMemory.h:82-88). */
@@ -305,21 +347,168 @@ static int wrap_coord(int coord, u32 wrap, int size) {
         return coord;
     }
 }
-/* I8 nearest texel decode (TextureDecoder_Common.cpp:417-433). */
-static u8 i8_texel(const u8* src, u32 src_len, int s, int t, int image_w_minus_1) {
-    u32 sBlk = (u32)s >> 3, tBlk = (u32)t >> 2;
-    u32 widthBlks = ((u32)image_w_minus_1 >> 3) + 1;
-    u32 base = (tBlk * widthBlks + sBlk) << 5;
-    u32 blkS = (u32)s & 7, blkT = (u32)t & 3;
-    u32 off = base + (blkT << 3) + blkS;
-    return (off < src_len) ? src[off] : 0;
+
+static inline u8 safe_u8(const u8* src, u32 len, u32 off) { return (off < len) ? src[off] : 0; }
+
+/* Per-texel decode (TextureDecoder_Common.cpp TexDecoder_DecodeTexel:361-639,
+ * transcribed exactly for the 7 non-paletted formats the menu uses). `out` is
+ * RGBA (matches the rest of the TEV pipeline's texel[4] convention). Endianness
+ * note: RGB565/RGB5A3/CMPR color1/color2 explicitly Common::swap16 the raw
+ * 16-bit read before decoding (so we reconstruct the true big-endian value via
+ * be_u16); IA8 does NOT swap (DecodePixel_IA8 takes the raw unswapped read), so
+ * on Dolphin's little-endian host alpha ends up as the FIRST transmitted byte
+ * and intensity the second — reproduced here with direct byte indexing rather
+ * than be_u16, to match the oracle bit-for-bit rather than the "IA" name. */
+static void decode_texel(u32 fmt, const u8* src, u32 src_len, int s, int t,
+                         int image_w_minus_1, u8 out[4]) {
+    u32 ss = (u32)s, tt = (u32)t, iw1 = (u32)image_w_minus_1;
+    switch (fmt) {
+    case TEXFMT_I4: {
+        u32 sBlk = ss >> 3, tBlk = tt >> 3, widthBlks = (iw1 >> 3) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 5;
+        u32 blkOff = ((tt & 7) << 3) + (ss & 7);
+        int rs = (blkOff & 1) ? 0 : 4;
+        u8 raw = safe_u8(src, src_len, base + (blkOff >> 1));
+        u8 val = Convert4To8((u8)((raw >> rs) & 0xFu));
+        out[0] = out[1] = out[2] = out[3] = val;
+        break;
+    }
+    case TEXFMT_I8: {
+        u32 sBlk = ss >> 3, tBlk = tt >> 2, widthBlks = (iw1 >> 3) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 5;
+        u32 blkOff = ((tt & 3) << 3) + (ss & 7);
+        u8 val = safe_u8(src, src_len, base + blkOff);
+        out[0] = out[1] = out[2] = out[3] = val;
+        break;
+    }
+    case TEXFMT_IA4: {
+        u32 sBlk = ss >> 3, tBlk = tt >> 2, widthBlks = (iw1 >> 3) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 5;
+        u32 blkOff = ((tt & 3) << 3) + (ss & 7);
+        u8 raw = safe_u8(src, src_len, base + blkOff);
+        u8 a = Convert4To8((u8)(raw >> 4)), l = Convert4To8((u8)(raw & 0xFu));
+        out[0] = l; out[1] = l; out[2] = l; out[3] = a;
+        break;
+    }
+    case TEXFMT_IA8: {
+        u32 sBlk = ss >> 2, tBlk = tt >> 2, widthBlks = (iw1 >> 2) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 4;
+        u32 blkOff = ((tt & 3) << 2) + (ss & 3);
+        u32 offset = (base + blkOff) << 1;
+        u8 a = safe_u8(src, src_len, offset), i = safe_u8(src, src_len, offset + 1);
+        out[0] = i; out[1] = i; out[2] = i; out[3] = a;
+        break;
+    }
+    case TEXFMT_RGB565: {
+        u32 sBlk = ss >> 2, tBlk = tt >> 2, widthBlks = (iw1 >> 2) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 4;
+        u32 blkOff = ((tt & 3) << 2) + (ss & 3);
+        u32 offset = (base + blkOff) << 1;
+        u16 val = (offset + 1 < src_len) ? be_u16(&src[offset]) : 0;
+        out[0] = Convert5To8((u8)((val >> 11) & 0x1Fu));
+        out[1] = Convert6To8((u8)((val >> 5) & 0x3Fu));
+        out[2] = Convert5To8((u8)(val & 0x1Fu));
+        out[3] = 0xFFu;
+        break;
+    }
+    case TEXFMT_RGB5A3: {
+        u32 sBlk = ss >> 2, tBlk = tt >> 2, widthBlks = (iw1 >> 2) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 4;
+        u32 blkOff = ((tt & 3) << 2) + (ss & 3);
+        u32 offset = (base + blkOff) << 1;
+        u16 val = (offset + 1 < src_len) ? be_u16(&src[offset]) : 0;
+        if (val & 0x8000u) {
+            out[0] = Convert5To8((u8)((val >> 10) & 0x1Fu));
+            out[1] = Convert5To8((u8)((val >> 5) & 0x1Fu));
+            out[2] = Convert5To8((u8)(val & 0x1Fu));
+            out[3] = 0xFFu;
+        } else {
+            out[3] = Convert3To8((u8)((val >> 12) & 0x7u));
+            out[0] = Convert4To8((u8)((val >> 8) & 0xFu));
+            out[1] = Convert4To8((u8)((val >> 4) & 0xFu));
+            out[2] = Convert4To8((u8)(val & 0xFu));
+        }
+        break;
+    }
+    case TEXFMT_RGBA8: {
+        u32 sBlk = ss >> 2, tBlk = tt >> 2, widthBlks = (iw1 >> 2) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 5;   /* shift by 5 is correct (AR+GB planes) */
+        u32 blkOff = ((tt & 3) << 2) + (ss & 3);
+        u32 offset = (base + blkOff) << 1;
+        out[3] = safe_u8(src, src_len, offset);       /* A */
+        out[0] = safe_u8(src, src_len, offset + 1);   /* R */
+        out[1] = safe_u8(src, src_len, offset + 32);  /* G */
+        out[2] = safe_u8(src, src_len, offset + 33);  /* B */
+        break;
+    }
+    case TEXFMT_CMPR: {
+        u32 sDxt = ss >> 2, tDxt = tt >> 2;
+        u32 sBlk = sDxt >> 1, tBlk = tDxt >> 1, widthBlks = (iw1 >> 3) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 2;
+        u32 blkOff = ((tDxt & 1) << 1) + (sDxt & 1);
+        u32 offset = (base + blkOff) << 3;   /* 8 bytes/DXTBlock: c1(2) c2(2) lines(4) */
+        u16 c1 = (offset + 1 < src_len) ? be_u16(&src[offset]) : 0;
+        u16 c2 = (offset + 3 < src_len) ? be_u16(&src[offset + 2]) : 0;
+        u8 line = safe_u8(src, src_len, offset + 4 + (tt & 3));
+        int blue1 = Convert5To8((u8)(c1 & 0x1Fu)),  blue2 = Convert5To8((u8)(c2 & 0x1Fu));
+        int green1 = Convert6To8((u8)((c1 >> 5) & 0x3Fu)), green2 = Convert6To8((u8)((c2 >> 5) & 0x3Fu));
+        int red1 = Convert5To8((u8)((c1 >> 11) & 0x1Fu)), red2 = Convert5To8((u8)((c2 >> 11) & 0x1Fu));
+        int rs = 6 - (int)((ss & 3) << 1);
+        int colorSel = (line >> rs) & 3;
+        colorSel |= (c1 > c2) ? 0 : 4;
+        switch (colorSel) {
+        case 0: case 4:
+            out[0] = (u8)red1; out[1] = (u8)green1; out[2] = (u8)blue1; out[3] = 0xFFu; break;
+        case 1: case 5:
+            out[0] = (u8)red2; out[1] = (u8)green2; out[2] = (u8)blue2; out[3] = 0xFFu; break;
+        case 2:
+            out[0] = (u8)((red2 * 3 + red1 * 5) >> 3);
+            out[1] = (u8)((green2 * 3 + green1 * 5) >> 3);
+            out[2] = (u8)((blue2 * 3 + blue1 * 5) >> 3);
+            out[3] = 0xFFu; break;
+        case 3:
+            out[0] = (u8)((red1 * 3 + red2 * 5) >> 3);
+            out[1] = (u8)((green1 * 3 + green2 * 5) >> 3);
+            out[2] = (u8)((blue1 * 3 + blue2 * 5) >> 3);
+            out[3] = 0xFFu; break;
+        case 6:
+            out[0] = (u8)((red1 + red2) / 2); out[1] = (u8)((green1 + green2) / 2);
+            out[2] = (u8)((blue1 + blue2) / 2); out[3] = 0xFFu; break;
+        case 7:
+            out[0] = (u8)((red1 + red2) / 2); out[1] = (u8)((green1 + green2) / 2);
+            out[2] = (u8)((blue1 + blue2) / 2); out[3] = 0x00u; break;
+        default:
+            out[0] = out[1] = out[2] = out[3] = 0; break;
+        }
+        break;
+    }
+    default:
+        out[0] = out[1] = out[2] = out[3] = 0;   /* unreachable: caller trapped */
+        break;
+    }
 }
+
 static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     u32 ti0 = tx_image0(texmap);
     u32 fmt = bits(ti0, 20, 4);
     int w1 = (int)bits(ti0, 0, 10);   /* width  - 1 */
     int h1 = (int)bits(ti0, 10, 10);  /* height - 1 */
-    if (fmt != TEXFMT_I8) { TRAP(nonI8, "texture format != I8"); memset(out, 0, 4); return; }
+    switch (fmt) {
+    case TEXFMT_I4: case TEXFMT_I8: case TEXFMT_IA4: case TEXFMT_IA8:
+    case TEXFMT_RGB565: case TEXFMT_RGB5A3: case TEXFMT_RGBA8: case TEXFMT_CMPR:
+        break;   /* supported */
+    case TEXFMT_C4: case TEXFMT_C8: case TEXFMT_C14X2:
+        TRAPF(paletted, "paletted texture format %u (C4/C8/C14X2 need a TLUT model "
+              "we haven't built) — texmap %u, %ux%u, TX_SETIMAGE0=0x%06X",
+              fmt, texmap, w1 + 1, h1 + 1, ti0);
+        memset(out, 0, 4); return;
+    default:
+        TRAPF(unknowntexfmt, "unknown/unsupported texture format %u (texmap %u, %ux%u, "
+              "TX_SETIMAGE0=0x%06X TX_SETIMAGE3=0x%06X src_addr=0x%08X)",
+              fmt, texmap, w1 + 1, h1 + 1, ti0, tx_image3(texmap),
+              (tx_image3(texmap) & 0x00ffffffu) << 5);
+        memset(out, 0, 4); return;
+    }
 
     u32 img_base = (tx_image3(texmap) & 0x00ffffffu) << 5;
     u32 phys = img_base & 0x1FFFFFFFu;
@@ -341,21 +530,22 @@ static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
         iT  = wrap_coord(iT,  wrap_t, h1 + 1);
         iS1 = wrap_coord(iS1, wrap_s, w1 + 1);
         iT1 = wrap_coord(iT1, wrap_t, h1 + 1);
-        u8 v00 = i8_texel(src, src_len, iS,  iT,  w1);
-        u8 v10 = i8_texel(src, src_len, iS1, iT,  w1);
-        u8 v01 = i8_texel(src, src_len, iS,  iT1, w1);
-        u8 v11 = i8_texel(src, src_len, iS1, iT1, w1);
-        u32 acc = v00 * (u32)((128 - fS) * (128 - fT)) +
-                  v10 * (u32)((fS)       * (128 - fT)) +
-                  v01 * (u32)((128 - fS) * (fT)) +
-                  v11 * (u32)((fS)       * (fT));
-        u8 val = (u8)(acc >> 14);
-        out[0] = out[1] = out[2] = out[3] = val;
+        u8 v00[4], v10[4], v01[4], v11[4];
+        decode_texel(fmt, src, src_len, iS,  iT,  w1, v00);
+        decode_texel(fmt, src, src_len, iS1, iT,  w1, v10);
+        decode_texel(fmt, src, src_len, iS,  iT1, w1, v01);
+        decode_texel(fmt, src, src_len, iS1, iT1, w1, v11);
+        for (int c = 0; c < 4; c++) {
+            u32 acc = v00[c] * (u32)((128 - fS) * (128 - fT)) +
+                      v10[c] * (u32)((fS)       * (128 - fT)) +
+                      v01[c] * (u32)((128 - fS) * (fT)) +
+                      v11[c] * (u32)((fS)       * (fT));
+            out[c] = (u8)(acc >> 14);
+        }
     } else {
         int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
         int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
-        u8 val = i8_texel(src, src_len, iS, iT, w1);
-        out[0] = out[1] = out[2] = out[3] = val;
+        decode_texel(fmt, src, src_len, iS, iT, w1, out);
     }
 }
 
@@ -1058,7 +1248,9 @@ static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
 typedef struct {
     float position[3];
     float normal[3][3];
-    u8    color[2][4];    /* [chan][R,G,B,A] */
+    u8    color[2][4];         /* [chan][ALP_C,BLU_C,GRN_C,RED_C] (abgr); always
+                                * populated: decoded attribute or the routed
+                                * missing-color default (opaque white)        */
     float texCoords[8][2];
     u8    posMtx;
     u8    texMtx[8];
@@ -1213,7 +1405,6 @@ static void light_alpha(const float* pos, const float* normal, int lnum, u32 dif
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 static void tf_color(const InVtx* in, OutVtx* out) {
-    (void)in;   /* no per-vertex color in scope; material comes from XF regs */
     u32 numchan = gm_numcolchans();
     for (u32 chan = 0; chan < 2; chan++) {
         u32 colorreg = s_xf[0x100e + chan];   /* LitChannel color */
@@ -1224,7 +1415,19 @@ static void tf_color(const InVtx* in, OutVtx* out) {
         u8 matcolor[4];   /* index: 0=A,1=B,2=G,3=R (abgr) */
         matcolor[0] = (u8)matc; matcolor[1] = (u8)(matc >> 8);
         matcolor[2] = (u8)(matc >> 16); matcolor[3] = (u8)(matc >> 24);
-        if (bits(colorreg, 0, 1) != 0) { TRAP(vtxcolor, "vertex material color (no color attr)"); }
+        /* TransformUnit.cpp TransformColor: matsource==Vertex takes matcolor
+         * straight from the vertex color (in->color[chan], already in
+         * [ALP_C,BLU_C,GRN_C,RED_C]=[0,1,2,3] order and ALWAYS populated by
+         * load_vertex — decoded attribute or the missing-color default);
+         * Register keeps the XF material color already loaded. Only
+         * matcolor[1..3] (B,G,R) come from the COLOR matsource bit —
+         * matcolor[0] (A) is decided independently by the ALPHA matsource bit
+         * below, exactly mirroring Dolphin's two separate matsource checks. */
+        if (bits(colorreg, 0, 1) != 0) {
+            matcolor[1] = in->color[chan][1];
+            matcolor[2] = in->color[chan][2];
+            matcolor[3] = in->color[chan][3];
+        }
 
         u8 chancolor[4];
         if (bits(colorreg, 1, 1)) {   /* enablelighting */
@@ -1252,8 +1455,10 @@ static void tf_color(const InVtx* in, OutVtx* out) {
             chancolor[1] = matcolor[1]; chancolor[2] = matcolor[2]; chancolor[3] = matcolor[3];
         }
 
-        if (bits(alphareg, 0, 1) != 0) { TRAP(vtxalpha, "vertex material alpha"); }
-        u8 mata = (u8)matc;   /* matcolor alpha */
+        /* alpha matsource (TransformColor:369-372): Vertex takes the vertex
+         * color's alpha (populated or missing-color default), Register the XF
+         * material alpha. */
+        u8 mata = bits(alphareg, 0, 1) ? in->color[chan][0] : (u8)matc;
         if (bits(alphareg, 1, 1)) {   /* alpha lighting */
             float la;
             if (bits(alphareg, 6, 1)) { TRAP(ambavtx, "vertex ambient alpha"); la = 0; }
@@ -1368,6 +1573,61 @@ static float read_direct_elem(const u8* v, u32* off, u32 fmt) {
     }
 }
 
+/* Color0/Color1 vertex attribute (VertexLoader_Color.cpp SetCol/SetCol565/
+ * SetCol4444/SetCol6666 + Read24/Read32; CPMemory.h ColorFormat 0..5). Every
+ * format decodes to full 8-bit R/G/B/A (sub-8-bit channels expanded via the
+ * standard N->8 bit replication) and is written out[ALP_C,BLU_C,GRN_C,RED_C] —
+ * the exact order TransformUnit.cpp TransformColor reads a vertex color in
+ * ("// abgr"), matching the material-color path already used above (matcolor
+ * index 0=A,1=B,2=G,3=R). Byte widths (VertexLoader_Color.h s_table_size Direct
+ * row): 565/4444 = 2, 888/6666 = 3, 888x/8888 = 4. */
+enum { CFMT_RGB565 = 0, CFMT_RGB888 = 1, CFMT_RGB888X = 2, CFMT_RGBA4444 = 3,
+       CFMT_RGBA6666 = 4, CFMT_RGBA8888 = 5 };
+
+static u32 color_fmt_bytes(u32 cfmt) {
+    static const u32 w[6] = { 2, 3, 4, 2, 3, 4 };
+    return (cfmt <= 5u) ? w[cfmt] : 0u;
+}
+static void decode_color_565(const u8* p, u8 out[4]) {
+    u16 val = be_u16(p);
+    u8 r5 = (u8)((val >> 11) & 0x1Fu), g6 = (u8)((val >> 5) & 0x3Fu), b5 = (u8)(val & 0x1Fu);
+    out[ALP_C] = 0xFFu; out[RED_C] = Convert5To8(r5); out[GRN_C] = Convert6To8(g6);
+    out[BLU_C] = Convert5To8(b5);
+}
+/* 888/888x direct source bytes are already R,G,B in transmission order (the
+ * same big-endian-bytes-as-is convention SWEfbInterface/matColor rely on);
+ * 888x consumes one extra padding byte (caller advances via color_fmt_bytes). */
+static void decode_color_888(const u8* p, u8 out[4]) {
+    out[ALP_C] = 0xFFu; out[RED_C] = p[0]; out[GRN_C] = p[1]; out[BLU_C] = p[2];
+}
+static void decode_color_4444(const u8* p, u8 out[4]) {
+    u16 val = be_u16(p);   /* nibbles (MSB->LSB): B[15:12] A[11:8] R[7:4] G[3:0] */
+    out[ALP_C] = Convert4To8((u8)((val >> 8) & 0xFu));
+    out[RED_C] = Convert4To8((u8)((val >> 4) & 0xFu));
+    out[GRN_C] = Convert4To8((u8)(val & 0xFu));
+    out[BLU_C] = Convert4To8((u8)((val >> 12) & 0xFu));
+}
+static void decode_color_6666(const u8* p, u8 out[4]) {
+    u32 val = ((u32)p[0] << 16) | ((u32)p[1] << 8) | p[2];  /* RRRRRRGG GGGGBBBB BBAAAAAA */
+    out[RED_C] = Convert6To8((u8)((val >> 18) & 0x3Fu));
+    out[GRN_C] = Convert6To8((u8)((val >> 12) & 0x3Fu));
+    out[BLU_C] = Convert6To8((u8)((val >> 6) & 0x3Fu));
+    out[ALP_C] = Convert6To8((u8)(val & 0x3Fu));
+}
+static void decode_color_8888(const u8* p, u8 out[4]) {
+    out[RED_C] = p[0]; out[GRN_C] = p[1]; out[BLU_C] = p[2]; out[ALP_C] = p[3];
+}
+static void decode_color_by_fmt(u32 cfmt, const u8* p, u8 out[4]) {
+    switch (cfmt) {
+    case CFMT_RGB565:   decode_color_565(p, out);   break;
+    case CFMT_RGB888:   decode_color_888(p, out);   break;
+    case CFMT_RGB888X:  decode_color_888(p, out);   break;
+    case CFMT_RGBA4444: decode_color_4444(p, out);  break;
+    case CFMT_RGBA6666: decode_color_6666(p, out);  break;
+    default:             decode_color_8888(p, out); break;  /* CFMT_RGBA8888 */
+    }
+}
+
 static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, InVtx* out) {
     u32 low = cp->vtx_desc_lo, high = cp->vtx_desc_hi;
     u32 g0 = cp->vat_g0[vat];
@@ -1423,9 +1683,51 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
         out->normal[0][2] = be_s16(p + 4) / (float)(1 << 14);
     }
 
-    /* color0/color1 — not present in scope */
-    if (((low >> 13) & 3) != VCF_NONE) { TRAP(color0, "color0 attribute present"); return 0; }
-    if (((low >> 15) & 3) != VCF_NONE) { TRAP(color1, "color1 attribute present"); return 0; }
+    /* color0/color1 (VertexLoader_Color.cpp): Direct or Index8/16, all 6 GX
+     * component formats — decoded as [ALP_C,BLU_C,GRN_C,RED_C] (see
+     * decode_color_by_fmt above). Attribute bytes are consumed in VCD order,
+     * then routed per ParseColorAttributes (SWVertexLoader.cpp:164-192): a
+     * lone enabled attribute always feeds CHANNEL 0, and any channel without
+     * an attribute gets the "missing color" default — opaque white, Dolphin's
+     * GFX_HACK_MISSING_COLOR_VALUE default 0xFFFFFFFF (GraphicsSettings.cpp:
+     * 211-212; set_default_color unpacks it to A=B=G=R=0xFF). This makes
+     * matsource=Vertex WITHOUT a vertex color attribute defined behavior
+     * (matching the oracle exactly), not a trap. */
+    {
+        u8  col_attr[2][4];
+        int col_en[2];
+        for (int ch = 0; ch < 2; ch++) {
+            u32 ctype = (low >> (13 + ch * 2)) & 3u;
+            col_en[ch] = (ctype != VCF_NONE);
+            if (ctype == VCF_NONE) continue;
+            u32 cfmt = (g0 >> (14 + ch * 4)) & 7u;   /* Color0Comp bits14-16 / Color1Comp bits18-20 */
+            if (cfmt > 5u) {
+                TRAPF(colorfmt, "color%d format %u > RGBA8888(5) (vat %u vcd_lo=0x%08X vat_g0=0x%08X)",
+                      ch, cfmt, vat, low, g0);
+                return 0;
+            }
+            u32 w = color_fmt_bytes(cfmt);
+            if (ctype == VCF_DIRECT) {
+                decode_color_by_fmt(cfmt, &v[off], col_attr[ch]);
+                off += w;
+            } else {
+                u32 idx = read_index(v, &off, ctype);
+                const u8* p = array_ptr(cp, 2u + (u32)ch, idx, w);   /* CPArray::Color0=2/Color1=3 */
+                if (!p) {
+                    TRAPF(coloroob, "color%d array out of MEM1 (idx %u, fmt %u)", ch, idx, cfmt);
+                    return 0;
+                }
+                decode_color_by_fmt(cfmt, p, col_attr[ch]);
+            }
+        }
+        memset(out->color, 0xFF, sizeof out->color);   /* missing-color default */
+        if (col_en[0]) {
+            memcpy(out->color[0], col_attr[0], 4);
+            if (col_en[1]) memcpy(out->color[1], col_attr[1], 4);
+        } else if (col_en[1]) {
+            memcpy(out->color[0], col_attr[1], 4);     /* lone attribute -> chan 0 */
+        }
+    }
 
     /* tex coords: Direct (TexCoord_ReadDirect) or Index (TexCoord_ReadIndex),
      * both scaled by TCScale = 1/2^frac (VertexLoader_TextCoord.cpp), applied
@@ -1512,9 +1814,29 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
     /* prim 0/1 = GX_DRAW_QUADS / GX_DRAW_QUADS_2 (SetupUnit.cpp:34-40 routes
      * both to SetupQuad — Dolphin itself treats QUADS_2 as a non-standard
      * alias, not a distinct assembly). prim 4 = GX_DRAW_TRIANGLE_FAN. */
+    s_trap_cp = cp; s_trap_vat = vat; s_trap_prim = prim;
+
     int is_quad = (prim == 0 || prim == 1);
-    if (!is_quad && prim != 4) { TRAP(nonfan, "primitive != TRIANGLE_FAN/QUADS"); return; }
-    if (vat != 0)  { TRAP(nonvat0, "VAT index != 0"); }
+    if (!is_quad && prim != 4) {
+        TRAPF(nonfan, "primitive != TRIANGLE_FAN/QUADS (prim %u opcode-class, vat %u, "
+              "%u verts) pc=0x%08X vcd_lo=0x%08X vcd_hi=0x%08X",
+              prim, vat, nverts, s_cpu ? s_cpu->pc : 0u, cp->vtx_desc_lo, cp->vtx_desc_hi);
+        return;
+    }
+    /* VAT index != 0 is fully handled — every VAT field below is read from
+     * vat_g0/g1/g2[vat] — but log the first occurrence once with its format
+     * words so the inventory records which VATs the firmware exercises. */
+    if (vat != 0) {
+        static int vat_note = 0;
+        if (!vat_note) {
+            vat_note = 1;
+            fprintf(stderr, "gx_raster: note: first VAT!=0 draw (vat %u, prim %u, %u verts) "
+                    "pc=0x%08X vcd_lo=0x%08X vcd_hi=0x%08X vat_g0=0x%08X vat_g1=0x%08X "
+                    "vat_g2=0x%08X — handled\n",
+                    vat, prim, nverts, s_cpu ? s_cpu->pc : 0u, cp->vtx_desc_lo,
+                    cp->vtx_desc_hi, cp->vat_g0[vat], cp->vat_g1[vat], cp->vat_g2[vat]);
+        }
+    }
     if (nverts < 3) return;
 
     recompute_scissor();

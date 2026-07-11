@@ -399,3 +399,93 @@ in guest RAM. The heavy generic-GX surface — Direct attributes, per-vertex col
 multi-stage TEV, indirect textures, non-fan primitives, VATs 1–7 — is **not**
 touched by this frame and can be deferred behind a loud "unimplemented" trap
 rather than built up front.
+
+## (g) Main-menu UI (post-fade phase)
+
+Captured from the live always-on FIFO recorder ring during the continuous-draw
+phase that follows the boot-animation fade (`_work/fifo_menu_ring.json`, 4095
+bursts ≈ 4 frames, plus the one-time trap log of the pre-implementation run —
+each trap printed its full parameters). This is the phase where the menu UI
+draws every frame (double-buffered EFB→XFB copies alternating `0x800040` /
+`0x881860`; ~1100 bursts ≈ 30 KB of commands per frame, 3 EFB copies per frame
+including off-screen targets `0x8C2460` and `0x145E6E0`). Decode reproduce:
+
+```
+python tools/gx_fifo_decode.py _work/fifo_menu_trim.json --summary
+```
+
+(the `_trim` file drops the ring's leading partial command; the stream then
+decodes end-to-end with zero unknown opcodes).
+
+What this phase uses **beyond the boot-animation scope of (e)/(f)** — the six
+one-time traps of the previous session, now with their exact parameters:
+
+1. **EFB pixel format = RGB565_Z16.** `ZCOMPARE/PEControl (BP 0x43)` =
+   `0x000002` / `0x000042` (pixel_format=2, early_ztest toggling) — the entire
+   menu phase renders into an RGB565_Z16 EFB, not just a transient window.
+   *Implemented:* transcribed Dolphin's RGB565_Z16 handling exactly
+   (SWEfbInterface.cpp:89-98, 131-139, 164-166, 188-195 — Dolphin itself
+   treats it as RGB8_Z24, "not supported correctly yet"); Z24-only remains
+   trapped (never observed).
+2. **Vertex material color, matsource=Vertex.** Trap params:
+   `SETCHAN1_COLOR=0x00000401` (chan 1, matsource=Vertex) with VCD color1 =
+   NotPresent — plus the real vertex-colored draws of item 6. *Implemented:*
+   the full TransformColor matsource=Vertex path (TransformUnit.cpp:316-399),
+   including Dolphin's missing-color default `0xFFFFFFFF` (opaque white,
+   GraphicsSettings.cpp:211-212) and the lone-attribute→channel-0 routing
+   (SWVertexLoader.cpp ParseColorAttributes:164-192), so an enabled channel
+   without an attribute is defined behavior, not a trap.
+3. **Vertex material alpha, matsource=Vertex.** `SETCHAN1_ALPHA=0x00000401` —
+   same implementation (TransformColor:369-372).
+4. **VAT index 1.** First draw: `opcode 0x81` (QUADS, vat 1), 4 verts × 10
+   bytes, `vcd_lo=0x00000200 vcd_hi=0x00000001` (Position Direct + Tex0
+   Direct), `vat_g0=0x5AE16047`/`0x5CE16047` (pos 3×s16 frac 4, tex 2×s16
+   frac 13). All VAT fields were already read per-index; the trap is now an
+   informational one-time note ("handled").
+5. **Texture format RGBA8 (6).** `TX_SETIMAGE0=0x614C53` → **84×84 RGBA8** at
+   MEM1 `0x00ABC960` (`TX_SETIMAGE3=0x055E4B`). *Implemented:* the full
+   TexDecoder_DecodeTexel per-format set —
+   **I4/I8/IA4/IA8/RGB565/RGB5A3/RGBA8/CMPR** (TextureDecoder_Common.cpp:
+   300-640, including the AR/GB-plane RGBA8 layout and the exact CMPR/DXT
+   block decoder with the 3/8-5/8 DXTBlend and the transparent-average
+   colorSel=7 case). Paletted C4/C8/C14X2 still trap (need a TLUT model;
+   never observed).
+6. **Color0 vertex attribute present.** Menu-frame VCDs: `VCD_LO` ∈
+   {`0x200`,`0x400`,`0x600`,`0x1400`,`0x1600`,**`0x2200`**} with `VCD_HI` ∈
+   {0,1,2} — `0x2200` = Position Direct + **Color0 Direct**, with
+   `VAT_A[0]=0x4EF77009/0x50F76C09` → Color0 = **RGBA8888 Direct** (4
+   bytes/vertex). *Implemented:* all 6 GX color formats
+   (RGB565/RGB888/RGB888x/RGBA4444/RGBA6666/RGBA8888), Direct and
+   Index8/Index16 from `ARRAY_BASE[2]/[3]` (VertexLoader_Color.cpp:26-196,
+   byte widths from VertexLoader_Color.h s_table_size).
+
+Other menu-frame facts (from the same capture):
+
+- **GENMODE** = `0x000211`/`0x004211` (1 TEV stage) and `0x004610`/`0x004611`
+  (**2 TEV stages**, bits 10-13 = 1). The existing stage loop already iterates
+  `numtevstages+1` with per-stage configs from the register file, so no code
+  change was needed (`TEV_COLOR/ALPHA_ENV` 0xC0-0xC3 pairs active).
+- **Blending on:** `BLENDMODE = 0x4BC/0x4BD` — SrcAlpha/InvSrcAlpha alpha
+  blending with dither + color/alpha update (the reason the menu wants the
+  alpha-capable paths).
+- **Textures in play:** I8 352×40 (`0x109D5F`, the font), I8 64×64
+  (`0x10FC3F`), I8 128×128 (`0x11FC7F`), RGBA8 84×84 (`0x614C53`); MEM1
+  sources `TX_SETIMAGE3` ∈ {`0x0559B3`…`0x057667`} (<<5 = `0xAB3660`…
+  `0xAECCE0`).
+- **Matrix churn:** `MATINDEX_A` = `0x3CF3C780/0x3CF3CF00` per object;
+  `TEV_REGISTER` konst colors vary per object (5 unique values per frame —
+  per-object tinting, not a cross-frame ramp).
+- **Draw shapes:** QUADS (vat 0 and 1) + TRIANGLE_FANs; Direct attributes now
+  appear alongside the indexed families of (f).
+
+**Menu-phase visual state (2026-07-11 runs):** with all of the above
+implemented, the post-fade phase renders the menu's central object — the
+large glossy purple GameCube "G" logo cube (`_work/menu_probe5-7.png`,
+`mean_luma 29.7`, XFB double-buffering between `0x800040`/`0x881860`) instead
+of the previous black screen. The frame is currently **static** (identical
+TEV/XF state across frames minutes apart) and did not respond to a 70-frame
+D-pad RIGHT hold — the menu's animation/interaction gate (suspected
+audio-position or interrupt-driven sequencing, not GX: TB advances at
+0.534 M ticks/s ≈ 1/76 real speed, VI frames at ~0.35/s ≈ 1/170, DSP/SI/VI/
+PE_FINISH interrupts all live, PI INTMR at 0xFFC) is the open item for M3
+navigation, tracked outside this rasterizer inventory.

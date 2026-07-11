@@ -6,10 +6,15 @@
  * independent oracle); every routine cites the file it is transcribed from and
  * everything the IPL frame does NOT exercise traps loudly (see gx_raster.c).
  *
- * Scope (docs/GX_INVENTORY.md sections e+f): GX_DRAW_TRIANGLE_FAN only, VAT 0,
- * indexed Position(float)/Normal(short)/TexCoord0(short); orthographic XF
- * transform + one lit color channel; single-stage TEV; texture unit 0, I8, from
- * MEM1; z-buffered edge-function rasterizer; EFB->XFB YUY2 encode.
+ * Scope (docs/GX_INVENTORY.md sections e+f+g): TRIANGLE_FAN + QUADS, any VAT
+ * index; Position/Normal/TexCoord0 Direct or Index8/16 (float/short paths);
+ * Color0/Color1 vertex attributes in all 6 GX color formats (Direct/indexed)
+ * with Dolphin's missing-color routing; XF transform (ortho + perspective) with
+ * lit color channels and vertex-material color/alpha; multi-stage regular TEV;
+ * texture sampling from MEM1 in I4/I8/IA4/IA8/RGB565/RGB5A3/RGBA8/CMPR;
+ * RGB8_Z24 / RGBA6_Z24 / RGB565_Z16 EFB formats; z-buffered edge-function
+ * rasterizer; EFB->XFB YUY2 encode. Everything else (paletted textures,
+ * indirect TEV, ztex, fog, mip levels, ...) traps loudly.
  *
  * Transcription map:
  *   Transform         VideoBackends/Software/TransformUnit.cpp
@@ -17,12 +22,14 @@
  *   Primitive assembly VideoBackends/Software/SetupUnit.cpp
  *   Rasterizer        VideoBackends/Software/Rasterizer.cpp
  *   TEV               VideoBackends/Software/Tev.cpp (+ Tev.h LUTs)
- *   Texture sample    VideoBackends/Software/TextureSampler.cpp + I8 decode
- *                     VideoCommon/TextureDecoder_Common.cpp:417-433
+ *   Texture sample    VideoBackends/Software/TextureSampler.cpp + texel decode
+ *                     VideoCommon/TextureDecoder_Common.cpp:300-640
  *   EFB pixel ops     VideoBackends/Software/SWEfbInterface.cpp
  *   EFB clear         VideoBackends/Software/EfbCopy.cpp
  *   Scissor rects     VideoCommon/BPFunctions.cpp ComputeScissorRects
  *   Vertex dequant    VideoCommon/VertexLoader_{Normal,Position,TextCoord}.cpp
+ *   Vertex colors     VideoCommon/VertexLoader_Color.cpp + SWVertexLoader.cpp
+ *                     ParseColorAttributes:164-192 (missing-color routing)
  *   Register layouts  VideoCommon/{BPMemory,XFMemory,CPMemory}.h
  */
 #ifndef GCN_GX_GX_RASTER_H
