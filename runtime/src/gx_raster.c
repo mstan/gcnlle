@@ -1,0 +1,1668 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * GX rasterizer (impl). Scoped transcription of Dolphin's Software video
+ * backend. See include/gx/gx_raster.h for the transcription map and scope.
+ *
+ * Everything the IPL menu frame does not exercise traps loudly (one-time
+ * stderr) rather than silently guessing (PRINCIPLES: transcribe, never invent;
+ * make misses loud).
+ */
+#include "gx/gx_raster.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+/* EFB geometry (VideoCommon/VideoCommon.h:15-16). */
+#define EFB_WIDTH   640u
+#define EFB_HEIGHT  528u
+
+/* ---- one-time trap logging ------------------------------------------------ */
+static int trap_once(int* flag, const char* what) {
+    if (*flag) return 0;
+    *flag = 1;
+    fprintf(stderr, "gx_raster: UNIMPLEMENTED/out-of-scope: %s — trapped once\n",
+            what);
+    return 1;
+}
+#define TRAP(field, msg) do { static int field = 0; trap_once(&field, msg); } while (0)
+
+/* ---- bound state ---------------------------------------------------------- */
+static CPUState* s_cpu;
+static const u32* s_bp;    /* u32[256] BP register file (raw written values) */
+static const u32* s_xf;    /* u32[0x1058] XF memory (rd32 host-order words)  */
+
+/* ============================================================================
+ * EFB model. Dolphin keeps 3 color bytes + 3 depth bytes per pixel
+ * (SWEfbInterface.cpp:24-38); we keep the packed color word Dolphin stores
+ * (per pixel_format) and a 24-bit depth separately — the pixel-format pack/
+ * unpack semantics are transcribed exactly (SWEfbInterface.cpp:40-228).
+ * ==========================================================================*/
+static u32 s_efb_color[EFB_WIDTH * EFB_HEIGHT];
+static u32 s_efb_depth[EFB_WIDTH * EFB_HEIGHT];
+
+/* Tev / EfbInterface component ordering (Tev.h:225-231, matches EfbInterface). */
+enum { ALP_C = 0, BLU_C = 1, GRN_C = 2, RED_C = 3 };
+
+/* ---- bitfield helpers ----------------------------------------------------- */
+static inline u32 bits(u32 v, u32 pos, u32 n) { return (v >> pos) & ((n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1u)); }
+static inline s32 sext(u32 v, u32 n) {          /* sign-extend n-bit field */
+    u32 m = 1u << (n - 1);
+    return (s32)((v ^ m) - m);
+}
+static inline float xf_f(u32 addr) { float f; u32 v = s_xf[addr]; memcpy(&f, &v, 4); return f; }
+
+/* big-endian guest-RAM readers */
+static inline float be_f32(const u8* p) {
+    u32 v = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+    float f; memcpy(&f, &v, 4); return f;
+}
+static inline s16 be_s16(const u8* p) { return (s16)(((u16)p[0] << 8) | p[1]); }
+static inline u16 be_u16(const u8* p) { return (u16)(((u16)p[0] << 8) | p[1]); }
+
+/* PEControl.pixel_format (BPMemory.h:1734-1741 @ bp 0x43). */
+enum { PF_RGB8_Z24 = 0, PF_RGBA6_Z24 = 1, PF_RGB565_Z16 = 2, PF_Z24 = 3 };
+static u32 pixel_format(void) { return bits(s_bp[0x43], 0, 3); }
+
+static inline u8 Convert6To8(u8 v) { return (u8)((v << 2) | (v >> 4)); }
+
+/* ============================================================================
+ * EFB pixel access (SWEfbInterface.cpp). RGB8_Z24 and RGBA6_Z24 are the two
+ * formats the IPL uses; other formats trap.
+ * ==========================================================================*/
+static u32 GetPixelColor(u32 off) {
+    u32 src = s_efb_color[off];
+    switch (pixel_format()) {
+    case PF_RGB8_Z24:
+    case PF_Z24:
+        return 0xffu | ((src & 0x00ffffffu) << 8);
+    case PF_RGBA6_Z24:
+        return (u32)Convert6To8(src & 0x3f) |
+               ((u32)Convert6To8((src >> 6) & 0x3f) << 8) |
+               ((u32)Convert6To8((src >> 12) & 0x3f) << 16) |
+               ((u32)Convert6To8((src >> 18) & 0x3f) << 24);
+    default:
+        TRAP(pf_getcolor, "EFB GetPixelColor pixel_format (only RGB8_Z24/RGBA6_Z24)");
+        return 0xffu | ((src & 0x00ffffffu) << 8);
+    }
+}
+static void SetPixelColorOnly(u32 off, const u8* rgb) {
+    u32 src; memcpy(&src, rgb, 4);
+    switch (pixel_format()) {
+    case PF_RGB8_Z24: case PF_Z24: case PF_RGB565_Z16:
+        s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
+        break;
+    case PF_RGBA6_Z24: {
+        u32 val = s_efb_color[off] & 0xff00003fu;
+        val |= (src >> 4) & 0x00000fc0u;   /* blue  */
+        val |= (src >> 6) & 0x0003f000u;   /* green */
+        val |= (src >> 8) & 0x00fc0000u;   /* red   */
+        s_efb_color[off] = val;
+        break;
+    }
+    default: TRAP(pf_setcolor, "EFB SetPixelColorOnly pixel_format"); break;
+    }
+}
+static void SetPixelAlphaColor(u32 off, const u8* color) {
+    u32 src; memcpy(&src, color, 4);
+    switch (pixel_format()) {
+    case PF_RGB8_Z24: case PF_Z24: case PF_RGB565_Z16:
+        s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
+        break;
+    case PF_RGBA6_Z24: {
+        u32 val = s_efb_color[off] & 0xff000000u;
+        val |= (src >> 2) & 0x0000003fu;   /* alpha */
+        val |= (src >> 4) & 0x00000fc0u;   /* blue  */
+        val |= (src >> 6) & 0x0003f000u;   /* green */
+        val |= (src >> 8) & 0x00fc0000u;   /* red   */
+        s_efb_color[off] = val;
+        break;
+    }
+    default: TRAP(pf_setalpha, "EFB SetPixelAlphaColor pixel_format"); break;
+    }
+}
+static void SetPixelAlphaOnly(u32 off, u8 a) {
+    if (pixel_format() == PF_RGBA6_Z24) {
+        u32 val = s_efb_color[off] & 0xffffffc0u;
+        val |= (a >> 2) & 0x3f;
+        s_efb_color[off] = val;
+    }
+    /* RGB8/Z24/RGB565 have no alpha plane — nothing to do. */
+}
+static void SetPixelDepth(u32 off, u32 depth) { s_efb_depth[off] = depth & 0x00ffffffu; }
+static u32  GetPixelDepth(u32 off)            { return s_efb_depth[off] & 0x00ffffffu; }
+
+/* BlendMode (bp 0x41) accessors. */
+static u32 bm(void) { return s_bp[0x41]; }
+static int bm_blend_enable(void)  { return bits(bm(), 0, 1); }
+static int bm_logic_enable(void)  { return bits(bm(), 1, 1); }
+static int bm_dither(void)        { return bits(bm(), 2, 1); }
+static int bm_color_update(void)  { return bits(bm(), 3, 1); }
+static int bm_alpha_update(void)  { return bits(bm(), 4, 1); }
+static u32 bm_dst_factor(void)    { return bits(bm(), 5, 3); }
+static u32 bm_src_factor(void)    { return bits(bm(), 8, 3); }
+static int bm_subtract(void)      { return bits(bm(), 11, 1); }
+static u32 bm_logic_mode(void)    { return bits(bm(), 12, 4); }
+
+/* ZMode (bp 0x40). */
+static int zm_test_enable(void)   { return bits(s_bp[0x40], 0, 1); }
+static u32 zm_func(void)          { return bits(s_bp[0x40], 1, 3); }
+static int zm_update_enable(void) { return bits(s_bp[0x40], 4, 1); }
+/* ConstantAlpha / dstalpha (bp 0x42). */
+static int da_enable(void)        { return bits(s_bp[0x42], 8, 1); }
+static u8  da_alpha(void)         { return (u8)bits(s_bp[0x42], 0, 8); }
+/* early_ztest (bp 0x43 PEControl). */
+static int early_ztest(void)      { return bits(s_bp[0x43], 6, 1); }
+
+enum { CMP_NEVER, CMP_LESS, CMP_EQUAL, CMP_LEQUAL, CMP_GREATER, CMP_NEQUAL, CMP_GEQUAL, CMP_ALWAYS };
+
+static int ZCompare(u16 x, u16 y, u32 z) {
+    u32 off = (u32)x + (u32)y * EFB_WIDTH;
+    u32 depth = GetPixelDepth(off);
+    int pass;
+    switch (zm_func()) {
+    case CMP_NEVER:   pass = 0;        break;
+    case CMP_LESS:    pass = z < depth;  break;
+    case CMP_EQUAL:   pass = z == depth; break;
+    case CMP_LEQUAL:  pass = z <= depth; break;
+    case CMP_GREATER: pass = z > depth;  break;
+    case CMP_NEQUAL:  pass = z != depth; break;
+    case CMP_GEQUAL:  pass = z >= depth; break;
+    case CMP_ALWAYS:  pass = 1;        break;
+    default:          pass = 0;        break;
+    }
+    if (pass && zm_update_enable()) SetPixelDepth(off, z);
+    return pass;
+}
+
+/* Blend factor helpers (SWEfbInterface.cpp:230-310). Color arrays are [A,B,G,R]. */
+static u32 src_factor(const u8* s, const u8* d, u32 mode) {
+    u8 a;
+    switch (mode) {
+    case 0: return 0;                              /* Zero */
+    case 1: return 0xffffffffu;                    /* One  */
+    case 2: { u32 v; memcpy(&v, d, 4); return v; } /* DstClr */
+    case 3: { u32 v; memcpy(&v, d, 4); return 0xffffffffu - v; }
+    case 4: a = s[ALP_C]; break;                   /* SrcAlpha */
+    case 5: a = 0xff - s[ALP_C]; break;            /* InvSrcAlpha */
+    case 6: a = d[ALP_C]; break;                   /* DstAlpha */
+    case 7: a = 0xff - d[ALP_C]; break;            /* InvDstAlpha */
+    default: return 0;
+    }
+    return ((u32)a << 24) | ((u32)a << 16) | ((u32)a << 8) | a;
+}
+static u32 dst_factor(const u8* s, const u8* d, u32 mode) {
+    u8 a;
+    switch (mode) {
+    case 0: return 0;
+    case 1: return 0xffffffffu;
+    case 2: { u32 v; memcpy(&v, s, 4); return v; }          /* SrcClr */
+    case 3: { u32 v; memcpy(&v, s, 4); return 0xffffffffu - v; }
+    case 4: a = s[ALP_C]; break;
+    case 5: a = 0xff - s[ALP_C]; break;
+    case 6: a = d[ALP_C]; break;
+    case 7: a = 0xff - d[ALP_C]; break;
+    default: return 0;
+    }
+    return ((u32)a << 24) | ((u32)a << 16) | ((u32)a << 8) | a;
+}
+static void BlendColor(const u8* src, u8* dst) {
+    u32 sf = src_factor(src, dst, bm_src_factor());
+    u32 df = dst_factor(src, dst, bm_dst_factor());
+    for (int i = 0; i < 4; i++) {
+        u32 s = sf & 0xff; s += s >> 7;
+        u32 d = df & 0xff; d += d >> 7;
+        u32 c = (src[i] * s + dst[i] * d) >> 8;
+        dst[i] = (c > 255) ? 255 : (u8)c;
+        df >>= 8; sf >>= 8;
+    }
+}
+static void SubtractBlend(const u8* src, u8* dst) {
+    for (int i = 0; i < 4; i++) {
+        int c = (int)dst[i] - (int)src[i];
+        dst[i] = (c < 0) ? 0 : (u8)c;
+    }
+}
+static void LogicBlend(u32 s, u32* d, u32 op) {
+    switch (op) {
+    case 0:  *d = 0; break;
+    case 1:  *d = s & *d; break;
+    case 2:  *d = s & (~*d); break;
+    case 3:  *d = s; break;
+    case 4:  *d = (~s) & *d; break;
+    case 5:  break;
+    case 6:  *d = s ^ *d; break;
+    case 7:  *d = s | *d; break;
+    case 8:  *d = ~(s | *d); break;
+    case 9:  *d = ~(s ^ *d); break;
+    case 10: *d = ~*d; break;
+    case 11: *d = s | (~*d); break;
+    case 12: *d = ~s; break;
+    case 13: *d = (~s) | *d; break;
+    case 14: *d = ~(s & *d); break;
+    case 15: *d = 0xffffffffu; break;
+    }
+}
+static void Dither(u16 x, u16 y, u8* color) {
+    if (!bm_dither() || pixel_format() != PF_RGBA6_Z24) return;
+    static const u8 dth[2][2] = { {0, 2}, {3, 1} };
+    for (int i = BLU_C; i <= RED_C; i++)
+        color[i] = (u8)(((color[i] - (color[i] >> 6)) + dth[y & 1][x & 1]) & 0xfc);
+}
+/* BlendTev (SWEfbInterface.cpp:412-450). color is [A,B,G,R]. */
+static void BlendTev(u16 x, u16 y, u8* color) {
+    u32 off = (u32)x + (u32)y * EFB_WIDTH;
+    u32 dstClr = GetPixelColor(off);
+    u8* dstPtr = (u8*)&dstClr;
+
+    if (bm_blend_enable()) {
+        if (bm_subtract()) SubtractBlend(color, dstPtr);
+        else               BlendColor(color, dstPtr);
+    } else if (bm_logic_enable()) {
+        u32 s; memcpy(&s, color, 4);
+        LogicBlend(s, &dstClr, bm_logic_mode());
+    } else {
+        dstPtr = color;
+    }
+
+    if (da_enable()) dstPtr[ALP_C] = da_alpha();
+
+    if (bm_color_update()) {
+        Dither(x, y, dstPtr);
+        if (bm_alpha_update()) SetPixelAlphaColor(off, dstPtr);
+        else                   SetPixelColorOnly(off, dstPtr);
+    } else if (bm_alpha_update()) {
+        SetPixelAlphaOnly(off, dstPtr[ALP_C]);
+    }
+}
+
+/* ============================================================================
+ * Texture sampler — unit 0, I8, from MEM1 (TextureSampler.cpp + I8 decode
+ * TextureDecoder_Common.cpp:417-433). No TMEM cache, no mipmaps (trapped).
+ * ==========================================================================*/
+enum { TEXFMT_I8 = 1 };
+enum { WRAP_CLAMP = 0, WRAP_REPEAT = 1, WRAP_MIRROR = 2 };
+
+/* Per-unit BP register base: unit 0 lives at 0x80.. (BPMemory.h:82-88). */
+static u32 tx_mode0(u32 unit) { return s_bp[0x80 + unit]; }
+static u32 tx_mode1(u32 unit) { return s_bp[0x84 + unit]; }
+static u32 tx_image0(u32 unit){ return s_bp[0x88 + unit]; }
+static u32 tx_image3(u32 unit){ return s_bp[0x94 + unit]; }
+
+static int wrap_coord(int coord, u32 wrap, int size) {
+    switch (wrap) {
+    case WRAP_CLAMP:
+        if (coord < 0) coord = 0; else if (coord > size - 1) coord = size - 1;
+        return coord;
+    case WRAP_REPEAT:
+        return coord & (size - 1);
+    case WRAP_MIRROR:
+        if ((coord & size) != 0) coord = ~coord;
+        return coord & (size - 1);
+    default:
+        TRAP(wrapmode, "texture wrap mode 3");
+        if (coord < 0) coord = 0; else if (coord > size - 1) coord = size - 1;
+        return coord;
+    }
+}
+/* I8 nearest texel decode (TextureDecoder_Common.cpp:417-433). */
+static u8 i8_texel(const u8* src, u32 src_len, int s, int t, int image_w_minus_1) {
+    u32 sBlk = (u32)s >> 3, tBlk = (u32)t >> 2;
+    u32 widthBlks = ((u32)image_w_minus_1 >> 3) + 1;
+    u32 base = (tBlk * widthBlks + sBlk) << 5;
+    u32 blkS = (u32)s & 7, blkT = (u32)t & 3;
+    u32 off = base + (blkT << 3) + blkS;
+    return (off < src_len) ? src[off] : 0;
+}
+static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
+    u32 ti0 = tx_image0(texmap);
+    u32 fmt = bits(ti0, 20, 4);
+    int w1 = (int)bits(ti0, 0, 10);   /* width  - 1 */
+    int h1 = (int)bits(ti0, 10, 10);  /* height - 1 */
+    if (fmt != TEXFMT_I8) { TRAP(nonI8, "texture format != I8"); memset(out, 0, 4); return; }
+
+    u32 img_base = (tx_image3(texmap) & 0x00ffffffu) << 5;
+    u32 phys = img_base & 0x1FFFFFFFu;
+    if (!s_cpu || !s_cpu->ram || phys >= s_cpu->ram_size) {
+        TRAP(texoob, "texture source out of MEM1"); memset(out, 0, 4); return;
+    }
+    const u8* src = s_cpu->ram + phys;
+    u32 src_len = s_cpu->ram_size - phys;
+    u32 mode0 = tx_mode0(texmap);
+    u32 wrap_s = bits(mode0, 0, 2), wrap_t = bits(mode0, 2, 2);
+    if (bits(mode0, 5, 2) != 0) TRAP(mipmapfilter, "texture mipmap filter (mipmaps)");
+
+    if (linear) {
+        s -= 64; t -= 64;
+        int iS = s >> 7, iT = t >> 7;
+        int iS1 = iS + 1, iT1 = iT + 1;
+        int fS = s & 0x7f, fT = t & 0x7f;
+        iS  = wrap_coord(iS,  wrap_s, w1 + 1);
+        iT  = wrap_coord(iT,  wrap_t, h1 + 1);
+        iS1 = wrap_coord(iS1, wrap_s, w1 + 1);
+        iT1 = wrap_coord(iT1, wrap_t, h1 + 1);
+        u8 v00 = i8_texel(src, src_len, iS,  iT,  w1);
+        u8 v10 = i8_texel(src, src_len, iS1, iT,  w1);
+        u8 v01 = i8_texel(src, src_len, iS,  iT1, w1);
+        u8 v11 = i8_texel(src, src_len, iS1, iT1, w1);
+        u32 acc = v00 * (u32)((128 - fS) * (128 - fT)) +
+                  v10 * (u32)((fS)       * (128 - fT)) +
+                  v01 * (u32)((128 - fS) * (fT)) +
+                  v11 * (u32)((fS)       * (fT));
+        u8 val = (u8)(acc >> 14);
+        out[0] = out[1] = out[2] = out[3] = val;
+    } else {
+        int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
+        int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
+        u8 val = i8_texel(src, src_len, iS, iT, w1);
+        out[0] = out[1] = out[2] = out[3] = val;
+    }
+}
+
+/* FixedLog2 + LOD (Rasterizer.cpp:122-256). */
+static s32 fixed_log2(float f) {
+    u32 x; memcpy(&x, &f, 4);
+    s32 logInt = ((x & 0x7F800000) >> 19) - 2032;
+    s32 logFract = (x & 0x007fffff) >> 19;
+    return logInt + logFract;
+}
+
+/* ============================================================================
+ * TEV (Tev.cpp + Tev.h). Single-/multi-stage regular combiner + alpha test +
+ * blend. Indirect textures, z-texture and fog trap loudly if enabled.
+ * ==========================================================================*/
+typedef struct { s16 r, g, b, a; } TColor;
+typedef struct {
+    TColor Reg[4];          /* Prev, Color0, Color1, Color2 */
+    TColor Konst[4];        /* KonstantColors */
+    TColor TexColor, RasColor, StageKonst, RawTexColor;
+    s32    Position[3];
+    u8     Color[2][4];     /* [chan][R,G,B,A] */
+    s32    UvS[8], UvT[8];  /* s17.7 */
+    s32    TexCoordS, TexCoordT;
+    u8     AlphaBump;
+    s32    TextureLod[16];  int TextureLinear[16];
+} Tev;
+
+static const s16 s_Bias[4]   = { 0, 128, -128, 0 };
+static const u8  s_LShift[4] = { 0, 1, 2, 0 };
+static const u8  s_RShift[4] = { 0, 0, 0, 1 };
+
+static s16 clamp255(s16 v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+static s16 clamp1024(s16 v){ return v < -1024 ? -1024 : v > 1023 ? 1023 : v; }
+
+/* GenMode (bp 0x00). */
+static u32 gm_numtexgens(void)  { return bits(s_bp[0x00], 0, 4); }
+static u32 gm_numcolchans(void) { return bits(s_bp[0x00], 4, 3); }
+static u32 gm_numtevstages(void){ return bits(s_bp[0x00], 10, 4); }
+static u32 gm_cull_mode(void)   { return bits(s_bp[0x00], 14, 2); }
+static u32 gm_numindstages(void){ return bits(s_bp[0x00], 16, 3); }
+
+/* Konst LUT (Tev.h:158-195). Returns r,g,b,a for a KonstSel. */
+static void konst_lookup(const Tev* t, u32 sel, s16* r, s16* g, s16* b, s16* a) {
+    static const s16 fixed[8] = { 255, 223, 191, 159, 128, 96, 64, 32 };
+    if (sel < 8) { *r = *g = *b = *a = fixed[sel]; return; }
+    if (sel < 12) { *r = *g = *b = *a = 0; return; }
+    if (sel < 16) { const TColor* k = &t->Konst[sel - 12]; *r = k->r; *g = k->g; *b = k->b; *a = 0; return; }
+    if (sel < 20) { s16 v = t->Konst[sel - 16].r; *r = *g = *b = *a = v; return; }
+    if (sel < 24) { s16 v = t->Konst[sel - 20].g; *r = *g = *b = *a = v; return; }
+    if (sel < 28) { s16 v = t->Konst[sel - 24].b; *r = *g = *b = *a = v; return; }
+    { s16 v = t->Konst[sel - 28].a; *r = *g = *b = *a = v; return; }
+}
+
+/* Color input LUT (Tev.h:130-147): resolve TevColorArg -> (r,g,b). */
+static void color_arg(const Tev* t, u32 arg, s16* r, s16* g, s16* b) {
+    switch (arg) {
+    case 0:  *r = t->Reg[0].r; *g = t->Reg[0].g; *b = t->Reg[0].b; break;
+    case 1:  *r = *g = *b = t->Reg[0].a; break;
+    case 2:  *r = t->Reg[1].r; *g = t->Reg[1].g; *b = t->Reg[1].b; break;
+    case 3:  *r = *g = *b = t->Reg[1].a; break;
+    case 4:  *r = t->Reg[2].r; *g = t->Reg[2].g; *b = t->Reg[2].b; break;
+    case 5:  *r = *g = *b = t->Reg[2].a; break;
+    case 6:  *r = t->Reg[3].r; *g = t->Reg[3].g; *b = t->Reg[3].b; break;
+    case 7:  *r = *g = *b = t->Reg[3].a; break;
+    case 8:  *r = t->TexColor.r; *g = t->TexColor.g; *b = t->TexColor.b; break;
+    case 9:  *r = *g = *b = t->TexColor.a; break;
+    case 10: *r = t->RasColor.r; *g = t->RasColor.g; *b = t->RasColor.b; break;
+    case 11: *r = *g = *b = t->RasColor.a; break;
+    case 12: *r = *g = *b = 255; break;
+    case 13: *r = *g = *b = 128; break;
+    case 14: *r = t->StageKonst.r; *g = t->StageKonst.g; *b = t->StageKonst.b; break;
+    default: *r = *g = *b = 0; break;
+    }
+}
+static s16 alpha_arg(const Tev* t, u32 arg) {
+    switch (arg) {
+    case 0: return t->Reg[0].a;
+    case 1: return t->Reg[1].a;
+    case 2: return t->Reg[2].a;
+    case 3: return t->Reg[3].a;
+    case 4: return t->TexColor.a;
+    case 5: return t->RasColor.a;
+    case 6: return t->StageKonst.a;
+    default: return 0;
+    }
+}
+
+/* Swap table (BPMemory.h AllTevKSels::GetSwapTable). Returns 4 channel indices. */
+static void swap_table(u32 id, u32 out[4]) {
+    u32 rg = s_bp[0xF6 + (id << 1)];
+    u32 ba = s_bp[0xF6 + (id << 1) + 1];
+    out[0] = bits(rg, 0, 2);  /* red  <- */
+    out[1] = bits(rg, 2, 2);  /* green<- */
+    out[2] = bits(ba, 0, 2);  /* blue <- */
+    out[3] = bits(ba, 2, 2);  /* alpha<- */
+}
+
+/* Load TEV / konst registers from bp 0xE0-0xE7 (BPStructs.cpp:667-703). */
+static void tev_load_registers(Tev* t) {
+    for (int num = 0; num < 4; num++) {
+        u32 ra = s_bp[0xE0 + num * 2];
+        u32 bg = s_bp[0xE1 + num * 2];
+        s16 red = (s16)sext(bits(ra, 0, 11), 11);
+        s16 alp = (s16)sext(bits(ra, 12, 11), 11);
+        s16 blu = (s16)sext(bits(bg, 0, 11), 11);
+        s16 grn = (s16)sext(bits(bg, 12, 11), 11);
+        int ra_const = bits(ra, 23, 1);
+        int bg_const = bits(bg, 23, 1);
+        if (ra_const) { t->Konst[num].r = red; t->Konst[num].a = alp; }
+        else          { t->Reg[num].r   = red; t->Reg[num].a   = alp; }
+        if (bg_const) { t->Konst[num].g = grn; t->Konst[num].b = blu; }
+        else          { t->Reg[num].g   = grn; t->Reg[num].b   = blu; }
+    }
+}
+
+static void draw_color_regular(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4],
+                               const s32 inC[4], const s32 inD[4]) {
+    u32 bias = bits(cc, 16, 2), op = bits(cc, 18, 1);
+    u32 scale = bits(cc, 20, 2), dest = bits(cc, 22, 2);
+    for (int i = BLU_C; i <= RED_C; i++) {
+        u32 c = (u32)inC[i] + ((u32)inC[i] >> 7);
+        s32 temp = inA[i] * (256 - (s32)c) + inB[i] * (s32)c;
+        temp <<= s_LShift[scale];
+        temp += (scale == 3) ? 0 : (op ? 127 : 128);
+        temp >>= 8;
+        temp = op ? -temp : temp;
+        s32 result = ((inD[i] + s_Bias[bias]) << s_LShift[scale]) + temp;
+        result >>= s_RShift[scale];
+        if (i == BLU_C) t->Reg[dest].b = (s16)result;
+        else if (i == GRN_C) t->Reg[dest].g = (s16)result;
+        else t->Reg[dest].r = (s16)result;
+    }
+    if (bits(cc, 19, 1)) {
+        t->Reg[dest].r = clamp255(t->Reg[dest].r);
+        t->Reg[dest].g = clamp255(t->Reg[dest].g);
+        t->Reg[dest].b = clamp255(t->Reg[dest].b);
+    } else {
+        t->Reg[dest].r = clamp1024(t->Reg[dest].r);
+        t->Reg[dest].g = clamp1024(t->Reg[dest].g);
+        t->Reg[dest].b = clamp1024(t->Reg[dest].b);
+    }
+}
+static void draw_color_compare(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4],
+                               const s32 inC[4], const s32 inD[4]) {
+    u32 mode = bits(cc, 20, 2), cmp = bits(cc, 18, 1), dest = bits(cc, 22, 2);
+    for (int i = BLU_C; i <= RED_C; i++) {
+        u32 a, b;
+        switch (mode) {
+        case 0: a = inA[RED_C]; b = inB[RED_C]; break;
+        case 1: a = (inA[GRN_C] << 8) | inA[RED_C]; b = (inB[GRN_C] << 8) | inB[RED_C]; break;
+        case 2: a = (inA[BLU_C] << 16) | (inA[GRN_C] << 8) | inA[RED_C];
+                b = (inB[BLU_C] << 16) | (inB[GRN_C] << 8) | inB[RED_C]; break;
+        default: a = inA[i]; b = inB[i]; break;
+        }
+        s32 add = cmp ? (a == b ? inC[i] : 0) : (a > b ? inC[i] : 0);
+        s16 res = (s16)(inD[i] + add);
+        if (i == BLU_C) t->Reg[dest].b = res;
+        else if (i == GRN_C) t->Reg[dest].g = res;
+        else t->Reg[dest].r = res;
+    }
+    if (bits(cc, 19, 1)) {
+        t->Reg[dest].r = clamp255(t->Reg[dest].r);
+        t->Reg[dest].g = clamp255(t->Reg[dest].g);
+        t->Reg[dest].b = clamp255(t->Reg[dest].b);
+    }
+}
+static void draw_alpha_regular(Tev* t, u32 ac, s32 a, s32 b, s32 c, s32 d) {
+    u32 bias = bits(ac, 16, 2), op = bits(ac, 18, 1);
+    u32 scale = bits(ac, 20, 2), dest = bits(ac, 22, 2);
+    u32 cc = (u32)c + ((u32)c >> 7);
+    s32 temp = a * (256 - (s32)cc) + b * (s32)cc;
+    temp <<= s_LShift[scale];
+    temp += (scale == 3) ? 0 : (op ? 127 : 128);
+    temp = op ? (-temp >> 8) : (temp >> 8);
+    s32 result = ((d + s_Bias[bias]) << s_LShift[scale]) + temp;
+    result >>= s_RShift[scale];
+    t->Reg[dest].a = (s16)result;
+    t->Reg[dest].a = bits(ac, 19, 1) ? clamp255(t->Reg[dest].a) : clamp1024(t->Reg[dest].a);
+}
+static void draw_alpha_compare(Tev* t, u32 ac, const s32 inAa[4], const s32 inBa[4], s32 c, s32 d) {
+    u32 mode = bits(ac, 20, 2), cmp = bits(ac, 18, 1), dest = bits(ac, 22, 2);
+    u32 a, b;
+    switch (mode) {
+    case 0: a = inAa[RED_C]; b = inBa[RED_C]; break;
+    case 1: a = (inAa[GRN_C] << 8) | inAa[RED_C]; b = (inBa[GRN_C] << 8) | inBa[RED_C]; break;
+    case 2: a = (inAa[BLU_C] << 16) | (inAa[GRN_C] << 8) | inAa[RED_C];
+            b = (inBa[BLU_C] << 16) | (inBa[GRN_C] << 8) | inBa[RED_C]; break;
+    default: a = inAa[ALP_C]; b = inBa[ALP_C]; break;
+    }
+    s32 add = cmp ? (a == b ? c : 0) : (a > b ? c : 0);
+    t->Reg[dest].a = (s16)(d + add);
+    t->Reg[dest].a = bits(ac, 19, 1) ? clamp255(t->Reg[dest].a) : clamp1024(t->Reg[dest].a);
+}
+
+/* AlphaTest (bp 0xF3, Tev.cpp:193-238). */
+static int alpha_cmp(int alpha, int ref, u32 comp) {
+    switch (comp) {
+    case CMP_ALWAYS:  return 1;
+    case CMP_NEVER:   return 0;
+    case CMP_LEQUAL:  return alpha <= ref;
+    case CMP_LESS:    return alpha < ref;
+    case CMP_GEQUAL:  return alpha >= ref;
+    case CMP_GREATER: return alpha > ref;
+    case CMP_EQUAL:   return alpha == ref;
+    case CMP_NEQUAL:  return alpha != ref;
+    default:          return 1;
+    }
+}
+static int alpha_test(int alpha) {
+    u32 at = s_bp[0xF3];
+    int c0 = alpha_cmp(alpha, (int)bits(at, 0, 8), bits(at, 16, 3));
+    int c1 = alpha_cmp(alpha, (int)bits(at, 8, 8), bits(at, 19, 3));
+    switch (bits(at, 22, 2)) {
+    case 0: return c0 && c1;
+    case 1: return c0 || c1;
+    case 2: return c0 ^ c1;
+    default: return !(c0 ^ c1);
+    }
+}
+
+/* Full Tev::Draw (Tev.cpp:387-683), scoped: no indirect/ztex/fog. */
+static void tev_draw(Tev* t) {
+    if (gm_numindstages() != 0) TRAP(indstages, "indirect TEV stages");
+    if (bits(s_bp[0xF5], 2, 2) != 0) TRAP(ztex, "z-texture (ztex2.op)");
+    if (bits(s_bp[0xF1], 21, 3) != 0) TRAP(fog, "fog (FogParam3.fsel)");
+
+    u32 numstages = gm_numtevstages();  /* actual count is +1 */
+    u32 numtexgens = gm_numtexgens();
+
+    for (u32 stage = 0; stage <= numstages; stage++) {
+        u32 s2 = stage >> 1, odd = stage & 1;
+        u32 order = s_bp[0x28 + s2];
+        u32 cc = s_bp[0xC0 + stage * 2];
+        u32 ac = s_bp[0xC1 + stage * 2];
+
+        u32 texcoordSel = odd ? bits(order, 15, 3) : bits(order, 3, 3);
+        u32 texmap      = odd ? bits(order, 12, 3) : bits(order, 0, 3);
+        u32 enable      = odd ? bits(order, 18, 1) : bits(order, 6, 1);
+        u32 colorchan   = odd ? bits(order, 19, 3) : bits(order, 7, 3);
+        if (texcoordSel >= numtexgens) texcoordSel = 0;
+
+        /* Indirect: no indirect stages in scope -> TexCoord = Uv (Tev.cpp:369-384). */
+        u32 tevind = s_bp[0x10 + stage];
+        if (bits(tevind, 9, 2) != 0 || bits(tevind, 7, 2) != 0) TRAP(indactive, "active indirect stage");
+        t->TexCoordS = t->UvS[texcoordSel];
+        t->TexCoordT = t->UvT[texcoordSel];
+
+        if (enable) {
+            u8 texel[4];
+            if (numtexgens > 0)
+                tex_sample(texmap, t->TexCoordS, t->TexCoordT,
+                           t->TextureLinear[stage], texel);
+            else
+                memset(texel, 0, 4);
+            t->RawTexColor.r = texel[0]; t->RawTexColor.g = texel[1];
+            t->RawTexColor.b = texel[2]; t->RawTexColor.a = texel[3];
+            u32 sw[4]; swap_table(bits(ac, 2, 2), sw);  /* ac.tswap */
+            t->TexColor.r = texel[sw[0]]; t->TexColor.g = texel[sw[1]];
+            t->TexColor.b = texel[sw[2]]; t->TexColor.a = texel[sw[3]];
+        }
+
+        /* konst for this stage (kcsel/kasel, BPMemory AllTevKSels). */
+        u32 ksel = s_bp[0xF6 + s2];
+        u32 kc = odd ? bits(ksel, 14, 5) : bits(ksel, 4, 5);
+        u32 ka = odd ? bits(ksel, 19, 5) : bits(ksel, 9, 5);
+        { s16 r, g, b, a; konst_lookup(t, kc, &r, &g, &b, &a);
+          t->StageKonst.r = r; t->StageKonst.g = g; t->StageKonst.b = b;
+          konst_lookup(t, ka, &r, &g, &b, &a); t->StageKonst.a = a; }
+
+        /* ras color (SetRasColor, Tev.cpp:34-78). */
+        {
+            u32 rsw[4]; swap_table(bits(ac, 0, 2), rsw);  /* ac.rswap */
+            const u8* col = NULL;
+            if (colorchan == 0) col = t->Color[0];
+            else if (colorchan == 1) col = t->Color[1];
+            if (col) {
+                t->RasColor.r = col[rsw[0]]; t->RasColor.g = col[rsw[1]];
+                t->RasColor.b = col[rsw[2]]; t->RasColor.a = col[rsw[3]];
+            } else {
+                /* AlphaBump / normalized / zero: menu uses only Color0/1; others -> 0. */
+                if (colorchan != 7) TRAP(raschan, "ras color channel (alpha bump)");
+                t->RasColor.r = t->RasColor.g = t->RasColor.b = t->RasColor.a = 0;
+            }
+        }
+
+        /* combine inputs */
+        s32 inA[4], inB[4], inC[4], inD[4];
+        s16 r, g, b;
+        color_arg(t, bits(cc, 12, 4), &r, &g, &b); inA[RED_C]=r; inA[GRN_C]=g; inA[BLU_C]=b;
+        color_arg(t, bits(cc, 8, 4),  &r, &g, &b); inB[RED_C]=r; inB[GRN_C]=g; inB[BLU_C]=b;
+        color_arg(t, bits(cc, 4, 4),  &r, &g, &b); inC[RED_C]=r; inC[GRN_C]=g; inC[BLU_C]=b;
+        color_arg(t, bits(cc, 0, 4),  &r, &g, &b); inD[RED_C]=r; inD[GRN_C]=g; inD[BLU_C]=b;
+        inA[ALP_C] = alpha_arg(t, bits(ac, 13, 3));
+        inB[ALP_C] = alpha_arg(t, bits(ac, 10, 3));
+        inC[ALP_C] = alpha_arg(t, bits(ac, 7, 3));
+        inD[ALP_C] = alpha_arg(t, bits(ac, 4, 3));
+
+        if (bits(cc, 16, 2) != 3) draw_color_regular(t, cc, inA, inB, inC, inD);
+        else                      draw_color_compare(t, cc, inA, inB, inC, inD);
+        if (bits(ac, 16, 2) != 3) draw_alpha_regular(t, ac, inA[ALP_C], inB[ALP_C], inC[ALP_C], inD[ALP_C]);
+        else                      draw_alpha_compare(t, ac, inA, inB, inC[ALP_C], inD[ALP_C]);
+    }
+
+    u32 last = gm_numtevstages();
+    u32 color_dest = bits(s_bp[0xC0 + last * 2], 22, 2);
+    u32 alpha_dest = bits(s_bp[0xC1 + last * 2], 22, 2);
+    u8 output[4];
+    output[ALP_C] = (u8)t->Reg[alpha_dest].a;
+    output[BLU_C] = (u8)t->Reg[color_dest].b;
+    output[GRN_C] = (u8)t->Reg[color_dest].g;
+    output[RED_C] = (u8)t->Reg[color_dest].r;
+
+    if (!alpha_test(output[ALP_C])) return;
+
+    /* Late-Z (EmulatedZ::Late, Tev.cpp:663-672): z-test after shading. */
+    if (zm_test_enable() && !early_ztest()) {
+        if (!ZCompare((u16)t->Position[0], (u16)t->Position[1], (u32)t->Position[2]))
+            return;
+    }
+
+    BlendTev((u16)t->Position[0], (u16)t->Position[1], output);
+}
+
+/* ============================================================================
+ * Output vertex + rasterizer (Rasterizer.cpp).
+ * ==========================================================================*/
+typedef struct {
+    float mvPosition[3];
+    float projectedPosition[4];
+    float screenPosition[3];
+    float normal[3][3];
+    u8    color[2][4];      /* [chan][R,G,B,A] */
+    float texCoords[8][3];
+} OutVtx;
+
+typedef struct { float f0, dfdx, dfdy; s32 x0, y0; float xOff, yOff; } Slope;
+
+static Tev    s_tev;
+static Slope  s_ZSlope, s_WSlope, s_ColorSlopes[2][4], s_TexSlopes[8][3];
+
+static float slope_value(const Slope* s, s32 x, s32 y) {
+    float dx = s->xOff + (float)(x - s->x0);
+    float dy = s->yOff + (float)(y - s->y0);
+    return s->f0 + s->dfdx * dx + s->dfdy * dy;
+}
+
+typedef struct { float dx10, dx20, dy10, dy20; s32 x0, y0; float xOff, yOff; } SlopeCtx;
+
+static SlopeCtx make_ctx(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
+                         s32 x0, s32 y0, s32 x_off, s32 y_off) {
+    SlopeCtx c;
+    const float adjust = 0.495f;
+    c.xOff = ((float)x0 - (v0->screenPosition[0] - x_off)) + adjust;
+    c.yOff = ((float)y0 - (v0->screenPosition[1] - y_off)) + adjust;
+    c.dx10 = v1->screenPosition[0] - v0->screenPosition[0];
+    c.dx20 = v2->screenPosition[0] - v0->screenPosition[0];
+    c.dy10 = v1->screenPosition[1] - v0->screenPosition[1];
+    c.dy20 = v2->screenPosition[1] - v0->screenPosition[1];
+    c.x0 = x0; c.y0 = y0;
+    return c;
+}
+static Slope make_slope(float f0, float f1, float f2, const SlopeCtx* ctx) {
+    Slope s;
+    float d20 = f2 - f0, d10 = f1 - f0;
+    float a = d20 * ctx->dy10 - d10 * ctx->dy20;
+    float b = ctx->dx20 * d10 - ctx->dx10 * d20;
+    float c = ctx->dx20 * ctx->dy10 - ctx->dx10 * ctx->dy20;
+    s.dfdx = a / c; s.dfdy = b / c;
+    s.f0 = f0; s.x0 = ctx->x0; s.y0 = ctx->y0; s.xOff = ctx->xOff; s.yOff = ctx->yOff;
+    return s;
+}
+static int iround(float x) { int t = (int)x; if ((x - t) >= 0.5f) return t + 1; return t; }
+
+/* scissor rect + offset (from ComputeScissorRects Best()). */
+static int s_scissor_left, s_scissor_top, s_scissor_right, s_scissor_bottom;
+static int s_scissor_xoff, s_scissor_yoff;
+
+#define BLK 2
+typedef struct { float InvW; float Uv[8][2]; } RBPixel;
+static RBPixel s_rb[BLK][BLK];
+
+static void calc_lod(Tev* t, s32* lodp, int* linear, u32 texmap, u32 texcoord) {
+    u32 mode0 = tx_mode0(texmap), mode1 = tx_mode1(texmap);
+    float* uv00 = s_rb[0][0].Uv[texcoord];
+    float* uv10 = s_rb[1][0].Uv[texcoord];
+    float* uv01 = s_rb[0][1].Uv[texcoord];
+    float dudx = fabsf(uv00[0] - uv10[0]);
+    float dvdx = fabsf(uv00[1] - uv10[1]);
+    float dudy = fabsf(uv00[0] - uv01[0]);
+    float dvdy = fabsf(uv00[1] - uv01[1]);
+    float sDelta, tDelta;
+    if (bits(mode0, 8, 1)) { sDelta = dudx + dudy; tDelta = dvdx + dvdy; }
+    else { sDelta = dudx > dudy ? dudx : dudy; tDelta = dvdx > dvdy ? dvdx : dvdy; }
+    s32 lod = fixed_log2(sDelta > tDelta ? sDelta : tDelta);
+    int bias = (int)sext(bits(mode0, 9, 8), 8); bias >>= 1; lod += bias;
+    u32 magf = bits(mode0, 4, 1), minf = bits(mode0, 7, 1);
+    *linear = ((lod > 0 && minf == 1) || (lod <= 0 && magf == 1));
+    s32 maxlod = (s32)bits(mode1, 8, 8), minlod = (s32)bits(mode1, 0, 8);
+    if (lod > maxlod) lod = maxlod; else if (lod < minlod) lod = minlod;
+    *lodp = lod;
+    (void)t;
+}
+
+static void build_block(Tev* t, s32 bx, s32 by) {
+    u32 numtexgens = gm_numtexgens();
+    for (s32 yi = 0; yi < BLK; yi++) {
+        for (s32 xi = 0; xi < BLK; xi++) {
+            RBPixel* p = &s_rb[xi][yi];
+            s32 x = xi + bx, y = yi + by;
+            float invW = 1.0f / slope_value(&s_WSlope, x, y);
+            p->InvW = invW;
+            for (u32 i = 0; i < numtexgens; i++) {
+                float projection = invW;
+                float q = slope_value(&s_TexSlopes[i][2], x, y) * invW;
+                if (q != 0.0f) projection = invW / q;
+                p->Uv[i][0] = slope_value(&s_TexSlopes[i][0], x, y) * projection;
+                p->Uv[i][1] = slope_value(&s_TexSlopes[i][1], x, y) * projection;
+            }
+        }
+    }
+    u32 last = gm_numtevstages();
+    for (u32 i = 0; i <= last; i++) {
+        u32 s2 = i >> 1, odd = i & 1;
+        u32 order = s_bp[0x28 + s2];
+        u32 enable = odd ? bits(order, 18, 1) : bits(order, 6, 1);
+        if (enable) {
+            u32 texmap = odd ? bits(order, 12, 3) : bits(order, 0, 3);
+            u32 texcoord = odd ? bits(order, 15, 3) : bits(order, 3, 3);
+            if (texcoord >= numtexgens) texcoord = 0;
+            calc_lod(t, &t->TextureLod[i], &t->TextureLinear[i], texmap, texcoord);
+        }
+    }
+}
+
+static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
+    s32 z = (s32)slope_value(&s_ZSlope, x, y);
+    if (z < 0) z = 0; else if (z > 16777215) z = 16777215;
+
+    if (zm_test_enable() && early_ztest()) {
+        if (!ZCompare((u16)x, (u16)y, (u32)z)) return;
+    }
+    RBPixel* p = &s_rb[xi][yi];
+    t->Position[0] = x; t->Position[1] = y; t->Position[2] = z;
+    for (u32 i = 0; i < gm_numcolchans(); i++)
+        for (int comp = 0; comp < 4; comp++) {
+            float c = slope_value(&s_ColorSlopes[i][comp], x, y);
+            s16 cc = (s16)(c < 0 ? 0 : c > 255 ? 255 : c);
+            t->Color[i][comp] = (u8)cc;
+        }
+    for (u32 i = 0; i < gm_numtexgens(); i++) {
+        t->UvS[i] = (s32)(p->Uv[i][0] * 128.0f);
+        t->UvT[i] = (s32)(p->Uv[i][1] * 128.0f);
+    }
+    tev_draw(t);   /* runs the combiner, late-Z, alpha test, then blends */
+}
+
+static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
+                          s32 x_off, s32 y_off) {
+    /* zfreeze is off for the menu; recompute each triangle. */
+    s32 X1 = iround(16.0f * (v0->screenPosition[0] - x_off)) - 9;
+    s32 Y1 = iround(16.0f * (v0->screenPosition[1] - y_off)) - 9;
+    SlopeCtx ctx = make_ctx(v0, v1, v2, (X1 + 0xF) >> 4, (Y1 + 0xF) >> 4, x_off, y_off);
+    s_ZSlope = make_slope(v0->screenPosition[2], v1->screenPosition[2], v2->screenPosition[2], &ctx);
+}
+
+static void draw_triangle(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
+    s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
+    update_zslope(v0, v1, v2, x_off, y_off);
+
+    s32 Y1 = iround(16.0f * (v0->screenPosition[1] - y_off)) - 9;
+    s32 Y2 = iround(16.0f * (v1->screenPosition[1] - y_off)) - 9;
+    s32 Y3 = iround(16.0f * (v2->screenPosition[1] - y_off)) - 9;
+    s32 X1 = iround(16.0f * (v0->screenPosition[0] - x_off)) - 9;
+    s32 X2 = iround(16.0f * (v1->screenPosition[0] - x_off)) - 9;
+    s32 X3 = iround(16.0f * (v2->screenPosition[0] - x_off)) - 9;
+
+    s32 DX12 = X1 - X2, DX23 = X2 - X3, DX31 = X3 - X1;
+    s32 DY12 = Y1 - Y2, DY23 = Y2 - Y3, DY31 = Y3 - Y1;
+    s32 FDX12 = DX12 * 16, FDX23 = DX23 * 16, FDX31 = DX31 * 16;
+    s32 FDY12 = DY12 * 16, FDY23 = DY23 * 16, FDY31 = DY31 * 16;
+
+    s32 minx = (((X1 < X2 ? X1 : X2) < X3 ? (X1 < X2 ? X1 : X2) : X3) + 0xF) >> 4;
+    s32 maxx = (((X1 > X2 ? X1 : X2) > X3 ? (X1 > X2 ? X1 : X2) : X3) + 0xF) >> 4;
+    s32 miny = (((Y1 < Y2 ? Y1 : Y2) < Y3 ? (Y1 < Y2 ? Y1 : Y2) : Y3) + 0xF) >> 4;
+    s32 maxy = (((Y1 > Y2 ? Y1 : Y2) > Y3 ? (Y1 > Y2 ? Y1 : Y2) : Y3) + 0xF) >> 4;
+
+    if (minx < s_scissor_left)   minx = s_scissor_left;
+    if (maxx > s_scissor_right)  maxx = s_scissor_right;
+    if (miny < s_scissor_top)    miny = s_scissor_top;
+    if (maxy > s_scissor_bottom) maxy = s_scissor_bottom;
+    if (minx >= maxx || miny >= maxy) return;
+
+    SlopeCtx ctx = make_ctx(v0, v1, v2, (X1 + 0xF) >> 4, (Y1 + 0xF) >> 4, x_off, y_off);
+    float w[3] = { 1.0f / v0->projectedPosition[3], 1.0f / v1->projectedPosition[3],
+                   1.0f / v2->projectedPosition[3] };
+    s_WSlope = make_slope(w[0], w[1], w[2], &ctx);
+    for (u32 i = 0; i < gm_numcolchans(); i++)
+        for (int comp = 0; comp < 4; comp++)
+            s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
+                                                v2->color[i][comp], &ctx);
+    for (u32 i = 0; i < gm_numtexgens(); i++) {
+        s_TexSlopes[i][0] = make_slope(v0->texCoords[i][0]*w[0], v1->texCoords[i][0]*w[1], v2->texCoords[i][0]*w[2], &ctx);
+        s_TexSlopes[i][1] = make_slope(v0->texCoords[i][1]*w[0], v1->texCoords[i][1]*w[1], v2->texCoords[i][1]*w[2], &ctx);
+        s_TexSlopes[i][2] = make_slope(v0->texCoords[i][2]*w[0], v1->texCoords[i][2]*w[1], v2->texCoords[i][2]*w[2], &ctx);
+    }
+
+    s32 C1 = DY12 * X1 - DX12 * Y1;
+    s32 C2 = DY23 * X2 - DX23 * Y2;
+    s32 C3 = DY31 * X3 - DX31 * Y3;
+    if (DY12 < 0 || (DY12 == 0 && DX12 > 0)) C1++;
+    if (DY23 < 0 || (DY23 == 0 && DX23 > 0)) C2++;
+    if (DY31 < 0 || (DY31 == 0 && DX31 > 0)) C3++;
+
+    s32 block_minx = minx & ~(BLK - 1);
+    s32 block_miny = miny & ~(BLK - 1);
+    for (s32 y = block_miny; y < maxy; y += BLK) {
+        for (s32 x = block_minx; x < maxx; x += BLK) {
+            s32 x1_ = x + BLK - 1, y1_ = y + BLK - 1;
+            s32 x0 = x << 4, xx1 = x1_ << 4, y0 = y << 4, yy1 = y1_ << 4;
+            int a00 = C1 + DX12 * y0 - DY12 * x0 > 0, a10 = C1 + DX12 * y0 - DY12 * xx1 > 0;
+            int a01 = C1 + DX12 * yy1 - DY12 * x0 > 0, a11 = C1 + DX12 * yy1 - DY12 * xx1 > 0;
+            int a = (a00) | (a10 << 1) | (a01 << 2) | (a11 << 3);
+            int b00 = C2 + DX23 * y0 - DY23 * x0 > 0, b10 = C2 + DX23 * y0 - DY23 * xx1 > 0;
+            int b01 = C2 + DX23 * yy1 - DY23 * x0 > 0, b11 = C2 + DX23 * yy1 - DY23 * xx1 > 0;
+            int bb = (b00) | (b10 << 1) | (b01 << 2) | (b11 << 3);
+            int c00 = C3 + DX31 * y0 - DY31 * x0 > 0, c10 = C3 + DX31 * y0 - DY31 * xx1 > 0;
+            int c01 = C3 + DX31 * yy1 - DY31 * x0 > 0, c11 = C3 + DX31 * yy1 - DY31 * xx1 > 0;
+            int cc = (c00) | (c10 << 1) | (c01 << 2) | (c11 << 3);
+            if (a == 0 || bb == 0 || cc == 0) continue;
+
+            build_block(t, x, y);
+            if (a == 0xF && bb == 0xF && cc == 0xF && x >= minx && x1_ < maxx && y >= miny && y1_ < maxy) {
+                for (s32 iy = 0; iy < BLK; iy++)
+                    for (s32 ix = 0; ix < BLK; ix++)
+                        raster_pixel(t, x + ix, y + iy, ix, iy);
+            } else {
+                s32 CY1 = C1 + DX12 * y0 - DY12 * x0;
+                s32 CY2 = C2 + DX23 * y0 - DY23 * x0;
+                s32 CY3 = C3 + DX31 * y0 - DY31 * x0;
+                for (s32 iy = 0; iy < BLK; iy++) {
+                    s32 CX1 = CY1, CX2 = CY2, CX3 = CY3;
+                    for (s32 ix = 0; ix < BLK; ix++) {
+                        if (CX1 > 0 && CX2 > 0 && CX3 > 0) {
+                            if (x + ix >= minx && x + ix < maxx && y + iy >= miny && y + iy < maxy)
+                                raster_pixel(t, x + ix, y + iy, ix, iy);
+                        }
+                        CX1 -= FDY12; CX2 -= FDY23; CX3 -= FDY31;
+                    }
+                    CY1 += FDX12; CY2 += FDX23; CY3 += FDX31;
+                }
+            }
+        }
+    }
+}
+
+/* ============================================================================
+ * Clipper (Clipper.cpp): trivial-reject, cull, clip, perspective-divide, draw.
+ * ==========================================================================*/
+enum { CLIP_POS_X = 1, CLIP_NEG_X = 2, CLIP_POS_Y = 4, CLIP_NEG_Y = 8, CLIP_POS_Z = 16, CLIP_NEG_Z = 32 };
+
+static int calc_clip_mask(const OutVtx* v) {
+    int m = 0;
+    float x = v->projectedPosition[0], y = v->projectedPosition[1];
+    float z = v->projectedPosition[2], w = v->projectedPosition[3];
+    if (w - x < 0) m |= CLIP_POS_X;
+    if (x + w < 0) m |= CLIP_NEG_X;
+    if (w - y < 0) m |= CLIP_POS_Y;
+    if (y + w < 0) m |= CLIP_NEG_Y;
+    if (w * z > 0) m |= CLIP_POS_Z;
+    if (z + w < 0) m |= CLIP_NEG_Z;
+    return m;
+}
+static void vtx_lerp(OutVtx* o, float t, const OutVtx* a, const OutVtx* b) {
+#define LI(OUT, IN) ((OUT) + (((IN) - (OUT)) * t))
+    for (int i = 0; i < 3; i++) o->mvPosition[i] = LI(a->mvPosition[i], b->mvPosition[i]);
+    for (int i = 0; i < 4; i++) o->projectedPosition[i] = LI(a->projectedPosition[i], b->projectedPosition[i]);
+    for (int n = 0; n < 3; n++) for (int i = 0; i < 3; i++) o->normal[n][i] = LI(a->normal[n][i], b->normal[n][i]);
+    u16 ti = (u16)(t * 256);
+    for (int c = 0; c < 2; c++) for (int i = 0; i < 4; i++)
+        o->color[c][i] = (u8)(a->color[c][i] + (((int)b->color[c][i] - (int)a->color[c][i]) * ti >> 8));
+    for (int n = 0; n < 8; n++) for (int i = 0; i < 3; i++) o->texCoords[n][i] = LI(a->texCoords[n][i], b->texCoords[n][i]);
+#undef LI
+}
+
+static float vp_wd(void)  { return xf_f(0x101a); }
+static float vp_ht(void)  { return xf_f(0x101b); }
+static float vp_zr(void)  { return xf_f(0x101c); }
+static float vp_xo(void)  { return xf_f(0x101d); }
+static float vp_yo(void)  { return xf_f(0x101e); }
+static float vp_fz(void)  { return xf_f(0x101f); }
+
+static void perspective_divide(OutVtx* v) {
+    float wInv = 1.0f / v->projectedPosition[3];
+    v->screenPosition[0] = v->projectedPosition[0] * wInv * vp_wd() + vp_xo();
+    v->screenPosition[1] = v->projectedPosition[1] * wInv * vp_ht() + vp_yo();
+    v->screenPosition[2] = v->projectedPosition[2] * wInv * vp_zr() + vp_fz();
+}
+static int is_backface(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
+    float x0 = v0->projectedPosition[0], x1 = v1->projectedPosition[0], x2 = v2->projectedPosition[0];
+    float y0 = v0->projectedPosition[1], y1 = v1->projectedPosition[1], y2 = v2->projectedPosition[1];
+    float w0 = v0->projectedPosition[3], w1 = v1->projectedPosition[3], w2 = v2->projectedPosition[3];
+    float nz = (x0 * w2 - x2 * w0) * y1 + (x2 * y0 - x0 * y2) * w1 + (y2 * w0 - y0 * w2) * x1;
+    int backface = nz <= 0.0f;
+    if (vp_ht() > 0) backface = !backface;
+    return backface;
+}
+
+/* Storage for clipped vertices (Clipper.cpp NUM_CLIPPED_VERTICES=33). */
+#define NUM_CLIPPED 33
+static OutVtx  s_clipped[NUM_CLIPPED];
+static OutVtx* s_verts[NUM_CLIPPED + 3];
+
+static float clip_dot(int i, float A, float B, float C, float D) {
+    return s_verts[i]->projectedPosition[0] * A + s_verts[i]->projectedPosition[1] * B +
+           s_verts[i]->projectedPosition[2] * C + s_verts[i]->projectedPosition[3] * D;
+}
+static int s_numVertices;
+static void add_interp(float t, int out, int in) {
+    vtx_lerp(s_verts[s_numVertices++], t, s_verts[out], s_verts[in]);
+}
+#define DIFF_SIGNS(x, y) (((x) <= 0 && (y) > 0) || ((x) > 0 && (y) <= 0))
+
+static void clip_triangle(int* indices, int* numIndices, int mask) {
+    int vlist[2][2 * 6 + 1];
+    int* inlist = vlist[0];
+    int* outlist = vlist[1];
+    int n = 3;
+    s_numVertices = 3;
+    inlist[0] = 0; inlist[1] = 1; inlist[2] = 2;
+    indices[0] = indices[1] = indices[2] = -1;
+
+    static const struct { int bit; float A, B, C, D; } planes[6] = {
+        { CLIP_POS_X, -1, 0, 0, 1 }, { CLIP_NEG_X, 1, 0, 0, 1 },
+        { CLIP_POS_Y, 0, -1, 0, 1 }, { CLIP_NEG_Y, 0, 1, 0, 1 },
+        { CLIP_POS_Z, 0, 0, 0, 1 },  { CLIP_NEG_Z, 0, 0, 1, 1 },
+    };
+    for (int pl = 0; pl < 6; pl++) {
+        if (!(mask & planes[pl].bit)) continue;
+        float A = planes[pl].A, B = planes[pl].B, C = planes[pl].C, D = planes[pl].D;
+        int idxPrev = inlist[0];
+        float dpPrev = clip_dot(idxPrev, A, B, C, D);
+        int outcount = 0;
+        inlist[n] = inlist[0];
+        for (int j = 1; j <= n; j++) {
+            int idx = inlist[j];
+            float dp = clip_dot(idx, A, B, C, D);
+            if (dpPrev >= 0) outlist[outcount++] = idxPrev;
+            if (DIFF_SIGNS(dp, dpPrev)) {
+                if (dp < 0) { float t = dp / (dp - dpPrev); add_interp(t, idx, idxPrev); }
+                else        { float t = dpPrev / (dpPrev - dp); add_interp(t, idxPrev, idx); }
+                outlist[outcount++] = s_numVertices - 1;
+            }
+            idxPrev = idx; dpPrev = dp;
+        }
+        if (outcount < 3) return;   /* fully clipped (indices left as -1) */
+        int* tmp = inlist; inlist = outlist; outlist = tmp; n = outcount;
+    }
+    indices[0] = inlist[0]; indices[1] = inlist[1]; indices[2] = inlist[2];
+    for (int j = 3; j < n; ++j) {
+        indices[(*numIndices)++] = inlist[0];
+        indices[(*numIndices)++] = inlist[j - 1];
+        indices[(*numIndices)++] = inlist[j];
+    }
+}
+
+static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
+    int m = calc_clip_mask(v0) & calc_clip_mask(v1) & calc_clip_mask(v2);
+    if (m != 0) return;   /* trivially rejected */
+
+    int backface = is_backface(v0, v1, v2);
+    u32 cull = gm_cull_mode();
+    if (!backface) { if (cull == 1 || cull == 3) return; }   /* cull Back/All */
+    else           { if (cull == 2 || cull == 3) return; }   /* cull Front/All */
+
+    for (int i = 3; i < NUM_CLIPPED + 3; i++) s_verts[i] = &s_clipped[i - 3];
+    int indices[NUM_CLIPPED + 3];
+    for (int i = 0; i < NUM_CLIPPED + 3; i++) indices[i] = -1;
+    indices[0] = 0; indices[1] = 1; indices[2] = 2;
+    int numIndices = 3;
+
+    if (backface) { s_verts[0] = v0; s_verts[1] = v2; s_verts[2] = v1; }
+    else          { s_verts[0] = v0; s_verts[1] = v1; s_verts[2] = v2; }
+
+    int mask = calc_clip_mask(s_verts[0]) | calc_clip_mask(s_verts[1]) | calc_clip_mask(s_verts[2]);
+    if (mask != 0) clip_triangle(indices, &numIndices, mask);
+
+    for (int i = 0; i + 3 <= numIndices; i += 3) {
+        if (indices[i] == -1) continue;
+        perspective_divide(s_verts[indices[i]]);
+        perspective_divide(s_verts[indices[i + 1]]);
+        perspective_divide(s_verts[indices[i + 2]]);
+        draw_triangle(t, s_verts[indices[i]], s_verts[indices[i + 1]], s_verts[indices[i + 2]]);
+    }
+}
+
+/* ============================================================================
+ * Transform (TransformUnit.cpp).
+ * ==========================================================================*/
+typedef struct {
+    float position[3];
+    float normal[3][3];
+    u8    color[2][4];    /* [chan][R,G,B,A] */
+    float texCoords[8][2];
+    u8    posMtx;
+    u8    texMtx[8];
+} InVtx;
+
+static void mul_vec3_mat34(const float* v, const float* m, float* r) {
+    r[0] = m[0]*v[0] + m[1]*v[1] + m[2]*v[2] + m[3];
+    r[1] = m[4]*v[0] + m[5]*v[1] + m[6]*v[2] + m[7];
+    r[2] = m[8]*v[0] + m[9]*v[1] + m[10]*v[2] + m[11];
+}
+static void mul_vec3_mat33(const float* v, const float* m, float* r) {
+    r[0] = m[0]*v[0] + m[1]*v[1] + m[2]*v[2];
+    r[1] = m[3]*v[0] + m[4]*v[1] + m[5]*v[2];
+    r[2] = m[6]*v[0] + m[7]*v[1] + m[8]*v[2];
+}
+static void mul_vec2_mat24(const float* v, const float* m, float* r) {
+    r[0] = m[0]*v[0] + m[1]*v[1] + m[2] + m[3];
+    r[1] = m[4]*v[0] + m[5]*v[1] + m[6] + m[7];
+    r[2] = 1.0f;
+}
+static void mul_vec3_mat24(const float* v, const float* m, float* r) {
+    r[0] = m[0]*v[0] + m[1]*v[1] + m[2]*v[2] + m[3];
+    r[1] = m[4]*v[0] + m[5]*v[1] + m[6]*v[2] + m[7];
+    r[2] = 1.0f;
+}
+static void mul_vec2_mat34(const float* v, const float* m, float* r) {
+    r[0] = m[0]*v[0] + m[1]*v[1] + m[2] + m[3];
+    r[1] = m[4]*v[0] + m[5]*v[1] + m[6] + m[7];
+    r[2] = m[8]*v[0] + m[9]*v[1] + m[10] + m[11];
+}
+static void mul_vec3_mat34_tex(const float* v, const float* m, float* r) { mul_vec3_mat34(v, m, r); }
+
+static void normalize3(float* v) {
+    float len = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (len > 0.0f) { v[0] /= len; v[1] /= len; v[2] /= len; }
+}
+
+/* pos/normal matrix pointers into XF float memory */
+static void get_posmat(u8 idx, float* m) { for (int i = 0; i < 12; i++) m[i] = xf_f((u32)idx * 4 + i); }
+static void get_normmat(u8 idx, float* m) { for (int i = 0; i < 9; i++) m[i] = xf_f(0x400 + (u32)(idx & 31) * 3 + i); }
+static void get_texmat(u8 idx, float* m) { for (int i = 0; i < 12; i++) m[i] = xf_f((u32)idx * 4 + i); }
+static void get_postmat(u8 idx, float* m) { for (int i = 0; i < 12; i++) m[i] = xf_f(0x500 + (u32)idx * 4 + i); }
+
+static void tf_position(const InVtx* in, OutVtx* out) {
+    float m[12]; get_posmat(in->posMtx, m);
+    mul_vec3_mat34(in->position, m, out->mvPosition);
+    u32 ptype = s_xf[0x1026];      /* ProjectionType (0 persp, 1 ortho) */
+    float p[6]; for (int i = 0; i < 6; i++) p[i] = xf_f(0x1020 + i);
+    if (ptype == 0) {              /* Perspective (MultipleVec3Perspective) */
+        out->projectedPosition[0] = p[0]*out->mvPosition[0] + p[1]*out->mvPosition[2];
+        out->projectedPosition[1] = p[2]*out->mvPosition[1] + p[3]*out->mvPosition[2];
+        out->projectedPosition[2] = (p[4]*out->mvPosition[2] + p[5]) * (1.0f - 1e-7f);
+        out->projectedPosition[3] = -out->mvPosition[2];
+    } else {                       /* Orthographic */
+        out->projectedPosition[0] = p[0]*out->mvPosition[0] + p[1];
+        out->projectedPosition[1] = p[2]*out->mvPosition[1] + p[3];
+        out->projectedPosition[2] = p[4]*out->mvPosition[2] + p[5];
+        out->projectedPosition[3] = 1.0f;
+    }
+}
+static void tf_normal(const InVtx* in, OutVtx* out) {
+    float m[9]; get_normmat(in->posMtx, m);
+    mul_vec3_mat33(in->normal[0], m, out->normal[0]);
+    mul_vec3_mat33(in->normal[1], m, out->normal[1]);
+    mul_vec3_mat33(in->normal[2], m, out->normal[2]);
+    normalize3(out->normal[0]);
+}
+
+/* Lighting (TransformUnit.cpp:204-314). One light per channel is in scope. */
+static float dot3(const float* a, const float* b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+static void light_ptr(int n, u8 col[4], float cosatt[3], float distatt[3], float pos[3], float dir[3]) {
+    u32 base = 0x600 + (u32)n * 16;
+    u32 c = s_xf[base + 3];
+    /* Light.color[4] overlays the host-order xfmem word (TransformUnit.cpp:194-
+     * 202): color[0]=byte0=alpha, color[1]=blue, color[2]=green, color[3]=red
+     * (word = R<<24|G<<16|B<<8|A). AddScaledIntegerColor uses color[1..3]. */
+    col[0] = (u8)c; col[1] = (u8)(c >> 8); col[2] = (u8)(c >> 16); col[3] = (u8)(c >> 24);
+    for (int i = 0; i < 3; i++) cosatt[i]  = xf_f(base + 4 + i);
+    for (int i = 0; i < 3; i++) distatt[i] = xf_f(base + 7 + i);
+    for (int i = 0; i < 3; i++) pos[i]     = xf_f(base + 10 + i);
+    for (int i = 0; i < 3; i++) dir[i]     = xf_f(base + 13 + i);
+}
+static float safe_div(float n, float d) { return (d == 0) ? (n > 0 ? 1 : 0) : n / d; }
+static float calc_light_attn(const float* lcol_dir, float* ldir, const float* normal,
+                             u32 attnfunc, u32 diffusefunc,
+                             const float* cosatt, const float* distatt, const float* ldir_light) {
+    float attn = 1.0f;
+    (void)lcol_dir;
+    switch (attnfunc) {
+    case 0: case 2: {   /* None / Dir */
+        normalize3(ldir);
+        if (ldir[0] == 0 && ldir[1] == 0 && ldir[2] == 0) { ldir[0]=normal[0]; ldir[1]=normal[1]; ldir[2]=normal[2]; }
+        break;
+    }
+    case 1: {           /* Spec */
+        normalize3(ldir);
+        attn = dot3(ldir, normal) >= 0.0f ? (dot3(ldir_light, normal) > 0 ? dot3(ldir_light, normal) : 0) : 0;
+        float attLen[3] = { 1.0f, attn, attn*attn };
+        float cA = cosatt[0]*attLen[0] + cosatt[1]*attLen[1] + cosatt[2]*attLen[2];
+        float dA;
+        if (diffusefunc != 0) {
+            float d[3] = { distatt[0], distatt[1], distatt[2] }; normalize3(d);
+            dA = d[0]*attLen[0] + d[1]*attLen[1] + d[2]*attLen[2];
+        } else {
+            dA = distatt[0]*attLen[0] + distatt[1]*attLen[1] + distatt[2]*attLen[2];
+        }
+        attn = safe_div(cA > 0 ? cA : 0, dA);
+        break;
+    }
+    case 3: {           /* Spot */
+        float dist2 = dot3(ldir, ldir);
+        float dist = sqrtf(dist2);
+        ldir[0] /= dist; ldir[1] /= dist; ldir[2] /= dist;
+        attn = dot3(ldir, ldir_light); if (attn < 0) attn = 0;
+        float cA = cosatt[0] + cosatt[1]*attn + cosatt[2]*attn*attn;
+        float dA = distatt[0] + distatt[1]*dist + distatt[2]*dist2;
+        attn = safe_div(cA > 0 ? cA : 0, dA);
+        break;
+    }
+    default: TRAP(attn, "invalid attnfunc"); break;
+    }
+    return attn;
+}
+static void light_color(const float* pos, const float* normal, int lnum, u32 diffusefunc,
+                        u32 attnfunc, float* lightCol) {
+    u8 col[4]; float cosatt[3], distatt[3], lpos[3], ldirL[3];
+    light_ptr(lnum, col, cosatt, distatt, lpos, ldirL);
+    float ldir[3] = { lpos[0]-pos[0], lpos[1]-pos[1], lpos[2]-pos[2] };
+    float attn = calc_light_attn(NULL, ldir, normal, attnfunc, diffusefunc, cosatt, distatt, ldirL);
+    float difAttn = dot3(ldir, normal);
+    switch (diffusefunc) {
+    case 0: lightCol[0]+=col[1]*attn; lightCol[1]+=col[2]*attn; lightCol[2]+=col[3]*attn; break;
+    case 1: lightCol[0]+=col[1]*attn*difAttn; lightCol[1]+=col[2]*attn*difAttn; lightCol[2]+=col[3]*attn*difAttn; break;
+    default: if (difAttn < 0) difAttn = 0;
+             lightCol[0]+=col[1]*attn*difAttn; lightCol[1]+=col[2]*attn*difAttn; lightCol[2]+=col[3]*attn*difAttn; break;
+    }
+}
+static void light_alpha(const float* pos, const float* normal, int lnum, u32 diffusefunc,
+                        u32 attnfunc, float* lightCol) {
+    u8 col[4]; float cosatt[3], distatt[3], lpos[3], ldirL[3];
+    light_ptr(lnum, col, cosatt, distatt, lpos, ldirL);
+    float ldir[3] = { lpos[0]-pos[0], lpos[1]-pos[1], lpos[2]-pos[2] };
+    float attn = calc_light_attn(NULL, ldir, normal, attnfunc, diffusefunc, cosatt, distatt, ldirL);
+    float difAttn = dot3(ldir, normal);
+    switch (diffusefunc) {
+    case 0: *lightCol += col[0]*attn; break;
+    case 1: *lightCol += col[0]*attn*difAttn; break;
+    default: if (difAttn < 0) difAttn = 0; *lightCol += col[0]*attn*difAttn; break;
+    }
+}
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void tf_color(const InVtx* in, OutVtx* out) {
+    (void)in;   /* no per-vertex color in scope; material comes from XF regs */
+    u32 numchan = gm_numcolchans();
+    for (u32 chan = 0; chan < 2; chan++) {
+        u32 colorreg = s_xf[0x100e + chan];   /* LitChannel color */
+        u32 alphareg = s_xf[0x1010 + chan];   /* LitChannel alpha */
+        /* matcolor as [R,G,B,A]-ish; the SW backend treats matcolor as
+         * [A,B,G,R]? Actually indices [1..3]=B,G,R, [0]=A. matColor reg word. */
+        u32 matc = s_xf[0x100c + chan];
+        u8 matcolor[4];   /* index: 0=A,1=B,2=G,3=R (abgr) */
+        matcolor[0] = (u8)matc; matcolor[1] = (u8)(matc >> 8);
+        matcolor[2] = (u8)(matc >> 16); matcolor[3] = (u8)(matc >> 24);
+        if (bits(colorreg, 0, 1) != 0) { TRAP(vtxcolor, "vertex material color (no color attr)"); }
+
+        u8 chancolor[4];
+        if (bits(colorreg, 1, 1)) {   /* enablelighting */
+            float lightCol[3];
+            if (bits(colorreg, 6, 1)) {   /* ambsource == Vertex */
+                TRAP(ambvtx, "vertex ambient color");
+                lightCol[0] = lightCol[1] = lightCol[2] = 0;
+            } else {
+                u32 amb = s_xf[0x100a + chan];
+                lightCol[0] = (float)((amb >> 8) & 0xff);   /* b? follows abgr idx1..3 */
+                lightCol[1] = (float)((amb >> 16) & 0xff);
+                lightCol[2] = (float)((amb >> 24) & 0xff);
+            }
+            u32 mask = bits(colorreg, 1, 1) ? (bits(colorreg, 2, 4) | (bits(colorreg, 11, 4) << 4)) : 0;
+            u32 diffusefunc = bits(colorreg, 7, 2), attnfunc = bits(colorreg, 9, 2);
+            for (int i = 0; i < 8; i++)
+                if (mask & (1 << i)) light_color(out->mvPosition, out->normal[0], i, diffusefunc, attnfunc, lightCol);
+            int lx = clampi((int)lightCol[0], 0, 255);
+            int ly = clampi((int)lightCol[1], 0, 255);
+            int lz = clampi((int)lightCol[2], 0, 255);
+            chancolor[1] = (u8)((matcolor[1] * (lx + (lx >> 7))) >> 8);
+            chancolor[2] = (u8)((matcolor[2] * (ly + (ly >> 7))) >> 8);
+            chancolor[3] = (u8)((matcolor[3] * (lz + (lz >> 7))) >> 8);
+        } else {
+            chancolor[1] = matcolor[1]; chancolor[2] = matcolor[2]; chancolor[3] = matcolor[3];
+        }
+
+        if (bits(alphareg, 0, 1) != 0) { TRAP(vtxalpha, "vertex material alpha"); }
+        u8 mata = (u8)matc;   /* matcolor alpha */
+        if (bits(alphareg, 1, 1)) {   /* alpha lighting */
+            float la;
+            if (bits(alphareg, 6, 1)) { TRAP(ambavtx, "vertex ambient alpha"); la = 0; }
+            else la = (float)(s_xf[0x100a + chan] & 0xff);
+            u32 mask = bits(alphareg, 2, 4) | (bits(alphareg, 11, 4) << 4);
+            u32 diffusefunc = bits(alphareg, 7, 2), attnfunc = bits(alphareg, 9, 2);
+            for (int i = 0; i < 8; i++)
+                if (mask & (1 << i)) light_alpha(out->mvPosition, out->normal[0], i, diffusefunc, attnfunc, &la);
+            int a = clampi((int)la, 0, 255);
+            chancolor[0] = (u8)((mata * (a + (a >> 7))) >> 8);
+        } else {
+            chancolor[0] = mata;
+        }
+
+        /* chancolor is abgr (0=A,1=B,2=G,3=R); store out as [R,G,B,A]. */
+        out->color[chan][0] = chancolor[3];   /* R */
+        out->color[chan][1] = chancolor[2];   /* G */
+        out->color[chan][2] = chancolor[1];   /* B */
+        out->color[chan][3] = chancolor[0];   /* A */
+        (void)numchan;
+    }
+}
+
+static void tf_texcoord(const InVtx* in, OutVtx* out) {
+    u32 numtexgens = s_xf[0x103f] & 0xf;
+    int dualtex = bits(s_xf[0x1012], 0, 1);
+    for (u32 c = 0; c < numtexgens; c++) {
+        u32 info = s_xf[0x1040 + c];
+        u32 texgentype = bits(info, 4, 3);
+        u32 sourcerow = bits(info, 7, 5);
+        u32 projection = bits(info, 1, 1);   /* TexSize: 0 ST, 1 STQ */
+        u32 inputform = bits(info, 2, 1);    /* 0 AB11, 1 ABC1 */
+        if (texgentype != 0) { TRAP(texgentype, "tex gen type != Regular"); continue; }
+
+        float src[3];
+        if (sourcerow == 0) { src[0]=in->position[0]; src[1]=in->position[1]; src[2]=in->position[2]; }
+        else if (sourcerow == 1) { src[0]=out->normal[0][0]; src[1]=out->normal[0][1]; src[2]=out->normal[0][2]; }
+        else if (sourcerow >= 5 && sourcerow <= 12) {
+            u32 tn = sourcerow - 5;
+            src[0] = out->texCoords[tn][0]; src[1] = out->texCoords[tn][1]; src[2] = 1.0f;
+            /* texCoords not yet transformed for source; use input tex coords */
+            src[0] = in->texCoords[tn][0]; src[1] = in->texCoords[tn][1]; src[2] = 1.0f;
+        } else { TRAP(texsrcrow, "tex source row (binormal)"); src[0]=src[1]=0; src[2]=1; }
+
+        float m[12]; get_texmat(in->texMtx[c], m);
+        float* dst = out->texCoords[c];
+        if (projection == 0) {   /* ST */
+            if (inputform == 0) mul_vec2_mat24(src, m, dst);
+            else                mul_vec3_mat24(src, m, dst);
+        } else {                 /* STQ */
+            if (inputform == 0) mul_vec2_mat34(src, m, dst);
+            else                mul_vec3_mat34_tex(src, m, dst);
+        }
+        if (dualtex) {
+            u32 pinfo = s_xf[0x1050 + c];
+            u32 pidx = bits(pinfo, 0, 6);
+            int norm = bits(pinfo, 8, 1);
+            float tmp[3];
+            if (norm) { tmp[0]=dst[0]; tmp[1]=dst[1]; tmp[2]=dst[2]; normalize3(tmp); }
+            else { tmp[0]=dst[0]; tmp[1]=dst[1]; tmp[2]=dst[2]; }
+            float pm[12]; get_postmat((u8)pidx, pm);
+            mul_vec3_mat34(tmp, pm, dst);
+        }
+        if (dst[2] == 0.0f) {
+            float x = dst[0] / 2.0f, y = dst[1] / 2.0f;
+            dst[0] = x < -1 ? -1 : x > 1 ? 1 : x;
+            dst[1] = y < -1 ? -1 : y > 1 ? 1 : y;
+        }
+    }
+    /* texcoord scale (TransformUnit.cpp:445-449): *= texcoords[i].{s,t}.scale_minus_1+1 */
+    for (u32 c = 0; c < numtexgens; c++) {
+        u32 s_scale = bits(s_bp[0x30 + c * 2], 0, 16) + 1;
+        u32 t_scale = bits(s_bp[0x31 + c * 2], 0, 16) + 1;
+        out->texCoords[c][0] *= (float)s_scale;
+        out->texCoords[c][1] *= (float)t_scale;
+    }
+}
+
+/* ============================================================================
+ * Vertex loader — parse the display-list vertex payload into InVtx, honoring
+ * the recorded indexed formats (Position float / Normal short / TexCoord0
+ * short). Direct attrs, per-vertex color, and unexpected formats trap.
+ * ==========================================================================*/
+enum { VCF_NONE = 0, VCF_DIRECT = 1, VCF_INDEX8 = 2, VCF_INDEX16 = 3 };
+
+/* returns index value + advances *off; width 1 or 2 bytes. */
+static u32 read_index(const u8* v, u32* off, u32 type) {
+    if (type == VCF_INDEX8)  { u32 i = v[*off]; *off += 1; return i; }
+    else                     { u32 i = be_u16(&v[*off]); *off += 2; return i; }
+}
+static const u8* array_ptr(const GxCpState* cp, u32 arr, u32 index, u32 need) {
+    u32 stride = cp->array_strides[arr];
+    u32 base = cp->array_bases[arr] & 0x1FFFFFFFu;
+    u64 addr = (u64)base + (u64)index * stride;
+    if (!s_cpu || !s_cpu->ram || addr + need > (u64)s_cpu->ram_size) return NULL;
+    return s_cpu->ram + addr;
+}
+
+static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, InVtx* out) {
+    u32 low = cp->vtx_desc_lo, high = cp->vtx_desc_hi;
+    u32 g0 = cp->vat_g0[vat];
+    u32 off = 0;
+    memset(out, 0, sizeof *out);
+
+    /* matrix indices (bits 0-8) — none present in the IPL frame. */
+    if (low & 1) { out->posMtx = v[off++]; }
+    else { out->posMtx = (u8)bits(cp->matrix_index_a, 0, 6); }
+    for (int tt = 0; tt < 8; tt++) {
+        if ((low >> (1 + tt)) & 1) out->texMtx[tt] = v[off++];
+        else if (tt < 4) out->texMtx[tt] = (u8)bits(cp->matrix_index_a, 6 + tt * 6, 6);
+        else out->texMtx[tt] = (u8)bits(cp->matrix_index_b, (tt - 4) * 6, 6);
+    }
+
+    /* position (Index only; float XYZ) */
+    u32 postype = (low >> 9) & 3;
+    u32 posfmt = (g0 >> 1) & 7, poselem = g0 & 1;
+    if (postype == VCF_NONE) { TRAP(nopos, "vertex without position"); return 0; }
+    if (postype == VCF_DIRECT) { TRAP(directpos, "direct position attribute"); return 0; }
+    if (posfmt != 4) { TRAP(posfmt, "position format != float"); return 0; }
+    {
+        u32 idx = read_index(v, &off, postype);
+        u32 n = poselem ? 3 : 2;
+        const u8* p = array_ptr(cp, 0, idx, n * 4);
+        if (!p) { TRAP(posoob, "position array out of MEM1"); return 0; }
+        out->position[0] = be_f32(p);
+        out->position[1] = be_f32(p + 4);
+        out->position[2] = (n == 3) ? be_f32(p + 8) : 0.0f;
+    }
+
+    /* normal (Index only; short, /2^14 per FracAdjust) */
+    u32 normtype = (low >> 11) & 3;
+    if (normtype != VCF_NONE) {
+        u32 normfmt = (g0 >> 10) & 7, normelem = (g0 >> 9) & 1;
+        if (normtype == VCF_DIRECT) { TRAP(directnorm, "direct normal attribute"); return 0; }
+        if (normfmt != 3) { TRAP(normfmt, "normal format != short"); return 0; }
+        if (normelem != 0) { TRAP(normntb, "normal NTB (tangent/binormal)"); return 0; }
+        u32 idx = read_index(v, &off, normtype);
+        const u8* p = array_ptr(cp, 1, idx, 6);
+        if (!p) { TRAP(normoob, "normal array out of MEM1"); return 0; }
+        out->normal[0][0] = be_s16(p)     / (float)(1 << 14);
+        out->normal[0][1] = be_s16(p + 2) / (float)(1 << 14);
+        out->normal[0][2] = be_s16(p + 4) / (float)(1 << 14);
+    }
+
+    /* color0/color1 — not present in scope */
+    if (((low >> 13) & 3) != VCF_NONE) { TRAP(color0, "color0 attribute present"); return 0; }
+    if (((low >> 15) & 3) != VCF_NONE) { TRAP(color1, "color1 attribute present"); return 0; }
+
+    /* tex coords (Index only; short * tcScale) */
+    for (int tc = 0; tc < 8; tc++) {
+        u32 tctype = (high >> (2 * tc)) & 3;
+        if (tctype == VCF_NONE) continue;
+        if (tctype == VCF_DIRECT) { TRAP(directtc, "direct texcoord attribute"); return 0; }
+        /* VAT tex fields (only tc0 in scope). */
+        u32 fmt, elem, frac;
+        if (tc == 0) { elem = (g0 >> 21) & 1; fmt = (g0 >> 22) & 7; frac = (g0 >> 25) & 0x1f; }
+        else { TRAP(tcgt0, "texcoord index > 0"); return 0; }
+        if (fmt != 3) { TRAP(tcfmt, "texcoord format != short"); return 0; }
+        u32 n = elem ? 2 : 1;
+        float scale = 1.0f / (float)(1u << frac);
+        u32 idx = read_index(v, &off, tctype);
+        const u8* p = array_ptr(cp, 4 + tc, idx, n * 2);
+        if (!p) { TRAP(tcoob, "texcoord array out of MEM1"); return 0; }
+        out->texCoords[tc][0] = be_s16(p) * scale;
+        out->texCoords[tc][1] = (n == 2) ? be_s16(p + 2) * scale : 0.0f;
+    }
+
+    (void)vstride;
+    return 1;
+}
+
+/* ============================================================================
+ * Setup unit (triangle fan) + public draw.
+ * ==========================================================================*/
+static void recompute_scissor(void) {
+    /* ComputeScissorRects Best() — pick the rect with the largest viewport area,
+     * tie-broken by total area (BPFunctions.cpp:43-172). */
+    u32 tl = s_bp[0x20], br = s_bp[0x21], soff = s_bp[0x59];
+    int left = (int)bits(tl, 12, 11);   /* ScissorPos.x */
+    int top  = (int)bits(tl, 0, 11);    /* ScissorPos.y */
+    int right = (int)bits(br, 12, 11);
+    int bottom = (int)bits(br, 0, 11);
+    int xoff = (int)bits(soff, 0, 9) << 1;
+    int yoff = (int)bits(soff, 10, 9) << 1;
+
+    s_scissor_left = 0; s_scissor_top = 0; s_scissor_right = 0; s_scissor_bottom = 0;
+    s_scissor_xoff = 0; s_scissor_yoff = 0;
+    if (left > right || top > bottom) return;
+
+    float vx0 = vp_xo() - vp_wd(), vx1 = vp_xo() + vp_wd();
+    if (vx0 > vx1) { float t = vx0; vx0 = vx1; vx1 = t; }
+    float vy0 = vp_yo() - vp_ht(), vy1 = vp_yo() + vp_ht();
+    if (vy0 > vy1) { float t = vy0; vy0 = vy1; vy1 = t; }
+
+    long best_vp = -1, best_area = -1;
+    for (int ex = -4096; ex <= 4096; ex += 1024) {
+        int nx = xoff + ex;
+        int xs = clampi(left - nx, 0, (int)EFB_WIDTH);
+        int xe = clampi(right - nx + 1, 0, (int)EFB_WIDTH);
+        if (xs >= xe) continue;
+        for (int ey = -4096; ey <= 4096; ey += 1024) {
+            int ny = yoff + ey;
+            int ys = clampi(top - ny, 0, (int)EFB_HEIGHT);
+            int ye = clampi(bottom - ny + 1, 0, (int)EFB_HEIGHT);
+            if (ys >= ye) continue;
+            int vpx0 = clampi(xs + nx, (int)vx0, (int)vx1);
+            int vpx1 = clampi(xe + nx, (int)vx0, (int)vx1);
+            int vpy0 = clampi(ys + ny, (int)vy0, (int)vy1);
+            int vpy1 = clampi(ye + ny, (int)vy0, (int)vy1);
+            long vparea = (long)(vpx1 - vpx0) * (vpy1 - vpy0);
+            long area = (long)(xe - xs) * (ye - ys);
+            if (vparea > best_vp || (vparea == best_vp && area > best_area)) {
+                best_vp = vparea; best_area = area;
+                s_scissor_left = xs; s_scissor_right = xe;
+                s_scissor_top = ys; s_scissor_bottom = ye;
+                s_scissor_xoff = nx; s_scissor_yoff = ny;
+            }
+        }
+    }
+}
+
+void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
+                    const u8* verts, u32 nverts, u32 vstride) {
+    if (prim != 4) { TRAP(nonfan, "primitive != TRIANGLE_FAN"); return; }
+    if (vat != 0)  { TRAP(nonvat0, "VAT index != 0"); }
+    if (nverts < 3) return;
+
+    recompute_scissor();
+    tev_load_registers(&s_tev);
+
+    /* SetupUnit triangle-fan assembly (SetupUnit.cpp:12-130), transcribed with
+     * the same VertPointer juggling: v0 stays fixed, pv[1]/pv[2] alternate. The
+     * write pointer receives the freshly transformed vertex before SetupVertex. */
+    OutVtx store[3];
+    OutVtx* pv[3] = { &store[0], &store[1], &store[2] };
+    OutVtx* writep = pv[0];
+    u32 counter = 0;
+
+    for (u32 i = 0; i < nverts; i++) {
+        InVtx in;
+        if (!load_vertex(cp, vat, verts + (u64)i * vstride, vstride, &in)) return;
+
+        memset(writep, 0, sizeof *writep);        /* GetVertex() memsets */
+        tf_position(&in, writep);
+        tf_normal(&in, writep);
+        tf_color(&in, writep);
+        tf_texcoord(&in, writep);
+
+        /* SetupTriFan (SetupUnit.cpp:114-130). */
+        if (counter < 2) { counter++; writep = pv[counter]; continue; }
+        process_triangle(&s_tev, pv[0], pv[1], pv[2]);
+        counter++;
+        pv[1] = pv[2];
+        pv[2] = &store[2 - (counter & 1)];
+        writep = pv[2];
+    }
+}
+
+/* ============================================================================
+ * EFB copy (EfbCopy.cpp + SWEfbInterface.cpp EncodeXFB). copy-then-clear per
+ * BPStructs.cpp:240-395.
+ * ==========================================================================*/
+/* ConvertColorToYUV (SWEfbInterface.cpp:546-562). color = 0xRRGGBBAA. */
+static void color_to_yuv(u32 color, int* Y, int* U, int* V) {
+    int r = (int)((color >> 24) & 0xff);
+    int g = (int)((color >> 16) & 0xff);
+    int b = (int)((color >> 8) & 0xff);
+    int y = 66 * r + 129 * g + 25 * b;
+    int u = -38 * r - 74 * g + 112 * b;
+    int vv = 112 * r - 94 * g - 18 * b;
+    *Y = (u8)((y >> 8) + ((y >> 7) & 1));
+    *U = (s8)((u >> 8) + ((u >> 7) & 1));
+    *V = (s8)((vv >> 8) + ((vv >> 7) & 1));
+}
+
+static void efb_clear_rect(void) {
+    /* EfbCopy::ClearEfb (EfbCopy.cpp:16-34). */
+    u32 ar = s_bp[0x4f], gb = s_bp[0x50];
+    u32 clearColor = ((ar & 0xff) << 24) | (gb << 8) | ((ar & 0xff00) >> 8);
+    u32 clearZ = s_bp[0x51];
+    int left = (int)bits(s_bp[0x49], 0, 10);
+    int top  = (int)bits(s_bp[0x49], 10, 10);
+    int right = left + (int)bits(s_bp[0x4a], 0, 10);
+    int bottom = top + (int)bits(s_bp[0x4a], 10, 10);
+    if (right > (int)EFB_WIDTH - 1) right = (int)EFB_WIDTH - 1;
+    if (bottom > (int)EFB_HEIGHT - 1) bottom = (int)EFB_HEIGHT - 1;
+    u8 cc[4]; memcpy(cc, &clearColor, 4);
+    for (int y = top; y <= bottom; y++) {
+        for (int x = left; x <= right; x++) {
+            u32 off = (u32)x + (u32)y * EFB_WIDTH;
+            /* SetColor honors color_update/alpha_update. */
+            if (bm_color_update()) {
+                if (bm_alpha_update()) SetPixelAlphaColor(off, cc);
+                else                   SetPixelColorOnly(off, cc);
+            } else if (bm_alpha_update()) {
+                SetPixelAlphaOnly(off, cc[ALP_C]);
+            }
+            /* SetDepth honors zmode.update_enable. */
+            if (zm_update_enable()) SetPixelDepth(off, clearZ);
+        }
+    }
+}
+
+/* filtered YUV encode of one destination pixel column position x, EFB row y. */
+static u32 get_efb_color(int x, int y) {
+    if (x < 0) x = 0;
+    if (x >= (int)EFB_WIDTH) x = (int)EFB_WIDTH - 1;
+    if (y < 0) y = 0;
+    if (y >= (int)EFB_HEIGHT) y = (int)EFB_HEIGHT - 1;
+    return GetPixelColor((u32)x + (u32)y * EFB_WIDTH);
+}
+
+void gx_raster_efb_copy(const GxCpState* cp) {
+    (void)cp;
+    u32 copy = s_bp[0x52];
+    int clamp_top = bits(copy, 0, 1);
+    int clamp_bottom = bits(copy, 1, 1);
+    int scale_invert = bits(copy, 10, 1);
+    int clear = bits(copy, 11, 1);
+    int copy_to_xfb = bits(copy, 14, 1);
+    u32 gamma = bits(copy, 7, 2);
+
+    if (copy_to_xfb) {
+        int left = (int)bits(s_bp[0x49], 0, 10);
+        int top  = (int)bits(s_bp[0x49], 10, 10);
+        int wx = (int)bits(s_bp[0x4a], 0, 10);
+        int wy = (int)bits(s_bp[0x4a], 10, 10);
+        int right = left + wx + 1;         /* srcRect right (exclusive) */
+        int bottom = top + wy + 1;         /* srcRect bottom (exclusive) */
+
+        u32 dest_addr = s_bp[0x4b] << 5;
+        u32 dest_stride = s_bp[0x4d] << 5;  /* bytes */
+        u32 yscale_reg = s_bp[0x4e];
+        float yscale = scale_invert ? (yscale_reg ? 256.0f / (float)yscale_reg : 1.0f)
+                                    : (float)yscale_reg / 256.0f;
+        if (gamma != 0) TRAP(gammacopy, "EFB copy gamma != 1.0");
+
+        /* copy filter coefficients (bp 0x53 Low, 0x54 High). */
+        u32 flow = s_bp[0x53], fhigh = s_bp[0x54];
+        int w0 = bits(flow, 0, 6), w1 = bits(flow, 6, 6), w2 = bits(flow, 12, 6), w3 = bits(flow, 18, 6);
+        int w4 = bits(fhigh, 0, 6), w5 = bits(fhigh, 6, 6), w6 = bits(fhigh, 12, 6);
+
+        int src_w = right - left;
+        int src_h = bottom - top;
+        int dst_h = (int)(src_h * yscale);
+        if (src_w <= 0 || src_h <= 0 || dst_h <= 0) return;
+
+        u32 phys = dest_addr & 0x1FFFFFFFu;
+        u64 last = (u64)phys + (u64)(dst_h - 1) * dest_stride + (u64)src_w * 2u;
+        if (dest_stride == 0 || !s_cpu || !s_cpu->ram || last > (u64)s_cpu->ram_size) {
+            TRAP(xfboob, "EFB->XFB destination out of MEM1 / zero stride");
+        } else {
+            /* Build yuv422 per source scanline (vertical 3-tap copy filter +
+             * horizontal 1/4+1/2+1/4 chroma downsample), then nearest-neighbor
+             * vertical-scale into the guest XFB. */
+            static int scanY[EFB_WIDTH + 2];
+            static int scanU[EFB_WIDTH + 2];
+            static int scanV[EFB_WIDTH + 2];
+            for (int dy = 0; dy < dst_h; dy++) {
+                int sy = top + (int)(dy / (yscale == 0 ? 1.0f : yscale) + 0.5f);
+                if (sy >= bottom) sy = bottom - 1;
+                int yprev = (clamp_top ? top : 0);
+                if (sy - 1 > yprev) yprev = sy - 1;
+                int ynext = (clamp_bottom ? bottom : (int)EFB_HEIGHT) - 1;
+                if (sy + 1 < ynext) ynext = sy + 1;
+                /* per-pixel filtered YUV (indices 1..src_w) */
+                for (int i = 1, x = left; x < right; i++, x++) {
+                    u32 c0 = get_efb_color(x, yprev);
+                    u32 c1 = get_efb_color(x, sy);
+                    u32 c2 = get_efb_color(x, ynext);
+                    u8 cb0[4], cb1[4], cb2[4];
+                    memcpy(cb0, &c0, 4); memcpy(cb1, &c1, 4); memcpy(cb2, &c2, 4);
+                    u8 filt[4]; filt[ALP_C] = 0;
+                    for (int k = BLU_C; k <= RED_C; k++) {
+                        int sum = cb0[k] * (w0 + w1) + cb1[k] * (w2 + w3 + w4) + cb2[k] * (w5 + w6);
+                        sum >>= 6; if (sum > 255) sum = 255; filt[k] = (u8)sum;
+                    }
+                    u32 fc; memcpy(&fc, filt, 4);
+                    int Y, U, V; color_to_yuv(fc, &Y, &U, &V);
+                    scanY[i] = Y; scanU[i] = U; scanV[i] = V;
+                }
+                scanY[0] = scanY[1]; scanU[0] = scanU[1]; scanV[0] = scanV[1];
+                scanY[src_w + 1] = scanY[src_w]; scanU[src_w + 1] = scanU[src_w]; scanV[src_w + 1] = scanV[src_w];
+                u8* row = s_cpu->ram + phys + (u64)dy * dest_stride;
+                for (int i = 1, x = 0; x < src_w; i += 2, x += 2) {
+                    int Y0 = scanY[i] + 16;
+                    int UV0 = 128 + ((scanU[i - 1] + (scanU[i] << 1) + scanU[i + 1]) >> 2);
+                    int Y1 = scanY[i + 1] + 16;
+                    int UV1 = 128 + ((scanV[i - 1] + (scanV[i] << 1) + scanV[i + 1]) >> 2);
+                    row[x * 2 + 0] = (u8)(Y0 < 0 ? 0 : Y0 > 255 ? 255 : Y0);
+                    row[x * 2 + 1] = (u8)(UV0 < 0 ? 0 : UV0 > 255 ? 255 : UV0);
+                    row[x * 2 + 2] = (u8)(Y1 < 0 ? 0 : Y1 > 255 ? 255 : Y1);
+                    row[x * 2 + 3] = (u8)(UV1 < 0 ? 0 : UV1 > 255 ? 255 : UV1);
+                }
+            }
+        }
+    } else {
+        TRAP(efbtex, "EFB->texture copy (copy_to_xfb=0)");
+    }
+
+    if (clear) efb_clear_rect();
+}
+
+/* ============================================================================
+ * Init
+ * ==========================================================================*/
+void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
+    s_cpu = cpu; s_bp = bp; s_xf = xf;
+    memset(s_efb_color, 0, sizeof s_efb_color);
+    memset(s_efb_depth, 0, sizeof s_efb_depth);
+    memset(&s_tev, 0, sizeof s_tev);
+}

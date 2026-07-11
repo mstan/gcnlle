@@ -101,6 +101,7 @@ if(GCN_WITH_GENERATED)
     src/cp.c
     src/gp.c
     src/gx.c
+    src/gx_raster.c
     src/rings.c
     src/debug_server.c
     generated/generated.c

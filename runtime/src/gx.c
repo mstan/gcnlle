@@ -7,6 +7,7 @@
  * read-write distance exactly as Dolphin's single-core RunGpuLoop does.
  */
 #include "gx/gx.h"
+#include "gx/gx_raster.h"
 #include "debug/rings.h"
 
 #include <stdio.h>
@@ -64,19 +65,9 @@
 #define GX_XF_REGISTERS_END    0x1058u   /* XFMemory.h:240 (register region end) */
 #define GX_XF_MEM_WORDS        0x1058u   /* covers matrix/light mem + registers  */
 
-/* CP-state mirror needed to size vertices (CPMemory.h CPState:744-761). Only the
- * fields that affect vertex size are consulted; all are stored faithfully. */
-typedef struct {
-    u32 vtx_desc_lo;         /* TVtxDesc::Low.Hex  (VCD_LO) */
-    u32 vtx_desc_hi;         /* TVtxDesc::High.Hex (VCD_HI) */
-    u32 vat_g0[8];           /* UVAT_group0 per format index */
-    u32 vat_g1[8];           /* UVAT_group1 */
-    u32 vat_g2[8];           /* UVAT_group2 */
-    u32 array_bases[16];
-    u32 array_strides[16];
-    u32 matrix_index_a;
-    u32 matrix_index_b;
-} GxCpState;
+/* CP-state mirror needed to size + load vertices (CPMemory.h CPState:744-761).
+ * The type is defined in gx_raster.h so the rasterizer's vertex loader shares
+ * exactly this layout; all fields are stored faithfully. */
 
 typedef struct {
     CPUState* cpu;
@@ -296,115 +287,6 @@ static void gx_on_xf(GcnGx* gx, u16 address, u8 count, const u8* data) {
 }
 
 /* ============================================================================
- * EFB copy (BPStructs.cpp BPWritten BPMEM_TRIGGER_EFB_COPY:240-395). This
- * increment implements ONLY the copy-CLEAR to the XFB (fill the destination with
- * the clear color as YUY2); real EFB content copies are deferred loudly.
- * ==========================================================================*/
-
-/* ConvertColorToYUV (SWEfbInterface.cpp:546-562), color = 0xRRGGBBAA. */
-static void color_to_yuv(u32 color, u8* Y, u8* U, u8* V) {
-    int r = (int)((color >> 24) & 0xFF);
-    int g = (int)((color >> 16) & 0xFF);
-    int b = (int)((color >> 8)  & 0xFF);
-    int y =  66 * r + 129 * g +  25 * b;
-    int u = -38 * r -  74 * g + 112 * b;
-    int v = 112 * r -  94 * g -  18 * b;
-    int y_round = (y >> 8) + ((y >> 7) & 1);
-    int u_round = (u >> 8) + ((u >> 7) & 1);   /* signed */
-    int v_round = (v >> 8) + ((v >> 7) & 1);   /* signed */
-    /* EncodeXFB downsample (SWEfbInterface.cpp:643-652): Y += 16; a uniform field
-     * makes the 1/4+1/2+1/4 U/V filter the identity, so UV = 128 + U (or + V). */
-    int yb = y_round + 16;
-    int ub = 128 + u_round;
-    int vb = 128 + v_round;
-    *Y = (u8)(yb < 0 ? 0 : yb > 255 ? 255 : yb);
-    *U = (u8)(ub < 0 ? 0 : ub > 255 ? 255 : ub);
-    *V = (u8)(vb < 0 ? 0 : vb > 255 ? 255 : vb);
-}
-
-static void gx_efb_copy(GcnGx* gx) {
-    u32 copy = gx->bp[GX_BP_TRIGGER_EFB_COPY];
-    int clear        = (copy >> 11) & 1;
-    int copy_to_xfb  = (copy >> 14) & 1;
-    int scale_invert = (copy >> 10) & 1;
-
-    /* Source rect (X10Y10: x = bits0-9, y = bits10-19). BPStructs.cpp:250-256. */
-    u32 srcXY = gx->bp[GX_BP_EFB_TL];
-    u32 srcWH = gx->bp[GX_BP_EFB_WH];
-    u32 wh_x = srcWH & 0x3FFu;
-    u32 wh_y = (srcWH >> 10) & 0x3FFu;
-    u32 copy_width = wh_x + 1u;                        /* srcRect.GetWidth() */
-    (void)srcXY;
-
-    u32 dest_addr   = gx->bp[GX_BP_EFB_ADDR] << 5;     /* copyTexDest << 5 */
-    u32 dest_stride = gx->bp[GX_BP_EFB_STRIDE] << 5;   /* copyDestStride << 5 */
-    u32 yscale_reg  = gx->bp[GX_BP_COPYYSCALE];        /* dispcopyyscale */
-
-    if (!copy_to_xfb) {
-        if (note_once(&gx->seen_efb_tex))
-            fprintf(stderr, "gx: EFB->texture copy deferred (no rasterizer) "
-                            "[dest 0x%08X w %u]\n", dest_addr, copy_width);
-        return;
-    }
-    if (!clear) {
-        if (note_once(&gx->seen_efb_content))
-            fprintf(stderr, "gx: EFB content copy -> XFB deferred (no rasterizer) "
-                            "[dest 0x%08X w %u] — destination left untouched\n",
-                    dest_addr, copy_width);
-        return;
-    }
-
-    /* yScale (BPStructs.cpp:322-330). num_xfb_lines = 1 + wh_y * yScale. */
-    double yscale;
-    if (scale_invert)
-        yscale = (yscale_reg != 0) ? 256.0 / (double)yscale_reg : 1.0;
-    else
-        yscale = (double)yscale_reg / 256.0;
-    u32 height = (u32)(1.0 + (double)wh_y * yscale);
-    if (height < 1u) height = 1u;
-
-    /* Clear color (EfbCopy.cpp:18-19): 0xRRGGBBAA from clearcolorAR/GB. */
-    u32 ar = gx->bp[GX_BP_CLEAR_AR];
-    u32 gb = gx->bp[GX_BP_CLEAR_GB];
-    u32 clear_color = ((ar & 0xFFu) << 24) | (gb << 8) | ((ar & 0xFF00u) >> 8);
-
-    u8 Y, U, V;
-    color_to_yuv(clear_color, &Y, &U, &V);
-
-    CPUState* cpu = gx->cpu;
-    u32 phys_base = dest_addr & 0x1FFFFFFFu;
-    if (dest_stride == 0u || !cpu || !cpu->ram) {
-        if (note_once(&gx->seen_efb_zero))
-            fprintf(stderr, "gx: EFB copy-clear with zero stride / no RAM — skipped\n");
-        return;
-    }
-    /* Bounds: last byte touched is at phys_base + (height-1)*stride + width*2. */
-    u64 last = (u64)phys_base + (u64)(height - 1u) * dest_stride + (u64)copy_width * 2u;
-    if (last > (u64)cpu->ram_size) {
-        if (note_once(&gx->seen_efb_oob))
-            fprintf(stderr, "gx: EFB copy-clear XFB region out of MEM1 range "
-                            "(dest 0x%08X stride %u h %u w %u) — skipped\n",
-                    dest_addr, dest_stride, height, copy_width);
-        return;
-    }
-
-    /* Fill the XFB region with the clear color as YUY2 (bytes Y0,U,Y1,V per 2px,
-     * matching the debug-server screenshot decoder + Dolphin EncodeXFB layout). */
-    for (u32 row = 0; row < height; row++) {
-        u8* dst = cpu->ram + phys_base + (u64)row * dest_stride;
-        for (u32 x = 0; x < copy_width; x++) {
-            dst[x * 2u]      = Y;
-            dst[x * 2u + 1u] = (x & 1u) ? V : U;
-        }
-    }
-
-    if (note_once(&gx->seen_efb_clear))
-        fprintf(stderr, "gx: EFB copy-CLEAR -> XFB: dest 0x%08X stride %u w %u h %u "
-                        "clear 0x%08X (Y=%u U=%u V=%u)\n",
-                dest_addr, dest_stride, copy_width, height, clear_color, Y, U, V);
-}
-
-/* ============================================================================
  * BP register load (BPStructs.cpp BPWritten:55-396). Store the value; run the
  * side effects for the registers that have them.
  * ==========================================================================*/
@@ -431,7 +313,7 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 1);
         break;
     case GX_BP_TRIGGER_EFB_COPY:       /* BPStructs.cpp:240-395 */
-        gx_efb_copy(gx);
+        gx_raster_efb_copy(&gx->cpst);
         break;
     default:
         /* All other BP regs: state storage only (that IS their hardware effect
@@ -587,11 +469,13 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
             if (available < total) return 0;
 
             if (note_once(&gx->seen_prim[prim]))
-                fprintf(stderr, "gx: primitive type %u (opcode 0x%02X) — geometry "
-                                "rasterization deferred; %u-byte vertex payload "
-                                "skipped (%u verts x %u bytes)\n",
-                        prim, op, nverts * vsize, nverts, vsize);
-            return total;   /* skip the whole primitive (header + vertex payload) */
+                fprintf(stderr, "gx: primitive type %u (opcode 0x%02X) first drawn "
+                                "(%u verts x %u bytes, vat %u)\n",
+                        prim, op, nverts, vsize, vat);
+            /* Rasterize (SWVertexLoader -> TransformUnit -> Clipper ->
+             * Rasterizer -> Tev). The payload is contiguous in `data`. */
+            gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
+            return total;
         }
 
         /* Unknown opcode. HandleUnknownOpcode advances 1 byte (OpcodeDecoding.cpp
@@ -635,6 +519,9 @@ void gcn_gx_init(CPUState* cpu, GcnCp* cp, GcnPe* pe) {
     s_gx.cpu = cpu;
     s_gx.cp  = cp;
     s_gx.pe  = pe;
+    /* Bind the persistent BP/XF register files + guest CPU into the rasterizer
+     * (they never move) and clear the EFB model. */
+    gx_raster_init(cpu, s_gx.bp, s_gx.xf);
 }
 
 void gcn_gx_tick(u32 cycles) {
