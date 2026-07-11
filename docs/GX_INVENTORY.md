@@ -13,6 +13,11 @@ Reproduce:
 ```
 python tools/gx_fifo_decode.py _work/fifo_inventory.json            # full listing
 python tools/gx_fifo_decode.py _work/fifo_inventory.json --summary  # inventory only
+
+# Display-list draw inventory (section (f)): resolves each CALL_DL's bytes from a
+# raw MEM1 span using the CP (VCD/VAT) state live at the call site.
+python tools/gx_fifo_decode.py _work/fifo_inventory.json \
+       --dl _work/dl_span.bin _work/dl_manifest.json --dl-only --summary
 ```
 
 ## Sanity: end-to-end decode
@@ -227,3 +232,170 @@ That is essentially the complete GX raster pipeline. **Recommended sequencing:**
 ship (i) first — it is a genuine, oracle-checkable milestone (defined-color XFB +
 FIFO consumer that advances the read pointer past `SETDRAWDONE`), and it is the
 prerequisite for (ii) regardless.
+
+## (f) Display-list draw inventory
+
+The follow-up flagged in (e)(ii) is now done. `_work/dl_span.bin` is a raw dump
+of the guest MEM1 region holding all 22 display lists the menu calls (base
+physical `0x00AD7520`); `_work/dl_manifest.json` maps each DL's physical address
+→ {file offset, size}. The FIFO decoder was extended (`--dl <span> <manifest>`)
+to, **at every `CALL_DL`, resolve the DL's bytes from the span and walk them with
+the exact same opcode/VCD/VAT machinery** used for the gather-pipe stream — and
+with the **CP (VCD/VAT) state live at the call site** (the stream reloads
+`VCD_LO/HI` + `VAT_*` before each `CALL_DL`, so vertex sizing is call-site-exact).
+The stream walker and the DL walker are literally the same `decode_one`; only the
+byte buffer and the aggregation sink differ.
+
+### Sanity: end-to-end decode
+
+- **44 `CALL_DL` sites, all 44 resolved (0 unresolved); the 22 unique DL
+  addresses are 1:1 with the manifest.** Each unique DL is called **exactly
+  twice** → the capture spans **2 frames**.
+- **Every DL decodes end-to-end and consumes exactly its declared size**
+  (32 B … 1664 B), across **994 draw commands** and **87392 bytes** total, with
+  **zero unknown opcodes and zero truncation.** Exact byte-consumption using the
+  VCD/VAT-derived vertex sizes is itself the cross-check: a wrong offset or a
+  wrong vertex size would desync the walker into an unknown opcode almost
+  immediately; 22/22 clean is strong evidence the decode is correct.
+- **No anomalies.** All DLs also decode identically across their two calls
+  (consistent call-site CP state).
+
+### Per unique display list
+
+`ops` are per single invocation; a trailing `NOP` pad appears in most DLs.
+`fmt` = `VCD_LO/VCD_HI` (see the format table below).
+
+| DL (phys) | size | draws | verts | tris | prim | fmt(s) |
+|---|---:|---:|---:|---:|---|---|
+| `0x00AD7E00` | 0x2E0 | 80 | 240 | 80 | TRI_FAN | 600/0 |
+| `0x00AD7C40` | 0x1C0 | 40 | 160 | 80 | TRI_FAN | 600/0 |
+| `0x00AD7B20` | 0x120 | 48 | 144 | 48 | TRI_FAN | 400/0 |
+| `0x00AD7A60` | 0xC0 | 24 | 96 | 48 | TRI_FAN | 400/0 |
+| `0x00AD7A00` | 0x60 | 16 | 48 | 16 | TRI_FAN | 400/0 |
+| `0x00AD79A0` | 0x60 | 10 | 40 | 20 | TRI_FAN | 400/0 |
+| `0x00AD7860` | 0x140 | 52 | 156 | 52 | TRI_FAN | 400/0 |
+| `0x00AD7780` | 0xE0 | 28 | 112 | 56 | TRI_FAN | 400/0 |
+| `0x00AD7720` | 0x60 | 12 | 36 | 12 | TRI_FAN | 400/0 |
+| `0x00AD76E0` | 0x40 | 8 | 32 | 16 | TRI_FAN | 400/0 |
+| `0x00AD7680` | 0x60 | 16 | 48 | 16 | TRI_FAN | 400/0 |
+| `0x00AD7620` | 0x60 | 10 | 40 | 20 | TRI_FAN | 400/0 |
+| `0x00AD7600` | 0x20 | 4 | 12 | 4 | TRI_FAN | 400/0 |
+| `0x00AD75E0` | 0x20 | 4 | 16 | 8 | TRI_FAN | 400/0 |
+| `0x00AD7580` | 0x60 | 16 | 48 | 16 | TRI_FAN | 400/0 |
+| `0x00AD7520` | 0x60 | 10 | 40 | 20 | TRI_FAN | 400/0 |
+| `0x00AD8100` | 0x20 | 1 | 4 | 2 | TRI_FAN | 1600/2 |
+| `0x00AD8120` | 0x20 | 1 | 4 | 2 | TRI_FAN | 1600/2 |
+| `0x00AD8140` | 0x20 | 1 | 4 | 2 | TRI_FAN | 1600/2 |
+| `0x00AD8160` | 0x20 | 1 | 4 | 2 | TRI_FAN | 1600/2 |
+| `0x00AD80E0` | 0x20 | 1 | 4 | 2 | TRI_FAN | 1600/2 |
+| `0x00AEC400` | 0x680 | 114 | 432 | 204 | TRI_FAN | 1400/2 |
+
+Three families are visible:
+
+- **Position-only fans (`0xAD7520`–`0xAD7E00`, 16 DLs):** `Pos=Index8/16`, no
+  normal, no texcoord, no per-vertex color. Untextured flat-filled triangle fans
+  — the vector-drawn UI/text panels.
+- **Single textured+lit quads (`0xAD80E0`–`0xAD8160`, 5 DLs):** one 4-vertex fan
+  each, `Pos=Index16 + Nrm=Index8 + Tex0=Index8`. The 5 individual textured
+  sprites.
+- **Main textured+lit object (`0xAEC400`):** 114 fans, `Pos=Index8 + Nrm=Index8 +
+  Tex0=Index8`, 204 triangles — the bulk textured mesh (the rotating cube logo).
+
+### Union across all 22 DLs
+
+- **Draw opcodes:** `GX_DRAW_TRIANGLE_FAN` only — **994 draws, all VAT index 0.**
+  No other primitive type appears. Vertex counts are only **3** (536 draws → 1
+  tri each) and **4** (458 draws → 2 tris each).
+- **No BP, XF, or `LOAD_INDX` registers are written INSIDE any DL**, and no
+  nested `CALL_DL`. DLs are **pure geometry** (CP `VCD/VAT`/`MATINDEX` +
+  `DRAW`s); *all* pipeline/transform/texture state is set in the gather-pipe
+  stream (sections (b)–(c)). This matters for the interpreter: DL execution only
+  needs the vertex loader + array fetch + the transform/raster state already
+  latched by the stream.
+
+**Vertex formats actually used at draw time** (VCD decoded into named
+attributes; the VAT supplies component formats):
+
+| fmt (VCD_LO/HI) | Pos | Normal | TexCoord0 | Col0/1 | vtx bytes | draws (×2 frames) |
+|---|---|---|---|---|---:|---:|
+| `0x600 / 0x0` | Index16 | — | — | — | 2 | 240 |
+| `0x400 / 0x0` | Index8 | — | — | — | 1 | 516 |
+| `0x1600 / 0x2` | Index16 | Index8 | Index8 | — | 4 | 10 |
+| `0x1400 / 0x2` | Index8 | Index8 | Index8 | — | 3 | 228 |
+
+VAT index 0 is loaded with two alternating value sets during the frame
+(`g0 = 0x50E00C09` and `0x50F76C09`); both decode to: **Position = 3×`Float`
+(XYZ), Normal = 3×`Short`, TexCoord0 = 2×`Short` (ST)**, `ByteDequant=1`. (The
+two sets differ only in the unused Color0/1 element/format fields — RGB565 vs
+RGBA8888 — which never matter because Color is `NotPresent` in every VCD.) **No
+attribute is ever `Direct`/inline: every present attribute is indexed**, so DL
+payloads are tiny (1–4 bytes/vertex, just indices).
+
+**Vertex arrays referenced by indexed attributes** (Dolphin `CPArray`
+numbering) — matches the stream's `ARRAY_BASE`/`ARRAY_STRIDE` loads exactly:
+
+| attribute | `ARRAY_BASE[i]` | stride (from stream) | element |
+|---|---|---:|---|
+| Position | `[0]` | `0x0C` = 12 | 3×float XYZ |
+| Normal | `[1]` | `0x06` = 6 | 3×short |
+| TexCoord0 | `[4]` | `0x04` = 4 | 2×short ST |
+
+(The stream loads `ARRAY_BASE[0]=0x00AD5D80`, `[1]/[4]` in the same
+`0x00AD…`/`0x00AE…` MEM1 region — i.e. the indexed vertex data lives in guest
+RAM alongside the DLs, and is included in the same MEM1 span family.)
+
+### Geometry totals
+
+- **Per frame** (each of the 22 unique DLs once): **1720 vertices, 726
+  triangles.**
+- Whole capture (44 invocations, 2 frames): 3440 vertices, 1452 triangles.
+
+### Textures referenced (from the stream's BP texture cluster)
+
+Because texcoords are indexed and DLs carry no BP writes, texture state is
+entirely in the gather-pipe stream. Decoding the texture-unit-0 BP registers:
+
+- **`TX_SETIMAGE0` (BP 0x88):** two configs, **`352×40 I8`** and **`128×128 I8`**
+  — both **I8** (8-bit intensity/luminance), i.e. monochrome. Only texture
+  **unit 0** is programmed (units 1–3 untouched).
+- **`TX_SETIMAGE3` (BP 0x94):** source addresses `(val<<5)` = **`0x00AD8800`**
+  and **`0x00AECCE0`** — both in **MEM1**, inside the same DL/vertex-array span
+  family. ⚠️ **Correction to (b):** the `0x0D8000…0x0DDC00` values noted there
+  are `TX_SETIMAGE1/2` **TMEM** cache offsets, *not* MEM1 texture source
+  addresses; the real MEM1 sources are these two `TX_SETIMAGE3` addresses.
+- **`GENMODE` (BP 0x00) = `0x004210`/`0x004211`:** **1 TEV stage, 1 color
+  channel, 0 or 1 texgens** — a single-stage TEV (texture × channel-color), the
+  minimal texturing pipeline.
+
+### Rasterizer scoping verdict — minimal GX pipeline for the logo render
+
+Everything needed to render this menu frame, and nothing more:
+
+1. **Vertex loader (CP):** `GX_DRAW_TRIANGLE_FAN` only, VAT 0 only, 3- and
+   4-vertex fans. Support **indexed** `Position` (float XYZ), `Normal` (short),
+   `TexCoord0` (short ST) — **all Index8/Index16, no Direct/inline attributes,
+   no per-vertex color**. Fetch from `ARRAY_BASE[0]/[1]/[4]` in guest RAM with
+   strides 12/6/4. (The generic Direct-attribute and Color paths are exercised
+   *nowhere* in this frame — they can be stubbed/deferred.)
+2. **XF transform:** single position matrix (VCD `PosMatIdx=0`, so no per-vertex
+   matrix index), normal matrix, one tex matrix; the recorded **orthographic**
+   `SETPROJECTION` (type word = 1, ~588-wide) + `SETVIEWPORT` (~640×480) from
+   (b); `SETNUMTEXGENS`/`SETTEXMTXINFO`/`SETPOSTMTXINFO` texgen; 1 color channel
+   (`SETNUMCHAN=1`) with material/ambient color (per-vertex color absent, so the
+   fans are colored by the channel constant, and lit via the normal for the
+   textured families).
+3. **TEV / texture:** **1 TEV stage, 1 color channel**; **texture unit 0 only**,
+   **I8** format, two textures (`352×40`, `128×128`) loaded from MEM1
+   (`0x00AD8800`, `0x00AECCE0`) into TMEM; `TX_SETMODE0/1`, `SU_SSIZE/TSIZE`;
+   `ALPHACOMPARE`, `ZMODE`, `BLENDMODE` from the stream. No indirect textures are
+   needed for the geometry (the `IREF/TREF/IND_*` seen in (b) can wait — no draw
+   consumes a second texgen/indirect stage here).
+4. **Present:** the existing (e)(i) EFB→XFB copy+clear path presents the rendered
+   EFB — no change.
+
+Net: the logo frame is **flat/material-colored + single-stage-I8-textured
+triangle fans under a 2-D orthographic projection**, fed by indexed vertex arrays
+in guest RAM. The heavy generic-GX surface — Direct attributes, per-vertex color,
+multi-stage TEV, indirect textures, non-fan primitives, VATs 1–7 — is **not**
+touched by this frame and can be deferred behind a loud "unimplemented" trap
+rather than built up front.
