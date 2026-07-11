@@ -8,6 +8,7 @@
 #include "cp/cp.h"
 #include "debug/rings.h"
 
+#include <stdio.h>
 #include <string.h>
 
 void gcn_cp_set_irq(GcnCp* cp, GcnCpIrqFn fn, void* user) {
@@ -195,4 +196,58 @@ void gcn_cp_gather_pipe_bursted(GcnCp* cp, u32 pi_write_pointer) {
     cp_set_u32(cp, GCN_CP_FIFO_WPTR_LO, pi_write_pointer);
     cp_set_u32(cp, GCN_CP_FIFO_RW_DIST_LO,
                cp_u32(cp, GCN_CP_FIFO_RW_DIST_LO) + GCN_CP_GATHER_PIPE_SIZE);
+}
+
+/* ---- GPU-side FIFO consumer support (gx.c) ---------------------------------
+ * The read side of the FIFO, transcribed from Fifo.cpp RunGpuLoop:326-354. The
+ * consumer reads the 32 bytes at the current read pointer, then calls
+ * gcn_cp_gpu_consume_chunk to advance it. */
+
+u32 gcn_cp_fifo_read_pointer(const GcnCp* cp) {
+    return cp_u32(cp, GCN_CP_FIFO_RPTR_LO);
+}
+
+u32 gcn_cp_fifo_rw_distance(const GcnCp* cp) {
+    return cp_u32(cp, GCN_CP_FIFO_RW_DIST_LO);
+}
+
+/* AtBreakpoint (Fifo.cpp:404-411): bFF_BPEnable && (ReadPointer == Breakpoint). */
+int gcn_cp_at_breakpoint(const GcnCp* cp) {
+    return cp->bp_enable &&
+           (cp_u32(cp, GCN_CP_FIFO_RPTR_LO) == cp_u32(cp, GCN_CP_FIFO_BP_LO));
+}
+
+void gcn_cp_gpu_consume_chunk(GcnCp* cp) {
+    /* Advance the read pointer, wrapping CPEnd->CPBase (Fifo.cpp:329-332 — the
+     * same wrap the write side does in gp.c). */
+    u32 rptr = cp_u32(cp, GCN_CP_FIFO_RPTR_LO);
+    u32 base = cp_u32(cp, GCN_CP_FIFO_BASE_LO);
+    u32 end  = cp_u32(cp, GCN_CP_FIFO_END_LO);
+    if (rptr == end)
+        rptr = base;
+    else
+        rptr += GCN_CP_GATHER_PIPE_SIZE;
+    cp_set_u32(cp, GCN_CP_FIFO_RPTR_LO, rptr);
+
+    /* Subtract 32 from the distance (Fifo.cpp:347). Dolphin ASSERTs on a
+     * negative distance; we saturate at 0 and note it once rather than corrupt
+     * the value — a negative distance would only arise from a consumer/producer
+     * accounting bug, which would then diverge loudly in the oracle diff. */
+    u32 rwd = cp_u32(cp, GCN_CP_FIFO_RW_DIST_LO);
+    if (rwd < GCN_CP_GATHER_PIPE_SIZE) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "gcn cp: FIFO read-write distance underflow "
+                            "(rwd=%u < 32) — saturating at 0\n", rwd);
+            warned = 1;
+        }
+        rwd = 0;
+    } else {
+        rwd -= GCN_CP_GATHER_PIPE_SIZE;
+    }
+    cp_set_u32(cp, GCN_CP_FIFO_RW_DIST_LO, rwd);
+
+    /* SetCPStatusFromGPU (Fifo.cpp:354): re-run the watermark/interrupt eval now
+     * that the distance changed. STATUS itself is computed on read. */
+    cp_update_interrupts(cp);
 }

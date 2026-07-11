@@ -138,4 +138,20 @@ void gcn_cp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
  * write pointer into CPWritePointer and adds 32 to CPReadWriteDistance. */
 void gcn_cp_gather_pipe_bursted(GcnCp* cp, u32 pi_write_pointer);
 
+/* ---- GPU-side FIFO consumer support (used by gx.c) ----
+ * Fifo.cpp RunGpuLoop:286-354 is the single-core GPU loop; these expose the
+ * pieces of it the (synchronous) consumer needs without gx.c reaching into the
+ * static cp_u32 helper. Read-only getters plus one mutator that advances the
+ * read side of the FIFO exactly as the GPU thread does. */
+u32  gcn_cp_fifo_read_pointer(const GcnCp* cp);   /* CPReadPointer (physical)      */
+u32  gcn_cp_fifo_rw_distance(const GcnCp* cp);     /* CPReadWriteDistance           */
+int  gcn_cp_at_breakpoint(const GcnCp* cp);        /* AtBreakpoint (Fifo.cpp:404-411)*/
+
+/* Consume one 32-byte chunk from the GPU side (Fifo.cpp:326-354): advance the
+ * read pointer wrapping CPEnd->CPBase, subtract GATHER_PIPE_SIZE from the RW
+ * distance (clamped at 0 — Dolphin ASSERTs on underflow, we saturate + note),
+ * then re-run the CPU/GPU status + interrupt evaluation. Call AFTER reading the
+ * 32 bytes at the current read pointer. */
+void gcn_cp_gpu_consume_chunk(GcnCp* cp);
+
 #endif /* GCN_CP_CP_H */

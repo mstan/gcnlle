@@ -100,6 +100,7 @@ if(GCN_WITH_GENERATED)
     src/pe.c
     src/cp.c
     src/gp.c
+    src/gx.c
     src/rings.c
     src/debug_server.c
     generated/generated.c

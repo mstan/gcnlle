@@ -28,6 +28,7 @@
 #include "pe/pe.h"
 #include "cp/cp.h"
 #include "gp/gp.h"
+#include "gx/gx.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
 
@@ -248,6 +249,13 @@ int main(int argc, char** argv) {
     /* PI_FIFO_RESET (GXAbortFrame) resets the gather-pipe staging via this hook
      * (keeps pi.c free of a gp.h dependency). */
     gcn_pi_set_fifo_reset_hook(&pi, gcn_gp_reset);
+
+    /* GX FIFO consumer: device-less, ticked from the dispatch loop. Drains the
+     * guest-RAM FIFO ring gp.c fills, decodes + executes commands (CP/XF/BP
+     * state, display lists, EFB copy-clear), advancing the CP read pointer. It
+     * needs the guest RAM (FIFO/DL/XFB access), the CP register file, and the PE
+     * (SETDRAWDONE/PE_TOKEN commands raise its finish/token latches). */
+    gcn_gx_init(&cpu, &cp, &pe);
 
     gcn_mmio_install(&bus, &cpu);
 

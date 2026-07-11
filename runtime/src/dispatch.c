@@ -11,6 +11,7 @@
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
 #include "vi/vi.h"            /* advance the VI beam counter per block       */
 #include "di/di.h"            /* complete deferred DI drive commands per block */
+#include "gx/gx.h"            /* drain the GX FIFO + execute commands per block */
 #include "pi/pi.h"            /* deliver pending external interrupts         */
 #include "debug/rings.h"      /* always-on block/PC ring */
 #include "debug/debug_server.h" /* pumped once per block (non-blocking) */
@@ -68,6 +69,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         gcn_dsp_tick(GCN_DSP_CYCLES_PER_BLOCK);  /* run the DSP core in step */
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
         gcn_di_tick();                           /* complete a deferred DI command */
+        gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */
         /* Service the debug server between blocks: non-blocking, so it stays
          * responsive even while the guest busy-waits on unmodeled hardware. A
          * client "quit" ends the run cleanly. */
