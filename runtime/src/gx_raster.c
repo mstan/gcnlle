@@ -14,6 +14,14 @@
 #include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
 #include <string.h>
 #include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
+#include <emmintrin.h>   /* SSE2 — EFB-copy scanline encode (GCN_GX_NO_SIMD knob) */
+
+/* GCN_GX_NO_SIMD=1: force the EFB-copy scanline encode (gx_raster_efb_copy)
+ * to always take its scalar path, even when the SIMD preconditions hold.
+ * Own lazy -1-sentinel getenv, same pattern as s_no_fused (see its comment).
+ * This is the knob the SIMD task's same-binary A/B exactness proof toggles:
+ * SIMD-on and GCN_GX_NO_SIMD=1 must produce the identical golden XFB hash. */
+static int s_no_simd = -1;
 
 /* EFB geometry (VideoCommon/VideoCommon.h:15-16). */
 #define EFB_WIDTH   640u
@@ -393,52 +401,76 @@ static u32 GetPixelColor(u32 off) {
         return get_pixel_color_direct(off);
     }
 }
-static void SetPixelColorOnly(u32 off, const u8* rgb) {
+/* Same factoring as get_pixel_color_direct/get_pixel_color_rgba6 above, this
+ * time for the three EFB pixel SETTERS — pure extraction, each switch's own
+ * case body unchanged bit-for-bit, just calling these instead of inlining
+ * them. Lets efb_clear_rect (below) pick one specialized formula per setter
+ * ONCE PER CLEAR RECT (s_pf is a per-clear constant, same as it is per-copy)
+ * instead of re-switching on s_pf on every one of the rect's pixels. */
+static inline void set_pixel_color_only_direct(u32 off, const u8* rgb) {
     u32 src; memcpy(&src, rgb, 4);
+    s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
+}
+static inline void set_pixel_color_only_rgba6(u32 off, const u8* rgb) {
+    u32 src; memcpy(&src, rgb, 4);
+    u32 val = s_efb_color[off] & 0xff00003fu;
+    val |= (src >> 4) & 0x00000fc0u;   /* blue  */
+    val |= (src >> 6) & 0x0003f000u;   /* green */
+    val |= (src >> 8) & 0x00fc0000u;   /* red   */
+    s_efb_color[off] = val;
+}
+static void SetPixelColorOnly(u32 off, const u8* rgb) {
     switch (s_pf) {
     case PF_RGB8_Z24: case PF_Z24: case PF_RGB565_Z16:
-        s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
+        set_pixel_color_only_direct(off, rgb);
         break;
-    case PF_RGBA6_Z24: {
-        u32 val = s_efb_color[off] & 0xff00003fu;
-        val |= (src >> 4) & 0x00000fc0u;   /* blue  */
-        val |= (src >> 6) & 0x0003f000u;   /* green */
-        val |= (src >> 8) & 0x00fc0000u;   /* red   */
-        s_efb_color[off] = val;
+    case PF_RGBA6_Z24:
+        set_pixel_color_only_rgba6(off, rgb);
         break;
-    }
     default:
         TRAPF(pf_setcolor, "EFB SetPixelColorOnly pixel_format %u (raw bp[0x43]=0x%06X)",
               s_pf, s_bp[0x43]);
         break;
     }
 }
-static void SetPixelAlphaColor(u32 off, const u8* color) {
+static inline void set_pixel_alpha_color_direct(u32 off, const u8* color) {
     u32 src; memcpy(&src, color, 4);
+    s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
+}
+static inline void set_pixel_alpha_color_rgba6(u32 off, const u8* color) {
+    u32 src; memcpy(&src, color, 4);
+    u32 val = s_efb_color[off] & 0xff000000u;
+    val |= (src >> 2) & 0x0000003fu;   /* alpha */
+    val |= (src >> 4) & 0x00000fc0u;   /* blue  */
+    val |= (src >> 6) & 0x0003f000u;   /* green */
+    val |= (src >> 8) & 0x00fc0000u;   /* red   */
+    s_efb_color[off] = val;
+}
+static void SetPixelAlphaColor(u32 off, const u8* color) {
     switch (s_pf) {
     case PF_RGB8_Z24: case PF_Z24: case PF_RGB565_Z16:
-        s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
+        set_pixel_alpha_color_direct(off, color);
         break;
-    case PF_RGBA6_Z24: {
-        u32 val = s_efb_color[off] & 0xff000000u;
-        val |= (src >> 2) & 0x0000003fu;   /* alpha */
-        val |= (src >> 4) & 0x00000fc0u;   /* blue  */
-        val |= (src >> 6) & 0x0003f000u;   /* green */
-        val |= (src >> 8) & 0x00fc0000u;   /* red   */
-        s_efb_color[off] = val;
+    case PF_RGBA6_Z24:
+        set_pixel_alpha_color_rgba6(off, color);
         break;
-    }
     default:
         TRAPF(pf_setalpha, "EFB SetPixelAlphaColor pixel_format %u (raw bp[0x43]=0x%06X)",
               s_pf, s_bp[0x43]);
         break;
     }
 }
+/* RGB8/Z24/RGB565 have no alpha plane — nothing to do (no "direct" formula
+ * exists for this setter; the direct-format branch is a real, deliberate
+ * no-op, not an omission). */
+static inline void set_pixel_alpha_only_rgba6(u32 off, u8 a) {
+    u32 val = s_efb_color[off] & 0xffffffc0u;
+    val |= (a >> 2) & 0x3f;
+    s_efb_color[off] = val;
+}
 static void SetPixelAlphaOnly(u32 off, u8 a) {
     if (s_pf == PF_RGBA6_Z24) {
-        u32 val = s_efb_color[off] & 0xffffffc0u;
-        val |= (a >> 2) & 0x3f;
-        s_efb_color[off] = val;
+        set_pixel_alpha_only_rgba6(off, a);
     }
     /* RGB8/Z24/RGB565 have no alpha plane — nothing to do. */
 }
@@ -1942,7 +1974,20 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     void (*pixel_fn)(Tev*, s32, s32, s32, s32) = s_cfg.fused ? raster_pixel_fused : raster_pixel;
 
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
-    update_zslope(v0, v1, v2, x_off, y_off);
+    /* Dead-slope-setup skip (perf task, follow-up to ff6b617): update_zslope
+     * populates s_ZSlope, whose one and only reader is raster_pixel_prep's
+     * `s32 z = (s32)slope_value(&s_ZSlope, ...)` — reached exclusively via
+     * raster_pixel (the GENERAL pixel path). A fused draw's pixel_fn is
+     * raster_pixel_fused -> raster_pixel_prep_fused, which never calls
+     * raster_pixel_prep and never reads s_ZSlope (see the big comment above
+     * raster_pixel_prep_fused: fused_common_match pins zt_enable==0, so both
+     * of Position[2]'s gated readers are dead). Grepped: s_ZSlope has exactly
+     * one read site in this file. Skipping the eval on fused draws is provably
+     * a no-op for them; the general path still calls update_zslope
+     * unconditionally on every triangle (this `if` compiles away to nothing
+     * for it), so it keeps rebuilding s_ZSlope before raster_pixel_prep reads
+     * it, same as before this change. */
+    if (!s_cfg.fused) update_zslope(v0, v1, v2, x_off, y_off);
 
     s32 Y1 = iround(16.0f * (v0->screenPosition[1] - y_off)) - 9;
     s32 Y2 = iround(16.0f * (v1->screenPosition[1] - y_off)) - 9;
@@ -1971,8 +2016,17 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     float w[3] = { 1.0f / v0->projectedPosition[3], 1.0f / v1->projectedPosition[3],
                    1.0f / v2->projectedPosition[3] };
     s_WSlope = make_slope(w[0], w[1], w[2], &ctx);
+    /* Dead-slope-setup skip continued: the 3 RGB (comp 0..2) color-slope
+     * evals are provably dead on a fused draw too — fused_common_match pins
+     * numcolchans==1 (so this loop's `i` only ever reaches 0 when fused; the
+     * i==1 iteration simply never runs, same as always) and every fused
+     * stage's colorchan==0, and raster_pixel_prep_fused/fused_pixel_A/B/C
+     * read only Color[0][3] (alpha) — never Color[0][0]/[1]/[2] (see the big
+     * comment above raster_pixel_prep_fused). comp 3 (alpha) is unaffected
+     * and still evaluated either way. General path: s_cfg.fused is NULL, so
+     * comp starts at 0 exactly as before — byte-identical. */
     for (u32 i = 0; i < s_cfg.numcolchans; i++)
-        for (int comp = 0; comp < 4; comp++)
+        for (int comp = (s_cfg.fused ? 3 : 0); comp < 4; comp++)
             s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
                                                 v2->color[i][comp], &ctx);
     for (u32 i = 0; i < s_cfg.numtexgens; i++) {
@@ -3165,6 +3219,14 @@ static void color_to_yuv(u32 color, int* Y, int* U, int* V) {
     *V = (s8)((vv >> 8) + ((vv >> 7) & 1));
 }
 
+/* const-u8*-taking adapter so set_pixel_alpha_only_rgba6 (u32,u8) fits the
+ * same `void(*)(u32, const u8*)` shape as the color-only/alpha-color
+ * formulas below — lets efb_clear_rect pick ONE function-pointer type for
+ * whichever of the 3 actions this clear uses. */
+static inline void set_pixel_alpha_only_rgba6_cc(u32 off, const u8* cc) {
+    set_pixel_alpha_only_rgba6(off, cc[ALP_C]);
+}
+
 static void efb_clear_rect(void) {
     /* EfbCopy::ClearEfb (EfbCopy.cpp:16-34). */
     u32 ar = s_bp[0x4f], gb = s_bp[0x50];
@@ -3177,17 +3239,56 @@ static void efb_clear_rect(void) {
     if (right > (int)EFB_WIDTH - 1) right = (int)EFB_WIDTH - 1;
     if (bottom > (int)EFB_HEIGHT - 1) bottom = (int)EFB_HEIGHT - 1;
     u8 cc[4]; memcpy(cc, &clearColor, 4);
+
+    /* Per-clear-rect pixel-store selection, hoisted OUT of the x/y loop (same
+     * pattern as gx_raster_efb_copy's copy_getpx — see its big comment):
+     * s_bm_cu/s_bm_au (bp 0x41, cached by build_efb_cfg) decide WHICH of the
+     * 3 actions applies, and s_pf decides WHICH FORMULA that action uses —
+     * both are per-clear-rect constants (bp state is provably constant for
+     * the whole call, same reasoning as GetPixelColor's per-draw config
+     * cache), yet SetPixelColorOnly/SetPixelAlphaColor/SetPixelAlphaOnly used
+     * to re-decode s_pf via their own `switch (s_pf)` on every cleared pixel.
+     * clear_px is resolved to the exact direct/rgba6 formula this clear will
+     * use, once, here; NULL means "no color/alpha write this clear" — either
+     * because neither cu nor au is set (matches the original: no Set* call
+     * at all) or because the format is direct and the action is alpha-only
+     * (SetPixelAlphaOnly's own direct-format branch is a real no-op, "RGB8/
+     * Z24/RGB565 have no alpha plane"). Any s_pf outside the two known groups
+     * falls back to the untouched general per-pixel path (its own switch +
+     * TRAPF), so an unseen format traps exactly as loudly/correctly as
+     * before this change. */
+    int fmt_direct = (s_pf == PF_RGB8_Z24 || s_pf == PF_Z24 || s_pf == PF_RGB565_Z16);
+    int fmt_rgba6  = (s_pf == PF_RGBA6_Z24);
+    void (*clear_px)(u32, const u8*) = NULL;
+    if (fmt_direct || fmt_rgba6) {
+        if (s_bm_cu) {
+            clear_px = s_bm_au ? (fmt_direct ? set_pixel_alpha_color_direct : set_pixel_alpha_color_rgba6)
+                                : (fmt_direct ? set_pixel_color_only_direct : set_pixel_color_only_rgba6);
+        } else if (s_bm_au) {
+            clear_px = fmt_direct ? NULL : set_pixel_alpha_only_rgba6_cc;
+        }
+    }
+    /* Fallback path taken only for a genuinely unrecognized s_pf AND an
+     * actual color/alpha write requested (cu||au) — matches the original,
+     * which never called any Set* function at all when neither cu nor au
+     * was set, regardless of format. */
+    int use_fallback = !fmt_direct && !fmt_rgba6 && (s_bm_cu || s_bm_au);
+
     for (int y = top; y <= bottom; y++) {
         for (int x = left; x <= right; x++) {
             u32 off = (u32)x + (u32)y * EFB_WIDTH;
             /* SetColor honors color_update/alpha_update (bp 0x41, cached by
              * build_efb_cfg() into the shared s_bm_cu/s_bm_au — this is a
              * per-clear-rect constant, not a per-pixel one). */
-            if (s_bm_cu) {
-                if (s_bm_au) SetPixelAlphaColor(off, cc);
-                else         SetPixelColorOnly(off, cc);
-            } else if (s_bm_au) {
-                SetPixelAlphaOnly(off, cc[ALP_C]);
+            if (clear_px) {
+                clear_px(off, cc);
+            } else if (use_fallback) {
+                if (s_bm_cu) {
+                    if (s_bm_au) SetPixelAlphaColor(off, cc);
+                    else         SetPixelColorOnly(off, cc);
+                } else if (s_bm_au) {
+                    SetPixelAlphaOnly(off, cc[ALP_C]);
+                }
             }
             /* SetDepth honors zmode.update_enable (bp 0x40, cached as s_zt_upd). */
             if (s_zt_upd) SetPixelDepth(off, clearZ);
@@ -3212,6 +3313,206 @@ static u32 get_efb_color(int x, int y, u32 (*getpx)(u32)) {
     if (y < 0) y = 0;
     if (y >= (int)EFB_HEIGHT) y = (int)EFB_HEIGHT - 1;
     return getpx((u32)x + (u32)y * EFB_WIDTH);
+}
+
+/* One column of gx_raster_efb_copy's vertical-filter + YUV-encode stage,
+ * pure extraction (byte-identical to the loop body it replaces) — shared by
+ * the scalar (SIMD off / GCN_GX_NO_SIMD=1 / non-fast-path-format) sweep AND
+ * the SIMD sweep's scalar remainder tail below, so both take the literal
+ * same code path for anything not covered by a full SIMD batch. */
+static inline void efb_copy_col(int x, int yprev, int sy, int ynext, u32 (*getpx)(u32),
+                                 int w0, int w1, int w2, int w3, int w4, int w5, int w6,
+                                 int* scanY, int* scanU, int* scanV, int i) {
+    u32 c0 = get_efb_color(x, yprev, getpx);
+    u32 c1 = get_efb_color(x, sy, getpx);
+    u32 c2 = get_efb_color(x, ynext, getpx);
+    u8 cb0[4], cb1[4], cb2[4];
+    memcpy(cb0, &c0, 4); memcpy(cb1, &c1, 4); memcpy(cb2, &c2, 4);
+    u8 filt[4]; filt[ALP_C] = 0;
+    for (int k = BLU_C; k <= RED_C; k++) {
+        int sum = cb0[k] * (w0 + w1) + cb1[k] * (w2 + w3 + w4) + cb2[k] * (w5 + w6);
+        sum >>= 6; if (sum > 255) sum = 255; filt[k] = (u8)sum;
+    }
+    u32 fc; memcpy(&fc, filt, 4);
+    int Y, U, V; color_to_yuv(fc, &Y, &U, &V);
+    scanY[i] = Y; scanU[i] = U; scanV[i] = V;
+}
+
+/* One output-column-pair of the horizontal 1/4+1/2+1/4 chroma downsample +
+ * YUYV pack. Pure extraction, same sharing rationale as efb_copy_col. */
+static inline void efb_copy_pack(u8* row, int x, int i, const int* scanY, const int* scanU, const int* scanV) {
+    int Y0 = scanY[i] + 16;
+    int UV0 = 128 + ((scanU[i - 1] + (scanU[i] << 1) + scanU[i + 1]) >> 2);
+    int Y1 = scanY[i + 1] + 16;
+    int UV1 = 128 + ((scanV[i - 1] + (scanV[i] << 1) + scanV[i + 1]) >> 2);
+    row[x * 2 + 0] = (u8)(Y0 < 0 ? 0 : Y0 > 255 ? 255 : Y0);
+    row[x * 2 + 1] = (u8)(UV0 < 0 ? 0 : UV0 > 255 ? 255 : UV0);
+    row[x * 2 + 2] = (u8)(Y1 < 0 ? 0 : Y1 > 255 ? 255 : Y1);
+    row[x * 2 + 3] = (u8)(UV1 < 0 ? 0 : UV1 > 255 ? 255 : UV1);
+}
+
+/* ============================================================================
+ * SSE2 EFB-copy scanline encode (perf task, CLAUDE.md gx-raster). Vectorizes
+ * the interior of gx_raster_efb_copy's two per-scanline column loops — the
+ * vertical 3-tap filter + RGB->YUV convert (efb_copy_col's body) and the
+ * horizontal chroma downsample + YUYV pack (efb_copy_pack's body) — 4 EFB
+ * columns (loop 1) / 4 output-pixel-pairs (loop 2) per XMM register.
+ *
+ * Scope: ONLY the get_pixel_color_direct pixel-format group (RGB8_Z24/Z24/
+ * RGB565_Z16 — the only format the IPL boot's EFB copies ever use, see
+ * copy_getpx's selection below); RGBA6_Z24 and the general-fallback formula
+ * keep the untouched scalar path. get_efb_color's x/y clamps also keep the
+ * scalar path: the vectorized span only ever runs where the whole scanline's
+ * x range [left,right) is inside [0,EFB_WIDTH) (checked once per copy, see
+ * simd_ok below), so within that span x can never hit get_efb_color's clamp
+ * branch, matching the scalar formula exactly without needing to replicate
+ * the clamp per lane. The first/last partial group of each loop (not a
+ * multiple of 4 columns / 4 pixel-pairs) and anything outside simd_ok falls
+ * through to efb_copy_col/efb_copy_pack — the identical scalar code.
+ *
+ * Range derivations (why 32-bit lanes throughout, and where 16-bit ops are
+ * safe as an intermediate step):
+ *
+ *  efb_copy_col's filter sum: `cb[k]` is a u8 (0..255) tap sample; the 3
+ *  weights (w0+w1), (w2+w3+w4), (w5+w6) are sums of 2-3 six-bit BP fields
+ *  (0..63 each), so they bound to <=126, <=189, <=126 respectively. A SINGLE
+ *  product is at most 255*189 = 48195 — exceeds a signed 16-bit lane
+ *  (32767) but fits an UNSIGNED 16-bit lane (65535) exactly, so each product
+ *  is computed with a 16-bit multiply (_mm_mullo_epi16 — SSE2, take the low
+ *  16 bits of the true product) then zero-extended to 32-bit (the product is
+ *  never negative, so zero-extension recovers the exact value). The 3-term
+ *  SUM is at most 255*(126+189+126) = 112455 — needs 32-bit accumulation
+ *  (paddd); >>6 and the "clamp to 255" then run in 32-bit lanes (no SSE4.1
+ *  pminsd/pmaxsd available under SSE2, so the clamp is a compare+select).
+ *
+ *  color_to_yuv: r/g/b are u8 (0..255) filter outputs. y=66r+129g+25b maxes
+ *  at 255*(66+129+25)=56100; u=-38r-74g+112b and v=112r-94g-18b both range
+ *  exactly [-28560,28560] (checked at all 8 corners of {0,255}^3) — none of
+ *  these fit a 16-bit lane, so the r/g PAIR of each is computed with
+ *  _mm_madd_epi16 (SSE2 pmaddwd: true signed 16x16->32 multiplies, THEN a
+ *  32-bit add of the pair — no 16-bit-lane truncation risk at all, unlike
+ *  pmullw) against the two coefficients packed into one 16-bit-lane-pair
+ *  constant; the remaining b-alone term uses a plain 16-bit multiply
+ *  (individual b-coefficient products are <=28560, safely under 32768, so
+ *  sign-extension after the 16-bit multiply recovers the exact signed
+ *  value even for the negative b coefficient in v). All three combiner
+ *  outputs then get color_to_yuv's own (y>>8)+((y>>7)&1) rounding — done in
+ *  32-bit lanes with an arithmetic shift (_mm_srai_epi32, matching the
+ *  scalar code's `>>` on a possibly-negative int bit-for-bit) — and its
+ *  (u8)/(s8) truncating cast. That cast is a PROVEN no-op here: y>>8 maxes
+ *  at 219 (+ the 0/1 rounding bit = <=220), inside u8 range with room to
+ *  spare; u>>8 and v>>8 both range [-112,111] (+ rounding = [-112,112]),
+ *  inside s8's [-128,127] with room to spare — so the plain computed int32
+ *  IS the cast's result, no separate truncate/sign-extend step needed.
+ *
+ *  efb_copy_pack: scanY holds color_to_yuv's Y (proven 0..219ish, see
+ *  above); Y0/Y1 = scanY[i]+16 range [16,235] — the store clamp never
+ *  actually triggers but is still implemented (compare+select) for the same
+ *  "identical expression, not identical-only-when-lucky" reason as the
+ *  filter sum's clamp. scanU/scanV hold color_to_yuv's U/V (proven
+ *  [-112,112]); the 1/4+1/2+1/4 sum U[i-1]+2U[i]+U[i+1] ranges at most
+ *  [-448,448] (arithmetic >>2, matching the scalar `>>`, via _mm_srai_epi32)
+ *  then +128 gives [-112,240] before the same defensive clamp. All of this
+ *  fits comfortably in 32-bit lanes with no overflow anywhere, so this
+ *  stage runs in plain 32-bit SIMD throughout — no 16-bit intermediate step
+ *  needed at all.
+ *
+ * Loop 2 has no SIMD gather instruction available under SSE2, so its lane
+ * layout is built from CONTIGUOUS loads + in-register shuffles instead:
+ * scanY[i..i+7] loaded as two 4-lane regs already contains Y0/Y1 for 4
+ * iterations in exactly the output byte order (scanY[i]=Y0 of iter0,
+ * scanY[i+1]=Y1 of iter0, scanY[i+2]=Y0 of iter1, ...) with NO shuffle
+ * needed; the smoothed-chroma "1/4+1/2+1/4" values are needed only at the
+ * SAME stride-2 offsets, so gather_even2 (a _mm_shuffle_epi32 per input reg
+ * to bring lanes {0,2} to the front, then _mm_unpacklo_epi64 to concatenate
+ * the two regs' pairs) reconstructs the 4 needed values from 2 contiguous
+ * loads — a shuffle-based stride-2 "gather" entirely within SSE2, at the
+ * cost of pre-computing the smoothed chroma for every column (not just the
+ * odd ones the scalar loop reads) in a first pass — cheap (2 adds + 1 shift
+ * per column) and itself fully vectorizable with plain contiguous loads.
+ * ==========================================================================*/
+
+/* Zero/sign-extend the LOW 4 16-bit lanes of `x` to 4x32-bit lanes. */
+static inline __m128i simd_zext16_lo(__m128i x) { return _mm_unpacklo_epi16(x, _mm_setzero_si128()); }
+static inline __m128i simd_sext16_lo(__m128i x) { return _mm_srai_epi32(_mm_unpacklo_epi16(x, x), 16); }
+
+/* v <- clamp(v, 0, 255), 4x32-bit lanes. No pminsd/pmaxsd under SSE2 (that's
+ * SSE4.1), so this is a plain compare+select. `only_max`: caller already
+ * knows v can never be negative (efb_copy_col's filter sum), so skip the
+ * dead low-side compare — cheap, not a correctness-affecting shortcut (the
+ * omitted compare would never fire; see the big comment above). */
+static inline __m128i simd_clamp_max255(__m128i v) {
+    __m128i c255 = _mm_set1_epi32(255);
+    __m128i gt = _mm_cmpgt_epi32(v, c255);
+    return _mm_or_si128(_mm_and_si128(gt, c255), _mm_andnot_si128(gt, v));
+}
+static inline __m128i simd_clamp_0_255(__m128i v) {
+    __m128i zero = _mm_setzero_si128();
+    v = _mm_andnot_si128(_mm_cmplt_epi32(v, zero), v);
+    return simd_clamp_max255(v);
+}
+
+/* efb_copy_col's 3-tap weighted sum for one channel, 4 columns at a time.
+ * a/b/c: the yprev/sy/ynext taps' channel value (4x32-bit lanes, 0..255).
+ * wab/wbc/wca... see the big comment above for the range derivation. */
+static inline __m128i simd_filter_sum(__m128i a, __m128i b, __m128i c, int wa, int wb, int wc) {
+    __m128i ap = _mm_packs_epi32(a, a), bp = _mm_packs_epi32(b, b), cp = _mm_packs_epi32(c, c);
+    __m128i pa = _mm_mullo_epi16(ap, _mm_set1_epi16((short)wa));
+    __m128i pb = _mm_mullo_epi16(bp, _mm_set1_epi16((short)wb));
+    __m128i pc = _mm_mullo_epi16(cp, _mm_set1_epi16((short)wc));
+    __m128i sum = _mm_add_epi32(_mm_add_epi32(simd_zext16_lo(pa), simd_zext16_lo(pb)), simd_zext16_lo(pc));
+    sum = _mm_srli_epi32(sum, 6);   /* logical shift == arithmetic here: sum is always >= 0 */
+    return simd_clamp_max255(sum);
+}
+
+/* color_to_yuv, 4 columns at a time. R/G/B: 4x32-bit lanes, 0..255 (this
+ * copy's filt[RED_C]/[GRN_C]/[BLU_C]). The scalar version computes a wide
+ * `y`/`u`/`vv` intermediate and then narrows it with a `(u8)`/`(s8)` cast;
+ * that cast is a proven no-op here (see the big comment), so Yv/Uv/Vv below
+ * are already the final values color_to_yuv's out-params would hold —
+ * no separate truncate/sign-extend step is applied on top. */
+static inline void simd_color_to_yuv(__m128i R, __m128i G, __m128i B,
+                                      __m128i* Yv, __m128i* Uv, __m128i* Vv) {
+    __m128i Rp = _mm_packs_epi32(R, R), Gp = _mm_packs_epi32(G, G), Bp = _mm_packs_epi32(B, B);
+    __m128i RG = _mm_unpacklo_epi16(Rp, Gp);   /* R0,G0,R1,G1,R2,G2,R3,G3 */
+
+    const __m128i w_y = _mm_set1_epi32(0x00810042);          /* R:66 (even lane), G:129 (odd lane) */
+    const __m128i w_u = _mm_set1_epi32((int)0xFFB6FFDAu);    /* R:-38 (even), G:-74 (odd) */
+    const __m128i w_v = _mm_set1_epi32((int)0xFFA20070u);    /* R:112 (even), G:-94 (odd) */
+
+    __m128i y_rg = _mm_madd_epi16(RG, w_y);   /* R*66 + G*129, exact (pmaddwd, no truncation) */
+    __m128i u_rg = _mm_madd_epi16(RG, w_u);   /* R*-38 + G*-74 */
+    __m128i v_rg = _mm_madd_epi16(RG, w_v);   /* R*112 + G*-94 */
+
+    __m128i b25  = simd_sext16_lo(_mm_mullo_epi16(Bp, _mm_set1_epi16(25)));    /* 0..6375 */
+    __m128i b112 = simd_sext16_lo(_mm_mullo_epi16(Bp, _mm_set1_epi16(112)));   /* 0..28560 */
+    __m128i bm18 = simd_sext16_lo(_mm_mullo_epi16(Bp, _mm_set1_epi16(-18)));   /* -4590..0 */
+
+    __m128i y = _mm_add_epi32(y_rg, b25);
+    __m128i u = _mm_add_epi32(u_rg, b112);
+    __m128i v = _mm_add_epi32(v_rg, bm18);
+
+    const __m128i one = _mm_set1_epi32(1);
+    /* (u8)/(s8) cast: proven no-op (see the big comment), so the rounded
+     * int32 value below IS the cast's result — no truncate/sign-extend step
+     * needed on top of it. */
+    *Yv = _mm_add_epi32(_mm_srai_epi32(y, 8), _mm_and_si128(_mm_srai_epi32(y, 7), one));
+    *Uv = _mm_add_epi32(_mm_srai_epi32(u, 8), _mm_and_si128(_mm_srai_epi32(u, 7), one));
+    *Vv = _mm_add_epi32(_mm_srai_epi32(v, 8), _mm_and_si128(_mm_srai_epi32(v, 7), one));
+}
+
+/* Stride-2 "gather" via shuffle: from lo=[v0,v1,v2,v3] and hi=[v4,v5,v6,v7],
+ * return [v0,v2,v4,v6] (gather_even2) or [v1,v3,v5,v7] (gather_odd2). SSE2
+ * has no gather instruction; this reconstructs it from 2 contiguous loads. */
+static inline __m128i simd_gather_even2(__m128i lo, __m128i hi) {
+    __m128i los = _mm_shuffle_epi32(lo, _MM_SHUFFLE(3, 1, 2, 0));   /* [v0,v2,v1,v3] */
+    __m128i his = _mm_shuffle_epi32(hi, _MM_SHUFFLE(3, 1, 2, 0));
+    return _mm_unpacklo_epi64(los, his);                            /* [v0,v2, v4,v6] */
+}
+static inline __m128i simd_gather_odd2(__m128i lo, __m128i hi) {
+    __m128i los = _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 0, 3, 1));   /* [v1,v3,v0,v2] */
+    __m128i his = _mm_shuffle_epi32(hi, _MM_SHUFFLE(2, 0, 3, 1));
+    return _mm_unpacklo_epi64(los, his);                            /* [v1,v3, v5,v7] */
 }
 
 void gx_raster_efb_copy(const GxCpState* cp) {
@@ -3283,6 +3584,25 @@ void gx_raster_efb_copy(const GxCpState* cp) {
             static int scanY[EFB_WIDTH + 2];
             static int scanU[EFB_WIDTH + 2];
             static int scanV[EFB_WIDTH + 2];
+            /* SIMD-only scratch (see the big SSE2 comment above): the
+             * smoothed 1/4+1/2+1/4 chroma sum, precomputed for every column
+             * (not just the odd ones the scalar loop reads — cheap, and lets
+             * the pack stage below use a plain stride-2 shuffle-gather). */
+            static int smoothU[EFB_WIDTH + 2];
+            static int smoothV[EFB_WIDTH + 2];
+
+            /* SIMD eligibility, decided ONCE PER COPY (not per scanline):
+             * (a) not forced off via GCN_GX_NO_SIMD; (b) copy_getpx is
+             * exactly get_pixel_color_direct — the only format this SIMD
+             * path specializes for (see the big comment); (c) the whole
+             * scanline's x range is inside [0,EFB_WIDTH), so loop 1's
+             * vectorized span can never hit get_efb_color's x clamp (the
+             * scalar efb_copy_col fallback still carries that clamp,
+             * unconditionally, for anything that doesn't take this path). */
+            if (s_no_simd < 0) s_no_simd = getenv("GCN_GX_NO_SIMD") ? 1 : 0;
+            int simd_ok = !s_no_simd && copy_getpx == get_pixel_color_direct &&
+                          left >= 0 && right <= (int)EFB_WIDTH;
+
             for (int dy = 0; dy < dst_h; dy++) {
                 int sy = top + (int)(dy / (yscale == 0 ? 1.0f : yscale) + 0.5f);
                 if (sy >= bottom) sy = bottom - 1;
@@ -3291,33 +3611,96 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                 int ynext = (clamp_bottom ? bottom : (int)EFB_HEIGHT) - 1;
                 if (sy + 1 < ynext) ynext = sy + 1;
                 /* per-pixel filtered YUV (indices 1..src_w) */
-                for (int i = 1, x = left; x < right; i++, x++) {
-                    u32 c0 = get_efb_color(x, yprev, copy_getpx);
-                    u32 c1 = get_efb_color(x, sy, copy_getpx);
-                    u32 c2 = get_efb_color(x, ynext, copy_getpx);
-                    u8 cb0[4], cb1[4], cb2[4];
-                    memcpy(cb0, &c0, 4); memcpy(cb1, &c1, 4); memcpy(cb2, &c2, 4);
-                    u8 filt[4]; filt[ALP_C] = 0;
-                    for (int k = BLU_C; k <= RED_C; k++) {
-                        int sum = cb0[k] * (w0 + w1) + cb1[k] * (w2 + w3 + w4) + cb2[k] * (w5 + w6);
-                        sum >>= 6; if (sum > 255) sum = 255; filt[k] = (u8)sum;
+                if (simd_ok) {
+                    const u32* rowPrev = &s_efb_color[(u32)yprev * EFB_WIDTH];
+                    const u32* rowSy   = &s_efb_color[(u32)sy    * EFB_WIDTH];
+                    const u32* rowNext = &s_efb_color[(u32)ynext * EFB_WIDTH];
+                    const __m128i mask8 = _mm_set1_epi32(0xFF);
+                    int x = left;
+                    for (; x + 4 <= right; x += 4) {
+                        int i = x - left + 1;
+                        __m128i c0 = _mm_loadu_si128((const __m128i*)&rowPrev[x]);
+                        __m128i c1 = _mm_loadu_si128((const __m128i*)&rowSy[x]);
+                        __m128i c2 = _mm_loadu_si128((const __m128i*)&rowNext[x]);
+                        __m128i B0 = _mm_and_si128(c0, mask8);
+                        __m128i G0 = _mm_and_si128(_mm_srli_epi32(c0, 8), mask8);
+                        __m128i R0 = _mm_and_si128(_mm_srli_epi32(c0, 16), mask8);
+                        __m128i B1 = _mm_and_si128(c1, mask8);
+                        __m128i G1 = _mm_and_si128(_mm_srli_epi32(c1, 8), mask8);
+                        __m128i R1 = _mm_and_si128(_mm_srli_epi32(c1, 16), mask8);
+                        __m128i B2 = _mm_and_si128(c2, mask8);
+                        __m128i G2 = _mm_and_si128(_mm_srli_epi32(c2, 8), mask8);
+                        __m128i R2 = _mm_and_si128(_mm_srli_epi32(c2, 16), mask8);
+                        int wab = w0 + w1, wcde = w2 + w3 + w4, wfg = w5 + w6;
+                        __m128i filtB = simd_filter_sum(B0, B1, B2, wab, wcde, wfg);
+                        __m128i filtG = simd_filter_sum(G0, G1, G2, wab, wcde, wfg);
+                        __m128i filtR = simd_filter_sum(R0, R1, R2, wab, wcde, wfg);
+                        __m128i Yv, Uv, Vv;
+                        simd_color_to_yuv(filtR, filtG, filtB, &Yv, &Uv, &Vv);
+                        _mm_storeu_si128((__m128i*)&scanY[i], Yv);
+                        _mm_storeu_si128((__m128i*)&scanU[i], Uv);
+                        _mm_storeu_si128((__m128i*)&scanV[i], Vv);
                     }
-                    u32 fc; memcpy(&fc, filt, 4);
-                    int Y, U, V; color_to_yuv(fc, &Y, &U, &V);
-                    scanY[i] = Y; scanU[i] = U; scanV[i] = V;
+                    for (int i = x - left + 1; x < right; i++, x++)
+                        efb_copy_col(x, yprev, sy, ynext, copy_getpx, w0, w1, w2, w3, w4, w5, w6,
+                                     scanY, scanU, scanV, i);
+                } else {
+                    for (int i = 1, x = left; x < right; i++, x++)
+                        efb_copy_col(x, yprev, sy, ynext, copy_getpx, w0, w1, w2, w3, w4, w5, w6,
+                                     scanY, scanU, scanV, i);
                 }
                 scanY[0] = scanY[1]; scanU[0] = scanU[1]; scanV[0] = scanV[1];
                 scanY[src_w + 1] = scanY[src_w]; scanU[src_w + 1] = scanU[src_w]; scanV[src_w + 1] = scanV[src_w];
                 u8* row = s_cpu->ram + phys + (u64)dy * dest_stride;
-                for (int i = 1, x = 0; x < src_w; i += 2, x += 2) {
-                    int Y0 = scanY[i] + 16;
-                    int UV0 = 128 + ((scanU[i - 1] + (scanU[i] << 1) + scanU[i + 1]) >> 2);
-                    int Y1 = scanY[i + 1] + 16;
-                    int UV1 = 128 + ((scanV[i - 1] + (scanV[i] << 1) + scanV[i + 1]) >> 2);
-                    row[x * 2 + 0] = (u8)(Y0 < 0 ? 0 : Y0 > 255 ? 255 : Y0);
-                    row[x * 2 + 1] = (u8)(UV0 < 0 ? 0 : UV0 > 255 ? 255 : UV0);
-                    row[x * 2 + 2] = (u8)(Y1 < 0 ? 0 : Y1 > 255 ? 255 : Y1);
-                    row[x * 2 + 3] = (u8)(UV1 < 0 ? 0 : UV1 > 255 ? 255 : UV1);
+                if (simd_ok) {
+                    /* Precompute the smoothed chroma for every column 1..src_w
+                     * (padding at 0/src_w+1 already mirrors scanU/scanV
+                     * above, so this needs no edge-casing of its own — see
+                     * the big comment). */
+                    int i = 1;
+                    for (; i + 4 <= src_w + 1; i += 4) {
+                        __m128i um1 = _mm_loadu_si128((const __m128i*)&scanU[i - 1]);
+                        __m128i u0  = _mm_loadu_si128((const __m128i*)&scanU[i]);
+                        __m128i up1 = _mm_loadu_si128((const __m128i*)&scanU[i + 1]);
+                        _mm_storeu_si128((__m128i*)&smoothU[i],
+                            _mm_add_epi32(_mm_add_epi32(um1, _mm_slli_epi32(u0, 1)), up1));
+                        __m128i vm1 = _mm_loadu_si128((const __m128i*)&scanV[i - 1]);
+                        __m128i v0  = _mm_loadu_si128((const __m128i*)&scanV[i]);
+                        __m128i vp1 = _mm_loadu_si128((const __m128i*)&scanV[i + 1]);
+                        _mm_storeu_si128((__m128i*)&smoothV[i],
+                            _mm_add_epi32(_mm_add_epi32(vm1, _mm_slli_epi32(v0, 1)), vp1));
+                    }
+                    for (; i <= src_w; i++) {
+                        smoothU[i] = scanU[i - 1] + (scanU[i] << 1) + scanU[i + 1];
+                        smoothV[i] = scanV[i - 1] + (scanV[i] << 1) + scanV[i + 1];
+                    }
+
+                    int x = 0;
+                    i = 1;
+                    for (; x + 8 <= src_w; i += 8, x += 8) {
+                        __m128i Yc_lo = _mm_loadu_si128((const __m128i*)&scanY[i]);
+                        __m128i Yc_hi = _mm_loadu_si128((const __m128i*)&scanY[i + 4]);
+                        __m128i Y0v = simd_gather_even2(Yc_lo, Yc_hi);
+                        __m128i Y1v = simd_gather_odd2(Yc_lo, Yc_hi);
+                        __m128i sU_lo = _mm_loadu_si128((const __m128i*)&smoothU[i]);
+                        __m128i sU_hi = _mm_loadu_si128((const __m128i*)&smoothU[i + 4]);
+                        __m128i sV_lo = _mm_loadu_si128((const __m128i*)&smoothV[i]);
+                        __m128i sV_hi = _mm_loadu_si128((const __m128i*)&smoothV[i + 4]);
+                        __m128i UV0raw = simd_gather_even2(sU_lo, sU_hi);
+                        __m128i UV1raw = simd_gather_even2(sV_lo, sV_hi);
+                        __m128i Y0c = simd_clamp_0_255(_mm_add_epi32(Y0v, _mm_set1_epi32(16)));
+                        __m128i Y1c = simd_clamp_0_255(_mm_add_epi32(Y1v, _mm_set1_epi32(16)));
+                        __m128i UV0c = simd_clamp_0_255(_mm_add_epi32(_mm_set1_epi32(128), _mm_srai_epi32(UV0raw, 2)));
+                        __m128i UV1c = simd_clamp_0_255(_mm_add_epi32(_mm_set1_epi32(128), _mm_srai_epi32(UV1raw, 2)));
+                        __m128i word = _mm_or_si128(_mm_or_si128(Y0c, _mm_slli_epi32(UV0c, 8)),
+                                                     _mm_or_si128(_mm_slli_epi32(Y1c, 16), _mm_slli_epi32(UV1c, 24)));
+                        _mm_storeu_si128((__m128i*)(row + x * 2), word);
+                    }
+                    for (; x < src_w; i += 2, x += 2)
+                        efb_copy_pack(row, x, i, scanY, scanU, scanV);
+                } else {
+                    for (int i = 1, x = 0; x < src_w; i += 2, x += 2)
+                        efb_copy_pack(row, x, i, scanY, scanU, scanV);
                 }
             }
         }
