@@ -751,10 +751,16 @@ void gcn_gx_tick(u32 cycles) {
         gx_raster_get_pixel_stats(&ps);
         u64 ps_tot = ps.tsc_block + ps.tsc_slope + ps.tsc_tex + ps.tsc_comb + ps.tsc_blend;
         if (ps.shaded > 0u && ps_tot > 0u) {
+            /* texel_cache_hit%: hit rate of the per-draw decode_texel memo
+             * (gx_raster.c's "Per-draw texel cache" comment, above tex_sample)
+             * — hits+misses covers every decode_texel call tex_sample makes
+             * (4 bilinear taps or 1 point tap per sample). */
+            u64 tc_tot = ps.texel_cache_hits + ps.texel_cache_misses;
             fprintf(stderr,
                 "[gx-pixel-stats] block=%.1f%% slope=%.1f%% tex=%.1f%% comb=%.1f%% blend=%.1f%%"
                 "  | tex_calls=%llu linear=%llu point=%llu earlyz_rejected=%llu shaded=%llu"
-                " blend_writes=%llu\n",
+                " blend_writes=%llu texel_cache_hits=%llu texel_cache_misses=%llu"
+                " texel_cache_hit%%=%.1f%%\n",
                 100.0 * (double)ps.tsc_block / (double)ps_tot,
                 100.0 * (double)ps.tsc_slope / (double)ps_tot,
                 100.0 * (double)ps.tsc_tex   / (double)ps_tot,
@@ -762,7 +768,9 @@ void gcn_gx_tick(u32 cycles) {
                 100.0 * (double)ps.tsc_blend / (double)ps_tot,
                 (unsigned long long)ps.tex_calls, (unsigned long long)ps.tex_linear,
                 (unsigned long long)ps.tex_point, (unsigned long long)ps.earlyz_rejected,
-                (unsigned long long)ps.shaded, (unsigned long long)ps.blend_writes);
+                (unsigned long long)ps.shaded, (unsigned long long)ps.blend_writes,
+                (unsigned long long)ps.texel_cache_hits, (unsigned long long)ps.texel_cache_misses,
+                tc_tot > 0u ? 100.0 * (double)ps.texel_cache_hits / (double)tc_tot : 0.0);
             fflush(stderr);
         }
     }

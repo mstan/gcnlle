@@ -101,6 +101,8 @@ static u64 s_ps_tex_point;       /* ...of which point-sampled */
 static u64 s_ps_earlyz_rejected; /* raster_pixel_prep: early-Z rejected */
 static u64 s_ps_shaded;          /* tev_draw entries (own counter, see above) */
 static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
+static u64 s_ps_texel_cache_hits;   /* per-draw texel cache: decode_texel calls it satisfied */
+static u64 s_ps_texel_cache_misses; /* ...calls that had to fall through to a real decode */
 
 /* ---- one-time trap logging ------------------------------------------------ */
 static int trap_once(int* flag, const char* what) {
@@ -700,6 +702,116 @@ static void decode_texel(u32 fmt, const u8* src, u32 src_len, int s, int t,
     }
 }
 
+/* ============================================================================
+ * Per-draw texel cache (perf; GCN_GX_PIXEL_STATS showed tex_sample at 25% of
+ * the triangle-scan wall, with EVERY sample bilinear — 4 decode_texel calls
+ * each — and adjacent samples' bilinear footprints overlapping heavily (a
+ * given texel is typically re-decoded ~4x by one sample's own taps and again
+ * by neighboring pixels' taps). decode_texel does GameCube tiled-format
+ * address math + format conversion per call; none of that depends on
+ * anything but (fmt, src, src_len, iS, iT, w1).
+ *
+ * EXACTNESS: this is a correctness-preserving memo, not a heuristic. Within
+ * one gx_raster_draw call, tc = &s_cfg.tex[texmap] (build_draw_cfg, populated
+ * once at draw entry) freezes fmt/src/src_len/w1 for that texmap — BP loads
+ * are separate FIFO commands that never interleave with a draw's vertex/
+ * pixel payload (see the "Per-draw config cache" comment above), so they
+ * cannot change mid-draw. h1 does not participate at all: decode_texel's
+ * signature never takes it (only w1 drives the tiled block-row stride; the
+ * per-sample T wrapping that *does* use h1 happens in tex_sample before
+ * decode_texel is ever called). So for a fixed draw, (texmap, iS, iT) alone
+ * determines every argument decode_texel would receive, which means it also
+ * determines the output byte-for-byte. Caching keyed on (texmap, iS, iT) and
+ * invalidated at draw granularity is therefore exact: a hit returns the exact
+ * out[4] the replaced decode_texel call would have produced, never an
+ * approximation.
+ *
+ * GENERATION TAGGING (no per-draw memset): a global u32 generation counter
+ * bumped once per draw (build_draw_cfg). Each slot stores the generation it
+ * was written in; a slot is live only if its stored generation equals the
+ * current one, so starting a new draw invalidates the whole table for free
+ * (one integer increment) instead of paying to clear ~thousands of entries
+ * every draw regardless of how few of them the new draw will touch.
+ * Wraparound (u32 generation overflowing back to 0 after ~4 billion draws)
+ * is handled by treating stored-generation 0 as a reserved "never valid"
+ * sentinel: build_draw_cfg() skips 0 when it would otherwise land there, and
+ * pays for exactly one full-table memset at that moment (see build_draw_cfg
+ * for the code — this is the only clear the cache ever does in its entire
+ * lifetime, amortized over 4 billion draws, i.e. effectively never).
+ *
+ * SIZE / LAYOUT: direct-mapped, power-of-two entry count so the index is a
+ * plain AND-mask (no modulo). Entry is deliberately kept as two u32s + 4
+ * bytes (key, gen, rgba) rather than folding gen into the tag word: menu
+ * textures are small, but texmap (3 bits) + iS + iT (up to 10 bits each,
+ * GX's max texture dimension is 1024) already want 23 bits for a collision-
+ * free key, leaving too few spare bits to also carry a generation counter
+ * that wouldn't wrap (and re-trigger the full-clear path) many times a
+ * second. Two separate u32s cost 4 more bytes per entry but keep both fields
+ * exact and the wraparound vanishingly rare.
+ *
+ * KEY: texmap<<20 | iT<<10 | iS — exact and collision-free (iS/iT < 1024,
+ * texmap < 8), used only for the tag comparison, not the index.
+ *
+ * INDEX MIX: (iS ^ (iT<<5) ^ (texmap<<11)) & MASK. iS lands in the index's
+ * low bits untouched, so horizontally-adjacent texels in the same scanline
+ * (iS, iS+1, iS+2, ...) get distinct, sequential index slots instead of all
+ * colliding on the same one; the <<5 on iT and <<11 on texmap spread rows
+ * and texture units across the table so a vertically-adjacent or different-
+ * texmap request doesn't systematically alias iS's own bit pattern either.
+ * Size starts at 4096 (12-bit mask); measured hit rate is reported in the
+ * task's VERIFY output (bumped to 8192 if 4096 fell short of ~80%).
+ * ==========================================================================*/
+#define TEXEL_CACHE_BITS  12u
+#define TEXEL_CACHE_SIZE  (1u << TEXEL_CACHE_BITS)
+#define TEXEL_CACHE_MASK  (TEXEL_CACHE_SIZE - 1u)
+
+typedef struct {
+    u32 key;      /* texmap<<20 | iT<<10 | iS — exact tag, see comment above */
+    u32 gen;      /* draw generation this slot was last written in */
+    u8  rgba[4];  /* decode_texel's exact out[4] for that (texmap,iS,iT) */
+} TexelCacheEntry;
+
+static TexelCacheEntry s_texel_cache[TEXEL_CACHE_SIZE];
+
+/* 0 is reserved as the "slot never written since last full clear" sentinel
+ * (see the wraparound handling in build_draw_cfg) — so the very first real
+ * draw must not use generation 0 either; build_draw_cfg's pre-increment
+ * (0 -> 1 on the first call) already guarantees that. */
+static u32 s_texel_cache_gen;
+
+static inline u32 texel_cache_key(u32 texmap, u32 iS, u32 iT) {
+    return (texmap << 20) | (iT << 10) | iS;
+}
+static inline u32 texel_cache_index(u32 texmap, u32 iS, u32 iT) {
+    return (iS ^ (iT << 5) ^ (texmap << 11)) & TEXEL_CACHE_MASK;
+}
+
+/* Cache-checked decode_texel wrapper. Hooked INSIDE tex_sample (this is its
+ * only caller — decode_texel itself is left untouched and still callable
+ * directly, though a repo-wide grep found no other caller) so callers of
+ * decode_texel that might not share tex_sample's per-draw-frozen-texmap
+ * invariant are unaffected by construction, not just by accident. */
+static inline void decode_texel_cached(u32 texmap, u32 fmt, const u8* src, u32 src_len,
+                                        int iS, int iT, int w1, u8 out[4]) {
+    u32 key = texel_cache_key(texmap, (u32)iS, (u32)iT);
+    u32 idx = texel_cache_index(texmap, (u32)iS, (u32)iT);
+    TexelCacheEntry* e = &s_texel_cache[idx];
+
+    if (e->gen == s_texel_cache_gen && e->key == key) {
+        /* Hit: byte-identical to the decode_texel call this replaces (see the
+         * EXACTNESS argument above) — no recompute, just copy the 4 bytes. */
+        out[0] = e->rgba[0]; out[1] = e->rgba[1]; out[2] = e->rgba[2]; out[3] = e->rgba[3];
+        if (s_pixel_stats) s_ps_texel_cache_hits++;
+        return;
+    }
+
+    decode_texel(fmt, src, src_len, iS, iT, w1, out);
+    e->key = key;
+    e->gen = s_texel_cache_gen;
+    e->rgba[0] = out[0]; e->rgba[1] = out[1]; e->rgba[2] = out[2]; e->rgba[3] = out[3];
+    if (s_pixel_stats) s_ps_texel_cache_misses++;
+}
+
 static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     /* tx_mode0/mode1/image0/image3 field extraction is per-draw-constant (BP
      * loads never interleave with a draw's vertex payload) — decoded once by
@@ -745,10 +857,14 @@ static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
         iS1 = wrap_coord(iS1, wrap_s, w1 + 1);
         iT1 = wrap_coord(iT1, wrap_t, h1 + 1);
         u8 v00[4], v10[4], v01[4], v11[4];
-        decode_texel(fmt, src, src_len, iS,  iT,  w1, v00);
-        decode_texel(fmt, src, src_len, iS1, iT,  w1, v10);
-        decode_texel(fmt, src, src_len, iS,  iT1, w1, v01);
-        decode_texel(fmt, src, src_len, iS1, iT1, w1, v11);
+        /* Cache-checked (see "Per-draw texel cache" comment above): adjacent
+         * pixels in a scanline and adjacent samples' own 4 taps repeat the
+         * same (texmap,iS,iT) constantly, this is exactly what the cache
+         * memoizes. */
+        decode_texel_cached(texmap, fmt, src, src_len, iS,  iT,  w1, v00);
+        decode_texel_cached(texmap, fmt, src, src_len, iS1, iT,  w1, v10);
+        decode_texel_cached(texmap, fmt, src, src_len, iS,  iT1, w1, v01);
+        decode_texel_cached(texmap, fmt, src, src_len, iS1, iT1, w1, v11);
         for (int c = 0; c < 4; c++) {
             u32 acc = v00[c] * (u32)((128 - fS) * (128 - fT)) +
                       v10[c] * (u32)((fS)       * (128 - fT)) +
@@ -759,7 +875,7 @@ static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     } else {
         int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
         int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
-        decode_texel(fmt, src, src_len, iS, iT, w1, out);
+        decode_texel_cached(texmap, fmt, src, src_len, iS, iT, w1, out);
     }
 }
 
@@ -2116,6 +2232,18 @@ static void recompute_scissor(void) {
  * tev_load_registers(&s_tev): stage_konst resolution reads s_tev.Konst[],
  * which that call just (re)loaded from bp 0xE0-0xE7. */
 static void build_draw_cfg(void) {
+    /* Bump the per-draw texel cache's generation (see the big "Per-draw texel
+     * cache" comment above tex_sample) — this is the ENTIRE invalidation cost
+     * for a new draw: one integer increment, no memset. Skip stored-gen 0 (it
+     * is the "slot never written since last full clear" sentinel); on the
+     * u32 wraparound that lands exactly on 0, pay for one full-table clear
+     * (a few dozen KB memset — happens once every ~4 billion draws, i.e.
+     * never in practice) and resume at 1. */
+    if (++s_texel_cache_gen == 0) {
+        memset(s_texel_cache, 0, sizeof s_texel_cache);
+        s_texel_cache_gen = 1;
+    }
+
     s_pf     = pixel_format();
     s_zt_upd = zm_update_enable();
     s_bm_cu  = bm_color_update();
@@ -2375,6 +2503,8 @@ void gx_raster_get_pixel_stats(GxPixelStats* out) {
     out->earlyz_rejected = s_ps_earlyz_rejected;
     out->shaded = s_ps_shaded;
     out->blend_writes = s_ps_blend_writes;
+    out->texel_cache_hits   = s_ps_texel_cache_hits;
+    out->texel_cache_misses = s_ps_texel_cache_misses;
 }
 
 /* ============================================================================

@@ -88,10 +88,21 @@ void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u6
  * tev_draw: combiner stages + alpha test), BLEND (late-Z, if it lives after
  * alpha test, + BlendTev). All tsc_* fields and counters are cumulative since
  * process start; all zero if the knob was never turned on. */
+/* texel_cache_hits/misses: the per-draw direct-mapped decode_texel cache (see
+ * gx_raster.c's "Per-draw texel cache" comment, right before tex_sample) —
+ * every decode_texel call tex_sample makes (4 bilinear taps + 1 point tap)
+ * either hits an already-decoded (texmap,iS,iT) or misses and decodes+fills
+ * it. Always active (the cache is exact, not a heuristic — no separate env
+ * knob), but the hit/miss tally itself is only counted under this same
+ * GCN_GX_PIXEL_STATS gate as everything else here, so it costs nothing when
+ * the knob is off. hits+misses == tex_calls*4 (linear) + tex_calls*1 (point)
+ * i.e. == tex_linear*4 + tex_point, since every decode_texel call site is
+ * counted exactly once each. */
 typedef struct {
     u64 tsc_block, tsc_slope, tsc_tex, tsc_comb, tsc_blend;
     u64 tex_calls, tex_linear, tex_point;
     u64 earlyz_rejected, shaded, blend_writes;
+    u64 texel_cache_hits, texel_cache_misses;
 } GxPixelStats;
 
 void gx_raster_get_pixel_stats(GxPixelStats* out);
