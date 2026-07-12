@@ -115,13 +115,27 @@ static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
  * full field set once (see build_draw_cfg's census tail); per-config draw and
  * shaded-pixel counters print on the shared cadence via
  * gx_raster_print_census. Diagnostic only; default off; one untaken branch
- * per draw (and one per pixel) when off. */
+ * per draw (and one per pixel) when off. `fused_pixels` (added for the
+ * fused-pixel-path perf task) counts, per bucket, how many of that bucket's
+ * `pixels` were shaded via a fused_pixel_A/B/C specialization instead of the
+ * general tev_draw() — the coverage number the task's VERIFY step asks for,
+ * gated on this same knob so it costs nothing when census is off. */
 #define GX_CENSUS_MAX 16
-typedef struct { int used; u32 hash; u64 draws, pixels; } GxCensusEntry;
+typedef struct { int used; u32 hash; u64 draws, pixels, fused_pixels; } GxCensusEntry;
 static int s_tev_census = -1;
 static GxCensusEntry s_census[GX_CENSUS_MAX];
 static int s_census_cur = -1;   /* index of the current draw's config, else -1 */
 static u64 s_ps_texel_cache_hits;   /* per-draw texel cache: decode_texel calls it satisfied */
+
+/* GCN_GX_NO_FUSED=1: force every draw's fused-pixel-path selection (see
+ * build_draw_cfg's tail, near fused_pixel_A/B/C) to stay off, i.e. always
+ * fall back to the general tev_draw(). Own lazy -1-sentinel getenv, same
+ * pattern as s_tev_census/s_draw_stats/s_pixel_stats above — this is the
+ * knob the task's same-binary A/B exactness proof toggles (fused vs general,
+ * same executable, XFB hash must match either way). Independent of
+ * GCN_GX_TEV_CENSUS: fused selection runs on every draw regardless of whether
+ * the census is being collected. */
+static int s_no_fused = -1;
 static u64 s_ps_texel_cache_misses; /* ...calls that had to fall through to a real decode */
 
 /* ---- one-time trap logging ------------------------------------------------ */
@@ -203,6 +217,13 @@ static inline u8 Convert5To8(u8 v) { return (u8)((v << 3) | (v >> 2)); }
  * pre-resolved per-stage StageKonst — can sit ahead of every pixel-path
  * function that reads the cache (GetPixelColor, ZCompare, BlendTev, ...). */
 typedef struct { s16 r, g, b, a; } TColor;
+
+/* Forward declaration only (full definition lives with the rest of the Tev
+ * state, further down) so DrawCfg below can hold a function pointer typed
+ * over it — see DrawCfg::fused (GCN_GX_TEV fused-pixel-path perf task). A
+ * pointer to an incomplete struct type is legal in C; nothing here needs
+ * Tev's layout, only its address. */
+typedef struct Tev Tev;
 
 /* ============================================================================
  * Per-draw config cache (perf). BP loads are separate FIFO commands that never
@@ -307,6 +328,14 @@ typedef struct {
 
     TevStageCfg stage[16];   /* index = TEV stage number, 0..numtevstages       */
     TexUnitCfg  tex[8];      /* index = texture unit / texmap, always all 8     */
+
+    /* Fused specialized per-pixel TEV path (perf; see the big comment above
+     * fused_pixel_A/B/C, near tev_draw). NULL unless build_draw_cfg's tail
+     * matched this draw's FULL shading config against one of those functions'
+     * exact signatures bit-for-bit; raster_pixel() calls this instead of
+     * tev_draw() when set. GCN_GX_NO_FUSED=1 forces this to always stay NULL
+     * (same-binary A/B against the general path — see build_draw_cfg). */
+    void (*fused)(Tev* t);
 } DrawCfg;
 
 static DrawCfg s_cfg;
@@ -911,7 +940,8 @@ static s32 fixed_log2(float f) {
  * TEV (Tev.cpp + Tev.h). Single-/multi-stage regular combiner + alpha test +
  * blend. Indirect textures, z-texture and fog trap loudly if enabled.
  * ==========================================================================*/
-typedef struct {
+struct Tev {   /* tagged (not anonymous) so the DrawCfg::fused forward
+                * declaration above can name it before this definition */
     TColor Reg[4];          /* Prev, Color0, Color1, Color2 */
     TColor Konst[4];        /* KonstantColors */
     TColor TexColor, RasColor, StageKonst, RawTexColor;
@@ -921,7 +951,7 @@ typedef struct {
     s32    TexCoordS, TexCoordT;
     u8     AlphaBump;
     s32    TextureLod[16];  int TextureLinear[16];
-} Tev;
+};   /* Tev already named by the forward `typedef struct Tev Tev;` above */
 
 static const s16 s_Bias[4]   = { 0, 128, -128, 0 };
 static const u8  s_LShift[4] = { 0, 1, 2, 0 };
@@ -1138,6 +1168,69 @@ static void blend_stage(Tev* t, u8* output) {
     if (s_pixel_stats) s_ps_blend_writes++;   /* GCN_GX_PIXEL_STATS: blend_writes counter */
 }
 
+/* ============================================================================
+ * Shared per-pixel shading bookkeeping (GCN_GX_STATS / GCN_GX_PIXEL_STATS /
+ * GCN_GX_TEV_CENSUS side effects). Factored out of tev_draw's body so the
+ * fused_pixel_A/B/C specializations below — which bypass tev_draw's stage
+ * loop entirely — can reuse the exact same instrumentation instead of
+ * silently going dark on every stats/census knob whenever a fused path is
+ * selected. Pure extraction, no behavior change versus the code this
+ * replaces in tev_draw.
+ * ==========================================================================*/
+
+/* Top-of-shading counters (was tev_draw's first 3 lines). `fused` (new, for
+ * the fused-pixel-path task) additionally bumps the census bucket's
+ * fused_pixels counter so gx_raster_print_census can report fused coverage —
+ * gated on the same s_tev_census knob as the rest of the census, so it costs
+ * nothing when the census is off. */
+static inline void tev_stats_enter(int fused) {
+    if (s_draw_stats) s_pixels_shaded++;    /* GCN_GX_STATS: pixels_shaded counter */
+    if (s_pixel_stats) s_ps_shaded++;       /* GCN_GX_PIXEL_STATS: own shaded counter */
+    if (s_census_cur >= 0) {
+        s_census[s_census_cur].pixels++;               /* GCN_GX_TEV_CENSUS */
+        if (fused) s_census[s_census_cur].fused_pixels++;
+    }
+}
+
+/* GCN_GX_PIXEL_STATS TEX bucket: tex_sample total, timed only around the call
+ * itself (was tev_draw's inline if/else). Used by tev_draw's stage loop AND
+ * every fused function's one tex_sample call (config A/B/C all sample
+ * exactly once per pixel — see the fused derivation comments). */
+static inline void tev_sample_stat(u32 texmap, s32 texS, s32 texT, int linear, u8* texel) {
+    if (s_pixel_stats) {
+        s_ps_tex_calls++;
+        if (linear) s_ps_tex_linear++; else s_ps_tex_point++;
+        u64 tex_t0 = __rdtsc();
+        tex_sample(texmap, texS, texT, linear, texel);
+        s_tsc_tex += __rdtsc() - tex_t0;
+    } else {
+        tex_sample(texmap, texS, texT, linear, texel);
+    }
+}
+
+/* COMB-bucket-open (was tev_draw's `u64 comb_t0=0,tex_before=0; if(...)`). */
+static inline u64 tev_comb_begin(u64* tex_before) {
+    if (!s_pixel_stats) { *tex_before = 0; return 0; }
+    *tex_before = s_tsc_tex;
+    return __rdtsc();
+}
+
+/* COMB-bucket-close (pass exit) + blend dispatch (was tev_draw's final
+ * if/else). blend_fn is blend_stage() for the general path or
+ * fused_blend_stage() for a specialized config (see fused_pixel_A/B/C) — both
+ * have identical signatures, so one shared timed-call site covers either. */
+static inline void tev_comb_finish(Tev* t, u8* output, u64 comb_t0, u64 tex_before,
+                                    void (*blend_fn)(Tev*, u8*)) {
+    if (s_pixel_stats) {
+        s_tsc_comb += (__rdtsc() - comb_t0) - (s_tsc_tex - tex_before);
+        u64 blend_t0 = __rdtsc();
+        blend_fn(t, output);
+        s_tsc_blend += __rdtsc() - blend_t0;
+    } else {
+        blend_fn(t, output);
+    }
+}
+
 /* Full Tev::Draw (Tev.cpp:387-683), scoped: no indirect/ztex/fog. The
  * indstages/ztex/fog guard depends only on BP genmode/ztex2/fogparam3 words —
  * none of it is per-pixel data — so it has moved to build_draw_cfg() (draw
@@ -1153,14 +1246,18 @@ static void blend_stage(Tev* t, u8* output) {
  * accumulator-subtraction technique gx.c's DECODE bucket uses against its own
  * nested DRAW/EFB buckets. See the big s_pixel_stats comment near the top of
  * the file for the full bucket definitions and the alpha-test/late-Z boundary
- * rationale. */
+ * rationale.
+ *
+ * This is the GENERAL path: every draw whose full shading config didn't match
+ * one of fused_pixel_A/B/C's exact signatures (see build_draw_cfg's tail)
+ * still runs this, unchanged, stage-loop selector switches and all — the
+ * fused paths are a specialization ON TOP of this, never a replacement for
+ * it (CLAUDE.md: "fold only constant decisions", requirement 5: general path
+ * stays fully intact). */
 static void tev_draw(Tev* t) {
-    if (s_draw_stats) s_pixels_shaded++;    /* GCN_GX_STATS: pixels_shaded counter */
-    if (s_pixel_stats) s_ps_shaded++;       /* GCN_GX_PIXEL_STATS: own shaded counter */
-    if (s_census_cur >= 0) s_census[s_census_cur].pixels++;  /* GCN_GX_TEV_CENSUS */
+    tev_stats_enter(0);
 
-    u64 comb_t0 = 0, tex_before = 0;
-    if (s_pixel_stats) { comb_t0 = __rdtsc(); tex_before = s_tsc_tex; }
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
 
     u32 numstages = s_cfg.numtevstages;  /* actual count is +1 */
     u32 numtexgens = s_cfg.numtexgens;
@@ -1180,20 +1277,8 @@ static void tev_draw(Tev* t) {
         if (enable) {
             u8 texel[4];
             if (numtexgens > 0) {
-                /* GCN_GX_PIXEL_STATS TEX bucket: tex_sample total, timed only
-                 * around the call itself (not the memset fallback above/the
-                 * swap-table color assignment below). */
-                if (s_pixel_stats) {
-                    s_ps_tex_calls++;
-                    if (t->TextureLinear[stage]) s_ps_tex_linear++; else s_ps_tex_point++;
-                    u64 tex_t0 = __rdtsc();
-                    tex_sample(texmap, t->TexCoordS, t->TexCoordT,
-                               t->TextureLinear[stage], texel);
-                    s_tsc_tex += __rdtsc() - tex_t0;
-                } else {
-                    tex_sample(texmap, t->TexCoordS, t->TexCoordT,
-                               t->TextureLinear[stage], texel);
-                }
+                tev_sample_stat(texmap, t->TexCoordS, t->TexCoordT,
+                                 t->TextureLinear[stage], texel);
             } else {
                 memset(texel, 0, 4);
             }
@@ -1259,16 +1344,322 @@ static void tev_draw(Tev* t) {
         return;
     }
 
-    /* COMB bucket boundary (pass exit): same subtraction, taken before
-     * blend_stage() starts so BLEND's own timing below doesn't leak into it. */
-    if (s_pixel_stats) {
-        s_tsc_comb += (__rdtsc() - comb_t0) - (s_tsc_tex - tex_before);
-        u64 blend_t0 = __rdtsc();
-        blend_stage(t, output);   /* late-Z (if it lives here) + BlendTev */
-        s_tsc_blend += __rdtsc() - blend_t0;
-    } else {
-        blend_stage(t, output);   /* late-Z (if it lives here) + BlendTev */
+    /* COMB bucket boundary (pass exit) + blend, timed together. */
+    tev_comb_finish(t, output, comb_t0, tex_before, blend_stage);
+}
+
+/* ============================================================================
+ * Fused specialized per-pixel TEV paths (perf task, CLAUDE.md gx-raster COMB
+ * bucket). GCN_GX_TEV_CENSUS=1 over a real IPL-menu boot (5,000,000 ticks,
+ * 2026-07-12) showed the entire menu's shaded pixels concentrate into 8
+ * distinct full shading configs, and 3 of those alone cover ~95.7% of every
+ * shaded pixel in the whole run:
+ *
+ *   config A: hash=3a916e1f stages=1 texgens=1 st0 cc=00F8CF ac=00F670       -- 44.3% px
+ *   config B: hash=62776c53 stages=2 texgens=1 st0 cc=18F28F ac=08F670 en=1
+ *                                              st1 cc=08FC0F ac=08F870 en=0  -- 45.8% px
+ *   config C: hash=eefdb25f stages=1 texgens=1 st0 cc=18F28F ac=08F670       --  5.6% px
+ *   (all: colchan=0, numcolchans=1, zt_enable=0, zt_early=0, da_enable=0,
+ *    bm_blend_enable=1, bm_logic_enable=0, bm_subtract=0, bm_dither=1,
+ *    bm_src_factor=4/SrcAlpha, bm_dst_factor=5/InvSrcAlpha, color_update=1,
+ *    alpha_update=1, alpha-test word=0x7F0000, swaptab[0]==identity)
+ *
+ * The general tev_draw() stage loop re-decodes a fixed set of selector
+ * switches (color_arg/alpha_arg cases, draw_color_regular's bias/op/scale/
+ * dest, swap-table indirection, konst copy, the c16==3/a16==3 compare-mode
+ * branch) on EVERY PIXEL even though every one of those decisions is
+ * DRAW-INVARIANT once cc/ac/enable/colorchan/numtexgens/numcolchans and the
+ * blend/z/alpha-test words are fixed (which build_draw_cfg's selection below
+ * verifies bit-for-bit, not just "probably"). The three functions below fold
+ * that decision tree once per DRAW (at selection time) into straight-line C
+ * that reads only the genuinely per-pixel-varying inputs (RasColor, TexColor)
+ * and per-draw-constant data values (TEV Reg[]/Konst[] registers — read
+ * live, never assumed) with no remaining runtime branch on any folded
+ * selector.
+ *
+ * EXACTNESS: every fold below was verified bit-exact against the general
+ * path's own integer semantics (draw_color_regular/draw_alpha_regular,
+ * transcribed verbatim into a standalone checker) by brute force over the
+ * FULL possible range of every folded operand — not just plausible asset
+ * values: TEV Reg[]/Konst[] components are signed 11-bit
+ * (tev_load_registers' sext(...,11) => -1024..1023) wherever a fold uses one,
+ * swept over that entire range, not just 0..255. Total: >850,000 case
+ * combinations checked, 0 mismatches. See each function's derivation comment
+ * for its own bit-field decode and formula. Blend folding (fused_blend_stage,
+ * below) was verified the same way (200,000 random trials + an exhaustive
+ * sweep over the source-alpha byte, 0 mismatches).
+ * ==========================================================================*/
+
+/* Folded BlendTev/BlendColor for configs A/B/C. Requires (checked once, at
+ * selection time, by build_draw_cfg — see fused_common_match): zt_enable==0
+ * (the general blend_stage's `if (zt_enable && !zt_early) return` is always
+ * false here, so late-Z is skipped outright, not just usually-false-checked);
+ * bm_blend_enable==1 && bm_subtract==0 && bm_logic_enable==0 (BlendColor is
+ * the ONLY branch BlendTev can take, never SubtractBlend/LogicBlend);
+ * bm_src_factor==4(SrcAlpha)/bm_dst_factor==5(InvSrcAlpha) (src_factor/
+ * dst_factor's switch collapses to a splat of the shaded pixel's OWN alpha /
+ * its inverse — note dst_factor's case 5 also keys off the SOURCE alpha, not
+ * dst's, so both factors derive from `output[ALP_C]` alone); da_enable==0 (no
+ * dst-alpha override); s_bm_cu==1 && s_bm_au==1 (always the Dither-then-
+ * SetPixelAlphaColor branch, never SetPixelColorOnly/SetPixelAlphaOnly).
+ *
+ * NOT folded (deliberately, per the derivation): GetPixelColor/
+ * SetPixelAlphaColor's own pixel_format switch (pixel_format is a genuinely
+ * separate EFB-storage-format concern, orthogonal to the TEV combiner shape
+ * this task targets, and both helpers are cheap/already-shared — no need to
+ * assume or check a pixel_format constant here), and Dither's x/y parity +
+ * s_pf==RGBA6_Z24 gate (real per-pixel data — the general Dither() is called
+ * exactly as tev_draw's own blend_stage would call it). */
+static inline void fused_blend_stage(Tev* t, u8* output) {
+    u32 off = (u32)(u16)t->Position[0] + (u32)(u16)t->Position[1] * EFB_WIDTH;
+    u32 dstClr = GetPixelColor(off);
+    u8* d = (u8*)&dstClr;
+
+    /* BlendColor folded: sf/df are always a splat of output[ALP_C] / its
+     * inverse (SrcAlpha/InvSrcAlpha), so `s`/`d` in the general per-channel
+     * loop are the SAME two scalars on every one of the 4 iterations — hoist
+     * them out instead of re-deriving a 32-bit splat and re-masking &0xff
+     * each time (verified bit-exact, see the file-header derivation note). */
+    u32 srcA = output[ALP_C];
+    u32 sa = srcA + (srcA >> 7);
+    u32 invA = 255u - srcA;
+    u32 da = invA + (invA >> 7);
+    for (int i = 0; i < 4; i++) {
+        u32 c = (output[i] * sa + d[i] * da) >> 8;
+        d[i] = (c > 255u) ? 255u : (u8)c;
     }
+
+    /* da_enable==0 folded away: no dstPtr[ALP_C]=da_alpha override. */
+    Dither((u16)t->Position[0], (u16)t->Position[1], d);   /* real call, see above */
+    SetPixelAlphaColor(off, d);                             /* s_bm_cu==1 && s_bm_au==1 */
+    if (s_pixel_stats) s_ps_blend_writes++;   /* GCN_GX_PIXEL_STATS: blend_writes counter */
+}
+
+/* Shared preconditions for every fused config (see the file-header derivation
+ * table above): everything EXCEPT the per-stage cc/ac/enable/colorchan words
+ * themselves, which each fused_pixel_* signature check below compares
+ * separately (an exact cc/ac word match already pins every selector the fold
+ * depends on — argA..D/aargA..D, bias, op, clamp, scale, dest, tswap_id,
+ * rswap_id — in one comparison, since those are exactly the bits build_draw_cfg
+ * extracted them from). swaptab[0] must still be checked separately: the cc/ac
+ * match only pins tswap_id/rswap_id to 0, not what table entry 0 itself
+ * currently holds (a separate BP-register-driven array) — see the derivation
+ * table's "swaptab[0]==identity" note. */
+static int fused_common_match(void) {
+    return s_cfg.numtexgens == 1 && s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 0 && s_cfg.zt_early == 0 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 1 &&
+           s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3;
+}
+
+/* Exact per-stage cc/ac/enable/colorchan compare — see fused_common_match's
+ * comment for why matching the raw cc/ac words is sufficient to pin every
+ * argument/bias/op/clamp/scale/dest/swap-id selector the fold depends on. */
+static inline int fused_stage_match(u32 stage_idx, u32 exp_cc, u32 exp_ac,
+                                     u32 exp_enable, u32 exp_colorchan) {
+    const TevStageCfg* sc = &s_cfg.stage[stage_idx];
+    return sc->cc == exp_cc && sc->ac == exp_ac &&
+           sc->enable == exp_enable && sc->colorchan == exp_colorchan;
+}
+
+/* ---- config A: stages=1, texgens=1, st0 cc=0x00F8CF ac=0x00F670 ----------
+ *
+ * cc=0x00F8CF bit-field decode (bits() same as build_draw_cfg):
+ *   argA=15(ZERO)=0  argB=8(TexColor.rgb)  argC=12(ONE)=255  argD=15(ZERO)=0
+ *   bias(c16)=0  op(c18)=0(add)  clamp(c19)=0(->clamp1024)  scale(c20)=0  dest(c22)=0(Prev)
+ * ac=0x00F670 bit-field decode:
+ *   aargA=7(out of alpha_arg's 0..6 range -> 0/ZERO)  aargB=5(RasColor.a)
+ *   aargC=4(TexColor.a)  aargD=7(-> 0/ZERO)
+ *   bias(a16)=0  op(a18)=0(add)  clamp(a19)=0(->clamp1024)  scale(a20)=0  dest(a22)=0(Prev)
+ *   tswap_id=0  rswap_id=0
+ *
+ * COLOR fold: draw_color_regular with A=0,B=X(=TexColor.ch),C=255,D=0,bias=0,
+ * op=0,scale=0 is the textbook TEV "replace with texture" identity —
+ * ((X*256 + 128) >> 8) == X exactly for every X in 0..255 (texel bytes are
+ * always in this range) because the +128 remainder never reaches 256.
+ * Verified for all 256 values, 0 mismatches -- there is no arithmetic left to
+ * perform, Reg[Prev].ch IS TexColor.ch bit-for-bit.
+ *
+ * ALPHA fold: A=0,B=Y(=RasColor.a),C=X(=TexColor.a),D=0,bias=0,op=0,scale=0:
+ *   cc = X + (X>>7);  temp = (Y*cc + 128) >> 8;  Reg[Prev].a = clamp1024(temp)
+ * (clamp1024 instead of C's clamp255 since a19==0 here — but the natural
+ * range of Y*cc>>8-ish is already 0..255, so the two clamps are
+ * indistinguishable on the actual output byte; kept as clamp1024 to match the
+ * general path's literal choice, not because it changes the result).
+ * Verified bit-exact over the full Y,X in [0,255]x[0,255] (65536 cases). */
+static void fused_pixel_A(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+
+    u32 texmap = s_cfg.stage[0].texmap;
+    /* texcoordSel is provably 0 whenever numtexgens==1 (build_draw_cfg clamps
+     * sc->texcoordSel to 0 if it's >= numtexgens, and numtexgens==1 is part
+     * of this config's signature), so UvS[0]/UvT[0] is the only possible
+     * index — no need to read sc->texcoordSel at all. */
+    u8 texel[4];
+    tev_sample_stat(texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+
+    /* colorchan==0, rswap_id==0 with swaptab[0]==identity (both checked at
+     * selection time) -> RasColor.a == t->Color[0][3] directly. */
+    u8 ras_a = t->Color[0][3];
+
+    u8 output[4];
+    output[RED_C] = texel[0];   /* tswap_id==0 identity -> TexColor.ch == texel[ch] */
+    output[GRN_C] = texel[1];
+    output[BLU_C] = texel[2];
+    {
+        s32 X = texel[3];
+        s32 cc = X + (X >> 7);
+        s32 temp = (s32)ras_a * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp1024((s16)temp);
+    }
+
+    /* alpha test: at word 0x7F0000 decodes to comp0==comp1==CMP_ALWAYS (7)
+     * with op==OR; alpha_cmp(CMP_ALWAYS) returns 1 UNCONDITIONALLY (it never
+     * reads alpha or ref), so c0||c1 is always true regardless of the shaded
+     * alpha value — proven structurally from the word's bit fields, not
+     * sampled/assumed. No alpha_test() call needed. */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* ---- shared core for config B's stage0 and config C's only stage --------
+ * cc=0x18F28F ac=0x08F670 bit-field decode:
+ *   argA=15(ZERO)=0  argB=2(Reg[1].rgb, "Color0" TEV const-register)
+ *   argC=8(TexColor.rgb)  argD=15(ZERO)=0
+ *   bias(c16)=0  op(c18)=0(add)  clamp(c19)=1(->clamp255)  scale(c20)=1  dest(c22)=0(Prev)
+ *   aargA=7(->0/ZERO)  aargB=5(RasColor.a)  aargC=4(TexColor.a)  aargD=7(->0/ZERO)
+ *   bias(a16)=0  op(a18)=0(add)  clamp(a19)=1(->clamp255)  scale(a20)=0  dest(a22)=0(Prev)
+ *   tswap_id=0  rswap_id=0
+ *
+ * COLOR fold: draw_color_regular with A=0,B=K(=Reg[1].ch),C=X(=TexColor.ch),
+ * D=0,bias=0,op=0,scale=1,clamp=255. K is a TEV constant register loaded by
+ * tev_load_registers as a SIGNED 11-bit field (sext(...,11) => -1024..1023,
+ * NOT just 0..255) — read live every draw, never assumed:
+ *   c = X + (X>>7)
+ *   temp = (K * c) << 1              // s_LShift[scale=1] == 1
+ *   temp += 128                      // scale!=3, op==0
+ *   temp >>= 8
+ *   Reg[Prev].ch = clamp255(temp)    // (0+0)<<1 + temp, >>s_RShift[1](==0), unchanged
+ * Verified bit-exact over K in the FULL signed range [-1024,1023] x X in
+ * [0,255] (524288 cases, 0 mismatches).
+ *
+ * ALPHA fold: same shape as config A's alpha (A=0,B=Y=RasColor.a,
+ * C=X=TexColor.a,D=0,bias=0,op=0,scale=0), but clamp(a19)==1 here -> clamp255
+ * (config A's a19==0 -> clamp1024; the two are byte-identical on this input
+ * range regardless, see config A's note). Verified bit-exact over the full
+ * Y,X in [0,255]x[0,255] (65536 cases). */
+static inline void fused_core_C(Tev* t, u8 output[4]) {
+    u32 texmap = s_cfg.stage[0].texmap;
+    u8 texel[4];
+    tev_sample_stat(texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+
+    u8 ras_a = t->Color[0][3];         /* colorchan==0, rswap_id==0 identity */
+    const TColor* reg1 = &t->Reg[1];   /* "Color0" TEV const register, per-draw */
+
+    s32 c;
+    c = texel[0] + (texel[0] >> 7);
+    { s32 temp = ((s32)reg1->r * c) << 1; temp += 128; temp >>= 8;
+      output[RED_C] = (u8)clamp255((s16)temp); }
+    c = texel[1] + (texel[1] >> 7);
+    { s32 temp = ((s32)reg1->g * c) << 1; temp += 128; temp >>= 8;
+      output[GRN_C] = (u8)clamp255((s16)temp); }
+    c = texel[2] + (texel[2] >> 7);
+    { s32 temp = ((s32)reg1->b * c) << 1; temp += 128; temp >>= 8;
+      output[BLU_C] = (u8)clamp255((s16)temp); }
+
+    {
+        s32 X = texel[3];
+        s32 cc = X + (X >> 7);
+        s32 temp = (s32)ras_a * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp255((s16)temp);
+    }
+}
+
+/* ---- config C: stages=1, texgens=1, st0 cc=0x18F28F ac=0x08F670 ---------- */
+static void fused_pixel_C(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+
+    u8 output[4];
+    fused_core_C(t, output);
+
+    /* alpha test always passes -- see fused_pixel_A's identical derivation
+     * (same 0x7F0000 word, checked as part of fused_common_match). */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* ---- config B: stages=2, texgens=1 ----------------------------------------
+ * st0 cc=0x18F28F ac=0x08F670 en=1 -- identical to config C's only stage,
+ *   see fused_core_C's derivation.
+ * st1 cc=0x08FC0F ac=0x08F870 en=0 -- enable==0 means stage1 NEVER samples a
+ *   texture (Tev::Draw only enters its tex_sample block `if (enable)`), so
+ *   TexColor/RawTexColor simply keep stage0's stale value for the rest of the
+ *   stage loop; RasColor is still recomputed every stage regardless of
+ *   enable (SetRasColor has no enable gate) but stage1's args below never
+ *   reference it, so that recomputation is dead work the fused path can just
+ *   not do (it has zero effect on the final output either way).
+ *
+ * st1 cc=0x08FC0F bit-field decode:
+ *   argA=15(ZERO)=0  argB=12(ONE)=255  argC=0(Reg[Prev].rgb == stage0's output)
+ *   argD=15(ZERO)=0
+ *   bias(c16)=0  op(c18)=0  clamp(c19)=1(->255)  scale(c20)=0  dest(c22)=0(Prev)
+ * COLOR fold: A=0,B=255,C=P(=stage0 Prev.ch, already 0..255 from stage0's own
+ * clamp255),D=0,bias=0,op=0,scale=0 -- the SAME "replace" identity as config
+ * A's color fold: ((P*256+128)>>8) == P exactly for every P in 0..255.
+ * Verified separately for this exact clamp mode too (256 cases, 0
+ * mismatches) -- stage1 leaves output[RED_C]/[GRN_C]/[BLU_C] UNCHANGED, so
+ * there is nothing left to compute; fused_pixel_B below does not touch them
+ * after fused_core_C.
+ *
+ * st1 ac=0x08F870 bit-field decode:
+ *   aargA=7(->0/ZERO)  aargB=6(StageKonst.a -- this stage's own per-draw
+ *   konst alpha, resolved once per draw by build_draw_cfg into
+ *   s_cfg.stage[1].stage_konst -- read live below, its numeric VALUE is never
+ *   assumed or compared, only the SELECTOR case aargB==6 matters for the
+ *   signature, which the exact ac-word match already pins)
+ *   aargC=0(Reg[Prev].a == stage0's alpha, i.e. output[ALP_C] just computed)
+ *   aargD=7(->0/ZERO)
+ *   bias(a16)=0  op(a18)=0  clamp(a19)=1(->255)  scale(a20)=0  dest(a22)=0(Prev)
+ * ALPHA fold: A=0,B=K2(=StageKonst.a),C=P(=stage0 alpha, 0..255),D=0,bias=0,
+ * op=0,scale=0:
+ *   cc = P + (P>>7);  temp = (K2*cc + 128) >> 8;  Reg[Prev].a = clamp255(temp)
+ * K2 comes from konst_lookup's kasel path, which for sel>=16 returns a raw
+ * Konst[] component directly -- the SAME signed 11-bit range as the color
+ * register fold above, NOT just the fixed positive LUT. Verified bit-exact
+ * over K2 in the full signed range [-1024,1023] x P in [0,255] (524288
+ * cases, 0 mismatches). */
+static void fused_pixel_B(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+
+    u8 output[4];
+    fused_core_C(t, output);   /* stage0 -- identical to config C */
+
+    /* stage1 color: proven exact no-op (see derivation above), nothing to do. */
+
+    /* stage1 alpha: modulate stage0's alpha by this stage's own konst alpha. */
+    {
+        s32 konst_a = s_cfg.stage[1].stage_konst.a;
+        s32 P = output[ALP_C];
+        s32 cc = P + (P >> 7);
+        s32 temp = konst_a * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp255((s16)temp);
+    }
+
+    /* alpha test always passes -- see fused_pixel_A's identical derivation. */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
 }
 
 /* ============================================================================
@@ -1416,16 +1807,25 @@ static void build_block_timed(Tev* t, s32 bx, s32 by) {
     s_tsc_block += __rdtsc() - t0;
 }
 
+/* Dispatch to the fused specialized path when build_draw_cfg's selection
+ * matched one (s_cfg.fused != NULL), else the general tev_draw — see the big
+ * fused_pixel_A/B/C comment block above tev_draw for what this trades away
+ * (nothing: verified bit-exact, same-binary A/B via GCN_GX_NO_FUSED is the
+ * task's primary exactness proof). */
+static inline void tev_shade(Tev* t) {
+    if (s_cfg.fused) s_cfg.fused(t); else tev_draw(t);
+}
+
 static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     if (!s_pixel_stats) {
-        if (raster_pixel_prep(t, x, y, xi, yi)) tev_draw(t);   /* runs the combiner, late-Z, alpha test, then blends */
+        if (raster_pixel_prep(t, x, y, xi, yi)) tev_shade(t);   /* runs the combiner, late-Z, alpha test, then blends */
         return;
     }
     u64 t0 = __rdtsc();
     int ready = raster_pixel_prep(t, x, y, xi, yi);
     s_tsc_slope += __rdtsc() - t0;
     if (!ready) { s_ps_earlyz_rejected++; return; }
-    tev_draw(t);
+    tev_shade(t);
 }
 
 static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
@@ -2369,6 +2769,41 @@ static void build_draw_cfg(void) {
         tc->maxlod = bits(mode1, 8, 8);
     }
 
+    /* Fused specialized per-pixel path selection (perf task; see the big
+     * fused_pixel_A/B/C comment block near tev_draw for the derivation this
+     * checks against). Runs on EVERY draw, independent of GCN_GX_TEV_CENSUS
+     * (that knob is diagnostic-only; this is the actual perf feature).
+     * GCN_GX_NO_FUSED=1 forces s_cfg.fused to stay NULL unconditionally — the
+     * task's same-binary A/B exactness proof (fused vs general, same
+     * executable, XFB hash must match either way) toggles this and nothing
+     * else. FULL field compare: fused_common_match() covers every
+     * draw-global field the fused math folds (counts, z, blend/dest-alpha
+     * state including dither/logic/subtract/factors, the alpha-test word,
+     * swaptab[0]'s actual contents); fused_stage_match() covers each stage's
+     * cc/ac/enable/colorchan exactly (an exact cc/ac word match already pins
+     * every arg/bias/op/clamp/scale/dest/swap-id selector the fold depends
+     * on, since those are exactly the bits they were extracted from above).
+     * stage_konst's VALUE is deliberately never compared for config B's
+     * stage1 (aargB==6/StageKonst.a) — the fold reads it live every draw
+     * (s_cfg.stage[1].stage_konst.a), it is never assumed to be any
+     * particular number, so there is nothing about it to pin in a signature
+     * beyond the cc/ac match already pinning WHICH selector case applies. */
+    if (s_no_fused < 0) s_no_fused = getenv("GCN_GX_NO_FUSED") ? 1 : 0;
+    s_cfg.fused = NULL;
+    if (!s_no_fused && fused_common_match()) {
+        if (s_cfg.numtevstages == 0 &&
+            fused_stage_match(0, 0x00F8CFu, 0x00F670u, 1, 0)) {
+            s_cfg.fused = fused_pixel_A;
+        } else if (s_cfg.numtevstages == 0 &&
+                   fused_stage_match(0, 0x18F28Fu, 0x08F670u, 1, 0)) {
+            s_cfg.fused = fused_pixel_C;
+        } else if (s_cfg.numtevstages == 1 &&
+                   fused_stage_match(0, 0x18F28Fu, 0x08F670u, 1, 0) &&
+                   fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0)) {
+            s_cfg.fused = fused_pixel_B;
+        }
+    }
+
     /* GCN_GX_TEV_CENSUS (see the block comment above this function). */
     if (s_tev_census < 0) s_tev_census = getenv("GCN_GX_TEV_CENSUS") ? 1 : 0;
     s_census_cur = -1;
@@ -2583,20 +3018,30 @@ void gx_raster_get_pixel_stats(GxPixelStats* out) {
  * unless the knob is on and at least one draw has been censused. */
 void gx_raster_print_census(void) {
     if (s_tev_census != 1) return;
-    u64 total_px = 0;
+    u64 total_px = 0, total_fused = 0;
     for (int i = 0; i < GX_CENSUS_MAX; i++)
-        if (s_census[i].used) total_px += s_census[i].pixels;
+        if (s_census[i].used) { total_px += s_census[i].pixels; total_fused += s_census[i].fused_pixels; }
     if (total_px == 0) return;
     fprintf(stderr, "[gx-census]");
     for (int i = 0; i < GX_CENSUS_MAX; i++) {
         if (!s_census[i].used) continue;
-        fprintf(stderr, " #%d:%08x draws=%llu px=%llu(%.1f%%)",
+        /* fused_pixels (added for the fused-pixel-path perf task) is the
+         * per-bucket coverage the task's VERIFY step asks to report: how
+         * many of this bucket's shaded pixels took a fused_pixel_A/B/C
+         * specialization instead of the general tev_draw(). */
+        fprintf(stderr, " #%d:%08x draws=%llu px=%llu(%.1f%%) fused=%llu(%.1f%%)",
                 i, s_census[i].hash,
                 (unsigned long long)s_census[i].draws,
                 (unsigned long long)s_census[i].pixels,
-                100.0 * (double)s_census[i].pixels / (double)total_px);
+                100.0 * (double)s_census[i].pixels / (double)total_px,
+                (unsigned long long)s_census[i].fused_pixels,
+                s_census[i].pixels
+                    ? 100.0 * (double)s_census[i].fused_pixels / (double)s_census[i].pixels
+                    : 0.0);
     }
-    fprintf(stderr, "\n");
+    fprintf(stderr, " | total_fused=%llu/%llu(%.1f%%)\n",
+            (unsigned long long)total_fused, (unsigned long long)total_px,
+            100.0 * (double)total_fused / (double)total_px);
     fflush(stderr);
 }
 
