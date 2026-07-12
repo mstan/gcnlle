@@ -406,6 +406,11 @@ struct SDSP
   // Advances the step counter used for debugging purposes.
   void AdvanceStepCounter() { ++m_step_counter; }
 
+  // [gcnrecomp vendored addition] Read the step counter — lets the C-API shim
+  // report executed-instructions-per-RunCycles-call (GCN_DSP_STATS) without
+  // touching core behavior. Upstream keeps this private/debug-only.
+  u64 GetStepCounter() const { return m_step_counter; }
+
   // Sets the calculated IRAM CRC for debugging purposes.
   void SetIRAMCRC(u32 crc) { m_iram_crc = crc; }
 

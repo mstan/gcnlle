@@ -11,6 +11,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <chrono>   // GCN_DSP_STATS wall-clock accounting only
 
 // Wired by dsp_lle_init; read by src/host.cpp (the DSP::Host callbacks).
 uint8_t* g_dsp_mem1 = nullptr;
@@ -137,6 +138,46 @@ void dsp_lle_update(int ppc_cycles) {
       fprintf(stderr, "[dsp] pc=%04x cr=%04x\n",
               g_core->DSPState().pc, g_core->DSPState().control_reg);
       fflush(stderr);
+    }
+    // GCN_DSP_STATS=1: per-call accounting of the RunCycles budget vs the pc it
+    // stopped on and whether the analyzer would idle-skip there. Answers "is
+    // the batched budget being burned stepping an unrecognized wait loop, or
+    // is idle-skip actually terminating calls early?" without a debugger.
+    // Env-gated observability only; off by default (zero hot-path cost beyond
+    // one cached getenv).
+    static int s_stats = -1;
+    if (s_stats < 0) s_stats = getenv("GCN_DSP_STATS") ? 1 : 0;
+    if (s_stats) {
+      static uint64_t calls = 0, budget = 0, stop_idle = 0, stop_other = 0;
+      static uint64_t wall_ns = 0;
+      auto& st = g_core->DSPState();
+      calls++;
+      budget += (uint64_t)dsp_cycles;
+      auto t0 = std::chrono::steady_clock::now();
+      g_core->RunCycles(dsp_cycles);
+      auto t1 = std::chrono::steady_clock::now();
+      wall_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+      if (st.GetAnalyzer().IsIdleSkip(st.pc))
+        stop_idle++;
+      else
+        stop_other++;
+      if ((calls & 0x3FFu) == 0u) {
+        uint64_t steps = st.GetStepCounter();
+        fprintf(stderr,
+                "[dsp-stats] calls=%llu budget=%llu (avg %.1f cyc/call) "
+                "steps=%llu wall_ms=%.1f ns/step=%.1f ns/call=%.0f "
+                "stop@idle=%llu stop@other=%llu last_pc=%04x cr=%04x\n",
+                (unsigned long long)calls, (unsigned long long)budget,
+                (double)budget / (double)calls,
+                (unsigned long long)steps,
+                (double)wall_ns / 1e6,
+                steps ? (double)wall_ns / (double)steps : 0.0,
+                (double)wall_ns / (double)calls,
+                (unsigned long long)stop_idle, (unsigned long long)stop_other,
+                st.pc, st.control_reg);
+        fflush(stderr);
+      }
+      return;
     }
     g_core->RunCycles(dsp_cycles);
   }

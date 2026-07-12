@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <x86intrin.h>   /* __rdtsc — GCN_DISPATCH_STATS attribution only */
 
 /* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP core
  * advances ~1/6th of it). A recompiled block is only ~5-10 PPC cycles, so this
@@ -76,6 +77,12 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     u32 dsp_cycles_per_block = GCN_DSP_CYCLES_PER_BLOCK;
     { const char* e = getenv("GCN_DSP_CYCLES");
       if (e && *e) dsp_cycles_per_block = (u32)strtoul(e, NULL, 0); }
+
+    /* GCN_DISPATCH_STATS=1: per-component wall attribution (see the stats
+     * branch below). Read once; the tsc accumulators live across nested runs. */
+    static int s_dstats = -1;
+    static u64 s_tsc[6];
+    if (s_dstats < 0) s_dstats = getenv("GCN_DISPATCH_STATS") ? 1 : 0;
 
     while (max_blocks == 0u || blocks < max_blocks) {
         /* A block that raises an exception returns with ctx->pc set to the vector
@@ -144,17 +151,53 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
 
         u32 pending = ctx->exception;
         ctx->exception = 0;
+        /* GCN_DISPATCH_STATS=1: rdtsc-based wall attribution of the per-block
+         * loop across block-exec and each device tick, printed every 2^20
+         * blocks. Shares (not absolute ns) are the product — the tsc frequency
+         * never needs calibrating. Off by default; ~zero cost when off. */
+        if (s_dstats) {
+            u64 t0 = __rdtsc();
+            int ok = dolrecomp_call(ctx, ctx->pc);
+            u64 t1 = __rdtsc(); s_tsc[0] += t1 - t0;
+            if (!ok) { ctx->exception = pending; return 0; }
+            ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
+            device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
+            gcn_dsp_tick(dsp_cycles_per_block);
+            u64 t2 = __rdtsc(); s_tsc[1] += t2 - t1;
+            gcn_ai_tick();
+            u64 t3 = __rdtsc(); s_tsc[2] += t3 - t2;
+            gcn_vi_tick(device_cycles);
+            u64 t4 = __rdtsc(); s_tsc[3] += t4 - t3;
+            gcn_di_tick();
+            u64 t5 = __rdtsc(); s_tsc[4] += t5 - t4;
+            gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);
+            u64 t6 = __rdtsc(); s_tsc[5] += t6 - t5;
+            if ((blocks & 0xFFFFFu) == 0xFFFFFu) {
+                u64 tot = s_tsc[0]+s_tsc[1]+s_tsc[2]+s_tsc[3]+s_tsc[4]+s_tsc[5];
+                fprintf(stderr, "[dispatch-stats] blocks=%u  block-exec=%.1f%% "
+                        "dsp=%.1f%% ai=%.1f%% vi=%.1f%% di=%.1f%% gx=%.1f%%\n",
+                        blocks + 1u,
+                        100.0*(double)s_tsc[0]/(double)tot, 100.0*(double)s_tsc[1]/(double)tot,
+                        100.0*(double)s_tsc[2]/(double)tot, 100.0*(double)s_tsc[3]/(double)tot,
+                        100.0*(double)s_tsc[4]/(double)tot, 100.0*(double)s_tsc[5]/(double)tot);
+                fflush(stderr);
+            }
+        } else {
         if (!dolrecomp_call(ctx, ctx->pc)) {   /* off-image PC / no handler */
             ctx->exception = pending;
             return 0;
         }
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
         device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
-        gcn_dsp_tick(dsp_cycles_per_block);      /* run the DSP core in step */
+        /* Accrues DSP-cycle debt and flushes it at CPU observation points or
+         * the K-cycle cap (default 4096 PPC cycles, GCN_DSP_BATCH_PPC) —
+         * no longer runs the DSP core every block; see gcn_dsp_flush (dsp.c). */
+        gcn_dsp_tick(dsp_cycles_per_block);
         gcn_ai_tick();                            /* pace AISCNT / AIINT while PSTAT=1 */
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
         gcn_di_tick();                           /* complete a deferred DI command */
         gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */
+        }
         /* Service the debug server between blocks: non-blocking, so it stays
          * responsive even while the guest busy-waits on unmodeled hardware. A
          * client "quit" ends the run cleanly. Pumped every 256 blocks rather than
