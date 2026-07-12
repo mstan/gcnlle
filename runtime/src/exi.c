@@ -94,6 +94,46 @@ void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter) {
     exi->rtc_counter = rtc_counter;
 }
 
+void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user) {
+    exi->persist = fn;
+    exi->persist_user = user;
+}
+
+bool gcn_exi_persist_load(const char* path, u32* out_rtc,
+                           u8 out_sram[GCN_SRAM_SIZE_BYTES]) {
+    if (!path || !*path || !out_rtc || !out_sram) return false;
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;   /* no file yet: caller keeps the fixture */
+
+    u8 buf[GCN_EXI_PERSIST_FILE_SIZE];
+    size_t got = fread(buf, 1, sizeof(buf), f);
+    /* Reject anything but an exact-size file (truncated/corrupt/foreign) so a
+     * bad file falls back to the fixture instead of half-loading garbage. */
+    if (got != sizeof(buf) || fgetc(f) != EOF) { fclose(f); return false; }
+    fclose(f);
+
+    *out_rtc = ((u32)buf[0] << 24) | ((u32)buf[1] << 16) |
+               ((u32)buf[2] << 8)  |  (u32)buf[3];
+    memcpy(out_sram, buf + 4, GCN_SRAM_SIZE_BYTES);
+    return true;
+}
+
+bool gcn_exi_persist_save(const char* path, u32 rtc,
+                           const u8 sram[GCN_SRAM_SIZE_BYTES]) {
+    if (!path || !*path) return false;
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+
+    u8 buf[GCN_EXI_PERSIST_FILE_SIZE];
+    buf[0] = (u8)(rtc >> 24); buf[1] = (u8)(rtc >> 16);
+    buf[2] = (u8)(rtc >> 8);  buf[3] = (u8)rtc;
+    memcpy(buf + 4, sram, GCN_SRAM_SIZE_BYTES);
+
+    size_t wrote = fwrite(buf, 1, sizeof(buf), f);
+    int closed_ok = (fclose(f) == 0);
+    return wrote == sizeof(buf) && closed_ok;
+}
+
 /* ---- CSR write (write-1-to-clear + chip-select edge) -----------------------*/
 
 static void reset_transaction(GcnExi* exi, u32 ch) {
@@ -225,6 +265,7 @@ static void ipl_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma, u
         } else {                /* subsequent write = data payload */
             if (exi->op[ch] == GCN_EXI_OP_RTC_WRITE) {
                 exi->rtc_counter = c->data;
+                if (exi->persist) exi->persist(exi->persist_user);
             } else if (exi->op[ch] == GCN_EXI_OP_SRAM_WRITE) {
                 for (u32 i = 0; i < len && i < 4u; i++) {
                     u32 p = exi->dev_pos[ch] + i;
@@ -232,6 +273,7 @@ static void ipl_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma, u
                         exi->sram[p] = (u8)(c->data >> (24u - 8u * i));
                 }
                 exi->dev_pos[ch] += len;
+                if (exi->persist) exi->persist(exi->persist_user);
             }
         }
     } else {                    /* READ: device -> CPU */

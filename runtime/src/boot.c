@@ -10,6 +10,29 @@
  * "unmapped 0x0C..." for the first MMIO register BS2 reaches for, which is the
  * signal for the next device to build. A finite block budget (default 200k)
  * prevents a hang if BS2 busy-waits on a status bit that currently reads 0.
+ *
+ * Environment variables (all optional; unset = today's behavior, unchanged):
+ *   GCN_IPL_ROM       full descrambled IPL dump backing the EXI mask-ROM
+ *                      device (else the BS2 payload window is reused).
+ *   GCN_DSP_ROM        DSP-LLE IROM dump (default bios/dsp_rom.bin).
+ *   GCN_DSP_COEF       DSP-LLE coefficient dump (default bios/dsp_coef.bin).
+ *   GCN_DEBUG_PORT     enable the TCP debug server on this port (see
+ *                      docs/TCP_COMMANDS.md); with it set, gcn_boot runs
+ *                      unbounded and parks on stop instead of exiting.
+ *   GCN_MEM_DUMP       ';'-separated "<addr>:<len>:<path>" MEM1 dump specs,
+ *                      taken after the run stops.
+ *   GCN_SRAM_FILE      host-file backing for the EXI SRAM+RTC state (ROADMAP
+ *                      M3 persistence). If the file exists and is exactly
+ *                      GCN_EXI_PERSIST_FILE_SIZE bytes (0x44 — the real GC
+ *                      "combined RTC+SRAM" blob, byte-identical to Dolphin's
+ *                      `GC/SRAM.raw`: BE32 rtc counter then the 0x40-byte
+ *                      OSSram/OSSramEx image, Core/HW/Sram.h `struct Sram`),
+ *                      it OVERRIDES the seed.c fixture at boot. Every guest
+ *                      RTC_WRITE/SRAM_WRITE (exi.c ipl_transfer) then flushes
+ *                      the live state back to that path, and a final flush
+ *                      runs at clean shutdown. Unset (the default): nothing
+ *                      is read or written — fixtures only, byte-identical to
+ *                      before this option existed.
  */
 #include "cpu/cpu.h"
 #include "memory/memory.h"
@@ -78,6 +101,22 @@ static void cp_irq_to_pi(void* user, int level) {
     gcn_pi_set_interrupt((GcnPi*)user, GCN_PI_INT_CP, level);
 }
 
+/* GCN_SRAM_FILE write-back (ROADMAP M3): exi.c calls this synchronously right
+ * after a guest RTC_WRITE/SRAM_WRITE lands, so the host file always reflects
+ * the live device state a moment after the guest commits it — no batching or
+ * shutdown-only flush invented here (that would silently lose state on a
+ * crash/kill). The context is a static (outlives main's stack frame the same
+ * way the device models below do) so the callback needs no heap alloc. */
+typedef struct { GcnExi* exi; const char* path; } GcnSramPersistCtx;
+static GcnSramPersistCtx s_sram_persist_ctx;
+
+static void sram_persist_to_file(void* user) {
+    GcnSramPersistCtx* ctx = (GcnSramPersistCtx*)user;
+    if (!gcn_exi_persist_save(ctx->path, ctx->exi->rtc_counter, ctx->exi->sram))
+        fprintf(stderr, "gcn boot: WARNING — failed to write GCN_SRAM_FILE '%s'\n",
+                ctx->path);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -142,6 +181,32 @@ int main(int argc, char** argv) {
     }
     gcn_exi_set_sram(&exi, devices.sram);
     gcn_exi_set_rtc(&exi, devices.rtc_counter);
+
+    /* ROADMAP M3: optional host-file backing for the SRAM+RTC state, so a
+     * date/language/sound change made through the Calendar/Options UI
+     * survives a process restart. Unset (default): none of this runs, and
+     * behavior is byte-identical to before this feature existed — fixtures
+     * only, nothing touches disk. */
+    const char* sram_path = getenv("GCN_SRAM_FILE");
+    if (sram_path && *sram_path) {
+        u32 loaded_rtc = 0;
+        u8 loaded_sram[GCN_SRAM_SIZE_BYTES];
+        if (gcn_exi_persist_load(sram_path, &loaded_rtc, loaded_sram)) {
+            gcn_exi_set_sram(&exi, loaded_sram);
+            gcn_exi_set_rtc(&exi, loaded_rtc);
+            fprintf(stdout,
+                    "gcn boot: GCN_SRAM_FILE '%s' loaded — overriding the seed "
+                    "fixture (persisted RTC=%u)\n", sram_path, loaded_rtc);
+        } else {
+            fprintf(stdout,
+                    "gcn boot: GCN_SRAM_FILE '%s' not found/invalid — using the "
+                    "seed fixture (will be created on the first guest write or "
+                    "at clean shutdown)\n", sram_path);
+        }
+        s_sram_persist_ctx.exi = &exi;
+        s_sram_persist_ctx.path = sram_path;
+        gcn_exi_set_persist(&exi, sram_persist_to_file, &s_sram_persist_ctx);
+    }
 
     gcn_mmio_register(&bus, "EXI", GCN_EXI_BASE, GCN_EXI_REGISTER_BYTES,
                       gcn_exi_read, gcn_exi_write, &exi);
@@ -328,6 +393,14 @@ int main(int argc, char** argv) {
             } else fprintf(stderr, "gcn boot: bad/out-of-range GCN_MEM_DUMP spec '%s'\n", s);
         }
     }
+
+    /* ROADMAP M3: final flush at clean shutdown. Every guest write already
+     * flushes immediately (exi.c's persist hook), so this is a safety-net
+     * no-op in the common case — it only matters if gcn_exi_set_persist was
+     * never wired to a per-write flush for some future caller, or as cheap
+     * insurance against this function's own flush having failed earlier. */
+    if (sram_path && *sram_path)
+        sram_persist_to_file(&s_sram_persist_ctx);
 
     gcn_dsp_free(&dsp);
     cpu_free(&cpu);

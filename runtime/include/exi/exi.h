@@ -90,6 +90,14 @@ enum {
 /* Level change on the EXI->PI interrupt line (level: 1 assert, 0 deassert). */
 typedef void (*GcnExiIrqFn)(void* user, int level);
 
+/* Fired synchronously whenever a guest RTC_WRITE or SRAM_WRITE transaction
+ * mutates exi->rtc_counter / exi->sram (ROADMAP M3 persistence). The runtime
+ * host (boot.c) hooks this to flush the combined RTC+SRAM blob to the
+ * GCN_SRAM_FILE path, mirroring the "write straight through" semantics real
+ * SRAM/RTC hardware has (no host-side batching invented here). NULL by
+ * default: zero overhead / byte-identical behavior when no file is configured. */
+typedef void (*GcnExiPersistFn)(void* user);
+
 typedef struct GcnExi {
     GcnExiChannel channels[GCN_EXI_CHANNELS];
 
@@ -119,6 +127,9 @@ typedef struct GcnExi {
     int         irq_level;   /* last EXI->PI line level (edge detect for the ring) */
     GcnExiIrqFn irq;         /* sink for the EXI interrupt line (boot.c -> PI) */
     void*       irq_user;
+
+    GcnExiPersistFn persist;      /* NULL unless GCN_SRAM_FILE is configured */
+    void*           persist_user;
 } GcnExi;
 
 /* Initialise all channels (reset CSR: ch0 EXTINT; ch1 EXTINT|CS=1; ch2 idle;
@@ -136,6 +147,35 @@ void gcn_exi_set_rom(GcnExi* exi, const u8* rom, u32 size, u32 base);
 /* Install the SRAM fixture (0x40 bytes) and RTC seconds-since-2000 counter. */
 void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]);
 void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter);
+
+/* Register the write-back hook (ROADMAP M3): called synchronously right after
+ * a guest RTC_WRITE or SRAM_WRITE lands in exi->rtc_counter / exi->sram. NULL
+ * (the gcn_exi_init default) means no persistence — every write path stays
+ * exactly as it is today. */
+void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user);
+
+/* ---- host-file persistence (ROADMAP M3: GCN_SRAM_FILE) --------------------
+ * On-disk layout is the real GC "combined RTC+SRAM" blob, byte-identical to
+ * Dolphin's raw `GC/SRAM.raw` dump (Core/HW/Sram.h `struct Sram`: a
+ * big-endian u32 rtc counter immediately followed by the 0x40-byte
+ * OSSram/OSSramEx settings image) — 0x44 bytes total. Using the same layout
+ * means a file written by this runtime is byte-for-byte what Dolphin itself
+ * would write/read, and vice versa. */
+#define GCN_EXI_PERSIST_FILE_SIZE (4u + GCN_SRAM_SIZE_BYTES)
+
+/* Load `path` (exactly GCN_EXI_PERSIST_FILE_SIZE bytes: BE32 rtc, then the
+ * 0x40-byte SRAM image) into *out_rtc / out_sram. Returns false (out params
+ * left untouched) if the file does not exist, cannot be opened, or is not
+ * exactly that size — the caller's fixture stays authoritative, matching the
+ * documented "no file yet -> fixture, byte-identical to today" contract. */
+bool gcn_exi_persist_load(const char* path, u32* out_rtc,
+                           u8 out_sram[GCN_SRAM_SIZE_BYTES]);
+
+/* Write `path` atomically-enough for a single-process debug tool (truncate +
+ * full write) as BE32 rtc followed by the 0x40-byte SRAM image. Returns false
+ * on any I/O failure (caller logs; never fatal — persistence is optional). */
+bool gcn_exi_persist_save(const char* path, u32 rtc,
+                           const u8 sram[GCN_SRAM_SIZE_BYTES]);
 
 /* MMIO device-dispatch entry points (registered on the MMIO bus for
  * [GCN_EXI_BASE, GCN_EXI_BASE + GCN_EXI_REGISTER_BYTES)). */
