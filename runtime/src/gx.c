@@ -712,5 +712,22 @@ void gcn_gx_tick(u32 cycles) {
                 (unsigned long long)s_gx_dlcalls, (unsigned long long)s_gx_efbcopies);
             fflush(stderr);
         }
+
+        /* gx_raster.c's own further split of the DRAW bucket above (vertex
+         * load+transform+clip vs triangle scan/pixel) plus a pixels-shaded
+         * counter — same cadence, piggybacked onto this tick so there is only
+         * one stats print site to keep in sync (gx_raster_get_draw_stats). */
+        u64 tsc_vtx, tsc_tri, pixels_shaded, draw_calls;
+        gx_raster_get_draw_stats(&tsc_vtx, &tsc_tri, &pixels_shaded, &draw_calls);
+        u64 vtx_tri_tot = tsc_vtx + tsc_tri;
+        if (draw_calls > 0u && vtx_tri_tot > 0u) {
+            fprintf(stderr,
+                "[gx-draw-stats] draws=%llu  vtx=%.1f%% tri=%.1f%%  | pixels_shaded=%llu\n",
+                (unsigned long long)draw_calls,
+                100.0 * (double)tsc_vtx / (double)vtx_tri_tot,
+                100.0 * (double)tsc_tri / (double)vtx_tri_tot,
+                (unsigned long long)pixels_shaded);
+            fflush(stderr);
+        }
     }
 }

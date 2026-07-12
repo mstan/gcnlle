@@ -11,11 +11,34 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
 #include <string.h>
+#include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
 
 /* EFB geometry (VideoCommon/VideoCommon.h:15-16). */
 #define EFB_WIDTH   640u
 #define EFB_HEIGHT  528u
+
+/* ============================================================================
+ * GCN_GX_STATS=1 (same knob gx.c reads — see its GX_STAT_DRAW bucket comment):
+ * a further split of THAT bucket's own time between (a) vertex load+transform+
+ * clip (SWVertexLoader -> TransformUnit -> Clipper's trivial-reject/cull/clip,
+ * everything in gx_raster_draw except actual scan conversion) and (b) triangle
+ * scan/pixel (Rasterizer.cpp's edge-function loop + per-pixel Tev::Draw),
+ * plus a pixels_shaded counter incremented wherever tev_draw() actually runs.
+ * gx.c reads these via gx_raster_get_draw_stats() and prints them as a
+ * "[gx-draw-stats]" line at the same 2^20-tick cadence as its own summary.
+ *
+ * Own cached getenv (own translation unit, same lazy -1 sentinel pattern as
+ * gx.c's s_gxstats) — this file has no visibility into gx.c's static. Zero
+ * cost when off: every timed site below is a single untaken
+ * `if (s_draw_stats)` branch, no rdtsc, no counter writes, identical
+ * rasterizer behavior either way. */
+static int s_draw_stats = -1;
+static u64 s_tsc_vtx;          /* vertex load+transform+clip (per gx_raster_draw call) */
+static u64 s_tsc_tri;          /* triangle scan/pixel (draw_triangle, incl. all its pixels) */
+static u64 s_pixels_shaded;    /* tev_draw() invocations (one per shaded pixel candidate) */
+static u64 s_draw_calls_stat;  /* gx_raster_draw calls counted (vtx bucket samples) */
 
 /* ---- one-time trap logging ------------------------------------------------ */
 static int trap_once(int* flag, const char* what) {
@@ -90,6 +113,133 @@ static inline u8 Convert3To8(u8 v) { return (u8)((v << 5) | (v << 2) | (v >> 1))
 static inline u8 Convert4To8(u8 v) { return (u8)((v << 4) | v); }
 static inline u8 Convert5To8(u8 v) { return (u8)((v << 3) | (v >> 2)); }
 
+/* TEV register value (Tev.h TevRegister). Declared up here (ahead of its
+ * original home beside the rest of the Tev state, further down) purely so the
+ * per-draw config cache immediately below — which needs this type for its
+ * pre-resolved per-stage StageKonst — can sit ahead of every pixel-path
+ * function that reads the cache (GetPixelColor, ZCompare, BlendTev, ...). */
+typedef struct { s16 r, g, b, a; } TColor;
+
+/* ============================================================================
+ * Per-draw config cache (perf). BP loads are separate FIFO commands that never
+ * interleave with a draw's vertex payload — gx.c hands gx_raster_draw one
+ * complete, contiguous vertex block per call, and gx_raster_efb_copy is its own
+ * separate call — so every BP-derived value below is provably constant for the
+ * whole call. Dolphin's own per-pixel code (Tev.cpp, Rasterizer.cpp,
+ * TextureSampler.cpp) re-reads the BP words on every pixel because its
+ * BPMemory is a live register file it must treat as volatile in the general
+ * case; we run single-threaded with FIFO-serialized BP writes, so decoding
+ * once at the top of each entry point and reusing the result for every pixel/
+ * stage/sample it produces is exact, not an approximation (see gx_raster.h
+ * scope note). Populated by build_draw_cfg() (gx_raster_draw) or the smaller
+ * build_efb_cfg() (gx_raster_efb_copy); never touched mid-call after that.
+ *
+ * PURE DECODE MOTION ONLY: every field here is the same bits()/register read
+ * the pixel path already did, just performed once instead of once per pixel.
+ * The TRAP-guard conditions that depend only on these same BP-genmode fields
+ * (indirect stages / z-texture / fog) move their *check* here too — same
+ * trap-once semantics, evaluated once per draw instead of once per pixel
+ * (CLAUDE.md gx-raster perf task). Traps whose firing still depends on
+ * per-pixel data, or that weren't called out for hoisting, keep their
+ * trap_once() call at the original per-pixel/per-sample site, just reading
+ * the cached field instead of re-decoding it (paletted/unknown texture
+ * format, texture-OOB, mipmap-filter, ras-color-channel, active-indirect).
+ * ==========================================================================*/
+typedef struct {
+    /* order (bp 0x28+s2) fields, pre-split per stage — no more odd/even math
+     * or s_bp reads at TEV-draw time (Tev.cpp SetupTextures/SetRasColor). */
+    u32 texcoordSel, texmap, enable, colorchan;
+    int tevind_active;   /* bits(tevind,9,2)!=0 || bits(tevind,7,2)!=0 (decode
+                           * only; the TRAP itself still fires at its original
+                           * per-pixel-per-stage call site in tev_draw). */
+
+    u32 cc, ac;           /* raw TevStageCombiner color/alpha words */
+
+    /* color_arg/alpha_arg selectors (Tev.h GetColorInput/GetAlphaInput). */
+    u32 argA, argB, argC, argD;      /* cc bits 12/8/4/0, 4 each */
+    u32 aargA, aargB, aargC, aargD;  /* ac bits 13/10/7/4, 3 each */
+
+    /* draw_color_{regular,compare} / draw_alpha_{regular,compare} fields.
+     * Same physical bit ranges serve both regular and compare-mode encodings
+     * (bias==3 in the c16/a16 field is Dolphin's compare-mode sentinel), so a
+     * single set of cached extracts covers both call targets. */
+    u32 c16, c18, c19, c20, c22;   /* cc: bias|n/a, op|cmp, clamp, scale|mode, dest */
+    u32 a16, a18, a19, a20, a22;   /* ac: same layout for alpha */
+
+    u32 tswap_id, rswap_id;   /* ac bits 2,2 / 0,2 -> index into s_cfg.swaptab */
+
+    /* StageKonst is itself draw-invariant, not just its kcsel/kasel selector:
+     * konst_lookup() only ever reads t->Konst[] (loaded once by
+     * tev_load_registers before build_draw_cfg runs and never mutated again
+     * during the draw) or fixed tables, so the resolved (r,g,b,a) can be
+     * precomputed once per stage instead of re-run through konst_lookup()
+     * every pixel (Tev.h AllTevKSels konst LUT). */
+    TColor stage_konst;
+} TevStageCfg;
+
+typedef struct {
+    /* tex_sample/decode_texel/wrap_coord/calc_lod fields (TextureSampler.cpp,
+     * TextureDecoder_Common.cpp, Rasterizer.cpp calc_lod). `valid` false means
+     * every sample from this unit is forced to (0,0,0,0) — the trap for it
+     * still fires (once) at tex_sample's original per-sample call site. */
+    u32 fmt;
+    int w1, h1;                 /* width-1, height-1 (TX_SETIMAGE0) */
+    u32 wrap_s, wrap_t;         /* TX_SETMODE0 bits 0-2, 2-2 */
+    u32 magf, minf;             /* TX_SETMODE0 bits 4 (mag), 7 (min) */
+    int mipmapfilter_bad;       /* TX_SETMODE0 bits 5-2 != 0 */
+    int lod_edge;               /* TX_SETMODE0 bit 8 */
+    s32 lod_bias_half;          /* sext(TX_SETMODE0[16:9], 8) >> 1, precomputed */
+    u32 minlod, maxlod;         /* TX_SETMODE1 bits 0-8 / 8-8 */
+    u32 image0_raw, image3_raw; /* raw TX_SETIMAGE0/3 (for trap-log messages) */
+    u32 img_base;               /* (image3_raw & 0xFFFFFF) << 5, UNMASKED (matches
+                                  * the original inline trap-log expression) */
+    u32 phys;                   /* img_base & 0x1FFFFFFF (the actual MEM1 offset) */
+    int valid;                  /* s_cpu && s_cpu->ram && phys < ram_size */
+    const u8* src;               /* s_cpu->ram + phys, only meaningful if valid */
+    u32 src_len;                 /* ram_size - phys, only meaningful if valid   */
+} TexUnitCfg;
+
+typedef struct {
+    /* GenMode (bp 0x00). */
+    u32 numtexgens, numcolchans, numtevstages, cullmode;
+
+    /* ZMode (bp 0x40) + PEControl.early_ztest (bp 0x43 bit 6). Draw-only (the
+     * EFB-copy path never z-tests), unlike the shared quad below. */
+    int zt_enable, zt_early;
+    u32 zt_func;
+
+    /* BlendMode (bp 0x41) fields BlendTev/BlendColor/LogicBlend need. Also
+     * draw-only — color_update/alpha_update are shared (see s_bm_cu/s_bm_au
+     * below; efb_clear_rect needs those too). */
+    int bm_blend_enable, bm_logic_enable, bm_dither, bm_subtract;
+    u32 bm_dst_factor, bm_src_factor, bm_logic_mode;
+
+    /* ConstantAlpha / dstalpha (bp 0x42). */
+    int da_enable;
+    u8  da_alpha;
+
+    u32 swaptab[4][4];   /* AllTevKSels swap tables (bp 0xF6+id*2 / +1), ids 0..3,
+                           * pre-built once instead of rebuilt per pixel per stage. */
+
+    TevStageCfg stage[16];   /* index = TEV stage number, 0..numtevstages       */
+    TexUnitCfg  tex[8];      /* index = texture unit / texmap, always all 8     */
+} DrawCfg;
+
+static DrawCfg s_cfg;
+
+/* Shared with gx_raster_efb_copy (which rebuilds this same subset for its own
+ * call via build_efb_cfg() — see below): PEControl.pixel_format and
+ * BlendMode.{color,alpha}_update / ZMode.update_enable back the low-level EFB
+ * pixel helpers (GetPixelColor family, ZCompare, efb_clear_rect) that BOTH the
+ * draw and EFB-copy paths call. A single cache slot updated at whichever entry
+ * point currently owns it is correct: gx_raster_draw and gx_raster_efb_copy
+ * never run concurrently or re-enter each other, and each decodes this subset
+ * fresh at its own entry before any pixel work reads it. */
+static u32 s_pf;       /* pixel_format() */
+static int s_zt_upd;   /* zm_update_enable() */
+static int s_bm_cu;    /* bm_color_update() */
+static int s_bm_au;    /* bm_alpha_update() */
+
 /* ============================================================================
  * EFB pixel access (SWEfbInterface.cpp). RGB8_Z24, RGBA6_Z24 and RGB565_Z16
  * (menu-observed: a transient PEControl switch during the boot animation) are
@@ -97,7 +247,7 @@ static inline u8 Convert5To8(u8 v) { return (u8)((v << 3) | (v >> 2)); }
  * ==========================================================================*/
 static u32 GetPixelColor(u32 off) {
     u32 src = s_efb_color[off];
-    switch (pixel_format()) {
+    switch (s_pf) {
     case PF_RGB8_Z24:
     case PF_Z24:
     case PF_RGB565_Z16:   /* SWEfbInterface.cpp:164-166 — Dolphin itself treats this
@@ -112,13 +262,13 @@ static u32 GetPixelColor(u32 off) {
     default:
         TRAPF(pf_getcolor, "EFB GetPixelColor pixel_format %u (only RGB8_Z24=0/RGBA6_Z24=1 "
               "in scope; raw ZCOMPARE/PEControl bp[0x43]=0x%06X)",
-              pixel_format(), s_bp[0x43]);
+              s_pf, s_bp[0x43]);
         return 0xffu | ((src & 0x00ffffffu) << 8);
     }
 }
 static void SetPixelColorOnly(u32 off, const u8* rgb) {
     u32 src; memcpy(&src, rgb, 4);
-    switch (pixel_format()) {
+    switch (s_pf) {
     case PF_RGB8_Z24: case PF_Z24: case PF_RGB565_Z16:
         s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
         break;
@@ -132,13 +282,13 @@ static void SetPixelColorOnly(u32 off, const u8* rgb) {
     }
     default:
         TRAPF(pf_setcolor, "EFB SetPixelColorOnly pixel_format %u (raw bp[0x43]=0x%06X)",
-              pixel_format(), s_bp[0x43]);
+              s_pf, s_bp[0x43]);
         break;
     }
 }
 static void SetPixelAlphaColor(u32 off, const u8* color) {
     u32 src; memcpy(&src, color, 4);
-    switch (pixel_format()) {
+    switch (s_pf) {
     case PF_RGB8_Z24: case PF_Z24: case PF_RGB565_Z16:
         s_efb_color[off] = (s_efb_color[off] & 0xff000000u) | (src >> 8);
         break;
@@ -153,12 +303,12 @@ static void SetPixelAlphaColor(u32 off, const u8* color) {
     }
     default:
         TRAPF(pf_setalpha, "EFB SetPixelAlphaColor pixel_format %u (raw bp[0x43]=0x%06X)",
-              pixel_format(), s_bp[0x43]);
+              s_pf, s_bp[0x43]);
         break;
     }
 }
 static void SetPixelAlphaOnly(u32 off, u8 a) {
-    if (pixel_format() == PF_RGBA6_Z24) {
+    if (s_pf == PF_RGBA6_Z24) {
         u32 val = s_efb_color[off] & 0xffffffc0u;
         val |= (a >> 2) & 0x3f;
         s_efb_color[off] = val;
@@ -196,7 +346,7 @@ static int ZCompare(u16 x, u16 y, u32 z) {
     u32 off = (u32)x + (u32)y * EFB_WIDTH;
     u32 depth = GetPixelDepth(off);
     int pass;
-    switch (zm_func()) {
+    switch (s_cfg.zt_func) {
     case CMP_NEVER:   pass = 0;        break;
     case CMP_LESS:    pass = z < depth;  break;
     case CMP_EQUAL:   pass = z == depth; break;
@@ -207,7 +357,7 @@ static int ZCompare(u16 x, u16 y, u32 z) {
     case CMP_ALWAYS:  pass = 1;        break;
     default:          pass = 0;        break;
     }
-    if (pass && zm_update_enable()) SetPixelDepth(off, z);
+    if (pass && s_zt_upd) SetPixelDepth(off, z);
     return pass;
 }
 
@@ -243,8 +393,8 @@ static u32 dst_factor(const u8* s, const u8* d, u32 mode) {
     return ((u32)a << 24) | ((u32)a << 16) | ((u32)a << 8) | a;
 }
 static void BlendColor(const u8* src, u8* dst) {
-    u32 sf = src_factor(src, dst, bm_src_factor());
-    u32 df = dst_factor(src, dst, bm_dst_factor());
+    u32 sf = src_factor(src, dst, s_cfg.bm_src_factor);
+    u32 df = dst_factor(src, dst, s_cfg.bm_dst_factor);
     for (int i = 0; i < 4; i++) {
         u32 s = sf & 0xff; s += s >> 7;
         u32 d = df & 0xff; d += d >> 7;
@@ -280,7 +430,7 @@ static void LogicBlend(u32 s, u32* d, u32 op) {
     }
 }
 static void Dither(u16 x, u16 y, u8* color) {
-    if (!bm_dither() || pixel_format() != PF_RGBA6_Z24) return;
+    if (!s_cfg.bm_dither || s_pf != PF_RGBA6_Z24) return;
     static const u8 dth[2][2] = { {0, 2}, {3, 1} };
     for (int i = BLU_C; i <= RED_C; i++)
         color[i] = (u8)(((color[i] - (color[i] >> 6)) + dth[y & 1][x & 1]) & 0xfc);
@@ -291,23 +441,23 @@ static void BlendTev(u16 x, u16 y, u8* color) {
     u32 dstClr = GetPixelColor(off);
     u8* dstPtr = (u8*)&dstClr;
 
-    if (bm_blend_enable()) {
-        if (bm_subtract()) SubtractBlend(color, dstPtr);
-        else               BlendColor(color, dstPtr);
-    } else if (bm_logic_enable()) {
+    if (s_cfg.bm_blend_enable) {
+        if (s_cfg.bm_subtract) SubtractBlend(color, dstPtr);
+        else                   BlendColor(color, dstPtr);
+    } else if (s_cfg.bm_logic_enable) {
         u32 s; memcpy(&s, color, 4);
-        LogicBlend(s, &dstClr, bm_logic_mode());
+        LogicBlend(s, &dstClr, s_cfg.bm_logic_mode);
     } else {
         dstPtr = color;
     }
 
-    if (da_enable()) dstPtr[ALP_C] = da_alpha();
+    if (s_cfg.da_enable) dstPtr[ALP_C] = s_cfg.da_alpha;
 
-    if (bm_color_update()) {
+    if (s_bm_cu) {
         Dither(x, y, dstPtr);
-        if (bm_alpha_update()) SetPixelAlphaColor(off, dstPtr);
-        else                   SetPixelColorOnly(off, dstPtr);
-    } else if (bm_alpha_update()) {
+        if (s_bm_au) SetPixelAlphaColor(off, dstPtr);
+        else         SetPixelColorOnly(off, dstPtr);
+    } else if (s_bm_au) {
         SetPixelAlphaOnly(off, dstPtr[ALP_C]);
     }
 }
@@ -489,10 +639,15 @@ static void decode_texel(u32 fmt, const u8* src, u32 src_len, int s, int t,
 }
 
 static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
-    u32 ti0 = tx_image0(texmap);
-    u32 fmt = bits(ti0, 20, 4);
-    int w1 = (int)bits(ti0, 0, 10);   /* width  - 1 */
-    int h1 = (int)bits(ti0, 10, 10);  /* height - 1 */
+    /* tx_mode0/mode1/image0/image3 field extraction is per-draw-constant (BP
+     * loads never interleave with a draw's vertex payload) — decoded once by
+     * build_draw_cfg() into s_cfg.tex[texmap] instead of every sample. Trap
+     * firing (paletted/unknown format, texture-OOB, mipmap filter) stays at
+     * this original per-sample call site, just reading the cached fields
+     * instead of re-decoding them each time. */
+    const TexUnitCfg* tc = &s_cfg.tex[texmap];
+    u32 fmt = tc->fmt;
+    int w1 = tc->w1, h1 = tc->h1;   /* width - 1, height - 1 */
     switch (fmt) {
     case TEXFMT_I4: case TEXFMT_I8: case TEXFMT_IA4: case TEXFMT_IA8:
     case TEXFMT_RGB565: case TEXFMT_RGB5A3: case TEXFMT_RGBA8: case TEXFMT_CMPR:
@@ -500,26 +655,23 @@ static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     case TEXFMT_C4: case TEXFMT_C8: case TEXFMT_C14X2:
         TRAPF(paletted, "paletted texture format %u (C4/C8/C14X2 need a TLUT model "
               "we haven't built) — texmap %u, %ux%u, TX_SETIMAGE0=0x%06X",
-              fmt, texmap, w1 + 1, h1 + 1, ti0);
+              fmt, texmap, w1 + 1, h1 + 1, tc->image0_raw);
         memset(out, 0, 4); return;
     default:
         TRAPF(unknowntexfmt, "unknown/unsupported texture format %u (texmap %u, %ux%u, "
               "TX_SETIMAGE0=0x%06X TX_SETIMAGE3=0x%06X src_addr=0x%08X)",
-              fmt, texmap, w1 + 1, h1 + 1, ti0, tx_image3(texmap),
-              (tx_image3(texmap) & 0x00ffffffu) << 5);
+              fmt, texmap, w1 + 1, h1 + 1, tc->image0_raw, tc->image3_raw,
+              tc->img_base);
         memset(out, 0, 4); return;
     }
 
-    u32 img_base = (tx_image3(texmap) & 0x00ffffffu) << 5;
-    u32 phys = img_base & 0x1FFFFFFFu;
-    if (!s_cpu || !s_cpu->ram || phys >= s_cpu->ram_size) {
+    if (!tc->valid) {
         TRAP(texoob, "texture source out of MEM1"); memset(out, 0, 4); return;
     }
-    const u8* src = s_cpu->ram + phys;
-    u32 src_len = s_cpu->ram_size - phys;
-    u32 mode0 = tx_mode0(texmap);
-    u32 wrap_s = bits(mode0, 0, 2), wrap_t = bits(mode0, 2, 2);
-    if (bits(mode0, 5, 2) != 0) TRAP(mipmapfilter, "texture mipmap filter (mipmaps)");
+    const u8* src = tc->src;
+    u32 src_len = tc->src_len;
+    u32 wrap_s = tc->wrap_s, wrap_t = tc->wrap_t;
+    if (tc->mipmapfilter_bad) TRAP(mipmapfilter, "texture mipmap filter (mipmaps)");
 
     if (linear) {
         s -= 64; t -= 64;
@@ -561,7 +713,6 @@ static s32 fixed_log2(float f) {
  * TEV (Tev.cpp + Tev.h). Single-/multi-stage regular combiner + alpha test +
  * blend. Indirect textures, z-texture and fog trap loudly if enabled.
  * ==========================================================================*/
-typedef struct { s16 r, g, b, a; } TColor;
 typedef struct {
     TColor Reg[4];          /* Prev, Color0, Color1, Color2 */
     TColor Konst[4];        /* KonstantColors */
@@ -662,10 +813,16 @@ static void tev_load_registers(Tev* t) {
     }
 }
 
-static void draw_color_regular(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4],
+/* draw_color_{regular,compare} / draw_alpha_{regular,compare} take the
+ * per-stage cache instead of the raw cc/ac words: the cc/ac bit fields they
+ * read (bias|n/a @16, op|cmp @18, clamp @19, scale|mode @20, dest @22) are
+ * per-draw-constant, decoded once into TevStageCfg by build_draw_cfg() rather
+ * than re-extracted via bits() on every pixel/stage (perf; PURE DECODE
+ * MOTION — same fields, same values, just read once instead of N times). */
+static void draw_color_regular(Tev* t, const TevStageCfg* sc, const s32 inA[4], const s32 inB[4],
                                const s32 inC[4], const s32 inD[4]) {
-    u32 bias = bits(cc, 16, 2), op = bits(cc, 18, 1);
-    u32 scale = bits(cc, 20, 2), dest = bits(cc, 22, 2);
+    u32 bias = sc->c16, op = sc->c18;
+    u32 scale = sc->c20, dest = sc->c22;
     for (int i = BLU_C; i <= RED_C; i++) {
         u32 c = (u32)inC[i] + ((u32)inC[i] >> 7);
         s32 temp = inA[i] * (256 - (s32)c) + inB[i] * (s32)c;
@@ -679,7 +836,7 @@ static void draw_color_regular(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4
         else if (i == GRN_C) t->Reg[dest].g = (s16)result;
         else t->Reg[dest].r = (s16)result;
     }
-    if (bits(cc, 19, 1)) {
+    if (sc->c19) {
         t->Reg[dest].r = clamp255(t->Reg[dest].r);
         t->Reg[dest].g = clamp255(t->Reg[dest].g);
         t->Reg[dest].b = clamp255(t->Reg[dest].b);
@@ -689,9 +846,9 @@ static void draw_color_regular(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4
         t->Reg[dest].b = clamp1024(t->Reg[dest].b);
     }
 }
-static void draw_color_compare(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4],
+static void draw_color_compare(Tev* t, const TevStageCfg* sc, const s32 inA[4], const s32 inB[4],
                                const s32 inC[4], const s32 inD[4]) {
-    u32 mode = bits(cc, 20, 2), cmp = bits(cc, 18, 1), dest = bits(cc, 22, 2);
+    u32 mode = sc->c20, cmp = sc->c18, dest = sc->c22;
     for (int i = BLU_C; i <= RED_C; i++) {
         u32 a, b;
         switch (mode) {
@@ -707,15 +864,15 @@ static void draw_color_compare(Tev* t, u32 cc, const s32 inA[4], const s32 inB[4
         else if (i == GRN_C) t->Reg[dest].g = res;
         else t->Reg[dest].r = res;
     }
-    if (bits(cc, 19, 1)) {
+    if (sc->c19) {
         t->Reg[dest].r = clamp255(t->Reg[dest].r);
         t->Reg[dest].g = clamp255(t->Reg[dest].g);
         t->Reg[dest].b = clamp255(t->Reg[dest].b);
     }
 }
-static void draw_alpha_regular(Tev* t, u32 ac, s32 a, s32 b, s32 c, s32 d) {
-    u32 bias = bits(ac, 16, 2), op = bits(ac, 18, 1);
-    u32 scale = bits(ac, 20, 2), dest = bits(ac, 22, 2);
+static void draw_alpha_regular(Tev* t, const TevStageCfg* sc, s32 a, s32 b, s32 c, s32 d) {
+    u32 bias = sc->a16, op = sc->a18;
+    u32 scale = sc->a20, dest = sc->a22;
     u32 cc = (u32)c + ((u32)c >> 7);
     s32 temp = a * (256 - (s32)cc) + b * (s32)cc;
     temp <<= s_LShift[scale];
@@ -724,10 +881,10 @@ static void draw_alpha_regular(Tev* t, u32 ac, s32 a, s32 b, s32 c, s32 d) {
     s32 result = ((d + s_Bias[bias]) << s_LShift[scale]) + temp;
     result >>= s_RShift[scale];
     t->Reg[dest].a = (s16)result;
-    t->Reg[dest].a = bits(ac, 19, 1) ? clamp255(t->Reg[dest].a) : clamp1024(t->Reg[dest].a);
+    t->Reg[dest].a = sc->a19 ? clamp255(t->Reg[dest].a) : clamp1024(t->Reg[dest].a);
 }
-static void draw_alpha_compare(Tev* t, u32 ac, const s32 inAa[4], const s32 inBa[4], s32 c, s32 d) {
-    u32 mode = bits(ac, 20, 2), cmp = bits(ac, 18, 1), dest = bits(ac, 22, 2);
+static void draw_alpha_compare(Tev* t, const TevStageCfg* sc, const s32 inAa[4], const s32 inBa[4], s32 c, s32 d) {
+    u32 mode = sc->a20, cmp = sc->a18, dest = sc->a22;
     u32 a, b;
     switch (mode) {
     case 0: a = inAa[RED_C]; b = inBa[RED_C]; break;
@@ -738,7 +895,7 @@ static void draw_alpha_compare(Tev* t, u32 ac, const s32 inAa[4], const s32 inBa
     }
     s32 add = cmp ? (a == b ? c : 0) : (a > b ? c : 0);
     t->Reg[dest].a = (s16)(d + add);
-    t->Reg[dest].a = bits(ac, 19, 1) ? clamp255(t->Reg[dest].a) : clamp1024(t->Reg[dest].a);
+    t->Reg[dest].a = sc->a19 ? clamp255(t->Reg[dest].a) : clamp1024(t->Reg[dest].a);
 }
 
 /* AlphaTest (bp 0xF3, Tev.cpp:193-238). */
@@ -767,30 +924,28 @@ static int alpha_test(int alpha) {
     }
 }
 
-/* Full Tev::Draw (Tev.cpp:387-683), scoped: no indirect/ztex/fog. */
+/* Full Tev::Draw (Tev.cpp:387-683), scoped: no indirect/ztex/fog. The
+ * indstages/ztex/fog guard depends only on BP genmode/ztex2/fogparam3 words —
+ * none of it is per-pixel data — so it has moved to build_draw_cfg() (draw
+ * entry) and fires once per draw instead of once per pixel; every other trap
+ * below (active-indirect-stage, ras-color-channel) keeps its original
+ * per-pixel/per-stage call site, just reading the pre-decoded TevStageCfg
+ * field instead of re-extracting it from s_bp each time. */
 static void tev_draw(Tev* t) {
-    if (gm_numindstages() != 0) TRAP(indstages, "indirect TEV stages");
-    if (bits(s_bp[0xF5], 2, 2) != 0) TRAP(ztex, "z-texture (ztex2.op)");
-    if (bits(s_bp[0xF1], 21, 3) != 0) TRAP(fog, "fog (FogParam3.fsel)");
+    if (s_draw_stats) s_pixels_shaded++;   /* GCN_GX_STATS: pixels_shaded counter */
 
-    u32 numstages = gm_numtevstages();  /* actual count is +1 */
-    u32 numtexgens = gm_numtexgens();
+    u32 numstages = s_cfg.numtevstages;  /* actual count is +1 */
+    u32 numtexgens = s_cfg.numtexgens;
 
     for (u32 stage = 0; stage <= numstages; stage++) {
-        u32 s2 = stage >> 1, odd = stage & 1;
-        u32 order = s_bp[0x28 + s2];
-        u32 cc = s_bp[0xC0 + stage * 2];
-        u32 ac = s_bp[0xC1 + stage * 2];
-
-        u32 texcoordSel = odd ? bits(order, 15, 3) : bits(order, 3, 3);
-        u32 texmap      = odd ? bits(order, 12, 3) : bits(order, 0, 3);
-        u32 enable      = odd ? bits(order, 18, 1) : bits(order, 6, 1);
-        u32 colorchan   = odd ? bits(order, 19, 3) : bits(order, 7, 3);
-        if (texcoordSel >= numtexgens) texcoordSel = 0;
+        const TevStageCfg* sc = &s_cfg.stage[stage];
+        u32 texcoordSel = sc->texcoordSel;
+        u32 texmap      = sc->texmap;
+        u32 enable      = sc->enable;
+        u32 colorchan   = sc->colorchan;
 
         /* Indirect: no indirect stages in scope -> TexCoord = Uv (Tev.cpp:369-384). */
-        u32 tevind = s_bp[0x10 + stage];
-        if (bits(tevind, 9, 2) != 0 || bits(tevind, 7, 2) != 0) TRAP(indactive, "active indirect stage");
+        if (sc->tevind_active) TRAP(indactive, "active indirect stage");
         t->TexCoordS = t->UvS[texcoordSel];
         t->TexCoordT = t->UvT[texcoordSel];
 
@@ -803,22 +958,19 @@ static void tev_draw(Tev* t) {
                 memset(texel, 0, 4);
             t->RawTexColor.r = texel[0]; t->RawTexColor.g = texel[1];
             t->RawTexColor.b = texel[2]; t->RawTexColor.a = texel[3];
-            u32 sw[4]; swap_table(bits(ac, 2, 2), sw);  /* ac.tswap */
+            const u32* sw = s_cfg.swaptab[sc->tswap_id];  /* ac.tswap */
             t->TexColor.r = texel[sw[0]]; t->TexColor.g = texel[sw[1]];
             t->TexColor.b = texel[sw[2]]; t->TexColor.a = texel[sw[3]];
         }
 
-        /* konst for this stage (kcsel/kasel, BPMemory AllTevKSels). */
-        u32 ksel = s_bp[0xF6 + s2];
-        u32 kc = odd ? bits(ksel, 14, 5) : bits(ksel, 4, 5);
-        u32 ka = odd ? bits(ksel, 19, 5) : bits(ksel, 9, 5);
-        { s16 r, g, b, a; konst_lookup(t, kc, &r, &g, &b, &a);
-          t->StageKonst.r = r; t->StageKonst.g = g; t->StageKonst.b = b;
-          konst_lookup(t, ka, &r, &g, &b, &a); t->StageKonst.a = a; }
+        /* konst for this stage (kcsel/kasel, BPMemory AllTevKSels) — StageKonst
+         * itself is draw-invariant (see TevStageCfg comment), so it is just
+         * copied out of the cache instead of re-run through konst_lookup(). */
+        t->StageKonst = sc->stage_konst;
 
         /* ras color (SetRasColor, Tev.cpp:34-78). */
         {
-            u32 rsw[4]; swap_table(bits(ac, 0, 2), rsw);  /* ac.rswap */
+            const u32* rsw = s_cfg.swaptab[sc->rswap_id];  /* ac.rswap */
             const u8* col = NULL;
             if (colorchan == 0) col = t->Color[0];
             else if (colorchan == 1) col = t->Color[1];
@@ -835,24 +987,24 @@ static void tev_draw(Tev* t) {
         /* combine inputs */
         s32 inA[4], inB[4], inC[4], inD[4];
         s16 r, g, b;
-        color_arg(t, bits(cc, 12, 4), &r, &g, &b); inA[RED_C]=r; inA[GRN_C]=g; inA[BLU_C]=b;
-        color_arg(t, bits(cc, 8, 4),  &r, &g, &b); inB[RED_C]=r; inB[GRN_C]=g; inB[BLU_C]=b;
-        color_arg(t, bits(cc, 4, 4),  &r, &g, &b); inC[RED_C]=r; inC[GRN_C]=g; inC[BLU_C]=b;
-        color_arg(t, bits(cc, 0, 4),  &r, &g, &b); inD[RED_C]=r; inD[GRN_C]=g; inD[BLU_C]=b;
-        inA[ALP_C] = alpha_arg(t, bits(ac, 13, 3));
-        inB[ALP_C] = alpha_arg(t, bits(ac, 10, 3));
-        inC[ALP_C] = alpha_arg(t, bits(ac, 7, 3));
-        inD[ALP_C] = alpha_arg(t, bits(ac, 4, 3));
+        color_arg(t, sc->argA, &r, &g, &b); inA[RED_C]=r; inA[GRN_C]=g; inA[BLU_C]=b;
+        color_arg(t, sc->argB, &r, &g, &b); inB[RED_C]=r; inB[GRN_C]=g; inB[BLU_C]=b;
+        color_arg(t, sc->argC, &r, &g, &b); inC[RED_C]=r; inC[GRN_C]=g; inC[BLU_C]=b;
+        color_arg(t, sc->argD, &r, &g, &b); inD[RED_C]=r; inD[GRN_C]=g; inD[BLU_C]=b;
+        inA[ALP_C] = alpha_arg(t, sc->aargA);
+        inB[ALP_C] = alpha_arg(t, sc->aargB);
+        inC[ALP_C] = alpha_arg(t, sc->aargC);
+        inD[ALP_C] = alpha_arg(t, sc->aargD);
 
-        if (bits(cc, 16, 2) != 3) draw_color_regular(t, cc, inA, inB, inC, inD);
-        else                      draw_color_compare(t, cc, inA, inB, inC, inD);
-        if (bits(ac, 16, 2) != 3) draw_alpha_regular(t, ac, inA[ALP_C], inB[ALP_C], inC[ALP_C], inD[ALP_C]);
-        else                      draw_alpha_compare(t, ac, inA, inB, inC[ALP_C], inD[ALP_C]);
+        if (sc->c16 != 3) draw_color_regular(t, sc, inA, inB, inC, inD);
+        else              draw_color_compare(t, sc, inA, inB, inC, inD);
+        if (sc->a16 != 3) draw_alpha_regular(t, sc, inA[ALP_C], inB[ALP_C], inC[ALP_C], inD[ALP_C]);
+        else              draw_alpha_compare(t, sc, inA, inB, inC[ALP_C], inD[ALP_C]);
     }
 
-    u32 last = gm_numtevstages();
-    u32 color_dest = bits(s_bp[0xC0 + last * 2], 22, 2);
-    u32 alpha_dest = bits(s_bp[0xC1 + last * 2], 22, 2);
+    const TevStageCfg* last_sc = &s_cfg.stage[numstages];
+    u32 color_dest = last_sc->c22;
+    u32 alpha_dest = last_sc->a22;
     u8 output[4];
     output[ALP_C] = (u8)t->Reg[alpha_dest].a;
     output[BLU_C] = (u8)t->Reg[color_dest].b;
@@ -862,7 +1014,7 @@ static void tev_draw(Tev* t) {
     if (!alpha_test(output[ALP_C])) return;
 
     /* Late-Z (EmulatedZ::Late, Tev.cpp:663-672): z-test after shading. */
-    if (zm_test_enable() && !early_ztest()) {
+    if (s_cfg.zt_enable && !s_cfg.zt_early) {
         if (!ZCompare((u16)t->Position[0], (u16)t->Position[1], (u32)t->Position[2]))
             return;
     }
@@ -929,7 +1081,9 @@ typedef struct { float InvW; float Uv[8][2]; } RBPixel;
 static RBPixel s_rb[BLK][BLK];
 
 static void calc_lod(Tev* t, s32* lodp, int* linear, u32 texmap, u32 texcoord) {
-    u32 mode0 = tx_mode0(texmap), mode1 = tx_mode1(texmap);
+    /* tx_mode0/mode1 fields are per-draw-constant; s_cfg.tex[texmap] carries
+     * them (build_draw_cfg), so this no longer re-reads BP per block. */
+    const TexUnitCfg* tc = &s_cfg.tex[texmap];
     float* uv00 = s_rb[0][0].Uv[texcoord];
     float* uv10 = s_rb[1][0].Uv[texcoord];
     float* uv01 = s_rb[0][1].Uv[texcoord];
@@ -938,20 +1092,19 @@ static void calc_lod(Tev* t, s32* lodp, int* linear, u32 texmap, u32 texcoord) {
     float dudy = fabsf(uv00[0] - uv01[0]);
     float dvdy = fabsf(uv00[1] - uv01[1]);
     float sDelta, tDelta;
-    if (bits(mode0, 8, 1)) { sDelta = dudx + dudy; tDelta = dvdx + dvdy; }
+    if (tc->lod_edge) { sDelta = dudx + dudy; tDelta = dvdx + dvdy; }
     else { sDelta = dudx > dudy ? dudx : dudy; tDelta = dvdx > dvdy ? dvdx : dvdy; }
     s32 lod = fixed_log2(sDelta > tDelta ? sDelta : tDelta);
-    int bias = (int)sext(bits(mode0, 9, 8), 8); bias >>= 1; lod += bias;
-    u32 magf = bits(mode0, 4, 1), minf = bits(mode0, 7, 1);
-    *linear = ((lod > 0 && minf == 1) || (lod <= 0 && magf == 1));
-    s32 maxlod = (s32)bits(mode1, 8, 8), minlod = (s32)bits(mode1, 0, 8);
+    lod += tc->lod_bias_half;
+    *linear = ((lod > 0 && tc->minf == 1) || (lod <= 0 && tc->magf == 1));
+    s32 maxlod = (s32)tc->maxlod, minlod = (s32)tc->minlod;
     if (lod > maxlod) lod = maxlod; else if (lod < minlod) lod = minlod;
     *lodp = lod;
     (void)t;
 }
 
 static void build_block(Tev* t, s32 bx, s32 by) {
-    u32 numtexgens = gm_numtexgens();
+    u32 numtexgens = s_cfg.numtexgens;
     for (s32 yi = 0; yi < BLK; yi++) {
         for (s32 xi = 0; xi < BLK; xi++) {
             RBPixel* p = &s_rb[xi][yi];
@@ -967,17 +1120,11 @@ static void build_block(Tev* t, s32 bx, s32 by) {
             }
         }
     }
-    u32 last = gm_numtevstages();
+    u32 last = s_cfg.numtevstages;
     for (u32 i = 0; i <= last; i++) {
-        u32 s2 = i >> 1, odd = i & 1;
-        u32 order = s_bp[0x28 + s2];
-        u32 enable = odd ? bits(order, 18, 1) : bits(order, 6, 1);
-        if (enable) {
-            u32 texmap = odd ? bits(order, 12, 3) : bits(order, 0, 3);
-            u32 texcoord = odd ? bits(order, 15, 3) : bits(order, 3, 3);
-            if (texcoord >= numtexgens) texcoord = 0;
-            calc_lod(t, &t->TextureLod[i], &t->TextureLinear[i], texmap, texcoord);
-        }
+        const TevStageCfg* sc = &s_cfg.stage[i];
+        if (sc->enable)
+            calc_lod(t, &t->TextureLod[i], &t->TextureLinear[i], sc->texmap, sc->texcoordSel);
     }
 }
 
@@ -985,18 +1132,18 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     s32 z = (s32)slope_value(&s_ZSlope, x, y);
     if (z < 0) z = 0; else if (z > 16777215) z = 16777215;
 
-    if (zm_test_enable() && early_ztest()) {
+    if (s_cfg.zt_enable && s_cfg.zt_early) {
         if (!ZCompare((u16)x, (u16)y, (u32)z)) return;
     }
     RBPixel* p = &s_rb[xi][yi];
     t->Position[0] = x; t->Position[1] = y; t->Position[2] = z;
-    for (u32 i = 0; i < gm_numcolchans(); i++)
+    for (u32 i = 0; i < s_cfg.numcolchans; i++)
         for (int comp = 0; comp < 4; comp++) {
             float c = slope_value(&s_ColorSlopes[i][comp], x, y);
             s16 cc = (s16)(c < 0 ? 0 : c > 255 ? 255 : c);
             t->Color[i][comp] = (u8)cc;
         }
-    for (u32 i = 0; i < gm_numtexgens(); i++) {
+    for (u32 i = 0; i < s_cfg.numtexgens; i++) {
         t->UvS[i] = (s32)(p->Uv[i][0] * 128.0f);
         t->UvT[i] = (s32)(p->Uv[i][1] * 128.0f);
     }
@@ -1012,7 +1159,7 @@ static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
     s_ZSlope = make_slope(v0->screenPosition[2], v1->screenPosition[2], v2->screenPosition[2], &ctx);
 }
 
-static void draw_triangle(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
+static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
     update_zslope(v0, v1, v2, x_off, y_off);
 
@@ -1043,11 +1190,11 @@ static void draw_triangle(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutV
     float w[3] = { 1.0f / v0->projectedPosition[3], 1.0f / v1->projectedPosition[3],
                    1.0f / v2->projectedPosition[3] };
     s_WSlope = make_slope(w[0], w[1], w[2], &ctx);
-    for (u32 i = 0; i < gm_numcolchans(); i++)
+    for (u32 i = 0; i < s_cfg.numcolchans; i++)
         for (int comp = 0; comp < 4; comp++)
             s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
                                                 v2->color[i][comp], &ctx);
-    for (u32 i = 0; i < gm_numtexgens(); i++) {
+    for (u32 i = 0; i < s_cfg.numtexgens; i++) {
         s_TexSlopes[i][0] = make_slope(v0->texCoords[i][0]*w[0], v1->texCoords[i][0]*w[1], v2->texCoords[i][0]*w[2], &ctx);
         s_TexSlopes[i][1] = make_slope(v0->texCoords[i][1]*w[0], v1->texCoords[i][1]*w[1], v2->texCoords[i][1]*w[2], &ctx);
         s_TexSlopes[i][2] = make_slope(v0->texCoords[i][2]*w[0], v1->texCoords[i][2]*w[1], v2->texCoords[i][2]*w[2], &ctx);
@@ -1100,6 +1247,19 @@ static void draw_triangle(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutV
             }
         }
     }
+}
+
+/* GCN_GX_STATS bucket (b) — triangle scan/pixel: draw_triangle_impl covers
+ * setup (edge equations, slopes) through every raster_pixel/tev_draw call for
+ * this triangle, i.e. everything gx_raster_draw's vertex loop is NOT (see the
+ * vtx/tri split comment near the top of the file). A thin wrapper rather than
+ * inline timing so draw_triangle_impl's early `return` (degenerate/empty
+ * bbox) doesn't need a second accumulation site. */
+static void draw_triangle(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
+    if (!s_draw_stats) { draw_triangle_impl(t, v0, v1, v2); return; }
+    u64 t0 = __rdtsc();
+    draw_triangle_impl(t, v0, v1, v2);
+    s_tsc_tri += __rdtsc() - t0;
 }
 
 /* ============================================================================
@@ -1217,7 +1377,7 @@ static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
     if (m != 0) return;   /* trivially rejected */
 
     int backface = is_backface(v0, v1, v2);
-    u32 cull = gm_cull_mode();
+    u32 cull = s_cfg.cullmode;
     if (!backface) { if (cull == 1 || cull == 3) return; }   /* cull Back/All */
     else           { if (cull == 2 || cull == 3) return; }   /* cull Front/All */
 
@@ -1809,7 +1969,134 @@ static void recompute_scissor(void) {
     }
 }
 
-void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
+/* Populate s_cfg (+ the shared s_pf/s_zt_upd/s_bm_cu/s_bm_au quad) once for the
+ * whole draw call — see the big "Per-draw config cache" comment above
+ * GetPixelColor for why this is exact rather than approximate. Must run AFTER
+ * tev_load_registers(&s_tev): stage_konst resolution reads s_tev.Konst[],
+ * which that call just (re)loaded from bp 0xE0-0xE7. */
+static void build_draw_cfg(void) {
+    s_pf     = pixel_format();
+    s_zt_upd = zm_update_enable();
+    s_bm_cu  = bm_color_update();
+    s_bm_au  = bm_alpha_update();
+
+    s_cfg.numtexgens   = gm_numtexgens();
+    s_cfg.numcolchans  = gm_numcolchans();
+    s_cfg.numtevstages = gm_numtevstages();
+    s_cfg.cullmode     = gm_cull_mode();
+
+    s_cfg.zt_enable = zm_test_enable();
+    s_cfg.zt_early  = early_ztest();
+    s_cfg.zt_func   = zm_func();
+
+    s_cfg.bm_blend_enable = bm_blend_enable();
+    s_cfg.bm_logic_enable = bm_logic_enable();
+    s_cfg.bm_dither       = bm_dither();
+    s_cfg.bm_dst_factor   = bm_dst_factor();
+    s_cfg.bm_src_factor   = bm_src_factor();
+    s_cfg.bm_subtract     = bm_subtract();
+    s_cfg.bm_logic_mode   = bm_logic_mode();
+
+    s_cfg.da_enable = da_enable();
+    s_cfg.da_alpha  = da_alpha();
+
+    for (u32 id = 0; id < 4; id++) swap_table(id, s_cfg.swaptab[id]);
+
+    /* indstages/ztex/fog (Tev::Draw guard, Tev.cpp:387-390): BP-genmode/ztex2/
+     * fogparam3 conditions only — no per-pixel data involved — so the trap
+     * check itself (not just its decode) moves here: same trap-once message,
+     * evaluated once per draw instead of once per pixel. */
+    if (gm_numindstages() != 0) TRAP(indstages, "indirect TEV stages");
+    if (bits(s_bp[0xF5], 2, 2) != 0) TRAP(ztex, "z-texture (ztex2.op)");
+    if (bits(s_bp[0xF1], 21, 3) != 0) TRAP(fog, "fog (FogParam3.fsel)");
+
+    for (u32 stage = 0; stage <= s_cfg.numtevstages; stage++) {
+        TevStageCfg* sc = &s_cfg.stage[stage];
+        u32 s2 = stage >> 1, odd = stage & 1;
+        u32 order = s_bp[0x28 + s2];
+        u32 cc = s_bp[0xC0 + stage * 2];
+        u32 ac = s_bp[0xC1 + stage * 2];
+        sc->cc = cc; sc->ac = ac;
+
+        sc->texcoordSel = odd ? bits(order, 15, 3) : bits(order, 3, 3);
+        sc->texmap      = odd ? bits(order, 12, 3) : bits(order, 0, 3);
+        sc->enable      = odd ? bits(order, 18, 1) : bits(order, 6, 1);
+        sc->colorchan   = odd ? bits(order, 19, 3) : bits(order, 7, 3);
+        if (sc->texcoordSel >= s_cfg.numtexgens) sc->texcoordSel = 0;
+
+        u32 tevind = s_bp[0x10 + stage];
+        sc->tevind_active = (bits(tevind, 9, 2) != 0 || bits(tevind, 7, 2) != 0);
+
+        sc->tswap_id = bits(ac, 2, 2);
+        sc->rswap_id = bits(ac, 0, 2);
+
+        /* konst for this stage (kcsel/kasel, BPMemory AllTevKSels) — resolved
+         * once, not just its selector (see TevStageCfg comment). */
+        u32 ksel = s_bp[0xF6 + s2];
+        u32 kc = odd ? bits(ksel, 14, 5) : bits(ksel, 4, 5);
+        u32 ka = odd ? bits(ksel, 19, 5) : bits(ksel, 9, 5);
+        { s16 r, g, b, a;
+          konst_lookup(&s_tev, kc, &r, &g, &b, &a);
+          sc->stage_konst.r = r; sc->stage_konst.g = g; sc->stage_konst.b = b;
+          konst_lookup(&s_tev, ka, &r, &g, &b, &a); sc->stage_konst.a = a; }
+
+        sc->argA = bits(cc, 12, 4); sc->argB = bits(cc, 8, 4);
+        sc->argC = bits(cc, 4, 4);  sc->argD = bits(cc, 0, 4);
+        sc->aargA = bits(ac, 13, 3); sc->aargB = bits(ac, 10, 3);
+        sc->aargC = bits(ac, 7, 3);  sc->aargD = bits(ac, 4, 3);
+
+        sc->c16 = bits(cc, 16, 2); sc->c18 = bits(cc, 18, 1);
+        sc->c19 = bits(cc, 19, 1); sc->c20 = bits(cc, 20, 2); sc->c22 = bits(cc, 22, 2);
+        sc->a16 = bits(ac, 16, 2); sc->a18 = bits(ac, 18, 1);
+        sc->a19 = bits(ac, 19, 1); sc->a20 = bits(ac, 20, 2); sc->a22 = bits(ac, 22, 2);
+    }
+
+    for (u32 unit = 0; unit < 8; unit++) {
+        TexUnitCfg* tc = &s_cfg.tex[unit];
+        u32 ti0 = tx_image0(unit);
+        tc->image0_raw = ti0;
+        tc->fmt = bits(ti0, 20, 4);
+        tc->w1  = (int)bits(ti0, 0, 10);
+        tc->h1  = (int)bits(ti0, 10, 10);
+
+        u32 ti3 = tx_image3(unit);
+        tc->image3_raw = ti3;
+        tc->img_base = (ti3 & 0x00ffffffu) << 5;
+        tc->phys = tc->img_base & 0x1FFFFFFFu;
+        tc->valid = (s_cpu && s_cpu->ram && tc->phys < s_cpu->ram_size);
+        tc->src     = tc->valid ? s_cpu->ram + tc->phys : NULL;
+        tc->src_len = tc->valid ? s_cpu->ram_size - tc->phys : 0u;
+
+        u32 mode0 = tx_mode0(unit), mode1 = tx_mode1(unit);
+        tc->wrap_s = bits(mode0, 0, 2);
+        tc->wrap_t = bits(mode0, 2, 2);
+        tc->mipmapfilter_bad = (bits(mode0, 5, 2) != 0);
+        tc->magf = bits(mode0, 4, 1);
+        tc->minf = bits(mode0, 7, 1);
+        tc->lod_edge = (int)bits(mode0, 8, 1);
+        { int bias = (int)sext(bits(mode0, 9, 8), 8); tc->lod_bias_half = bias >> 1; }
+        tc->minlod = bits(mode1, 0, 8);
+        tc->maxlod = bits(mode1, 8, 8);
+    }
+}
+
+/* Shared subset of build_draw_cfg() the EFB-copy path needs: pixel_format /
+ * color_update / alpha_update / z-update back GetPixelColor & friends, used by
+ * BOTH gx_raster_draw (s_pf/s_zt_upd/s_bm_cu/s_bm_au, set above) and here —
+ * "gx_raster_efb_copy entry for its own config" (CLAUDE.md gx-raster task). */
+static void build_efb_cfg(void) {
+    s_pf     = pixel_format();
+    s_zt_upd = zm_update_enable();
+    s_bm_cu  = bm_color_update();
+    s_bm_au  = bm_alpha_update();
+}
+
+/* GCN_GX_STATS: gx_raster_draw's actual body, wrapped below by the public
+ * entry point so the vtx/clip-vs-triangle split (see the big comment near the
+ * top of the file) has a single measurement point regardless of which of this
+ * function's several early-return paths (bad primitive, vat<3 verts,
+ * load_vertex failure, normal completion) is taken. */
+static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
                     const u8* verts, u32 nverts, u32 vstride) {
     /* prim 0/1 = GX_DRAW_QUADS / GX_DRAW_QUADS_2 (SetupUnit.cpp:34-40 routes
      * both to SetupQuad — Dolphin itself treats QUADS_2 as a non-standard
@@ -1841,6 +2128,7 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
 
     recompute_scissor();
     tev_load_registers(&s_tev);
+    build_draw_cfg();
 
     /* SetupUnit vertex assembly (SetupUnit.cpp:12-130): v0 stays in store[0]
      * for the whole call (its slot is never reassigned by either path); only
@@ -1886,6 +2174,42 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
     }
 }
 
+/* GCN_GX_STATS: total gx_raster_draw_impl wall time minus the triangle-scan/
+ * pixel time already accumulated into s_tsc_tri by draw_triangle (before/after
+ * subtraction — same technique gx.c uses to isolate its own DECODE bucket from
+ * the nested DRAW/EFB ones) gives the vertex load+transform+clip time exactly,
+ * for every early-return path uniformly (see gx_raster_draw_impl's comment). */
+void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
+                    const u8* verts, u32 nverts, u32 vstride) {
+    if (s_draw_stats < 0)
+        s_draw_stats = getenv("GCN_GX_STATS") ? 1 : 0;
+
+    if (!s_draw_stats) {
+        gx_raster_draw_impl(cp, prim, vat, verts, nverts, vstride);
+        return;
+    }
+
+    u64 tri_before = s_tsc_tri;
+    u64 t0 = __rdtsc();
+    gx_raster_draw_impl(cp, prim, vat, verts, nverts, vstride);
+    u64 total = __rdtsc() - t0;
+    u64 tri_delta = s_tsc_tri - tri_before;
+    s_tsc_vtx += (total > tri_delta) ? (total - tri_delta) : 0;
+    s_draw_calls_stat++;
+}
+
+/* Expose the accumulators above to gx.c, which prints them as a
+ * "[gx-draw-stats]" line at the same cadence as its own "[gx-stats]" summary
+ * (gcn_gx_tick). All zero if GCN_GX_STATS was never set (draw_calls==0 tells
+ * the caller there is nothing meaningful to print yet, same convention as
+ * gx.c's own tot>0 guard). */
+void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u64* draw_calls) {
+    if (tsc_vtx) *tsc_vtx = s_tsc_vtx;
+    if (tsc_tri) *tsc_tri = s_tsc_tri;
+    if (pixels_shaded) *pixels_shaded = s_pixels_shaded;
+    if (draw_calls) *draw_calls = s_draw_calls_stat;
+}
+
 /* ============================================================================
  * EFB copy (EfbCopy.cpp + SWEfbInterface.cpp EncodeXFB). copy-then-clear per
  * BPStructs.cpp:240-395.
@@ -1918,15 +2242,17 @@ static void efb_clear_rect(void) {
     for (int y = top; y <= bottom; y++) {
         for (int x = left; x <= right; x++) {
             u32 off = (u32)x + (u32)y * EFB_WIDTH;
-            /* SetColor honors color_update/alpha_update. */
-            if (bm_color_update()) {
-                if (bm_alpha_update()) SetPixelAlphaColor(off, cc);
-                else                   SetPixelColorOnly(off, cc);
-            } else if (bm_alpha_update()) {
+            /* SetColor honors color_update/alpha_update (bp 0x41, cached by
+             * build_efb_cfg() into the shared s_bm_cu/s_bm_au — this is a
+             * per-clear-rect constant, not a per-pixel one). */
+            if (s_bm_cu) {
+                if (s_bm_au) SetPixelAlphaColor(off, cc);
+                else         SetPixelColorOnly(off, cc);
+            } else if (s_bm_au) {
                 SetPixelAlphaOnly(off, cc[ALP_C]);
             }
-            /* SetDepth honors zmode.update_enable. */
-            if (zm_update_enable()) SetPixelDepth(off, clearZ);
+            /* SetDepth honors zmode.update_enable (bp 0x40, cached as s_zt_upd). */
+            if (s_zt_upd) SetPixelDepth(off, clearZ);
         }
     }
 }
@@ -1942,6 +2268,9 @@ static u32 get_efb_color(int x, int y) {
 
 void gx_raster_efb_copy(const GxCpState* cp) {
     (void)cp;
+    /* Own decode of the pixel_format/color_update/alpha_update/z-update quad
+     * this call's GetPixelColor/efb_clear_rect calls need — see build_efb_cfg. */
+    build_efb_cfg();
     u32 copy = s_bp[0x52];
     int clamp_top = bits(copy, 0, 1);
     int clamp_bottom = bits(copy, 1, 1);

@@ -70,4 +70,14 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
  * preserving Dolphin's copy-then-clear order. */
 void gx_raster_efb_copy(const GxCpState* cp);
 
+/* GCN_GX_STATS=1 (same knob gx.c reads): gx_raster_draw's own internal time
+ * split between vertex load+transform+clip and triangle scan/pixel, plus a
+ * pixels_shaded counter (tev_draw invocations). gx.c calls this at the same
+ * 2^20-tick cadence as its own "[gx-stats]" summary and prints a
+ * "[gx-draw-stats]" line alongside it. All outputs are cumulative since
+ * process start (never reset), matching gx.c's own s_gx_tsc/s_gx_* counters;
+ * *draw_calls == 0 means the stat gate was never turned on. Any output
+ * pointer may be NULL. */
+void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u64* draw_calls);
+
 #endif /* GCN_GX_GX_RASTER_H */
