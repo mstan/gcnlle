@@ -11,7 +11,9 @@
 #include "debug/rings.h"
 
 #include <stdio.h>
+#include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
 #include <string.h>
+#include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
 
 /* Staging ("video buffer") capacity. Fifo.cpp keeps a linear buffer that
  * accumulates 32-byte chunks and is consumed a whole-command-at-a-time; leftover
@@ -98,6 +100,38 @@ typedef struct {
 } GcnGx;
 
 static GcnGx s_gx;
+
+/* ============================================================================
+ * GCN_GX_STATS=1: rdtsc-based wall attribution WITHIN gcn_gx_tick, split
+ * across the four dominant sub-paths dispatch-stats (GCN_DISPATCH_STATS,
+ * dispatch.c) proved gx_tick itself dominates:
+ *   FIFO   - the 32-byte chunk memcpy + gcn_cp_gpu_consume_chunk + the
+ *            leftover memmove (gcn_gx_tick, guest-RAM <-> staging buffer)
+ *   DECODE - gx_run/gx_run_command: CP/XF/BP loads, NOP runs, CALL_DL
+ *            bookkeeping — i.e. gx_run's own wall time with the nested
+ *            DRAW/EFB time (below) subtracted back out, so the four buckets
+ *            partition gx_run's tree exactly instead of double-counting.
+ *   DRAW   - gx_raster_draw (software rasterizer), timed at its call site in
+ *            gx_run_command
+ *   EFB    - gx_raster_efb_copy, timed at its call site in gx_on_bp
+ * Plus event counters over the same window (chunks/commands/draws/verts/
+ * DL calls/EFB copies) so a % share can be read alongside "how much work".
+ *
+ * Same style as GCN_DISPATCH_STATS: one cached getenv (s_gxstats, lazily
+ * resolved to 0/1 on the first tick), then straight-line `if (s_gxstats)`
+ * guards at each timed site. Off by default; the only per-tick/per-command
+ * cost when off is those untaken branches — no rdtsc calls, no counter
+ * writes, identical GX behavior either way. */
+static int s_gxstats = -1;
+enum { GX_STAT_FIFO = 0, GX_STAT_DECODE, GX_STAT_DRAW, GX_STAT_EFB, GX_STAT_N };
+static u64 s_gx_tsc[GX_STAT_N];
+static u64 s_gx_ticks;      /* gcn_gx_tick calls that passed the CP/enable gate */
+static u64 s_gx_chunks;     /* 32-byte FIFO chunks drained */
+static u64 s_gx_commands;   /* gx_run_command invocations that consumed >0 bytes */
+static u64 s_gx_draws;      /* GX_OP_PRIM_* commands rasterized */
+static u64 s_gx_verts;      /* total vertices across those draws */
+static u64 s_gx_dlcalls;    /* CALL_DL commands actually executed (non-recursive) */
+static u64 s_gx_efbcopies;  /* GX_BP_TRIGGER_EFB_COPY writes */
 
 /* Log a first-occurrence once; returns 1 the first time a flag is raised. */
 static int note_once(u8* flag) {
@@ -316,7 +350,16 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 1);
         break;
     case GX_BP_TRIGGER_EFB_COPY:       /* BPStructs.cpp:240-395 */
-        gx_raster_efb_copy(&gx->cpst);
+        /* GCN_GX_STATS bucket 4 (EFB): timed only at this call site, not the
+         * BP dispatch around it — the off path below is byte-identical work. */
+        if (s_gxstats) {
+            u64 t0 = __rdtsc();
+            gx_raster_efb_copy(&gx->cpst);
+            s_gx_tsc[GX_STAT_EFB] += __rdtsc() - t0;
+            s_gx_efbcopies++;
+        } else {
+            gx_raster_efb_copy(&gx->cpst);
+        }
         break;
     default:
         /* All other BP regs: state storage only (that IS their hardware effect
@@ -411,6 +454,7 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
         u32 phys = addr & 0x1FFFFFFFu;
         if (cpu && cpu->ram && size > 0u &&
             (u64)phys + (u64)size <= (u64)cpu->ram_size) {
+            if (s_gxstats) s_gx_dlcalls++;   /* GCN_GX_STATS: DL calls counter */
             gx->dl_depth++;
             gx->cur_dl_addr = addr;
             gx_run(gx, cpu->ram + phys, size);
@@ -483,8 +527,18 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
                         gx->cpst.vtx_desc_lo, gx->cpst.vtx_desc_hi,
                         gx->cpst.vat_g0[vat], gx->cpst.vat_g1[vat], gx->cpst.vat_g2[vat]);
             /* Rasterize (SWVertexLoader -> TransformUnit -> Clipper ->
-             * Rasterizer -> Tev). The payload is contiguous in `data`. */
-            gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
+             * Rasterizer -> Tev). The payload is contiguous in `data`.
+             * GCN_GX_STATS bucket 3 (DRAW): timed only at this call site — the
+             * off path below is byte-identical work. */
+            if (s_gxstats) {
+                u64 t0 = __rdtsc();
+                gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
+                s_gx_tsc[GX_STAT_DRAW] += __rdtsc() - t0;
+                s_gx_draws++;
+                s_gx_verts += nverts;
+            } else {
+                gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
+            }
             return total;
         }
 
@@ -516,6 +570,7 @@ static u32 gx_run(GcnGx* gx, const u8* data, u32 available) {
     while (off < available) {
         u32 sz = gx_run_command(gx, &data[off], available - off);
         if (sz == 0u) break;
+        if (s_gxstats) s_gx_commands++;   /* GCN_GX_STATS: commands-decoded counter */
         off += sz;
     }
     return off;
@@ -536,12 +591,20 @@ void gcn_gx_init(CPUState* cpu, GcnCp* cp, GcnPe* pe) {
 
 void gcn_gx_tick(u32 cycles) {
     (void)cycles;
+    /* GCN_GX_STATS=1: resolved once (cached -1 sentinel), then a single
+     * `if (s_gxstats)` branch guards every timed site below — see the big
+     * comment above s_gx.c's stats statics for the bucket definitions. */
+    if (s_gxstats < 0)
+        s_gxstats = getenv("GCN_GX_STATS") ? 1 : 0;
+
     GcnGx* gx = &s_gx;
     if (!gx->cp || !gx->cpu)
         return;
     /* Fifo.cpp RunGpuLoop:317-320 gate: GPReadEnable && distance && !breakpoint. */
     if (!gx->cp->gp_read_enable)
         return;
+
+    if (s_gxstats) s_gx_ticks++;
 
     u32 drained = 0;
     while (drained < GCN_GX_DRAIN_BYTES_PER_TICK &&
@@ -571,21 +634,83 @@ void gcn_gx_tick(u32 cycles) {
             }
             break;
         }
-        memcpy(gx->buf + gx->buf_len, gx->cpu->ram + phys, GCN_CP_GATHER_PIPE_SIZE);
-        gx->buf_len += GCN_CP_GATHER_PIPE_SIZE;
 
-        /* Advance the read side (wrap + distance-32 + status/interrupt eval). */
-        gcn_cp_gpu_consume_chunk(gx->cp);
+        /* GCN_GX_STATS bucket 1 (FIFO): the chunk copy + CP consume. The off
+         * path is byte-identical work, zero timing calls. */
+        if (s_gxstats) {
+            u64 t0 = __rdtsc();
+            memcpy(gx->buf + gx->buf_len, gx->cpu->ram + phys, GCN_CP_GATHER_PIPE_SIZE);
+            gx->buf_len += GCN_CP_GATHER_PIPE_SIZE;
+            /* Advance the read side (wrap + distance-32 + status/interrupt eval). */
+            gcn_cp_gpu_consume_chunk(gx->cp);
+            s_gx_tsc[GX_STAT_FIFO] += __rdtsc() - t0;
+            s_gx_chunks++;
+        } else {
+            memcpy(gx->buf + gx->buf_len, gx->cpu->ram + phys, GCN_CP_GATHER_PIPE_SIZE);
+            gx->buf_len += GCN_CP_GATHER_PIPE_SIZE;
+            gcn_cp_gpu_consume_chunk(gx->cp);
+        }
         drained += GCN_CP_GATHER_PIPE_SIZE;
 
         /* Run whole commands out of the staging buffer; keep the leftover partial
          * command for the next chunk (Fifo.cpp:342-352 advances the read ptr past
-         * consumed commands only). */
-        u32 consumed = gx_run(gx, gx->buf, gx->buf_len);
+         * consumed commands only).
+         *
+         * GCN_GX_STATS bucket 2 (DECODE): gx_run's own wall time with whatever
+         * it spent inside gx_raster_draw/gx_raster_efb_copy (buckets 3/4,
+         * timed at their own call sites deeper in gx_run_command/gx_on_bp)
+         * subtracted back out — those nested calls happen *inside* this
+         * gx_run() call, so without the subtraction DECODE would double-count
+         * them. Reading the DRAW/EFB accumulators before and after isolates
+         * exactly the delta this call contributed. */
+        u32 consumed;
+        if (s_gxstats) {
+            u64 draw_efb_before = s_gx_tsc[GX_STAT_DRAW] + s_gx_tsc[GX_STAT_EFB];
+            u64 t0 = __rdtsc();
+            consumed = gx_run(gx, gx->buf, gx->buf_len);
+            u64 t1 = __rdtsc();
+            u64 draw_efb_after = s_gx_tsc[GX_STAT_DRAW] + s_gx_tsc[GX_STAT_EFB];
+            s_gx_tsc[GX_STAT_DECODE] += (t1 - t0) - (draw_efb_after - draw_efb_before);
+        } else {
+            consumed = gx_run(gx, gx->buf, gx->buf_len);
+        }
+
         if (consumed > 0u) {
-            if (consumed < gx->buf_len)
-                memmove(gx->buf, gx->buf + consumed, gx->buf_len - consumed);
-            gx->buf_len -= consumed;
+            /* GCN_GX_STATS bucket 1 (FIFO) continued: the leftover memmove. */
+            if (s_gxstats) {
+                u64 t0 = __rdtsc();
+                if (consumed < gx->buf_len)
+                    memmove(gx->buf, gx->buf + consumed, gx->buf_len - consumed);
+                gx->buf_len -= consumed;
+                s_gx_tsc[GX_STAT_FIFO] += __rdtsc() - t0;
+            } else {
+                if (consumed < gx->buf_len)
+                    memmove(gx->buf, gx->buf + consumed, gx->buf_len - consumed);
+                gx->buf_len -= consumed;
+            }
+        }
+    }
+
+    /* Summary line every 2^20 ticks (matches GCN_DISPATCH_STATS' cadence) so
+     * stderr stays sparse — this is a diagnostic window, not per-tick noise.
+     * Guarded on tot>0 so a run that never reaches this gate (or hasn't yet
+     * accumulated any bucket time) doesn't print a divide-by-zero line. */
+    if (s_gxstats && (s_gx_ticks & 0xFFFFFu) == 0u) {
+        u64 tot = s_gx_tsc[GX_STAT_FIFO] + s_gx_tsc[GX_STAT_DECODE] +
+                  s_gx_tsc[GX_STAT_DRAW] + s_gx_tsc[GX_STAT_EFB];
+        if (tot > 0u) {
+            fprintf(stderr,
+                "[gx-stats] ticks=%llu  fifo=%.1f%% decode=%.1f%% draw=%.1f%% efb=%.1f%%"
+                "  | chunks=%llu cmds=%llu draws=%llu verts=%llu dl=%llu efbcopy=%llu\n",
+                (unsigned long long)s_gx_ticks,
+                100.0 * (double)s_gx_tsc[GX_STAT_FIFO]   / (double)tot,
+                100.0 * (double)s_gx_tsc[GX_STAT_DECODE] / (double)tot,
+                100.0 * (double)s_gx_tsc[GX_STAT_DRAW]   / (double)tot,
+                100.0 * (double)s_gx_tsc[GX_STAT_EFB]    / (double)tot,
+                (unsigned long long)s_gx_chunks, (unsigned long long)s_gx_commands,
+                (unsigned long long)s_gx_draws, (unsigned long long)s_gx_verts,
+                (unsigned long long)s_gx_dlcalls, (unsigned long long)s_gx_efbcopies);
+            fflush(stderr);
         }
     }
 }
