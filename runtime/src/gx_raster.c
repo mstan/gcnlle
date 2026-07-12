@@ -358,25 +358,39 @@ static int s_bm_au;    /* bm_alpha_update() */
  * (menu-observed: a transient PEControl switch during the boot animation) are
  * handled; Z24-only (depth-only rendering) stays a trap — never observed.
  * ==========================================================================*/
-static u32 GetPixelColor(u32 off) {
+/* The two GetPixelColor formulas, factored out to plain per-format functions
+ * (u32 off -> u32 color) so gx_raster_efb_copy's inner loop can pick one of
+ * them ONCE PER COPY (its s_pf is per-copy-constant, see build_efb_cfg) instead
+ * of re-switching on s_pf on every one of its GetPixelColor calls — see
+ * get_efb_color/gx_raster_efb_copy below. Pure extraction: GetPixelColor's own
+ * switch below is unchanged bit-for-bit, it just calls these instead of
+ * inlining their bodies. */
+static inline u32 get_pixel_color_direct(u32 off) {
+    /* RGB8_Z24 / Z24 / RGB565_Z16 (SWEfbInterface.cpp:164-166 — Dolphin itself
+     * treats RGB565_Z16 identically to RGB8_Z24, "not supported correctly
+     * yet"; transcribed as-is so we match the oracle exactly). */
+    return 0xffu | ((s_efb_color[off] & 0x00ffffffu) << 8);
+}
+static inline u32 get_pixel_color_rgba6(u32 off) {
     u32 src = s_efb_color[off];
+    return (u32)Convert6To8(src & 0x3f) |
+           ((u32)Convert6To8((src >> 6) & 0x3f) << 8) |
+           ((u32)Convert6To8((src >> 12) & 0x3f) << 16) |
+           ((u32)Convert6To8((src >> 18) & 0x3f) << 24);
+}
+static u32 GetPixelColor(u32 off) {
     switch (s_pf) {
     case PF_RGB8_Z24:
     case PF_Z24:
-    case PF_RGB565_Z16:   /* SWEfbInterface.cpp:164-166 — Dolphin itself treats this
-                           * identically to RGB8_Z24 ("not supported correctly yet");
-                           * transcribed as-is so we match the oracle exactly. */
-        return 0xffu | ((src & 0x00ffffffu) << 8);
+    case PF_RGB565_Z16:
+        return get_pixel_color_direct(off);
     case PF_RGBA6_Z24:
-        return (u32)Convert6To8(src & 0x3f) |
-               ((u32)Convert6To8((src >> 6) & 0x3f) << 8) |
-               ((u32)Convert6To8((src >> 12) & 0x3f) << 16) |
-               ((u32)Convert6To8((src >> 18) & 0x3f) << 24);
+        return get_pixel_color_rgba6(off);
     default:
         TRAPF(pf_getcolor, "EFB GetPixelColor pixel_format %u (only RGB8_Z24=0/RGBA6_Z24=1 "
               "in scope; raw ZCOMPARE/PEControl bp[0x43]=0x%06X)",
               s_pf, s_bp[0x43]);
-        return 0xffu | ((src & 0x00ffffffu) << 8);
+        return get_pixel_color_direct(off);
     }
 }
 static void SetPixelColorOnly(u32 off, const u8* rgb) {
@@ -1828,6 +1842,86 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     tev_shade(t);
 }
 
+/* ============================================================================
+ * Fused-draw specialization of raster_pixel/raster_pixel_prep (perf task,
+ * dead-work elimination — CLAUDE.md gx-raster "skip dead per-pixel work on
+ * fused draws"). Selected ONCE PER TRIANGLE by draw_triangle_impl (which reads
+ * s_cfg.fused — itself set ONCE PER DRAW by build_draw_cfg — into a local
+ * function pointer before entering the pixel loops; see draw_triangle_impl),
+ * never re-checked per pixel. Used only when s_cfg.fused != NULL, i.e. every
+ * fused_common_match()/fused_stage_match() precondition documented above
+ * fused_pixel_A/B/C already holds for the whole draw.
+ *
+ * What's skipped, and why it is provably dead for a fused draw:
+ *
+ *  - z slope eval (slope_value(&s_ZSlope,...)), its clamp, and the
+ *    t->Position[2] write. Grepped every reader of t->Position[2] in this
+ *    file: (1) raster_pixel_prep's own early-Z branch, gated on
+ *    `s_cfg.zt_enable && s_cfg.zt_early`; (2) blend_stage's late-Z ZCompare,
+ *    gated on `s_cfg.zt_enable && !s_cfg.zt_early`. fused_common_match pins
+ *    zt_enable==0, so BOTH gates are always false for a fused draw. And
+ *    blend_stage itself is never even called on a fused draw: tev_shade only
+ *    reaches it via tev_draw's tail, whereas a fused draw's tev_comb_finish
+ *    always passes fused_blend_stage, which reads Position[0]/[1] only (EFB
+ *    offset, Dither) and never Position[2]. So z has zero readers on a fused
+ *    draw's pixels, in either the early or late position.
+ *  - the 3 RGB color-slope evals (Color[0][0..2]; comp 3/alpha is unaffected
+ *    and still evaluated below). fused_common_match pins numcolchans==1 (so
+ *    channel 1 is never touched even by the general path) and every fused
+ *    stage's colorchan==0. fused_pixel_A/fused_core_C (shared by B and C) are
+ *    read in full above: each reads exactly `t->Color[0][3]` for RasColor.a
+ *    and never references Color[0][0]/[1]/[2] (RasColor.r/g/b) at all — the
+ *    general path only ever reads those through SetRasColor/color_arg, which
+ *    the fused functions bypass entirely (they never call tev_draw).
+ *
+ * Stale-read hazard analysis (t->Position[2] and t->Color[0][0..2] are fields
+ * of the single shared `s_tev`/Tev* instance reused across every pixel and
+ * draw, so a skipped WRITE could in principle leak a PRIOR draw's/pixel's
+ * value to a later READ):
+ *  - Within a fused draw: no reader exists (see above), so whatever stale
+ *    bytes sit in Position[2]/Color[0][0..2] are never observed. Not a hazard.
+ *  - A later GENERAL-path draw: raster_pixel (unmodified) always calls the
+ *    unmodified raster_pixel_prep first, which unconditionally recomputes and
+ *    overwrites Position[2] and Color[i][0..3] for every one of its pixels
+ *    BEFORE tev_shade/tev_draw ever reads them. So a general draw can never
+ *    observe a fused draw's skipped writes either. No cross-draw hazard in
+ *    either direction.
+ * ==========================================================================*/
+static void raster_pixel_prep_fused(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
+    RBPixel* p = &s_rb[xi][yi];
+    t->Position[0] = x; t->Position[1] = y;   /* Position[2]/z: skipped, see above */
+    {
+        /* Channel-0 alpha only (comp 3) — the only Color[0] component any
+         * fused_pixel_A/B/C ever reads (via fused_core_C's `ras_a`). */
+        float c = slope_value(&s_ColorSlopes[0][3], x, y);
+        s16 cc = (s16)(c < 0 ? 0 : c > 255 ? 255 : c);
+        t->Color[0][3] = (u8)cc;
+    }
+    for (u32 i = 0; i < s_cfg.numtexgens; i++) {
+        t->UvS[i] = (s32)(p->Uv[i][0] * 128.0f);
+        t->UvT[i] = (s32)(p->Uv[i][1] * 128.0f);
+    }
+}
+
+/* Fused counterpart of raster_pixel(). No ready/reject branch to mirror: a
+ * fused draw's zt_early is always 0 (fused_common_match), so
+ * raster_pixel_prep's early-Z gate — the only way raster_pixel_prep can ever
+ * return 0 — never fires; every fused pixel always proceeds to shading, same
+ * as the general path would for these same draws (verified by the
+ * GCN_GX_NO_FUSED=1 A/B: general-path early-Z rejection count on these draws
+ * is always 0 too, since zt_early==0 there as well). */
+static void raster_pixel_fused(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
+    if (!s_pixel_stats) {
+        raster_pixel_prep_fused(t, x, y, xi, yi);
+        s_cfg.fused(t);
+        return;
+    }
+    u64 t0 = __rdtsc();
+    raster_pixel_prep_fused(t, x, y, xi, yi);
+    s_tsc_slope += __rdtsc() - t0;
+    s_cfg.fused(t);
+}
+
 static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
                           s32 x_off, s32 y_off) {
     /* zfreeze is off for the menu; recompute each triangle. */
@@ -1838,6 +1932,15 @@ static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
 }
 
 static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
+    /* Fused-path pixel-fn selection, hoisted OUT of the pixel loops below:
+     * s_cfg.fused is set once per DRAW by build_draw_cfg (never mid-draw), so
+     * reading it once per TRIANGLE here — instead of once per pixel, as
+     * tev_shade's own s_cfg.fused check already effectively did before this
+     * task — is enough; no per-pixel re-check of s_cfg remains on this path.
+     * See the big comment above raster_pixel_prep_fused for what this
+     * specialization skips and why it's provably dead work. */
+    void (*pixel_fn)(Tev*, s32, s32, s32, s32) = s_cfg.fused ? raster_pixel_fused : raster_pixel;
+
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
     update_zslope(v0, v1, v2, x_off, y_off);
 
@@ -1906,7 +2009,7 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
             if (a == 0xF && bb == 0xF && cc == 0xF && x >= minx && x1_ < maxx && y >= miny && y1_ < maxy) {
                 for (s32 iy = 0; iy < BLK; iy++)
                     for (s32 ix = 0; ix < BLK; ix++)
-                        raster_pixel(t, x + ix, y + iy, ix, iy);
+                        pixel_fn(t, x + ix, y + iy, ix, iy);
             } else {
                 s32 CY1 = C1 + DX12 * y0 - DY12 * x0;
                 s32 CY2 = C2 + DX23 * y0 - DY23 * x0;
@@ -1916,7 +2019,7 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
                     for (s32 ix = 0; ix < BLK; ix++) {
                         if (CX1 > 0 && CX2 > 0 && CX3 > 0) {
                             if (x + ix >= minx && x + ix < maxx && y + iy >= miny && y + iy < maxy)
-                                raster_pixel(t, x + ix, y + iy, ix, iy);
+                                pixel_fn(t, x + ix, y + iy, ix, iy);
                         }
                         CX1 -= FDY12; CX2 -= FDY23; CX3 -= FDY31;
                     }
@@ -3092,13 +3195,23 @@ static void efb_clear_rect(void) {
     }
 }
 
-/* filtered YUV encode of one destination pixel column position x, EFB row y. */
-static u32 get_efb_color(int x, int y) {
+/* filtered YUV encode of one destination pixel column position x, EFB row y.
+ * `getpx` is the per-copy-constant pixel-format formula (see
+ * gx_raster_efb_copy below) — hoisted out here instead of going through
+ * GetPixelColor's own `switch (s_pf)` on every call: s_pf cannot change
+ * mid-copy (build_efb_cfg decodes it once, at the top of this same call —
+ * see the "Per-draw config cache" comment near GetPixelColor's definition
+ * for why BP state is provably constant for the whole call), yet this
+ * function is invoked 3 times per output pixel column (yprev/sy/ynext taps)
+ * times every column times every scanline of the copy, so the switch used to
+ * re-run per tap. Bounds clamping stays here unchanged: x/y genuinely vary
+ * per call and are NOT per-copy-constant. */
+static u32 get_efb_color(int x, int y, u32 (*getpx)(u32)) {
     if (x < 0) x = 0;
     if (x >= (int)EFB_WIDTH) x = (int)EFB_WIDTH - 1;
     if (y < 0) y = 0;
     if (y >= (int)EFB_HEIGHT) y = (int)EFB_HEIGHT - 1;
-    return GetPixelColor((u32)x + (u32)y * EFB_WIDTH);
+    return getpx((u32)x + (u32)y * EFB_WIDTH);
 }
 
 void gx_raster_efb_copy(const GxCpState* cp) {
@@ -3106,6 +3219,26 @@ void gx_raster_efb_copy(const GxCpState* cp) {
     /* Own decode of the pixel_format/color_update/alpha_update/z-update quad
      * this call's GetPixelColor/efb_clear_rect calls need — see build_efb_cfg. */
     build_efb_cfg();
+
+    /* Pixel-format decision, hoisted to ONCE PER COPY instead of once per
+     * get_efb_color() call (see that function's comment): s_pf is one of a
+     * fixed small set of BP-decoded values for the whole call, so pick the
+     * direct formula function now instead of re-switching on s_pf 3 times per
+     * output column. A live 5M/8M-tick IPL-menu boot (GCN_GX_STATS-adjacent
+     * census, 2026-07-12) showed every observed EFB copy uses s_pf==2
+     * (RGB565_Z16) — part of the RGB8_Z24/Z24/RGB565_Z16 group that all share
+     * get_pixel_color_direct's formula — but this covers EVERY pixel_format
+     * GetPixelColor itself supports, not just the one observed: RGBA6_Z24
+     * gets its own direct formula, and any other/unexpected s_pf value falls
+     * back to the general GetPixelColor() (switch + TRAPF), so an unseen
+     * format is exactly as correct (and traps exactly the same way) as before
+     * this change — nothing here assumes s_pf is fixed to the observed value,
+     * only that it doesn't change mid-copy. */
+    u32 (*copy_getpx)(u32) =
+        (s_pf == PF_RGB8_Z24 || s_pf == PF_Z24 || s_pf == PF_RGB565_Z16) ? get_pixel_color_direct :
+        (s_pf == PF_RGBA6_Z24)                                          ? get_pixel_color_rgba6 :
+                                                                           GetPixelColor;
+
     u32 copy = s_bp[0x52];
     int clamp_top = bits(copy, 0, 1);
     int clamp_bottom = bits(copy, 1, 1);
@@ -3159,9 +3292,9 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                 if (sy + 1 < ynext) ynext = sy + 1;
                 /* per-pixel filtered YUV (indices 1..src_w) */
                 for (int i = 1, x = left; x < right; i++, x++) {
-                    u32 c0 = get_efb_color(x, yprev);
-                    u32 c1 = get_efb_color(x, sy);
-                    u32 c2 = get_efb_color(x, ynext);
+                    u32 c0 = get_efb_color(x, yprev, copy_getpx);
+                    u32 c1 = get_efb_color(x, sy, copy_getpx);
+                    u32 c2 = get_efb_color(x, ynext, copy_getpx);
                     u8 cb0[4], cb1[4], cb2[4];
                     memcpy(cb0, &c0, 4); memcpy(cb1, &c1, 4); memcpy(cb2, &c2, 4);
                     u8 filt[4]; filt[ALP_C] = 0;
