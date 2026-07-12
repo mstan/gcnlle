@@ -26,7 +26,22 @@ static GcnSi* s_si = NULL;
  * for both the polled channel registers and the CMD_DIRECT buffer so they
  * cannot drift. Reads the injected state (si->input) — neutral at init
  * (buttons=0, sticks centered 0x80, triggers 0) until the debug-surface
- * set_input command (or a live client) changes it. */
+ * set_input command (or a live client) changes it.
+ *
+ * !!! KNOWN GAP (unresolved, 2026-07-11 M3 session) !!!
+ * In the IPL Calendar edit UI, ONLY the analog stick edits values; injected
+ * D-pad / C-stick / trigger / X/Y/Z state was observed completely inert at the
+ * value-editing level (dozens of controlled holds; the SI ring confirmed every
+ * injected bit propagates into this report correctly). We BELIEVE that is the
+ * real IPL behavior (its Adjust screen says "Select: [stick glyph]"), but it
+ * has NOT been cross-checked by driving the same UI in Dolphin with a real
+ * pad. If real hardware/Dolphin DOES respond to the D-pad there, the suspect
+ * is this report — most likely the reporting MODE (we hardwire mode 3; the
+ * IPL may set a different mode via SI_DIRECT/SIPOLL and expect a different
+ * byte layout, SI_DeviceGCController.cpp:168-236 switch) or ORIGIN handling
+ * (CMD_ORIGIN returns centered constants; a real pad returns calibration the
+ * PAD lib subtracts). Cross-check before building anything on stick-only
+ * assumptions. */
 static void si_pad_report(const GcnSi* si, u32* hi, u32* lo) {
     const GcnSiPadInput* in = &si->input;
     *hi = (u32)in->stick_y | ((u32)in->stick_x << 8) |

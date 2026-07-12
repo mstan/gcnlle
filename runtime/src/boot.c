@@ -33,6 +33,12 @@
  *                      runs at clean shutdown. Unset (the default): nothing
  *                      is read or written — fixtures only, byte-identical to
  *                      before this option existed.
+ *   GCN_RTC_HOST       [ENHANCEMENT] "1" makes RTC reads track the live host
+ *                      wall clock (GC-epoch converted, exi.h) so the menu
+ *                      shows the real current date/time. Nondeterministic by
+ *                      nature — never set it for oracle-diff runs. Wins over
+ *                      a GCN_SRAM_FILE-persisted counter (SRAM settings from
+ *                      the file still apply).
  */
 #include "cpu/cpu.h"
 #include "memory/memory.h"
@@ -206,6 +212,18 @@ int main(int argc, char** argv) {
         s_sram_persist_ctx.exi = &exi;
         s_sram_persist_ctx.path = sram_path;
         gcn_exi_set_persist(&exi, sram_persist_to_file, &s_sram_persist_ctx);
+    }
+
+    /* [ENHANCEMENT, opt-in] GCN_RTC_HOST=1: RTC reads track the live host
+     * wall clock (GC-epoch converted; see exi.h). Applied AFTER the
+     * GCN_SRAM_FILE load so host time wins over any persisted counter (the
+     * SRAM settings from the file still apply). Default off: the
+     * deterministic fixture serves every oracle-diff run. */
+    const char* rtc_host = getenv("GCN_RTC_HOST");
+    if (rtc_host && *rtc_host && *rtc_host != '0') {
+        gcn_exi_set_rtc_host_mode(&exi, 1);
+        fprintf(stdout, "gcn boot: GCN_RTC_HOST — RTC tracks the host clock "
+                "(enhancement mode; nondeterministic, not for oracle diffs)\n");
     }
 
     gcn_mmio_register(&bus, "EXI", GCN_EXI_BASE, GCN_EXI_REGISTER_BYTES,

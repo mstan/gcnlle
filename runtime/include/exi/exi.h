@@ -109,6 +109,21 @@ typedef struct GcnExi {
     u8        sram[GCN_SRAM_SIZE_BYTES];
     u32       rtc_counter;
 
+    /* [ENHANCEMENT, opt-in] Host-clock RTC (GCN_RTC_HOST=1): RTC reads return
+     * the live host wall clock converted to the GC epoch — seconds since
+     * 2000-01-01 00:00:00 UTC, i.e. unix_time - 0x386D4380 (Dolphin
+     * EXI_DeviceIPL.h:27 GC_EPOCH; its GetEmulatedTime does this same
+     * conversion) — plus rtc_host_offset, which an RTC_WRITE adjusts so the
+     * guest can still "set the clock" relative to host time (we never touch
+     * the host clock). DEFAULT OFF: reads serve the deterministic fixture
+     * counter, byte-identical to before — host mode is a per-run convenience
+     * on top of the validated baseline (PRINCIPLES: enhancements never
+     * replace it) and NOT usable for oracle-diff runs (host time is
+     * inherently nondeterministic). In host mode the persisted blob's rtc
+     * field is written on flush but IGNORED on load (host time wins). */
+    int       rtc_host_mode;
+    s32       rtc_host_offset;
+
     /* Per-channel transaction state (reset when a device is (re)selected). */
     int       op[GCN_EXI_CHANNELS];
     u32       rom_offset[GCN_EXI_CHANNELS];  /* current byte offset for ROM read */
@@ -147,6 +162,9 @@ void gcn_exi_set_rom(GcnExi* exi, const u8* rom, u32 size, u32 base);
 /* Install the SRAM fixture (0x40 bytes) and RTC seconds-since-2000 counter. */
 void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]);
 void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter);
+
+/* [ENHANCEMENT] Enable host-clock RTC mode (see the struct field doc). */
+void gcn_exi_set_rtc_host_mode(GcnExi* exi, int on);
 
 /* Register the write-back hook (ROADMAP M3): called synchronously right after
  * a guest RTC_WRITE or SRAM_WRITE lands in exi->rtc_counter / exi->sram. NULL

@@ -12,6 +12,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>   /* [ENHANCEMENT] host-clock RTC mode */
 
 /* ---- helpers ---------------------------------------------------------------*/
 
@@ -92,6 +93,21 @@ void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]) {
 
 void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter) {
     exi->rtc_counter = rtc_counter;
+}
+
+/* [ENHANCEMENT] Host-clock RTC (see exi.h). GC epoch = 2000-01-01 00:00:00 UTC
+ * = Unix 0x386D4380 (Dolphin EXI_DeviceIPL.h:27 GC_EPOCH; GetEmulatedTime does
+ * the same unix-minus-epoch conversion). */
+#define GCN_EXI_GC_EPOCH_UNIX 0x386D4380u
+
+static u32 exi_rtc_host_now(const GcnExi* exi) {
+    return (u32)((u64)time(NULL) - GCN_EXI_GC_EPOCH_UNIX)
+           + (u32)exi->rtc_host_offset;
+}
+
+void gcn_exi_set_rtc_host_mode(GcnExi* exi, int on) {
+    exi->rtc_host_mode = on;
+    exi->rtc_host_offset = 0;
 }
 
 void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user) {
@@ -213,8 +229,11 @@ static void ipl_dev_read(GcnExi* exi, CPUState* cpu, u32 ch, bool dma, u32 len) 
         ipl_rom_read(exi, cpu, ch, dma, len);
         break;
     case GCN_EXI_OP_RTC_READ:
-        /* Immediate 4-byte read returns the seconds-since-2000 counter. */
-        c->data = exi->rtc_counter;
+        /* Immediate 4-byte read returns the seconds-since-2000 counter —
+         * the deterministic fixture, or live host time in the opt-in
+         * GCN_RTC_HOST enhancement mode (see exi.h). */
+        c->data = exi->rtc_host_mode ? exi_rtc_host_now(exi)
+                                     : exi->rtc_counter;
         break;
     case GCN_EXI_OP_SRAM_READ:
         if (dma) {
@@ -264,7 +283,14 @@ static void ipl_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma, u
             }
         } else {                /* subsequent write = data payload */
             if (exi->op[ch] == GCN_EXI_OP_RTC_WRITE) {
-                exi->rtc_counter = c->data;
+                if (exi->rtc_host_mode) {
+                    /* [ENHANCEMENT] host mode: the guest "sets the clock" by
+                     * adjusting our offset from host time; the host clock
+                     * itself is never touched. */
+                    exi->rtc_host_offset += (s32)(c->data - exi_rtc_host_now(exi));
+                } else {
+                    exi->rtc_counter = c->data;
+                }
                 if (exi->persist) exi->persist(exi->persist_user);
             } else if (exi->op[ch] == GCN_EXI_OP_SRAM_WRITE) {
                 for (u32 i = 0; i < len && i < 4u; i++) {
