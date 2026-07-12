@@ -59,6 +59,53 @@ static char* emit_dispatch_to_string(void) {
     return buf;
 }
 
+/* A run of consecutive, equal-size, perfectly-tiling functions must collapse to
+ * one O(1) dispatch table indexed by (address-base)>>log2(stride), not N range
+ * checks. Uses three 0x4000 chunks so the stride is a power of two (shift). */
+static char* emit_table_dispatch_to_string(void) {
+    FunctionList funcs = {0};
+    FILE* f = NULL;
+    char* buf = NULL;
+
+    if (!function_list_add(&funcs, 0x80100000u, 0x80104000u) ||
+        !function_list_add(&funcs, 0x80104000u, 0x80108000u) ||
+        !function_list_add(&funcs, 0x80108000u, 0x8010C000u)) {
+        function_list_free(&funcs);
+        return NULL;
+    }
+
+    f = tmpfile();
+    if (!f) {
+        function_list_free(&funcs);
+        return NULL;
+    }
+
+    emit_chunk_prototype(f, 0x80100000u);
+    emit_chunk_prototype(f, 0x80104000u);
+    emit_chunk_prototype(f, 0x80108000u);
+    emit_dispatch_helpers(f, &funcs, 0x80100000u);
+    function_list_free(&funcs);
+    fflush(f);
+
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+
+    buf = (char*)malloc((size_t)size + 1u);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    size_t got = fread(buf, 1, (size_t)size, f);
+    buf[got] = '\0';
+    fclose(f);
+    return buf;
+}
+
 int main(void) {
     char* code = emit_dispatch_to_string();
     if (!code) {
@@ -86,6 +133,23 @@ int main(void) {
           "public dispatcher can fall back to original code");
 
     free(code);
+
+    char* tbl = emit_table_dispatch_to_string();
+    if (!tbl) {
+        check(0, "emit table dispatch helpers");
+        printf("DISPATCH,total,%d passed %d failed\n", pass_count, fail_count);
+        return 1;
+    }
+    check(strstr(tbl, "s_dolrecomp_tbl_0[3] = {") != NULL,
+          "tiling run emits an O(1) dispatch table");
+    check(strstr(tbl, "return s_dolrecomp_tbl_0[(address - 0x80100000u) >> 14u];") != NULL,
+          "table lookup indexes by (address-base)>>log2(stride)");
+    check(strstr(tbl, "func_80100000,") != NULL && strstr(tbl, "func_80108000,") != NULL,
+          "table covers all chunks in the run");
+    check(strstr(tbl, "return func_80104000;") == NULL,
+          "run members collapse into the table, not per-chunk range checks");
+    free(tbl);
+
     printf("DISPATCH,total,%d passed %d failed\n", pass_count, fail_count);
     return fail_count == 0 ? 0 : 1;
 }
