@@ -604,7 +604,14 @@ void gcn_gx_tick(u32 cycles) {
     if (!gx->cp->gp_read_enable)
         return;
 
-    if (s_gxstats) s_gx_ticks++;
+    /* Unconditional (not gated on s_gxstats): this counter is the shared
+     * 2^20-tick print cadence for ALL of "[gx-stats]"/"[gx-draw-stats]"/
+     * "[gx-pixel-stats]", and GCN_GX_PIXEL_STATS must be able to print on its
+     * own cadence without GCN_GX_STATS also being set (they are independent
+     * knobs — see gx_raster.c's s_pixel_stats comment). Cost is one u64
+     * increment per tick, not per pixel/command — negligible next to the FIFO
+     * drain work this function already does unconditionally every tick. */
+    s_gx_ticks++;
 
     u32 drained = 0;
     while (drained < GCN_GX_DRAIN_BYTES_PER_TICK &&
@@ -693,12 +700,15 @@ void gcn_gx_tick(u32 cycles) {
 
     /* Summary line every 2^20 ticks (matches GCN_DISPATCH_STATS' cadence) so
      * stderr stays sparse — this is a diagnostic window, not per-tick noise.
-     * Guarded on tot>0 so a run that never reaches this gate (or hasn't yet
-     * accumulated any bucket time) doesn't print a divide-by-zero line. */
-    if (s_gxstats && (s_gx_ticks & 0xFFFFFu) == 0u) {
+     * The cadence gate itself is independent of any specific stats knob (see
+     * s_gx_ticks' comment above); each block below is individually guarded on
+     * its own knob's data (tot>0 / draw_calls>0 / shaded>0) so GCN_GX_STATS
+     * and GCN_GX_PIXEL_STATS print on this shared cadence but fully
+     * independently of each other — neither requires the other to be set. */
+    if ((s_gx_ticks & 0xFFFFFu) == 0u) {
         u64 tot = s_gx_tsc[GX_STAT_FIFO] + s_gx_tsc[GX_STAT_DECODE] +
                   s_gx_tsc[GX_STAT_DRAW] + s_gx_tsc[GX_STAT_EFB];
-        if (tot > 0u) {
+        if (s_gxstats && tot > 0u) {
             fprintf(stderr,
                 "[gx-stats] ticks=%llu  fifo=%.1f%% decode=%.1f%% draw=%.1f%% efb=%.1f%%"
                 "  | chunks=%llu cmds=%llu draws=%llu verts=%llu dl=%llu efbcopy=%llu\n",
@@ -727,6 +737,32 @@ void gcn_gx_tick(u32 cycles) {
                 100.0 * (double)tsc_vtx / (double)vtx_tri_tot,
                 100.0 * (double)tsc_tri / (double)vtx_tri_tot,
                 (unsigned long long)pixels_shaded);
+            fflush(stderr);
+        }
+
+        /* GCN_GX_PIXEL_STATS: further split of the "tri" bucket above (triangle
+         * scan/pixel) into BLOCK/SLOPE/TEX/COMB/BLEND — see gx_raster.c's big
+         * comment above s_pixel_stats for the bucket definitions and the
+         * alpha-test/late-Z boundary rationale. Separate knob from
+         * GCN_GX_STATS (per-pixel rdtsc pairs are too expensive to leave on by
+         * default), same print cadence, piggybacked onto this tick so there is
+         * only one stats print site to keep in sync (gx_raster_get_pixel_stats). */
+        GxPixelStats ps;
+        gx_raster_get_pixel_stats(&ps);
+        u64 ps_tot = ps.tsc_block + ps.tsc_slope + ps.tsc_tex + ps.tsc_comb + ps.tsc_blend;
+        if (ps.shaded > 0u && ps_tot > 0u) {
+            fprintf(stderr,
+                "[gx-pixel-stats] block=%.1f%% slope=%.1f%% tex=%.1f%% comb=%.1f%% blend=%.1f%%"
+                "  | tex_calls=%llu linear=%llu point=%llu earlyz_rejected=%llu shaded=%llu"
+                " blend_writes=%llu\n",
+                100.0 * (double)ps.tsc_block / (double)ps_tot,
+                100.0 * (double)ps.tsc_slope / (double)ps_tot,
+                100.0 * (double)ps.tsc_tex   / (double)ps_tot,
+                100.0 * (double)ps.tsc_comb  / (double)ps_tot,
+                100.0 * (double)ps.tsc_blend / (double)ps_tot,
+                (unsigned long long)ps.tex_calls, (unsigned long long)ps.tex_linear,
+                (unsigned long long)ps.tex_point, (unsigned long long)ps.earlyz_rejected,
+                (unsigned long long)ps.shaded, (unsigned long long)ps.blend_writes);
             fflush(stderr);
         }
     }

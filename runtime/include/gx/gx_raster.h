@@ -80,4 +80,20 @@ void gx_raster_efb_copy(const GxCpState* cp);
  * pointer may be NULL. */
 void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u64* draw_calls);
 
+/* GCN_GX_PIXEL_STATS=1 (own knob, separate from GCN_GX_STATS — see gx_raster.c
+ * for why they must not share a cache/branch). Splits the triangle-scan wall
+ * time (GCN_GX_STATS' own "tri" bucket) five ways: BLOCK (build_block per-2x2
+ * setup), SLOPE (raster_pixel's pre-tev_draw work: z slope + early-Z + color
+ * slopes + UV fixed-point), TEX (tex_sample total), COMB (the rest of
+ * tev_draw: combiner stages + alpha test), BLEND (late-Z, if it lives after
+ * alpha test, + BlendTev). All tsc_* fields and counters are cumulative since
+ * process start; all zero if the knob was never turned on. */
+typedef struct {
+    u64 tsc_block, tsc_slope, tsc_tex, tsc_comb, tsc_blend;
+    u64 tex_calls, tex_linear, tex_point;
+    u64 earlyz_rejected, shaded, blend_writes;
+} GxPixelStats;
+
+void gx_raster_get_pixel_stats(GxPixelStats* out);
+
 #endif /* GCN_GX_GX_RASTER_H */

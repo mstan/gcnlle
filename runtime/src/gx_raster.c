@@ -40,6 +40,68 @@ static u64 s_tsc_tri;          /* triangle scan/pixel (draw_triangle, incl. all 
 static u64 s_pixels_shaded;    /* tev_draw() invocations (one per shaded pixel candidate) */
 static u64 s_draw_calls_stat;  /* gx_raster_draw calls counted (vtx bucket samples) */
 
+/* ============================================================================
+ * GCN_GX_PIXEL_STATS=1: a SEPARATE knob from GCN_GX_STATS above, with its own
+ * cached -1-sentinel getenv (s_pixel_stats) and its own accumulators. This is
+ * deliberate, not an oversight: per-pixel rdtsc pairs (one per tex_sample call,
+ * one per tev_draw call, ...) add ~30-50% overhead inside the hottest loop in
+ * the whole runtime (triangle scan is 96.9% of the GX draw bucket), which would
+ * silently distort every GCN_GX_STATS share if the two knobs shared a branch.
+ * Enable one or the other, never both in the same run.
+ *
+ * Splits GCN_GX_STATS' own "tri" bucket (draw_triangle / triangle scan+pixel)
+ * five ways:
+ *   BLOCK  build_block(): per-2x2-block setup (UV/interp/lod prep), timed as a
+ *          whole at its single call site in draw_triangle_impl.
+ *   SLOPE  raster_pixel's work strictly BEFORE tev_draw: z slope eval,
+ *          early-Z test, color slope evals, UV fixed-point conversion. Timed
+ *          over the whole raster_pixel_prep() call (whether it early-returns
+ *          on an early-Z reject or falls through to tev_draw) so the bucket
+ *          reflects real wall time regardless of outcome.
+ *   TEX    tex_sample() total, timed at its one call site inside tev_draw's
+ *          stage loop (covers decode_texel/wrap_coord/bilinear filter).
+ *   COMB   the rest of tev_draw: per-stage konst/ras/combiner math (color_arg,
+ *          alpha_arg, draw_color_regular/compare, draw_alpha_regular/compare)
+ *          through alpha_test(). Computed
+ *          as tev_draw's own wall time minus the nested TEX delta — same
+ *          before/after accumulator-subtraction technique gx.c's DECODE bucket
+ *          uses to isolate itself from DRAW/EFB.
+ *   BLEND  everything from the moment alpha_test() PASSES onward: late-Z
+ *          (EmulatedZ::Late — it lives here, after alpha test, not in SLOPE)
+ *          and BlendTev. Timed as a whole around the blend_stage() call, which
+ *          holds exactly that segment (its own early-return on a late-Z reject
+ *          still gets timed, mirroring the SLOPE approach for early-Z).
+ * Boundary is deliberately at alpha_test()'s pass/fail branch: alpha test
+ * itself is COMB (it's still shading math on the combiner's output), late-Z is
+ * BLEND (it's a per-pixel EFB read gated on the shaded result, same family as
+ * BlendTev's own EFB read-modify-write).
+ *
+ * Counters: tex_sample call count split bilinear(linear)/point, early-Z
+ * rejected pixels (raster_pixel_prep returned "rejected"), shaded pixels
+ * (tev_draw entries — own counter, mirrors s_pixels_shaded above but gated on
+ * this knob instead of GCN_GX_STATS so the two never cross-contaminate), and
+ * blend writes (blend_stage actually reached BlendTev, i.e. passed alpha test
+ * AND late-Z).
+ *
+ * Zero cost when off: every timed site is a single untaken `if (s_pixel_stats)`
+ * branch, no rdtsc, no counter writes, identical rasterizer behavior either
+ * way — same contract as s_draw_stats above. gx.c reads these via
+ * gx_raster_get_pixel_stats() and prints them as a "[gx-pixel-stats]" line at
+ * the same 2^20-tick cadence as "[gx-stats]"/"[gx-draw-stats]".
+ * ==========================================================================*/
+static int s_pixel_stats = -1;
+static u64 s_tsc_block;          /* build_block (per 2x2 block) */
+static u64 s_tsc_slope;          /* raster_pixel pre-tev_draw work */
+static u64 s_tsc_tex;            /* tex_sample total (nested inside COMB's wall) */
+static u64 s_tsc_comb;           /* tev_draw minus nested TEX and BLEND deltas */
+static u64 s_tsc_blend;          /* late-Z (if present) + BlendTev */
+static u64 s_ps_tex_calls;       /* tex_sample invocations */
+static u64 s_ps_tex_linear;      /* ...of which bilinear (TextureLinear[stage]) */
+static u64 s_ps_tex_point;       /* ...of which point-sampled */
+static u64 s_ps_earlyz_rejected; /* raster_pixel_prep: early-Z rejected */
+static u64 s_ps_shaded;          /* tev_draw entries (own counter, see above) */
+static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
+
 /* ---- one-time trap logging ------------------------------------------------ */
 static int trap_once(int* flag, const char* what) {
     if (*flag) return 0;
@@ -924,15 +986,44 @@ static int alpha_test(int alpha) {
     }
 }
 
+/* GCN_GX_PIXEL_STATS BLEND bucket: everything from the moment alpha_test()
+ * PASSES onward — late-Z (EmulatedZ::Late; it lives here, gated on the shaded
+ * result, not in SLOPE which only ever runs early-Z) and BlendTev. Factored
+ * out purely so the timed wrapper in tev_draw has one call to time regardless
+ * of whether late-Z rejects (early return) or the pixel reaches BlendTev —
+ * same technique as raster_pixel_prep. Behavior is unchanged from the inline
+ * version this replaces. */
+static void blend_stage(Tev* t, u8* output) {
+    if (s_cfg.zt_enable && !s_cfg.zt_early) {
+        if (!ZCompare((u16)t->Position[0], (u16)t->Position[1], (u32)t->Position[2]))
+            return;
+    }
+    BlendTev((u16)t->Position[0], (u16)t->Position[1], output);
+    if (s_pixel_stats) s_ps_blend_writes++;   /* GCN_GX_PIXEL_STATS: blend_writes counter */
+}
+
 /* Full Tev::Draw (Tev.cpp:387-683), scoped: no indirect/ztex/fog. The
  * indstages/ztex/fog guard depends only on BP genmode/ztex2/fogparam3 words —
  * none of it is per-pixel data — so it has moved to build_draw_cfg() (draw
  * entry) and fires once per draw instead of once per pixel; every other trap
  * below (active-indirect-stage, ras-color-channel) keeps its original
  * per-pixel/per-stage call site, just reading the pre-decoded TevStageCfg
- * field instead of re-extracting it from s_bp each time. */
+ * field instead of re-extracting it from s_bp each time.
+ *
+ * GCN_GX_PIXEL_STATS COMB/TEX split: comb_t0/tex_before bracket this whole
+ * function body (stage loop through alpha_test); TEX is timed at tex_sample's
+ * call site below and subtracted back out at both exit points (alpha-test-fail
+ * return and the fall-through into BLEND) — same before/after
+ * accumulator-subtraction technique gx.c's DECODE bucket uses against its own
+ * nested DRAW/EFB buckets. See the big s_pixel_stats comment near the top of
+ * the file for the full bucket definitions and the alpha-test/late-Z boundary
+ * rationale. */
 static void tev_draw(Tev* t) {
-    if (s_draw_stats) s_pixels_shaded++;   /* GCN_GX_STATS: pixels_shaded counter */
+    if (s_draw_stats) s_pixels_shaded++;    /* GCN_GX_STATS: pixels_shaded counter */
+    if (s_pixel_stats) s_ps_shaded++;       /* GCN_GX_PIXEL_STATS: own shaded counter */
+
+    u64 comb_t0 = 0, tex_before = 0;
+    if (s_pixel_stats) { comb_t0 = __rdtsc(); tex_before = s_tsc_tex; }
 
     u32 numstages = s_cfg.numtevstages;  /* actual count is +1 */
     u32 numtexgens = s_cfg.numtexgens;
@@ -951,11 +1042,24 @@ static void tev_draw(Tev* t) {
 
         if (enable) {
             u8 texel[4];
-            if (numtexgens > 0)
-                tex_sample(texmap, t->TexCoordS, t->TexCoordT,
-                           t->TextureLinear[stage], texel);
-            else
+            if (numtexgens > 0) {
+                /* GCN_GX_PIXEL_STATS TEX bucket: tex_sample total, timed only
+                 * around the call itself (not the memset fallback above/the
+                 * swap-table color assignment below). */
+                if (s_pixel_stats) {
+                    s_ps_tex_calls++;
+                    if (t->TextureLinear[stage]) s_ps_tex_linear++; else s_ps_tex_point++;
+                    u64 tex_t0 = __rdtsc();
+                    tex_sample(texmap, t->TexCoordS, t->TexCoordT,
+                               t->TextureLinear[stage], texel);
+                    s_tsc_tex += __rdtsc() - tex_t0;
+                } else {
+                    tex_sample(texmap, t->TexCoordS, t->TexCoordT,
+                               t->TextureLinear[stage], texel);
+                }
+            } else {
                 memset(texel, 0, 4);
+            }
             t->RawTexColor.r = texel[0]; t->RawTexColor.g = texel[1];
             t->RawTexColor.b = texel[2]; t->RawTexColor.a = texel[3];
             const u32* sw = s_cfg.swaptab[sc->tswap_id];  /* ac.tswap */
@@ -1011,15 +1115,23 @@ static void tev_draw(Tev* t) {
     output[GRN_C] = (u8)t->Reg[color_dest].g;
     output[RED_C] = (u8)t->Reg[color_dest].r;
 
-    if (!alpha_test(output[ALP_C])) return;
-
-    /* Late-Z (EmulatedZ::Late, Tev.cpp:663-672): z-test after shading. */
-    if (s_cfg.zt_enable && !s_cfg.zt_early) {
-        if (!ZCompare((u16)t->Position[0], (u16)t->Position[1], (u32)t->Position[2]))
-            return;
+    if (!alpha_test(output[ALP_C])) {
+        /* COMB bucket boundary (fail exit): stage loop + alpha_test, minus the
+         * nested TEX delta accumulated above. */
+        if (s_pixel_stats) s_tsc_comb += (__rdtsc() - comb_t0) - (s_tsc_tex - tex_before);
+        return;
     }
 
-    BlendTev((u16)t->Position[0], (u16)t->Position[1], output);
+    /* COMB bucket boundary (pass exit): same subtraction, taken before
+     * blend_stage() starts so BLEND's own timing below doesn't leak into it. */
+    if (s_pixel_stats) {
+        s_tsc_comb += (__rdtsc() - comb_t0) - (s_tsc_tex - tex_before);
+        u64 blend_t0 = __rdtsc();
+        blend_stage(t, output);   /* late-Z (if it lives here) + BlendTev */
+        s_tsc_blend += __rdtsc() - blend_t0;
+    } else {
+        blend_stage(t, output);   /* late-Z (if it lives here) + BlendTev */
+    }
 }
 
 /* ============================================================================
@@ -1128,12 +1240,19 @@ static void build_block(Tev* t, s32 bx, s32 by) {
     }
 }
 
-static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
+/* GCN_GX_PIXEL_STATS SLOPE bucket: everything raster_pixel does before handing
+ * off to tev_draw — z slope eval, early-Z, color slope evals, UV fixed-point
+ * conversion. Returns 1 if the pixel is ready for tev_draw, 0 if early-Z
+ * rejected it. Factored out of raster_pixel() purely so the timed wrapper
+ * below has one call to time regardless of which of the two outcomes this
+ * pixel hits — same technique as draw_triangle's wrapper over
+ * draw_triangle_impl. Behavior is byte-identical to the pre-split function. */
+static int raster_pixel_prep(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     s32 z = (s32)slope_value(&s_ZSlope, x, y);
     if (z < 0) z = 0; else if (z > 16777215) z = 16777215;
 
     if (s_cfg.zt_enable && s_cfg.zt_early) {
-        if (!ZCompare((u16)x, (u16)y, (u32)z)) return;
+        if (!ZCompare((u16)x, (u16)y, (u32)z)) return 0;
     }
     RBPixel* p = &s_rb[xi][yi];
     t->Position[0] = x; t->Position[1] = y; t->Position[2] = z;
@@ -1147,7 +1266,29 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
         t->UvS[i] = (s32)(p->Uv[i][0] * 128.0f);
         t->UvT[i] = (s32)(p->Uv[i][1] * 128.0f);
     }
-    tev_draw(t);   /* runs the combiner, late-Z, alpha test, then blends */
+    return 1;
+}
+
+/* GCN_GX_PIXEL_STATS BLOCK bucket: build_block's whole per-2x2-block wall time,
+ * timed at its single call site (draw_triangle_impl) — same thin-wrapper
+ * technique as draw_triangle over draw_triangle_impl. */
+static void build_block_timed(Tev* t, s32 bx, s32 by) {
+    if (!s_pixel_stats) { build_block(t, bx, by); return; }
+    u64 t0 = __rdtsc();
+    build_block(t, bx, by);
+    s_tsc_block += __rdtsc() - t0;
+}
+
+static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
+    if (!s_pixel_stats) {
+        if (raster_pixel_prep(t, x, y, xi, yi)) tev_draw(t);   /* runs the combiner, late-Z, alpha test, then blends */
+        return;
+    }
+    u64 t0 = __rdtsc();
+    int ready = raster_pixel_prep(t, x, y, xi, yi);
+    s_tsc_slope += __rdtsc() - t0;
+    if (!ready) { s_ps_earlyz_rejected++; return; }
+    tev_draw(t);
 }
 
 static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
@@ -1224,7 +1365,7 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
             int cc = (c00) | (c10 << 1) | (c01 << 2) | (c11 << 3);
             if (a == 0 || bb == 0 || cc == 0) continue;
 
-            build_block(t, x, y);
+            build_block_timed(t, x, y);
             if (a == 0xF && bb == 0xF && cc == 0xF && x >= minx && x1_ < maxx && y >= miny && y1_ < maxy) {
                 for (s32 iy = 0; iy < BLK; iy++)
                     for (s32 ix = 0; ix < BLK; ix++)
@@ -2183,6 +2324,12 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
                     const u8* verts, u32 nverts, u32 vstride) {
     if (s_draw_stats < 0)
         s_draw_stats = getenv("GCN_GX_STATS") ? 1 : 0;
+    /* GCN_GX_PIXEL_STATS: own cached getenv, resolved here (the one entry
+     * point every pixel-level call below is reachable from) rather than
+     * piggybacked on s_draw_stats — see the big comment near its statics for
+     * why the two knobs must never share a branch. */
+    if (s_pixel_stats < 0)
+        s_pixel_stats = getenv("GCN_GX_PIXEL_STATS") ? 1 : 0;
 
     if (!s_draw_stats) {
         gx_raster_draw_impl(cp, prim, vat, verts, nverts, vstride);
@@ -2208,6 +2355,26 @@ void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u6
     if (tsc_tri) *tsc_tri = s_tsc_tri;
     if (pixels_shaded) *pixels_shaded = s_pixels_shaded;
     if (draw_calls) *draw_calls = s_draw_calls_stat;
+}
+
+/* Sibling getter for GCN_GX_PIXEL_STATS (own knob, see the big comment near
+ * its statics). gx.c prints these as a "[gx-pixel-stats]" line at the same
+ * 2^20-tick cadence as "[gx-stats]"/"[gx-draw-stats]". All zero if
+ * GCN_GX_PIXEL_STATS was never set (out->shaded == 0 tells the caller there is
+ * nothing meaningful to print, same tot>0-style guard as the other two). */
+void gx_raster_get_pixel_stats(GxPixelStats* out) {
+    if (!out) return;
+    out->tsc_block = s_tsc_block;
+    out->tsc_slope = s_tsc_slope;
+    out->tsc_tex   = s_tsc_tex;
+    out->tsc_comb  = s_tsc_comb;
+    out->tsc_blend = s_tsc_blend;
+    out->tex_calls = s_ps_tex_calls;
+    out->tex_linear = s_ps_tex_linear;
+    out->tex_point  = s_ps_tex_point;
+    out->earlyz_rejected = s_ps_earlyz_rejected;
+    out->shaded = s_ps_shaded;
+    out->blend_writes = s_ps_blend_writes;
 }
 
 /* ============================================================================
