@@ -122,6 +122,8 @@ typedef struct {
     u64 now_cycles;               /* device clock at the last tick            */
     u64 last_cycles;              /* cycle stamp of the last halfline edge    */
     u64 ticks_last_line_start;    /* cycle stamp of the current full line     */
+    u64 tphl_cache;               /* memoized vi_ticks_per_halfline result    */
+    u32 tphl_key;                 /* (clock_bit<<10)|hlw the cache was computed from */
     int irq_level;                /* last VI->PI line level (edge detect for the event ring) */
     GcnViIrqFn irq;               /* sink for the VI interrupt line (boot.c -> PI) */
     void*      irq_user;

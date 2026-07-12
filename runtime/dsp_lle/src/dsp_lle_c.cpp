@@ -108,6 +108,27 @@ uint8_t* dsp_lle_aram(void) { return g_dsp_aram; }
 uint32_t dsp_lle_aram_size(void) { return GCN_DSP_LLE_ARAM_SIZE; }
 
 void dsp_lle_update(int ppc_cycles) {
+  // Fast-path: a halted DSP core (CR_HALT set) runs nothing. Interpreter::RunCycles'
+  // very first action is `if ((control_reg & CR_HALT) != 0) return 0;`
+  // (Interpreter/DSPInterpreter.cpp:178) — every entry while halted is a guaranteed
+  // no-op with zero side effects (no Step, no CheckExceptions, no state change). The
+  // GameCube IPL leaves the DSP halted ~99.9% of boot, so descending into
+  // DSPCore::RunCycles -> Interpreter::RunCycles each block just to hit that early
+  // return is wasted work. Skip it here, reading the SAME raw control_reg the
+  // interpreter checks (NOT dsp_lle_read_control, which carries CR_INIT_CODE
+  // timebase side effects). CR_HALT is cleared ONLY by a CPU control-register write
+  // (Interpreter::WriteControlRegister:265, the sole writer of control_reg), which
+  // runs on the MMIO path via dsp_lle_write_control — never from this per-block
+  // tick — so no wake is ever missed. Exact, not a heuristic.
+  // GCN_DSP_HALT_SKIP=0 disables it (for A/B measurement); default on.
+  static int s_halt_skip = -1;   // cached; getenv-per-block is a hot-path cost
+  if (s_halt_skip < 0) {
+    const char* e = getenv("GCN_DSP_HALT_SKIP");
+    s_halt_skip = (e && e[0] == '0') ? 0 : 1;
+  }
+  if (s_halt_skip && (g_core->DSPState().control_reg & CR_HALT) != 0)
+    return;
+
   const int dsp_cycles = ppc_cycles / 6;
   if (dsp_cycles > 0) {
     static int s_trace = -1;   // read once; getenv per block was a hot-path cost

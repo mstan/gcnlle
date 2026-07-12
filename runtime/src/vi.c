@@ -31,10 +31,23 @@ static u32 vi_hlw(const GcnVi* vi) {
     return vi->reg[GCN_VI_HTR0_LO >> 1] & 0x3FFu;
 }
 
-static u64 vi_ticks_per_halfline(const GcnVi* vi) {
-    u32 clock_hz = (vi->reg[GCN_VI_CLOCK >> 1] & 1u) ? 54000000u : 27000000u;
-    u64 ticks_per_sample = 2ull * GCN_VI_CORE_CLOCK / clock_hz;
-    return ticks_per_sample * vi_hlw(vi);
+/* Memoized on the two raw inputs (clock_bit, hlw): both are rarely-changing VI
+ * register fields, but this is called once per executed block via vi_update,
+ * so the u64 division below would otherwise be a per-block hot-path cost.
+ * Recompute only when the (clock_bit,hlw) key changes; the returned value is
+ * always identical to the pure formula since it is re-derived from the live
+ * registers whenever they differ from the cached key — this cannot desync. */
+static u64 vi_ticks_per_halfline(GcnVi* vi) {
+    u32 clock_bit = vi->reg[GCN_VI_CLOCK >> 1] & 1u;
+    u32 hlw = vi->reg[GCN_VI_HTR0_LO >> 1] & 0x3FFu;
+    u32 key = (clock_bit << 10) | hlw;
+    if (key != vi->tphl_key) {
+        u32 clock_hz = clock_bit ? 54000000u : 27000000u;
+        u64 ticks_per_sample = 2ull * GCN_VI_CORE_CLOCK / clock_hz;
+        vi->tphl_cache = ticks_per_sample * hlw;
+        vi->tphl_key = key;
+    }
+    return vi->tphl_cache;
 }
 
 static u32 vi_halflines_field(const GcnVi* vi, u32 psb_off, u32 prb_off) {
@@ -195,6 +208,11 @@ void gcn_vi_init(GcnVi* vi) {
     vi->reg[(GCN_VI_DI1 + 2u) >> 1] = 0x0001;  /* HCT=1                      */
     vi->reg[0x48 >> 1]           = 0x2828;  /* picture config: STD=40, WPL=40 */
     vi->reg[GCN_VI_CLOCK   >> 1] = 0x0001;  /* 54 MHz (Preset: IsNTSC(region)) */
+
+    /* Force the first vi_ticks_per_halfline() call to compute: 0xFFFFFFFF
+     * can never equal a real (clock_bit<<10)|hlw key (max 0x7FF), so it
+     * doesn't alias with the legitimate all-zero key. */
+    vi->tphl_key = 0xFFFFFFFFu;
 
     s_vi = vi;
 }
