@@ -777,5 +777,9 @@ void gcn_gx_tick(u32 cycles) {
         /* GCN_GX_TEV_CENSUS: per-config draw/pixel counters (no-op when off —
          * the knob lives in gx_raster.c beside its data). */
         gx_raster_print_census();
+
+        /* GCN_GX_STATS: per-triangle bbox-area histogram (no-op when off —
+         * same convention as the census above). */
+        gx_raster_print_area_hist();
     }
 }

@@ -112,4 +112,10 @@ void gx_raster_get_pixel_stats(GxPixelStats* out);
  * No-op unless the knob is on. Called from gx.c's shared stats cadence. */
 void gx_raster_print_census(void);
 
+/* GCN_GX_STATS: print the per-triangle post-scissor-bbox-area histogram
+ * (triangles / shaded pixels / scan-wall share per log2-area bucket) — the
+ * sizing input for the tile-parallel rasterizer's fork threshold. No-op
+ * unless the knob is on. Called from gx.c's shared stats cadence. */
+void gx_raster_print_area_hist(void);
+
 #endif /* GCN_GX_GX_RASTER_H */

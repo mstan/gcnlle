@@ -48,6 +48,21 @@ static u64 s_tsc_tri;          /* triangle scan/pixel (draw_triangle, incl. all 
 static u64 s_pixels_shaded;    /* tev_draw() invocations (one per shaded pixel candidate) */
 static u64 s_draw_calls_stat;  /* gx_raster_draw calls counted (vtx bucket samples) */
 
+/* Per-triangle scissored-bbox-area histogram (same GCN_GX_STATS knob): bucket
+ * k holds triangles whose post-scissor bounding-box area is in [2^(k-1), 2^k)
+ * pixels (bucket 0 = degenerate/empty-bbox early returns), with each bucket's
+ * triangle count, shaded-pixel count, and rdtsc wall. This is the sizing
+ * input for the tile-parallel rasterizer's fork threshold: it answers "what
+ * fraction of scan/pixel WALL lives in triangles big enough to be worth a
+ * fork/join" for any candidate area cutoff, not just one probe value —
+ * observability that works for every threshold question, per CLAUDE.md.
+ * EFB is 640x528 < 2^19, so 20 buckets cover every possible bbox. */
+#define GX_AREA_HIST_BUCKETS 20
+static u64 s_hist_tris[GX_AREA_HIST_BUCKETS];
+static u64 s_hist_pixels[GX_AREA_HIST_BUCKETS];
+static u64 s_hist_tsc[GX_AREA_HIST_BUCKETS];
+static u32 s_last_tri_area;    /* draw_triangle_impl -> draw_triangle wrapper */
+
 /* ============================================================================
  * GCN_GX_PIXEL_STATS=1: a SEPARATE knob from GCN_GX_STATS above, with its own
  * cached -1-sentinel getenv (s_pixel_stats) and its own accumulators. This is
@@ -1973,6 +1988,8 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
      * specialization skips and why it's provably dead work. */
     void (*pixel_fn)(Tev*, s32, s32, s32, s32) = s_cfg.fused ? raster_pixel_fused : raster_pixel;
 
+    if (s_draw_stats) s_last_tri_area = 0;   /* bucket 0 unless the bbox clamp below survives */
+
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
     /* Dead-slope-setup skip (perf task, follow-up to ff6b617): update_zslope
      * populates s_ZSlope, whose one and only reader is raster_pixel_prep's
@@ -2011,6 +2028,9 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     if (miny < s_scissor_top)    miny = s_scissor_top;
     if (maxy > s_scissor_bottom) maxy = s_scissor_bottom;
     if (minx >= maxx || miny >= maxy) return;
+    /* Histogram input for the draw_triangle wrapper: post-scissor bbox area.
+     * (Entry already zeroed it, so the early returns above land in bucket 0.) */
+    if (s_draw_stats) s_last_tri_area = (u32)((maxx - minx) * (maxy - miny));
 
     SlopeCtx ctx = make_ctx(v0, v1, v2, (X1 + 0xF) >> 4, (Y1 + 0xF) >> 4, x_off, y_off);
     float w[3] = { 1.0f / v0->projectedPosition[3], 1.0f / v1->projectedPosition[3],
@@ -2092,9 +2112,20 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
  * bbox) doesn't need a second accumulation site. */
 static void draw_triangle(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
     if (!s_draw_stats) { draw_triangle_impl(t, v0, v1, v2); return; }
+    u64 px_before = s_pixels_shaded;
     u64 t0 = __rdtsc();
     draw_triangle_impl(t, v0, v1, v2);
-    s_tsc_tri += __rdtsc() - t0;
+    u64 dt = __rdtsc() - t0;
+    s_tsc_tri += dt;
+    /* Area histogram (see s_hist_* comment near the top): bucket by
+     * log2(post-scissor bbox area), attributing this triangle's wall and
+     * shaded-pixel delta to it. area==0 (degenerate/early-return) -> bucket 0. */
+    u32 area = s_last_tri_area;
+    int b = area ? 32 - __builtin_clz(area) : 0;
+    if (b >= GX_AREA_HIST_BUCKETS) b = GX_AREA_HIST_BUCKETS - 1;
+    s_hist_tris[b]++;
+    s_hist_pixels[b] += s_pixels_shaded - px_before;
+    s_hist_tsc[b] += dt;
 }
 
 /* ============================================================================
@@ -3199,6 +3230,31 @@ void gx_raster_print_census(void) {
     fprintf(stderr, " | total_fused=%llu/%llu(%.1f%%)\n",
             (unsigned long long)total_fused, (unsigned long long)total_px,
             100.0 * (double)total_fused / (double)total_px);
+    fflush(stderr);
+}
+
+/* GCN_GX_STATS: dump the per-triangle bbox-area histogram (see s_hist_*
+ * comment near the top of the file). One line, non-empty buckets only —
+ * bucket label 2^k means area in [2^(k-1), 2^k). Called from gx.c's shared
+ * stats cadence next to the census; no-op unless GCN_GX_STATS is on and at
+ * least one triangle was binned. */
+void gx_raster_print_area_hist(void) {
+    if (s_draw_stats != 1) return;
+    u64 total_tris = 0, total_tsc = 0;
+    for (int i = 0; i < GX_AREA_HIST_BUCKETS; i++) {
+        total_tris += s_hist_tris[i];
+        total_tsc  += s_hist_tsc[i];
+    }
+    if (total_tris == 0) return;
+    fprintf(stderr, "[gx-area-hist]");
+    for (int i = 0; i < GX_AREA_HIST_BUCKETS; i++) {
+        if (!s_hist_tris[i]) continue;
+        fprintf(stderr, " 2^%d:tris=%llu px=%llu tsc=%.1f%%",
+                i, (unsigned long long)s_hist_tris[i],
+                (unsigned long long)s_hist_pixels[i],
+                total_tsc ? 100.0 * (double)s_hist_tsc[i] / (double)total_tsc : 0.0);
+    }
+    fprintf(stderr, " | tris=%llu\n", (unsigned long long)total_tris);
     fflush(stderr);
 }
 
