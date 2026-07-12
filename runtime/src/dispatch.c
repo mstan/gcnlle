@@ -21,11 +21,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP runs
- * ~1/6th of it). The DSP only acts on CPU stimuli, so a generous rate keeps its
- * IROM/ucode responsive without racing; exact timing is absorbed by the
- * poll-aware oracle diff. */
-#define GCN_DSP_CYCLES_PER_BLOCK 600u
+/* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP core
+ * advances ~1/6th of it). A recompiled block is only ~5-10 PPC cycles, so this
+ * should be ~5-12 to track the true DSP:CPU clock ratio. The old value (600) ran
+ * the DSP LLE core ~60-120x too fast per block, which — because the DSP core is
+ * the single dominant runtime cost — made the whole emulation a slideshow
+ * (~1 fps). 12 is the measured sweet spot: functional (boot animation/intro
+ * sequencer unfreeze intact), oracle-clean (matched=19355, one benign PI
+ * reorder), and ~20x faster. Override with GCN_DSP_CYCLES (dispatch.c). */
+#define GCN_DSP_CYCLES_PER_BLOCK 12u
 
 /* Guest time-base ticks advanced per executed block. The real Gekko TB runs at
  * bus/4; we don't have per-block instruction counts here, so M0 uses a fixed
@@ -62,6 +66,17 @@ const u8* gcn_dispatch_bs1_snapshot(u32* len_out) {
 int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     u32 blocks = 0;
     static u64 device_cycles = 0;   /* monotonic across nested/repeated runs */
+
+    /* DSP cycles advanced per executed block. The DSP-LLE core is the dominant
+     * runtime cost (running the DSP ucode/spin ~100 cycles per CPU block), and
+     * the fixed 600 PPC-cycle value was heavily over-provisioned: a recompiled
+     * block is only ~5-10 PPC cycles, so 600 ran the DSP ~60-100x faster than the
+     * true ~1/6 DSP:CPU ratio warrants. GCN_DSP_CYCLES overrides it (0 keeps the
+     * DSP ticking but does no work). Read ONCE here, not per block. */
+    u32 dsp_cycles_per_block = GCN_DSP_CYCLES_PER_BLOCK;
+    { const char* e = getenv("GCN_DSP_CYCLES");
+      if (e && *e) dsp_cycles_per_block = (u32)strtoul(e, NULL, 0); }
+
     while (max_blocks == 0u || blocks < max_blocks) {
         /* A block that raises an exception returns with ctx->pc set to the vector
          * (e.g. 0xC00 for `sc`) and ctx->exception still set — the generated
@@ -135,17 +150,22 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         }
         ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
         device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
-        gcn_dsp_tick(GCN_DSP_CYCLES_PER_BLOCK);  /* run the DSP core in step */
+        gcn_dsp_tick(dsp_cycles_per_block);      /* run the DSP core in step */
         gcn_ai_tick();                            /* pace AISCNT / AIINT while PSTAT=1 */
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
         gcn_di_tick();                           /* complete a deferred DI command */
         gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */
         /* Service the debug server between blocks: non-blocking, so it stays
          * responsive even while the guest busy-waits on unmodeled hardware. A
-         * client "quit" ends the run cleanly. */
-        gcn_debug_server_pump();
-        if (gcn_debug_server_quit_requested())
-            return 1;
+         * client "quit" ends the run cleanly. Pumped every 256 blocks rather than
+         * every block — the accept()/recv() syscalls were a per-block hot-path
+         * cost, and 256 blocks is well under a millisecond of guest time, so the
+         * TCP surface (screenshot/set_input/quit) stays responsive. */
+        if ((blocks & 0xFFu) == 0u) {
+            gcn_debug_server_pump();
+            if (gcn_debug_server_quit_requested())
+                return 1;
+        }
         blocks++;
     }
     return 1;

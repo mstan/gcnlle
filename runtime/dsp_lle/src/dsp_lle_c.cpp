@@ -110,7 +110,9 @@ uint32_t dsp_lle_aram_size(void) { return GCN_DSP_LLE_ARAM_SIZE; }
 void dsp_lle_update(int ppc_cycles) {
   const int dsp_cycles = ppc_cycles / 6;
   if (dsp_cycles > 0) {
-    if (getenv("GCN_DSP_TRACE") && (g_core->DSPState().control_reg & CR_HALT) == 0) {
+    static int s_trace = -1;   // read once; getenv per block was a hot-path cost
+    if (s_trace < 0) s_trace = getenv("GCN_DSP_TRACE") ? 1 : 0;
+    if (s_trace && (g_core->DSPState().control_reg & CR_HALT) == 0) {
       fprintf(stderr, "[dsp] pc=%04x cr=%04x\n",
               g_core->DSPState().pc, g_core->DSPState().control_reg);
       fflush(stderr);

@@ -98,7 +98,10 @@ static void dsp_aid_tick(GcnDsp* dsp) {
 }
 
 void gcn_dsp_tick(u32 ppc_cycles) {
-    if (getenv("GCN_DSP_NOTICK")) return;   /* bisect guard */
+    /* bisect guard, read once (getenv per block was a measurable hot-path cost). */
+    static int s_notick = -1;
+    if (s_notick < 0) s_notick = getenv("GCN_DSP_NOTICK") ? 1 : 0;
+    if (s_notick) return;
     dsp_lle_update((int)ppc_cycles);
     /* Latch a pending DSP->CPU mailbox interrupt and (re)assert the PI line every
      * block. This is what lets the interrupt reach PI while the guest sits in the
