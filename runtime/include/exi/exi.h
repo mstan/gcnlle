@@ -106,6 +106,11 @@ typedef struct GcnExi {
     u32       rom_size;
     u32       rom_base;   /* ROM offset that maps to rom[0] (0, or 0x100 when
                              backed by the BS2 payload slice) */
+    u8*       owned_rom;  /* M1: non-NULL iff gcn_exi_set_rom_scrambled malloc'd
+                             `rom` itself (the descrambled-in-place copy); freed
+                             by gcn_exi_free. NULL for the borrowed-pointer
+                             paths (gcn_exi_set_rom), which are unowned as
+                             before this field existed. */
     u8        sram[GCN_SRAM_SIZE_BYTES];
     u32       rtc_counter;
 
@@ -158,6 +163,33 @@ void gcn_exi_set_irq(GcnExi* exi, GcnExiIrqFn fn, void* user);
  * offset that `rom[0]` corresponds to (0 for a full 2 MB descrambled image;
  * 0x100 when reusing the descrambled BS2 payload as the backing window). */
 void gcn_exi_set_rom(GcnExi* exi, const u8* rom, u32 size, u32 base);
+
+/* M1: back the mask-ROM device with a RAW SCRAMBLED image (bios/ipl.bin as
+ * dumped, no offline pre-descramble) — the real reset-vector boot path
+ * (docs/M1_PLAN.md §4/§6.2). Mallocs an OWNED `raw_size`-byte copy, applies
+ * segher's descrambler ONCE, in place, over the documented body range
+ * [IPL_SCRAMBLE_START, IPL_SCRAMBLE_END) (tools/ipl_descramble/
+ * descramble_core.c — the vendored transcription this calls verbatim, not
+ * reimplemented here per PRINCIPLES "one algorithm, every call site"), then
+ * wires it up exactly like gcn_exi_set_rom(exi, owned, raw_size, 0).
+ *
+ * Precomputing the whole buffer once is mathematically identical to a
+ * faithful per-read hardware descramble (the keystream is a pure stateless
+ * function of byte offset — docs/M1_PLAN.md §6.2) and is NOT a fake-the-
+ * answer shortcut: the real EXI CSR/MAR/LEN transaction protocol still drives
+ * every byte served (ipl_rom_read below is untouched).
+ *
+ * Returns the descrambled buffer (borrowed; owned by `exi`, valid until
+ * gcn_exi_free) so the SAME image can also back the CPU's 0xFFF00000 ROM
+ * window (memory.c gcn_mem_set_rom_window) — one descrambled image, two
+ * consumers. Returns NULL (no state changed) if `raw` is NULL, `raw_size` is
+ * smaller than the documented scrambled range, or the allocation fails. */
+const u8* gcn_exi_set_rom_scrambled(GcnExi* exi, const u8* raw, u32 raw_size);
+
+/* Frees the buffer owned by a prior gcn_exi_set_rom_scrambled call (no-op if
+ * none, or if the device is currently backed by a borrowed gcn_exi_set_rom
+ * pointer instead). Safe to call unconditionally at shutdown. */
+void gcn_exi_free(GcnExi* exi);
 
 /* Install the SRAM fixture (0x40 bytes) and RTC seconds-since-2000 counter. */
 void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]);

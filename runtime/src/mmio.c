@@ -5,10 +5,24 @@
  * all MMIO and the fallback that keeps unmapped accesses loud (never faked).
  */
 #include "mmio/mmio.h"
+#include "memory/memory.h"
 #include "trace/trace.h"
 #include "debug/rings.h"
 
 #include <stdio.h>
+
+/* M1 finding (see memory.h GCN_MMIO_PHYS_BASE): BS1's true early bring-up,
+ * before MSR[DR] is on, addresses MMIO physically (0x0C00xxxx) rather than
+ * through the 0xCC00xxxx cached alias every OTHER modeled access (M0-onward)
+ * uses. Collapse it to the SAME canonical address before dispatch/tracing —
+ * exactly the RAM cached/uncached mirror collapse memory.c already does, not
+ * a new device behavior. Addresses outside the physical aperture pass through
+ * unchanged. */
+static u32 mmio_canonical(u32 ea) {
+    if (ea >= GCN_MMIO_PHYS_BASE && ea < GCN_MMIO_PHYS_BASE + GCN_MMIO_SIZE)
+        return GCN_MMIO_BASE | (ea - GCN_MMIO_PHYS_BASE);
+    return ea;
+}
 
 void gcn_mmio_bus_init(GcnMmioBus* bus) {
     bus->count = 0;
@@ -57,6 +71,7 @@ static void warn_unmapped(u32 addr, int is_write) {
 
 static u64 mmio_ext_read(CPUState* cpu, u32 ea, u8 size) {
     GcnMmioBus* bus = (GcnMmioBus*)cpu->external_user_data;
+    ea = mmio_canonical(ea);
     u32 value = 0;
     GcnMmioDevice* d = bus ? find_device(bus, ea) : NULL;
     if (d && d->read)
@@ -71,6 +86,7 @@ static u64 mmio_ext_read(CPUState* cpu, u32 ea, u8 size) {
 
 static void mmio_ext_write(CPUState* cpu, u32 ea, u64 value, u8 size) {
     GcnMmioBus* bus = (GcnMmioBus*)cpu->external_user_data;
+    ea = mmio_canonical(ea);
     if (gcn_trace_active())
         gcn_trace_mmio(cpu->pc, ea, (u32)value, size, 1);
     GcnMmioDevice* d = bus ? find_device(bus, ea) : NULL;

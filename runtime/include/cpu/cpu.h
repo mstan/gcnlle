@@ -40,6 +40,16 @@
 #define WII_MEM2_BASE       0x90000000u
 #define WII_MEM2_UNCACHED   0xD0000000u
 
+/* M1: the true hardware reset-vector ROM window. `cpu_glue.c`'s
+ * exception_vector_address already routes to 0xFFF00000+vector when
+ * MSR[IP]=1 (the real BS1 entry is 0xFFF00100, vector 0x100 = system reset);
+ * this is the READ-ONLY backing for that physical window, mapping guest
+ * 0xFFF00000+k to descrambled-ROM byte k (k==0 is the file's plaintext (C)
+ * header; BS1 itself starts at k=0x100 — docs/M1_PLAN.md §1/§6.2). Sized to
+ * whatever the caller backs (gcn_mem_set_rom_window); reads past that extent
+ * are unmapped, same as any other device gap. */
+#define GCN_ROM_WINDOW_BASE 0xFFF00000u
+
 /* --- exception/program-cause/vector bits (mirror of recompiler cpu.h) --- */
 #define PPC_EXC_PROGRAM       0x00000001u
 #define PPC_EXC_DSI           0x00000002u
@@ -139,6 +149,14 @@ struct CPUState {
     u64 cycles;              /* retired-block / step accounting */
     bool halted;             /* set by the dispatch driver on a terminal state */
     int halt_reason;         /* GCN_HALT_* */
+
+    /* M1: read-only backing for the 0xFFF00000 ROM window (borrowed pointer;
+     * owner is whatever descrambled the image, e.g. exi.c's
+     * gcn_exi_set_rom_scrambled owned buffer). NULL/0 = unmapped, same as
+     * before this field existed (memory.c only consults it in the read path,
+     * never gcn_mem_resolve, so a WRITE there stays loud/unmapped). */
+    const u8* rom_window;
+    u32       rom_window_size;
 };
 
 enum {

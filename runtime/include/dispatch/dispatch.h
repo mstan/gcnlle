@@ -25,4 +25,15 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks);
 /* The recompiled image's entry point (DOLRECOMP_ENTRY_POINT). */
 u32 gcn_dispatch_entry(void);
 
+/* M1: one-shot snapshot of MEM1[0x81300000, +len) taken THE INSTANT execution
+ * first reaches BS2's entry — i.e. the moment BS1's EXI DMA has finished and
+ * nothing of BS2 has run yet. The integrity check (boot.c) must compare THIS
+ * against the offline-descramble reference, never the end-of-run memory: BS2's
+ * own .data/.bss live inside the DMA'd span, so any post-handoff execution
+ * legitimately mutates it (a longer block budget would turn a true PASS into a
+ * false FAIL). Armed by boot.c before the run when BS1 mode + a reference are
+ * configured; returns NULL until the handoff happened. */
+void      gcn_dispatch_arm_bs1_snapshot(u32 len);
+const u8* gcn_dispatch_bs1_snapshot(u32* len_out);
+
 #endif /* GCN_DISPATCH_H */

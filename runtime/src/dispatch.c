@@ -17,6 +17,10 @@
 #include "debug/rings.h"      /* always-on block/PC ring */
 #include "debug/debug_server.h" /* pumped once per block (non-blocking) */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 /* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP runs
  * ~1/6th of it). The DSP only acts on CPU stimuli, so a generous rate keeps its
  * IROM/ucode responsive without racing; exact timing is absorbed by the
@@ -36,6 +40,21 @@
  * VI 27 MHz pixel clock) keep running through a TB write. Deriving device time
  * from the writable TB made the beam jump backward when the IPL rebased it. */
 #define GCN_CORE_CYCLES_PER_BLOCK (GCN_TB_TICKS_PER_BLOCK * 12u)
+
+/* M1 handoff snapshot (see dispatch.h): armed by boot.c, captured at the first
+ * pc==0x81300000 block below. */
+static u8* s_bs1_snap = NULL;
+static u32 s_bs1_snap_len = 0;
+static u32 s_bs1_snap_want = 0;
+
+void gcn_dispatch_arm_bs1_snapshot(u32 len) {
+    s_bs1_snap_want = len;
+}
+
+const u8* gcn_dispatch_bs1_snapshot(u32* len_out) {
+    *len_out = s_bs1_snap_len;
+    return s_bs1_snap;
+}
 
 /* Own the run loop (rather than the generated static-inline dolrecomp_run_blocks)
  * so we can advance the time base between blocks — otherwise mftb reads a frozen
@@ -59,6 +78,55 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * synchronous exception below. */
         gcn_pi_deliver_external(ctx);
         gcn_ring_block(ctx->pc);   /* always-on retired-block/PC timeline */
+
+        /* M1 (opt-in, GCN_LOG_BS1_HANDOFF=1): one-shot dump of the FULL CPU
+         * state the instant execution reaches BS2's entry (0x81300000),
+         * whichever path got here — the "fixture cross-check" docs/M1_PLAN.md
+         * §7 step 7 proposed: BS1 (real, GCN_BOOT_BS1=1) must produce the same
+         * HID0/BAT/MSR values Dolphin's HLE hardcodes at its 0x81200150 landing
+         * point (Boot.cpp:456-461, cited in the plan), even though Dolphin
+         * cannot be diffed live here (it never executes real BS1). Default
+         * off: byte-identical to before this existed. */
+        if (ctx->pc == 0x81300000u) {
+            /* M1 integrity snapshot (dispatch.h): capture the DMA'd BS2 image
+             * NOW, before a single BS2 instruction mutates its own data
+             * sections. One-shot; malloc'd (~1.5 MB) only when armed. */
+            if (s_bs1_snap_want && !s_bs1_snap && ctx->ram &&
+                0x01300000u + (u64)s_bs1_snap_want <= ctx->ram_size) {
+                s_bs1_snap = (u8*)malloc(s_bs1_snap_want);
+                if (s_bs1_snap) {
+                    memcpy(s_bs1_snap, ctx->ram + 0x01300000u, s_bs1_snap_want);
+                    s_bs1_snap_len = s_bs1_snap_want;
+                }
+            }
+            static int logged = 0;
+            const char* want_log = getenv("GCN_LOG_BS1_HANDOFF");
+            if (!logged && want_log && *want_log && *want_log != '0') {
+                logged = 1;
+                fprintf(stdout,
+                    "\n--- BS1->BS2 HANDOFF CPU STATE (pc=0x81300000) ---\n"
+                    "  msr   = 0x%08X   hid0 = 0x%08X   hid2 = 0x%08X\n"
+                    "  lr    = 0x%08X   cr = 0x%08X   xer = 0x%08X\n"
+                    "  sr[0..3]   = 0x%08X 0x%08X 0x%08X 0x%08X\n"
+                    "  dbat0 u/l  = 0x%08X 0x%08X   ibat0 u/l = 0x%08X 0x%08X\n"
+                    "  dbat1 u/l  = 0x%08X 0x%08X   ibat1 u/l = 0x%08X 0x%08X\n"
+                    "  dbat2 u/l  = 0x%08X 0x%08X   ibat2 u/l = 0x%08X 0x%08X\n"
+                    "  dbat3 u/l  = 0x%08X 0x%08X   ibat3 u/l = 0x%08X 0x%08X\n"
+                    "  gpr[1](sp) = 0x%08X   gpr[3] = 0x%08X   gpr[4] = 0x%08X\n",
+                    /* SPR numbering (PowerPC ISA): HID0=1008; IBAT0..3 U/L =
+                     * 528..535, DBAT0..3 U/L = 536..543 (matches cpu_glue.c's
+                     * ppc_spr_access[528..543/1008] = SPR_RW range). */
+                    ctx->msr, ctx->spr[1008], ctx->hid2, ctx->lr, ctx->cr, ctx->xer,
+                    ctx->sr[0], ctx->sr[1], ctx->sr[2], ctx->sr[3],
+                    ctx->spr[536], ctx->spr[537], ctx->spr[528], ctx->spr[529],
+                    ctx->spr[538], ctx->spr[539], ctx->spr[530], ctx->spr[531],
+                    ctx->spr[540], ctx->spr[541], ctx->spr[532], ctx->spr[533],
+                    ctx->spr[542], ctx->spr[543], ctx->spr[534], ctx->spr[535],
+                    ctx->gpr[1], ctx->gpr[3], ctx->gpr[4]);
+                fflush(stdout);
+            }
+        }
+
         u32 pending = ctx->exception;
         ctx->exception = 0;
         if (!dolrecomp_call(ctx, ctx->pc)) {   /* off-image PC / no handler */

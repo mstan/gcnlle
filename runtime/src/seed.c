@@ -176,13 +176,41 @@ bool gcn_seed_apply(CPUState* cpu, GcnSeedDevices* devices, const GcnSeedConfig*
     cpu->halt_reason = GCN_HALT_NONE;
 
     /* ---- device fixtures ---- */
-    if (devices) {
-        memset(devices, 0, sizeof(*devices));
-        gcn_seed_build_sram(devices->sram, cfg);       /* [FIXTURE] valid SRAM */
-        devices->rtc_counter = cfg->rtc_counter;       /* [FIXTURE] RTC epoch */
-    }
+    if (devices)
+        gcn_seed_build_devices(devices, cfg);
 
     return true;
+}
+
+void gcn_seed_build_devices(GcnSeedDevices* devices, const GcnSeedConfig* cfg) {
+    memset(devices, 0, sizeof(*devices));
+    gcn_seed_build_sram(devices->sram, cfg);   /* [FIXTURE] valid SRAM */
+    devices->rtc_counter = cfg->rtc_counter;   /* [FIXTURE] RTC epoch */
+}
+
+void gcn_seed_apply_true_reset(CPUState* cpu) {
+    /* Reset the register file + zero MEM1 (keeps device callbacks/ram/mem2
+     * intact) — identical lifecycle step gcn_seed_apply uses. */
+    cpu_reset(cpu);
+
+    /* [DEFAULT] Same deterministic MEM1 reset image as gcn_seed_apply, and for
+     * the same reason: nothing reads low memory before BS1/BS2Init writes it,
+     * and this keeps the oracle low-mem diff clean. No payload is loaded here
+     * at all — in M1 there IS no RAM copy of BS1; it executes straight out of
+     * the 0xFFF00000 ROM window (memory.c), and BS2 only appears in RAM once
+     * BS1's own EXI DMA lands it. */
+    gcn_mem_fill_mem1(cpu, GCN_SEED_MEM1_FILL);
+
+    /* [ROM] The true hardware reset vector + reset MSR (see seed.h for the
+     * exact citations). This is the M1 deliverable: NO other latch is seeded
+     * here. HID0/HID2/BATs/SRs/GQRs/GPRs all stay at cpu_reset()'s zeroed
+     * state; real recompiled BS1 programs every one of them itself. */
+    cpu->pc = GCN_RESET_ENTRY_PC;
+    cpu->msr = GCN_RESET_MSR;
+
+    cpu->cycles = 0;
+    cpu->halted = false;
+    cpu->halt_reason = GCN_HALT_NONE;
 }
 
 bool gcn_seed_read_file(const char* path, u8** out_data, u32* out_size) {

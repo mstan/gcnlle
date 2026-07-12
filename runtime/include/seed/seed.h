@@ -65,6 +65,19 @@ extern "C" {
 /* Language byte values (offset 0x12), from OSRtc.h OS_LANGUAGE_*. */
 #define GCN_SRAM_LANG_ENGLISH   0u
 
+/* [ROM] M1: the TRUE hardware reset vector, not the Dolphin-HLE landing point
+ * GCN_BS2_ENTRY_PC above. gc-forever Bootrom wiki / ogamespec gc-ipl (cited
+ * docs/M1_PLAN.md §2) + cpu_glue.c's exception_vector_address (already routes
+ * here when MSR[IP]=1): system-reset vector 0x100, prefixed by IP -> 0xFFF00100. */
+#define GCN_RESET_ENTRY_PC  0xFFF00100u
+
+/* [ROM] Textbook PowerPC hard-reset MSR: only IP (bit 25, "exception prefix",
+ * mask 0x00000040) is set; IR/DR/EE/ME/FP/... all start clear. BS1's own
+ * recompiled code (not a seed fake) programs HID0/BATs/SRs and turns on
+ * IR|DR itself (docs/M1_PLAN.md §3.1) — that is the entire point of M1: what
+ * GCN_BS2's seed marks [DEBT] below, real BS1 execution now supplies. */
+#define GCN_RESET_MSR       0x00000040u
+
 /* ---- device fixtures the seed installs (consumed by the future EXI model) ---- */
 typedef struct {
     u8  sram[GCN_SRAM_SIZE];   /* [FIXTURE] valid-checksum SRAM image */
@@ -108,6 +121,25 @@ bool gcn_sram_validate(const u8 sram[GCN_SRAM_SIZE]);
  * and the (flagged) CPU latches, and populate the device fixtures. Returns false
  * on any inconsistency (bad size, load overflow). Does NOT execute PPC. */
 bool gcn_seed_apply(CPUState* cpu, GcnSeedDevices* devices, const GcnSeedConfig* cfg);
+
+/* Populate the device fixtures only (SRAM + RTC) — the same [FIXTURE] logic
+ * gcn_seed_apply uses internally, factored out so gcn_seed_apply_true_reset
+ * (M1) can share it: SRAM/RTC are independent EXI peripherals whose content
+ * is genuinely arbitrary regardless of which CPU boot path is seeded, so both
+ * paths install the identical documented fixture. */
+void gcn_seed_build_devices(GcnSeedDevices* devices, const GcnSeedConfig* cfg);
+
+/* [M1] Apply ONLY the true-reset CPU seed: reset the CPU, fill MEM1 (same
+ * [DEFAULT] pattern as gcn_seed_apply, for the same reason — nothing reads it
+ * before BS1/BS2Init writes it), set pc=GCN_RESET_ENTRY_PC and
+ * msr=GCN_RESET_MSR, and leave EVERY OTHER register at cpu_reset()'s zeroed
+ * state. Unlike gcn_seed_apply this loads NO payload into RAM and sets NO
+ * [DEBT] latch (HID2/BATs/SRs/GQRs) — real BS1 execution programs those
+ * itself (docs/M1_PLAN.md §3.1), which is the entire M1 deliverable. Caller
+ * still wires the EXI ROM device (gcn_exi_set_rom_scrambled) and the CPU ROM
+ * window (gcn_mem_set_rom_window) separately; this function only touches CPU
+ * register state. */
+void gcn_seed_apply_true_reset(CPUState* cpu);
 
 /* Convenience: read a raw descrambled BS2 file into a malloc'd buffer.
  * Caller frees. */

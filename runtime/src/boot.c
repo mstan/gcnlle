@@ -39,6 +39,31 @@
  *                      nature — never set it for oracle-diff runs. Wins over
  *                      a GCN_SRAM_FILE-persisted counter (SRAM settings from
  *                      the file still apply).
+ *
+ *   GCN_BOOT_BS1       [M1] "1" switches to the REAL BS1 boot: argv[1] is now
+ *                      the RAW SCRAMBLED bios/ipl.bin (not a pre-descrambled
+ *                      payload), the CPU is seeded at the TRUE hardware reset
+ *                      vector (pc=0xFFF00100, msr=IP-only — seed.c
+ *                      gcn_seed_apply_true_reset, no [DEBT] latch faked), and
+ *                      the EXI mask-ROM + the CPU's 0xFFF00000 ROM window are
+ *                      both backed by the SAME image, descrambled once, in
+ *                      CPU-adjacent hardware (exi.c gcn_exi_set_rom_scrambled)
+ *                      rather than offline. BS1's own recompiled code (linked
+ *                      into the SAME dispatch table as the M0 default path —
+ *                      docs/M1_PLAN.md §7 step 4/5) then does its own real
+ *                      hardware bring-up and EXI DMA of BS2 into 0x81300000,
+ *                      at which point execution falls through into the SAME
+ *                      BS2 the M0 default path uses. Unset (default): today's
+ *                      M0 behavior, byte-identical.
+ *   GCN_BS1_REFERENCE  [M1] path to an independently-produced offline
+ *                      descramble to CRC/byte-compare BS1's own real-DMA'd
+ *                      MEM1 against (docs/M1_PLAN.md §8) — the M1 integrity
+ *                      check, only meaningful with GCN_BOOT_BS1=1. Accepts
+ *                      either the FULL descrambled image (tools/ipl_descramble
+ *                      -o, BS2 at file offset 0x820) or the trimmed BS2-payload
+ *                      slice (--bs2, BS2 at file offset 0x720) — detected by
+ *                      size. Unset: the check is skipped with a loud notice
+ *                      (never silently assumed to pass).
  */
 #include "cpu/cpu.h"
 #include "memory/memory.h"
@@ -60,10 +85,21 @@
 #include "gx/gx.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
+#include "util/crc32.h"
+#include "descramble_core.h"   /* IPL_SCRAMBLE_END etc. — the M1 integrity check */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* M1: BS1's real EXI-DMA bulk-copy size, measured empirically (see boot.c's
+ * GCN_BOOT_BS1 integrity-check comment below) — NOT docs/M1_PLAN.md §0's
+ * IPL_SCRAMBLE_END-0x820=0x1AF6E0 estimate, which the real hardware disproves:
+ * everything past this offset in the "descrambled" file is other data (later,
+ * on-demand resources) BS1's own initial bulk copy never touches; both a
+ * fresh true-reset BS1-at-ROM run and the pre-existing oracle-validated M0
+ * pipeline's own post-DMA dump independently confirm this exact boundary. */
+#define GCN_BS1_BS2_DMA_LEN 0x0016FFE0u
 
 /* VI display-interrupt line -> PI interrupt cause (level-triggered). */
 static void vi_irq_to_pi(void* user, int level) {
@@ -124,13 +160,19 @@ static void sram_persist_to_file(void* user) {
 }
 
 int main(int argc, char** argv) {
+    const char* bs1_env = getenv("GCN_BOOT_BS1");
+    int bs1_mode = bs1_env && *bs1_env && *bs1_env != '0';
+
     if (argc < 2) {
         fprintf(stderr,
-            "gcnrecomp boot (M0 execution)\n"
-            "usage: %s <descrambled_bs2.bin> [max_blocks]\n"
-            "  Seeds the BS2 payload + M0 declarative seed, then runs recompiled\n"
-            "  blocks from 0x81300000 until it stops (exception, off-image PC, or\n"
-            "  the block budget). Default budget: 200000 blocks.\n",
+            "gcnrecomp boot (M0/M1 execution)\n"
+            "usage: %s <descrambled_bs2.bin | raw_ipl.bin> [max_blocks]\n"
+            "  Default (GCN_BOOT_BS1 unset): seeds the BS2 payload + M0 declarative\n"
+            "  seed, then runs recompiled blocks from 0x81200150 until it stops.\n"
+            "  GCN_BOOT_BS1=1: <arg1> is the RAW SCRAMBLED bios/ipl.bin; seeds the\n"
+            "  TRUE hardware reset vector (0xFFF00100) and runs real BS1 -> its own\n"
+            "  EXI DMA of BS2 -> the same BS2 the default path uses. See the file\n"
+            "  header comment for every GCN_* env var. Default budget: 200000 blocks.\n",
             argv[0]);
         return 2;
     }
@@ -144,13 +186,28 @@ int main(int argc, char** argv) {
     CPUState cpu;
     if (!cpu_init(&cpu)) { free(payload); return 1; }
 
+    /* GcnSeedConfig still supplies the device-fixture (SRAM/RTC) defaults in
+     * BOTH modes — those are independent EXI peripherals, not part of the CPU
+     * true-reset debt (seed.h / gcn_seed_apply_true_reset doc comment). */
     GcnSeedConfig cfg;
     gcn_seed_default_config(&cfg);
     cfg.payload = payload;
     cfg.payload_size = size;
 
     GcnSeedDevices devices;
-    if (!gcn_seed_apply(&cpu, &devices, &cfg)) {
+    if (bs1_mode) {
+        if (size < IPL_SCRAMBLE_END) {
+            fprintf(stderr,
+                "gcn boot: GCN_BOOT_BS1=1 requires the RAW SCRAMBLED bios/ipl.bin "
+                "(>= 0x%X bytes), got '%s' (0x%X bytes)\n",
+                IPL_SCRAMBLE_END, argv[1], size);
+            cpu_free(&cpu);
+            free(payload);
+            return 1;
+        }
+        gcn_seed_apply_true_reset(&cpu);
+        gcn_seed_build_devices(&devices, &cfg);
+    } else if (!gcn_seed_apply(&cpu, &devices, &cfg)) {
         cpu_free(&cpu);
         free(payload);
         return 1;
@@ -165,25 +222,45 @@ int main(int argc, char** argv) {
     gcn_mmio_bus_init(&bus);
     gcn_exi_init(&exi);
 
-    /* EXI mask-ROM backing: prefer a full descrambled IPL image via
+    /* EXI mask-ROM backing.
+     *
+     * M1 (GCN_BOOT_BS1=1): argv[1] IS the raw scrambled bios/ipl.bin (already
+     * loaded into `payload`/`size` above). Descramble it ONCE here (owned by
+     * `exi`) and back BOTH the EXI device AND the CPU's 0xFFF00000 ROM window
+     * (memory.c) from the SAME returned buffer — one descrambled image, two
+     * consumers, exactly the split docs/M1_PLAN.md §6.2 calls for.
+     *
+     * M0 default (unchanged): prefer a full descrambled IPL image via
      * GCN_IPL_ROM (offset 0 = ROM offset 0); otherwise reuse the descrambled
-     * BS2 payload already loaded, whose byte k IS ROM offset (load_off + k). The
-     * IPL font/ROM DMA reads offsets 0x800..0x170800, all within that slice, so
-     * both backings serve identical bytes. */
-    u8* rom_file = NULL;
-    u32 rom_size = 0;
-    const char* rom_path = getenv("GCN_IPL_ROM");
-    if (rom_path && *rom_path && gcn_seed_read_file(rom_path, &rom_file, &rom_size)) {
-        gcn_exi_set_rom(&exi, rom_file, rom_size, 0u);
-        fprintf(stdout, "gcn boot: EXI mask-ROM backed by %s (%u bytes)\n",
-                rom_path, rom_size);
+     * BS2 payload already loaded, whose byte k IS ROM offset (load_off + k).
+     * The IPL font/ROM DMA reads offsets 0x800..0x170800, all within that
+     * slice, so both backings serve identical bytes. */
+    if (bs1_mode) {
+        const u8* descrambled = gcn_exi_set_rom_scrambled(&exi, payload, size);
+        if (!descrambled) {
+            fprintf(stderr, "gcn boot: failed to descramble '%s' for EXI\n", argv[1]);
+            cpu_free(&cpu); free(payload); return 1;
+        }
+        gcn_mem_set_rom_window(&cpu, descrambled, size);
+        fprintf(stdout,
+            "gcn boot: GCN_BOOT_BS1 — EXI mask-ROM + 0xFFF00000 CPU ROM window "
+            "backed by transparently-descrambled %s (%u bytes)\n", argv[1], size);
     } else {
-        /* load_addr is guest 0x8120_0000; ROM offset of payload[0] is the file
-         * offset the descramble started at (0x100 for USA). Derive it from the
-         * documented load contract: payload[0] == descrambled IPL[0x100]. */
-        gcn_exi_set_rom(&exi, payload, size, 0x100u);
-        fprintf(stdout, "gcn boot: EXI mask-ROM backed by BS2 payload window "
-                "(ROM base 0x100, %u bytes)\n", size);
+        u8* rom_file = NULL;
+        u32 rom_size = 0;
+        const char* rom_path = getenv("GCN_IPL_ROM");
+        if (rom_path && *rom_path && gcn_seed_read_file(rom_path, &rom_file, &rom_size)) {
+            gcn_exi_set_rom(&exi, rom_file, rom_size, 0u);
+            fprintf(stdout, "gcn boot: EXI mask-ROM backed by %s (%u bytes)\n",
+                    rom_path, rom_size);
+        } else {
+            /* load_addr is guest 0x8120_0000; ROM offset of payload[0] is the file
+             * offset the descramble started at (0x100 for USA). Derive it from the
+             * documented load contract: payload[0] == descrambled IPL[0x100]. */
+            gcn_exi_set_rom(&exi, payload, size, 0x100u);
+            fprintf(stdout, "gcn boot: EXI mask-ROM backed by BS2 payload window "
+                    "(ROM base 0x100, %u bytes)\n", size);
+        }
     }
     gcn_exi_set_sram(&exi, devices.sram);
     gcn_exi_set_rtc(&exi, devices.rtc_counter);
@@ -359,9 +436,18 @@ int main(int argc, char** argv) {
      * rather than racing to the block budget. */
     u32 run_blocks = (dbg_port > 0) ? 0u : max_blocks;
 
+    /* M1: arm the handoff-instant snapshot the integrity check compares (see
+     * dispatch.h — end-of-run memory is useless once BS2 has executed). */
+    if (bs1_mode) {
+        const char* ref_env = getenv("GCN_BS1_REFERENCE");
+        if (ref_env && *ref_env)
+            gcn_dispatch_arm_bs1_snapshot(GCN_BS1_BS2_DMA_LEN);
+    }
+
     fprintf(stdout,
-        "gcn boot: seeded; entering recompiled BS2 at 0x%08X (budget %u blocks)\n"
+        "gcn boot: seeded; entering recompiled %s at 0x%08X (budget %u blocks)\n"
         "--- execution (unmapped-MMIO warnings below are the M0 signal) ---\n",
+        bs1_mode ? "BS1 (true reset)" : "BS2",
         cpu.pc, dbg_port > 0 ? 0u : max_blocks);
     fflush(stdout);
 
@@ -386,6 +472,81 @@ int main(int argc, char** argv) {
         "  dar (addr)  : 0x%08X\n"
         "  dsisr       : 0x%08X\n",
         reason, cpu.pc, cpu.exception, cpu.lr, cpu.srr0, cpu.dar, cpu.dsisr);
+
+    /* M1 integrity check (docs/M1_PLAN.md §8): did BS1's own real EXI DMA,
+     * through the transparent in-CPU/EXI descrambler, reproduce the SAME
+     * bytes an independent offline descramble produces? Loud pass/fail,
+     * never silent — and skipped (loudly) rather than assumed if no
+     * reference was configured. This is the M1 headline; the M0 default path
+     * never runs this block. */
+    if (bs1_mode) {
+        const char* ref_path = getenv("GCN_BS1_REFERENCE");
+        if (!ref_path || !*ref_path) {
+            fprintf(stdout,
+                "gcn boot: GCN_BS1_REFERENCE not set — INTEGRITY CHECK SKIPPED "
+                "(not a pass; set it to an offline `ipl_descramble` output to "
+                "actually validate the real EXI DMA)\n");
+        } else {
+            u8* ref = NULL; u32 ref_size = 0;
+            if (!gcn_seed_read_file(ref_path, &ref, &ref_size)) {
+                fprintf(stderr,
+                    "gcn boot: GCN_BS1_REFERENCE '%s' unreadable — INTEGRITY CHECK "
+                    "SKIPPED (not a pass)\n", ref_path);
+            } else {
+                /* Accept either the FULL descrambled image (`-o`, BS2 at file
+                 * offset 0x820) or the trimmed BS2-payload slice (`--bs2`,
+                 * BS2 at file offset 0x720 — the same bytes, minus the
+                 * [0,0x100) copyright header) — distinguished by size. */
+                u32 ref_bs2_off = (ref_size >= IPL_SCRAMBLE_END) ? 0x820u : 0x720u;
+                /* GCN_BS1_BS2_DMA_LEN (not IPL_SCRAMBLE_END-0x820=0x1AF6E0, the
+                 * M1_PLAN.md §0 estimate — that span also covers later on-demand
+                 * resources BS1's own bulk copy never touches). Empirically
+                 * measured this session: BOTH a fresh true-reset BS1-at-ROM run
+                 * and the pre-existing oracle-validated M0 pipeline's own
+                 * post-DMA dump agree byte-for-byte with the offline reference
+                 * up to exactly this length and NEVER beyond it (all-zero
+                 * tail — BS1 simply never writes there). Two independent real
+                 * EXI-DMA runs landing on the identical boundary is strong
+                 * confirmation this is BS1's true, fixed DMA size, not an
+                 * artifact of either run. */
+                /* Compare the HANDOFF-INSTANT snapshot (dispatch.h), never the
+                 * end-of-run memory: BS2's own .data/.bss live inside the
+                 * DMA'd span, so any post-handoff execution mutates it and a
+                 * longer block budget would turn a true PASS into a false
+                 * FAIL (caught in independent re-verification of the first
+                 * implementation, which compared at process exit and only
+                 * passed with a budget that stopped at the jump). */
+                u32 have_ref = (ref_size > ref_bs2_off) ? (ref_size - ref_bs2_off) : 0u;
+                u32 snap_len = 0;
+                const u8* snap = gcn_dispatch_bs1_snapshot(&snap_len);
+                u32 len = snap_len;
+                if (len > have_ref) len = have_ref;
+
+                if (!snap || len == 0) {
+                    fprintf(stderr,
+                        "gcn boot: INTEGRITY CHECK FAIL — execution never reached "
+                        "the BS1->BS2 handoff (pc 0x81300000), or the reference is "
+                        "too short (snapshot=%u ref_avail=%u)\n", snap_len, have_ref);
+                } else {
+                    u32 mem_crc = gcn_crc32(snap, len);
+                    u32 ref_crc = gcn_crc32(ref + ref_bs2_off, len);
+                    int match = (mem_crc == ref_crc) &&
+                                (memcmp(snap, ref + ref_bs2_off, len) == 0);
+                    fprintf(stdout,
+                        "\n--- M1 INTEGRITY CHECK: handoff snapshot MEM1[0x81300000,+0x%X) "
+                        "vs %s[0x%X,+0x%X) ---\n"
+                        "  runtime CRC32 : 0x%08X\n"
+                        "  reference CRC32: 0x%08X\n"
+                        "  RESULT         : %s\n",
+                        len, ref_path, ref_bs2_off, len, mem_crc, ref_crc,
+                        match ? "PASS -- byte-identical (real BS1 EXI DMA reproduces "
+                                "the offline descramble exactly)"
+                              : "FAIL -- MISMATCH (see docs/M1_PLAN.md section 8)");
+                }
+            }
+            free(ref);
+        }
+    }
 
     /* Modify-before-recomp: dump MEM1 regions (the post-DMA code image + the
      * BS2 low-memory exception handlers) so DMA-loaded / runtime-written code can
@@ -421,6 +582,7 @@ int main(int argc, char** argv) {
         sram_persist_to_file(&s_sram_persist_ctx);
 
     gcn_dsp_free(&dsp);
+    gcn_exi_free(&exi);   /* no-op unless GCN_BOOT_BS1 owned a descrambled buffer */
     cpu_free(&cpu);
     free(payload);
     return 0;

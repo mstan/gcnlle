@@ -1,32 +1,46 @@
 # ipl_descramble
 
 Offline GameCube IPL descrambler — the "descramble offline, recompile the
-plaintext" half of **M0** (see `docs/ROADMAP.md`). The faithful in-CPU BS1
-descramble is deferred to M1.
+plaintext" half of **M0** (see `docs/ROADMAP.md`). **M1 adds the faithful
+in-CPU/EXI descramble** (real BS1, running from the true reset vector) —
+implemented in `runtime/src/exi.c`'s `gcn_exi_set_rom_scrambled`, which calls
+this tool's `descramble_core.c` algorithm verbatim (one vendored source, two
+consumers — this CLI and the runtime — never reimplemented a second time).
 
 ## What it does
 
 The GameCube IPL body is stored under a data-independent stream cipher that the
 on-chip BS1 bootrom descrambles at power-on. This tool applies segher's
-descrambler to the documented body range and can slice out the plaintext BS2
-payload — the input the recompiler and the M0 seed contract consume.
+descrambler to the documented body range and can slice out the plaintext
+BS1+BS2 payload — the input the recompiler and the M0 seed contract consume.
 
 ```
 ipl_descramble <ipl.bin> -o <descrambled.bin>     # full descrambled image
-ipl_descramble <ipl.bin> --bs2 <bs2.bin>          # just the BS2 payload
+ipl_descramble <ipl.bin> --bs2 <bs2.bin>          # the BS1+BS2 payload slice
 ```
 
-### Layout constants (from the descrambler + boot analysis)
+### Layout constants (from the descrambler + boot analysis; oracle-corrected
+2026-07-09 — see `descramble_core.h`'s own comment for the correction history)
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `IPL_SCRAMBLE_START` | `0x100` | first scrambled byte |
 | `IPL_SCRAMBLE_END` | `0x1AFF00` | one past the last scrambled byte |
-| `IPL_BS2_FILE_OFF` | `0x820` | plaintext BS2 begins here (post-descramble) |
-| `IPL_BS2_LOAD_ADDR` | `0x81300000` | BS1 copies BS2 here and enters it |
+| `IPL_BS2_FILE_OFF` | `0x100` | plaintext BS1+BS2 image begins here (post-descramble; right after the [0,0x100) plaintext copyright header) |
+| `IPL_BS2_LOAD_ADDR` | `0x81200000` | BS1 loads here; Dolphin's HLE enters at 0x81200150 |
 
-So the M0 seed payload is `descrambled[0x820 .. 0x1AFF00)`, loaded at and
-entered from `0x81300000`.
+So the M0 seed payload is `descrambled[0x100 .. 0x1AFF00)`, loaded at
+`0x81200000`. **BS2 itself** (the menu, at guest `0x81300000`) is NOT a fixed
+file-offset slice of this image at all — M0 gets there by letting BS1's own
+tail (from Dolphin's `0x81200150` landing point) perform its real EXI DMA and
+dumping the post-DMA MEM1 (`runtime/generate_postdma.sh`); M1 (`runtime/
+generate_bs1.sh`) gets there the honest way, running the true reset vector
+`0xFFF00100` end to end (real HID0/BAT/MSR bring-up, then the same DMA).
+Empirically, that DMA copies exactly `0x16FFE0` bytes starting at file offset
+`0x820` — the earlier "to `IPL_SCRAMBLE_END`" estimate was wrong; the
+remaining scrambled bytes are other data (later, on-demand resources) BS1's
+own bulk copy never touches. See `docs/M1_PLAN.md` and `runtime/src/boot.c`'s
+`GCN_BS1_BS2_DMA_LEN`.
 
 ## Provenance & correctness
 

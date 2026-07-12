@@ -9,9 +9,12 @@
 #include "exi/exi.h"
 #include "memory/memory.h"
 #include "debug/rings.h"
+#include "descramble_core.h"   /* tools/ipl_descramble — vendored segher descrambler,
+                                  transcribed verbatim (see gcn_exi_set_rom_scrambled) */
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>   /* [ENHANCEMENT] host-clock RTC mode */
 
 /* ---- helpers ---------------------------------------------------------------*/
@@ -85,6 +88,31 @@ static void exi_update_interrupts(GcnExi* exi) {
 
 void gcn_exi_set_rom(GcnExi* exi, const u8* rom, u32 size, u32 base) {
     exi->rom = rom; exi->rom_size = size; exi->rom_base = base;
+}
+
+/* M1: see exi.h for the full contract/provenance comment. */
+const u8* gcn_exi_set_rom_scrambled(GcnExi* exi, const u8* raw, u32 raw_size) {
+    if (!raw || raw_size < IPL_SCRAMBLE_END)
+        return NULL;
+    u8* buf = (u8*)malloc(raw_size);
+    if (!buf)
+        return NULL;
+    memcpy(buf, raw, raw_size);
+    /* Verbatim segher descrambler (descramble_core.c), over exactly the
+     * documented body range — everything outside it (the plaintext (C)
+     * header, and any trailing unscrambled font data past IPL_SCRAMBLE_END)
+     * is served as-is, faithfully mirroring what the real MX chip does. */
+    ipl_descramble(buf + IPL_SCRAMBLE_START, IPL_SCRAMBLE_END - IPL_SCRAMBLE_START);
+
+    free(exi->owned_rom);   /* replace any previously-owned buffer */
+    exi->owned_rom = buf;
+    gcn_exi_set_rom(exi, buf, raw_size, 0u);
+    return buf;
+}
+
+void gcn_exi_free(GcnExi* exi) {
+    free(exi->owned_rom);
+    exi->owned_rom = NULL;
 }
 
 void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]) {

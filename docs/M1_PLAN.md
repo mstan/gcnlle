@@ -479,3 +479,54 @@ runs against a truly scrambled backing — in which case the fallback (BS1
 itself must run the LFSR, meaning it lives somewhere in the small unwalked
 gap, or in code I haven't located) is still bounded, since the *entire* BS1
 body is only ~0x618 bytes and has already been fully walked once.
+
+## 11. M1 EXECUTION NOTES (post-implementation, this session)
+
+Real BS1 now boots from `0xFFF00100` against the raw scrambled `bios/ipl.bin`
+(`runtime/generate_bs1.sh`, `GCN_BOOT_BS1=1`). The plan above was directionally
+right but three things surprised implementation, recorded here so the next
+session doesn't re-derive them:
+
+1. **§0/§8's DMA-length estimate was wrong.** BS1's real EXI DMA does **not**
+   copy the whole remaining scrambled span (`IPL_SCRAMBLE_END-0x820 =
+   0x1AF6E0`). It copies exactly **`0x16FFE0` bytes** (file offset `0x820` to
+   `0x98FFDF`-ish) and stops — everything past that in the descrambled file is
+   other data (later, on-demand resources) BS1's own bulk copy never touches.
+   Confirmed two independent ways: a fresh true-reset BS1-at-ROM run, and the
+   pre-existing oracle-validated M0 pipeline's own post-DMA dump, both agree
+   byte-for-byte with the offline reference up to exactly this length and are
+   all-zero (never written) past it. This is `GCN_BS1_BS2_DMA_LEN` in
+   `runtime/src/boot.c`. **The integrity check must use this length**, not
+   the full scrambled-region span — using the longer span makes the check
+   FAIL even though BS1 is behaving correctly.
+2. **§6.3's chip-select numbering concern was already moot.** By the time this
+   session ran, `runtime/src/exi.c`'s `device_transfer` already special-cased
+   `ch==0 && cs==2` as the mask ROM (not the one-hot `cs==1` the plan
+   flagged) — apparently fixed in an earlier session without a doc update.
+   BS1's real CSR writes (`0xBA`/`0x31`) worked against it with no changes.
+3. **A genuinely new finding, not anticipated by the plan:** BS1's true early
+   bring-up (`0xFFF00100`-`~0xFFF00150`, the exact window Dolphin's HLE never
+   executes and which M0 never reached either) pokes the DSP and MI hardware
+   registers via their **physical** addresses (`0x0C005012`, `0x0C00501A`,
+   `0x0C004026`) rather than the `0xCC00xxxx` effective/cached alias every
+   other modeled access (M0-onward) uses — because this happens before BS1
+   turns MSR[DR] on. `runtime/src/mmio.c` now canonicalizes
+   `[0x0C000000,0x0D000000)` to the matching `0xCC00xxxx` address before
+   dispatch (`GCN_MMIO_PHYS_BASE`, `memory.h`) — the same kind of alias
+   collapse already applied to RAM's cached/uncached mirrors, not a new
+   device behavior. Caught live via the port-4386 MMIO ring, not by staring at
+   the disassembly — worth re-checking the ring on any future "M0 never
+   reached this code before" milestone.
+
+A CPU-state cross-check at the BS1→BS2 handoff (`GCN_LOG_BS1_HANDOFF=1`,
+`runtime/src/dispatch.c`) shows real BS1 produces `msr=0x00002030` (FP+IR+DR
+on) and BATs matching §3.1's walk exactly (DBAT0/IBAT0=`0x80001FFF/2`,
+DBAT1=`0xC0001FFF/0x2A`, DBAT3/IBAT3=`0xFFF0001F/0xFFF00001`), vs. `Boot.cpp`'s
+cited `HID0=0x0011C464` — ours is `0x0011CC64`, a one-bit (`0x800`) difference
+worth a closer look someday but not blocking (it's the REAL executed value,
+not a guess). `sr[0..3]` read back `0x80000000` where the walk describes `mtsr
+0..15` with `r4=0`; not investigated further since `sr[]` is inert bookkeeping
+no device model consults. HID2 is `0` at the handoff (BS1 never touches it, as
+§3 found) yet downstream execution reaches the identical PC/LR as the M0
+default path after the same block count — BS2 evidently doesn't need it in
+this window.

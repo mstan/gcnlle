@@ -3,11 +3,17 @@
  *
  * Reads a scrambled IPL dump, applies segher's descrambler to the documented
  * body range, and writes: (a) the full descrambled image, and/or (b) the
- * plaintext BS2 payload sliced at file offset 0x820 — the M0 seed input,
- * loaded at and entered from 0x81300000.
+ * plaintext BS1+BS2 payload sliced at file offset 0x100 (oracle-corrected,
+ * docs/M1_PLAN.md §1/§5 — NOT 0x820) — the M0 seed input, loaded at and
+ * entered from 0x81200000 (the Dolphin-HLE BS2 landing point is 0x81200150;
+ * true BS1 file offset 0x820 is not where 0x81300000 BS2 begins). The
+ * IPL_BS2_* macro names/constants in descramble_core.h are the ground truth;
+ * this comment mirrors them, not the other way around.
  *
  * This is the "descramble offline, recompile the plaintext" half of M0 (see
- * docs/ROADMAP.md); the faithful in-CPU BS1 descramble is M1.
+ * docs/ROADMAP.md). The faithful in-CPU/EXI BS1 descramble that M1 adds lives
+ * in the RUNTIME (exi.c gcn_exi_set_rom_scrambled) — this tool's algorithm
+ * (descramble_core.c) is the one vendored source both share, not duplicated.
  */
 #include <stdio.h>
 #include <stdlib.h>

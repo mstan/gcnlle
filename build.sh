@@ -17,7 +17,8 @@ build_dir() {  # <src-subdir>
   local sub="$1"
   [ -f "$ROOT/$sub/CMakeLists.txt" ] || { echo "skip $sub (no CMakeLists yet)"; return 0; }
   echo "=== building $sub ==="
-  cmake -S "$ROOT/$sub" -B "$ROOT/$sub/build" -G "$GEN"
+  # RelWithDebInfo is the standing default — never configure without it.
+  cmake -S "$ROOT/$sub" -B "$ROOT/$sub/build" -G "$GEN" -DCMAKE_BUILD_TYPE=RelWithDebInfo
   cmake --build "$ROOT/$sub/build"
 }
 

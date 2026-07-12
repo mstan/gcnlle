@@ -10,6 +10,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # the default runtime build catches breakage; linked into gcn_boot.
 add_subdirectory(dsp_lle)
 
+# M1: the vendored segher IPL descrambler (tools/ipl_descramble/descramble_core.c)
+# as its OWN existing CMake target (ipl_descramble_core) — reused verbatim by
+# gcn_boot's EXI model (exi.c gcn_exi_set_rom_scrambled) rather than recompiled
+# a second time under a different TU, per PRINCIPLES "one algorithm, every call
+# site switches to it". EXCLUDE_FROM_ALL: gcn_boot links it on demand; it does
+# not become part of `all` for builds that never enable GCN_WITH_GENERATED.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/ipl_descramble
+                  ${CMAKE_CURRENT_BINARY_DIR}/ipl_descramble EXCLUDE_FROM_ALL)
+
 # ---------------------------------------------------------------------------
 # LLE runtime for the recompiled GameCube IPL.
 #
@@ -51,6 +60,7 @@ add_library(gcn_runtime_core STATIC
   src/cpu_glue.c
   src/seed.c
   src/trace.c
+  src/util/crc32.c
 )
 target_include_directories(gcn_runtime_core PUBLIC include)
 # trace.c emits the shared oracle record format (oracle/trace_format.h).
@@ -108,7 +118,11 @@ if(GCN_WITH_GENERATED)
     ${GCN_GENERATED_CHUNKS}
   )
   # generated/ for "generated.h"; include/ for cpu|memory|seed|dispatch headers.
+  # descramble_core.h comes in transitively via ipl_descramble_core's PUBLIC
+  # include dir (M1: exi.c/boot.c call the vendored segher descrambler
+  # verbatim — one algorithm, one compiled object, two consumers).
   target_include_directories(gcn_boot PRIVATE include generated)
   # ws2_32: Winsock for the TCP debug server (debug_server.c).
-  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle ws2_32)
+  target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
+                         ipl_descramble_core ws2_32)
 endif()

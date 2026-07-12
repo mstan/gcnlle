@@ -187,6 +187,28 @@ void gcn_mem_fill_mem1(CPUState* cpu, u32 pattern_be) {
 }
 
 /* ---------------------------------------------------------------------------
+ * M1: the 0xFFF00000 ROM window — READ-ONLY, consulted only from the read-side
+ * bus primitives below (never gcn_mem_resolve / mem_write*), so a guest write
+ * there is unmapped exactly like any other unbacked address.
+ * ------------------------------------------------------------------------- */
+
+void gcn_mem_set_rom_window(CPUState* cpu, const u8* rom, u32 size) {
+    cpu->rom_window = rom;
+    cpu->rom_window_size = rom ? size : 0u;
+}
+
+static const u8* rom_window_resolve(CPUState* cpu, u32 addr, u32* avail) {
+    if (cpu->rom_window && addr >= GCN_ROM_WINDOW_BASE &&
+        addr < GCN_ROM_WINDOW_BASE + cpu->rom_window_size) {
+        u32 offset = addr - GCN_ROM_WINDOW_BASE;
+        *avail = cpu->rom_window_size - offset;
+        return cpu->rom_window + offset;
+    }
+    *avail = 0;
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------------
  * Reservation bookkeeping (lwarx/stwcx) — mirror of recompiler cpu.c
  * ------------------------------------------------------------------------- */
 
@@ -218,13 +240,15 @@ static void mmio_note(CPUState* cpu, u32 addr, u32 value, u8 size, int is_write)
 u64 mem_read64(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
-    if (!host || avail < 8) {
-        if (cpu->external_read)
-            return cpu->external_read(cpu, addr, 8);
-        mmio_note(cpu, addr, 0u, 8, 0);
-        return 0;
+    if (host && avail >= 8) return read_be64(host);
+    {
+        const u8* rom = rom_window_resolve(cpu, addr, &avail);
+        if (rom && avail >= 8) return read_be64(rom);
     }
-    return read_be64(host);
+    if (cpu->external_read)
+        return cpu->external_read(cpu, addr, 8);
+    mmio_note(cpu, addr, 0u, 8, 0);
+    return 0;
 }
 
 void mem_write64(CPUState* cpu, u32 addr, u64 value) {
@@ -242,13 +266,15 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
 u32 mem_read32(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
-    if (!host || avail < 4) {
-        if (cpu->external_read)
-            return (u32)cpu->external_read(cpu, addr, 4);
-        mmio_note(cpu, addr, 0u, 4, 0);
-        return 0;
+    if (host && avail >= 4) return read_be32(host);
+    {
+        const u8* rom = rom_window_resolve(cpu, addr, &avail);
+        if (rom && avail >= 4) return read_be32(rom);
     }
-    return read_be32(host);
+    if (cpu->external_read)
+        return (u32)cpu->external_read(cpu, addr, 4);
+    mmio_note(cpu, addr, 0u, 4, 0);
+    return 0;
 }
 
 void mem_write32(CPUState* cpu, u32 addr, u32 value) {
@@ -266,13 +292,15 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
 u16 mem_read16(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
-    if (!host || avail < 2) {
-        if (cpu->external_read)
-            return (u16)cpu->external_read(cpu, addr, 2);
-        mmio_note(cpu, addr, 0u, 2, 0);
-        return 0;
+    if (host && avail >= 2) return read_be16(host);
+    {
+        const u8* rom = rom_window_resolve(cpu, addr, &avail);
+        if (rom && avail >= 2) return read_be16(rom);
     }
-    return read_be16(host);
+    if (cpu->external_read)
+        return (u16)cpu->external_read(cpu, addr, 2);
+    mmio_note(cpu, addr, 0u, 2, 0);
+    return 0;
 }
 
 void mem_write16(CPUState* cpu, u32 addr, u16 value) {
@@ -290,13 +318,15 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
 u8 mem_read8(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
-    if (!host) {
-        if (cpu->external_read)
-            return (u8)cpu->external_read(cpu, addr, 1);
-        mmio_note(cpu, addr, 0u, 1, 0);
-        return 0;
+    if (host) return *host;
+    {
+        const u8* rom = rom_window_resolve(cpu, addr, &avail);
+        if (rom) return *rom;
     }
-    return *host;
+    if (cpu->external_read)
+        return (u8)cpu->external_read(cpu, addr, 1);
+    mmio_note(cpu, addr, 0u, 1, 0);
+    return 0;
 }
 
 void mem_write8(CPUState* cpu, u32 addr, u8 value) {

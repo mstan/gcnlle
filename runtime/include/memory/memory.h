@@ -35,6 +35,17 @@ extern "C" {
 #define GCN_MMIO_BASE      0xCC000000u
 #define GCN_MMIO_SIZE      0x01000000u
 
+/* M1 finding: BS1's TRUE early bring-up (before it turns MSR[DR] on — the
+ * ~0x100-0x14C window Dolphin's HLE never executes and M0 never reached
+ * either) pokes hardware registers via the PHYSICAL address directly (e.g.
+ * DSP reset at 0x0C005012/0x0C00501A, MI at 0x0C004026 — seen live on a real
+ * true-reset BS1-at-ROM run, port 4386 rings). GCN_MMIO_PHYS_BASE is that
+ * physical aperture — the SAME registers GCN_MMIO_BASE addresses once BATs +
+ * DR are on, mirrored exactly like the RAM cached (0x80..)/uncached (0xC0..)
+ * collapse above (a real hardware alias, not a device model change). Consumed
+ * in mmio.c's dispatch translation. */
+#define GCN_MMIO_PHYS_BASE 0x0C000000u
+
 /* Resolve a guest address to a host pointer into MEM1 (or MEM2 if allocated),
  * collapsing the cached (0x80..) and uncached (0xC0..) mirrors to the same
  * bytes. Returns NULL if the address is not RAM-backed; *avail (if non-NULL)
@@ -55,6 +66,16 @@ bool gcn_mem_load_blob(CPUState* cpu, u32 dst, const void* src, u32 size);
 /* Fill the whole of MEM1 with a repeating 32-bit big-endian pattern. Used by
  * the seed to establish a deterministic reset image before the payload lands. */
 void gcn_mem_fill_mem1(CPUState* cpu, u32 pattern_be);
+
+/* M1: back the 0xFFF00000 ROM window (cpu.h GCN_ROM_WINDOW_BASE) with a
+ * borrowed, already-descrambled image (see exi.c gcn_exi_set_rom_scrambled,
+ * whose returned buffer is the intended source — one descrambled image feeds
+ * both the EXI mask-ROM device and this CPU-side instruction/data window).
+ * READ-ONLY by construction: only the mem_read* bus primitives consult it
+ * (never gcn_mem_resolve, which mem_write* also uses), so a guest write into
+ * this range stays unmapped/loud exactly like before this existed. `rom`/
+ * `size` are borrowed (caller owns the lifetime); NULL/0 unmaps it again. */
+void gcn_mem_set_rom_window(CPUState* cpu, const u8* rom, u32 size);
 
 #ifdef __cplusplus
 }
