@@ -34,6 +34,14 @@ extern "C" {
 #define GCN_BLOCK_RING_CAP (1u << 18)
 #define GCN_EVENT_RING_CAP (1u << 16)
 #define GCN_FIFO_RING_CAP  (1u << 16)   /* GX gather-pipe bursts (32 bytes each) */
+/* Memcard transaction ring (ROADMAP M4). EXI memory-card traffic is SPARSE
+ * (presence poll + directory read + save read/write) compared to the VI/SI/GX
+ * flood, so a small dedicated ring covers a very long wall-clock window — the
+ * one-time directory-read/write burst stays resident and queryable long after
+ * it happened, exactly the always-on capture the MMIO ring is too shallow to
+ * provide for card traffic (see _work/M4_CAPTURE.md: the burst evicts from the
+ * 256K MMIO ring in a few menu seconds). One entry per card EXI transaction. */
+#define GCN_MEMCARD_RING_CAP (1u << 13)  /* 8192 card transactions */
 
 /* Event kinds recorded in the event ring (interrupt/DMA/DSP/EXI edges). */
 typedef enum {
@@ -66,6 +74,21 @@ void gcn_ring_event(u16 kind, u32 detail, u32 aux, u32 pc);
  * ROADMAP M2's "GX FIFO recorder" — the packet inventory for the interpreter. */
 void gcn_ring_fifo(u32 pc, u32 wptr, const u8* data32);
 
+/* One EXI memory-card transaction (ROADMAP M4). Recorded from exi.c's card
+ * path for every immediate/DMA transfer routed to a memcard device, so the
+ * sparse card command stream stays continuously queryable (the MMIO ring is
+ * too shallow to hold it under menu-phase traffic). Fields:
+ *   channel  0=slot A (ch0 dev0), 1=slot B (ch1 dev0)
+ *   cs       chip-select one-hot at transfer time (1 = card selected)
+ *   command  the memcard's decoded command opcode (mc->command) at transfer end
+ *   rw       0=read (device->CPU) 1=write (CPU->device)
+ *   dma      0=immediate 1=DMA
+ *   address  the card-side byte offset (mc->address) after the transfer
+ *   length   transfer length in bytes (imm: 1-4; dma: dma_length)
+ *   data     immediate data register value (imm) / guest DMA address (dma) */
+void gcn_ring_memcard(u32 pc, u8 channel, u8 cs, u8 command, u8 rw, u8 dma,
+                      u32 address, u32 length, u32 data);
+
 /* Current monotonic block index (number of blocks retired so far). */
 u64  gcn_ring_block_index(void);
 
@@ -80,6 +103,7 @@ int gcn_ring_mmio_json(char* out, int cap, int max_entries,
 int gcn_ring_block_json(char* out, int cap, int max_entries);
 int gcn_ring_event_json(char* out, int cap, int max_entries);
 int gcn_ring_fifo_json(char* out, int cap, int max_entries);
+int gcn_ring_memcard_json(char* out, int cap, int max_entries);
 
 #ifdef __cplusplus
 }

@@ -45,10 +45,12 @@ void gcn_exi_init(GcnExi* exi) {
     exi->channels[1].csr = GCN_EXI_CSR_EXTINT | GCN_EXI_CSR_CS_DEV0;
     /* Channel 2 is the AD16 dev-probe target: idle, no EXT. */
 
-    /* Device-present at chip-select 1 per channel (drives EXT on read). The
-     * Dolphin oracle boots with slot A occupied and slot B empty, so ch0 EXT
-     * reads 1 and ch1 EXT reads 0; ch2 is forced 0. See exi.h. */
-    exi->dev_present[0] = 1;
+    /* M4: dev_present (which drives the EXT card-inserted bit on a CSR read) is
+     * now LIVE — set by gcn_exi_set_memcard from card[ch]->present. All slots
+     * start empty here; boot.c installs a card in slot A (matching the Dolphin
+     * oracle's "card in slot A, slot B empty" config, EXT ch0=1 / ch1=0) via
+     * gcn_exi_set_memcard. ch2 is always forced 0 on read. */
+    exi->dev_present[0] = 0;
     exi->dev_present[1] = 0;
     exi->dev_present[2] = 0;
 }
@@ -71,7 +73,15 @@ static void exi_update_interrupts(GcnExi* exi) {
     int level = 0;
     for (u32 ch = 0; ch < GCN_EXI_CHANNELS; ch++) {
         u32 csr = exi->channels[ch].csr;
-        if (((csr & GCN_EXI_CSR_EXIINT) && (csr & GCN_EXI_CSR_EXIINTMASK)) ||
+        int exiint = (csr & GCN_EXI_CSR_EXIINT) ? 1 : 0;
+        /* M4: on channels 0/1 the memory card's own command-done interrupt
+         * (armed by SetInterrupt, latched by an erase/program) feeds EXIINT
+         * unconditionally — "Always check memcard slots" (EXI_Channel.cpp:253,
+         * IsCausingInterrupt). This is the interrupt the CARD flash driver waits
+         * on after a write/erase. */
+        if (ch < 2u && exi->card[ch] && gcn_memcard_interrupt_set(exi->card[ch]))
+            exiint = 1;
+        if ((exiint && (csr & GCN_EXI_CSR_EXIINTMASK)) ||
             ((csr & GCN_EXI_CSR_TCINT)  && (csr & GCN_EXI_CSR_TCINTMASK))  ||
             ((csr & GCN_EXI_CSR_EXTINT) && (csr & GCN_EXI_CSR_EXTINTMASK)))
             level = 1;
@@ -143,6 +153,19 @@ void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user) {
     exi->persist_user = user;
 }
 
+/* M4: install / remove a memory card on a channel, keeping dev_present (the EXT
+ * card-inserted bit source) in sync with the card's presence. */
+void gcn_exi_set_memcard(GcnExi* exi, u32 ch, GcnMemcard* card) {
+    if (ch >= GCN_EXI_CHANNELS) return;
+    exi->card[ch] = card;
+    exi->dev_present[ch] = (ch < 2u && card && card->present) ? 1u : 0u;
+}
+
+void gcn_exi_set_card_persist(GcnExi* exi, GcnExiCardPersistFn fn, void* user) {
+    exi->card_persist = fn;
+    exi->card_persist_user = user;
+}
+
 bool gcn_exi_persist_load(const char* path, u32* out_rtc,
                            u8 out_sram[GCN_SRAM_SIZE_BYTES]) {
     if (!path || !*path || !out_rtc || !out_sram) return false;
@@ -205,6 +228,20 @@ static void write_csr(GcnExi* exi, u32 ch, u32 value) {
      * device transaction. */
     u32 cs = csr_chip_select(c->csr);
     if (cs != exi->prev_cs[ch]) {
+        /* M4: drive the memory card's SetCS across its own selection edge (the
+         * card is device 0 = chip-select one-hot 1). Selecting resets the card's
+         * byte position; DESELECTING commits any pending erase/program
+         * (CEXIMemoryCard::SetCS) and, if that mutated the image, flushes it to
+         * the host .raw. Mirrors EXI_Channel.cpp:91-94. */
+        if (ch < 2u && exi->card[ch]) {
+            int was_sel = (exi->prev_cs[ch] == 1u);
+            int now_sel = (cs == 1u);
+            if (now_sel != was_sel) {
+                gcn_memcard_set_cs(exi->card[ch], now_sel);
+                if (!now_sel && exi->card[ch]->dirty && exi->card_persist)
+                    exi->card_persist(exi->card_persist_user, ch, exi->card[ch]);
+            }
+        }
         reset_transaction(exi, ch);
         exi->prev_cs[ch] = (u8)cs;
     }
@@ -335,18 +372,70 @@ static void ipl_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma, u
     }
 }
 
-static void device_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 cs,
-                            u32 rw, bool dma, u32 len) {
-    /* Chip-select is one-hot: 1=dev0, 2=dev1, 4=dev2. */
-    if (ch == 0u && cs == 2u) {            /* mask ROM / RTC / SRAM */
+/* Memory card (channel 0 dev0 = slot A, channel 1 dev0 = slot B; chip-select
+ * one-hot 1). Immediate transfers are byte-serial through the card's per-byte
+ * command state machine, packed MSB-first into the immediate data register
+ * exactly as IEXIDevice::ImmRead/ImmWrite decompose them (EXI_Device.cpp:33-54);
+ * DMA transfers move the block in bulk at the card's current address
+ * (CEXIMemoryCard::DMARead/DMAWrite). Every transaction is recorded into the
+ * always-on memcard ring. Returns whether TCINT should latch (see start_transfer):
+ * the memcard raises transfer-complete ONLY on DMA — its UseDelayedTransferCompletion
+ * is true, so the channel never auto-completes an immediate transfer
+ * (EXI_Channel.cpp:199) and immediate transfers schedule no completion event. */
+static int memcard_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma, u32 len) {
+    GcnMemcard* mc = exi->card[ch];
+    GcnExiChannel* c = &exi->channels[ch];
+    if (dma) {
+        u32 guest = 0x80000000u | (c->mar & 0x03FFFFFFu);   /* physical -> cached */
+        u32 avail = 0;
+        u8* p = gcn_mem_resolve(cpu, guest, &avail);
+        u32 n = (len < avail) ? len : avail;
+        if (p) {
+            if (rw == 1u) gcn_memcard_dma_write(mc, p, n);
+            else          gcn_memcard_dma_read(mc, p, n);
+        }
+    } else if (rw == 1u) {                 /* immediate WRITE: CPU -> card */
+        u32 v = c->data;
+        for (u32 i = 0; i < len && i < 4u; i++) {
+            u8 b = (u8)(v >> (24u - 8u * i));
+            gcn_memcard_transfer_byte(mc, &b);   /* response byte discarded */
+        }
+    } else if (rw == 0u) {                 /* immediate READ: card -> CPU */
+        u32 v = 0;
+        for (u32 i = 0; i < len && i < 4u; i++) {
+            u8 b = 0;
+            gcn_memcard_transfer_byte(mc, &b);
+            v |= (u32)b << (24u - 8u * i);
+        }
+        c->data = v;
+    }
+    /* rw==2 (read/write) is a no-op device-side: IEXIDevice::ImmReadWrite is
+     * empty (EXI_Device.cpp:56-58) and the card never relies on it. */
+
+    gcn_ring_memcard(cpu->pc, (u8)ch, /*cs*/1u, (u8)mc->command, (u8)rw,
+                     dma ? 1u : 0u, mc->address, len, dma ? c->mar : c->data);
+    return dma ? 1 : 0;
+}
+
+/* Route a started transfer to the selected device. Returns 1 if the transfer
+ * raises TCINT (a non-delayed device completes immediately; the memcard only on
+ * DMA — see memcard_transfer). Chip-select is one-hot: 1=dev0, 2=dev1, 4=dev2. */
+static int device_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 cs,
+                           u32 rw, bool dma, u32 len) {
+    if (ch == 0u && cs == 2u) {                        /* mask ROM / RTC / SRAM */
         ipl_transfer(exi, cpu, ch, rw, dma, len);
-    } else if (ch == 2u && cs == 1u) {     /* AD16 dev-hardware probe */
+        return 1;
+    } else if (ch < 2u && cs == 1u && exi->card[ch]) { /* memory card slot A/B */
+        return memcard_transfer(exi, cpu, ch, rw, dma, len);
+    } else if (ch == 2u && cs == 1u) {                 /* AD16 dev-hardware probe */
         /* Retail console has no AD16: reads drive 0, writes are ignored. */
         if (rw == 0u && !dma) exi->channels[ch].data = 0;
+        return 1;
     } else {
-        /* Memory cards (ch0 cs1 slot A, ch1 cs1 slot B) and SP1/SP2 are not
-         * modeled yet (M4). Present-but-empty: reads drive 0. FLAGGED. */
+        /* No device at this (channel, chip-select) — e.g. an empty card slot or
+         * SP1/SP2: reads drive 0. The "None" device still completes (TCINT). */
         if (rw == 0u && !dma) exi->channels[ch].data = 0;
+        return 1;
     }
 }
 
@@ -357,12 +446,13 @@ static void start_transfer(GcnExi* exi, CPUState* cpu, u32 ch) {
     u32 len = dma ? c->len : (((c->cr & GCN_EXI_CR_TLEN_MASK) >> 4u) + 1u);
     u32 cs  = csr_chip_select(c->csr);
 
-    device_transfer(exi, cpu, ch, cs, rw, dma, len);
+    int set_tcint = device_transfer(exi, cpu, ch, cs, rw, dma, len);
 
-    /* Complete synchronously: clear TSTART, latch transfer-complete interrupt
-     * (EXI_Channel.cpp:210 m_status.TCINT=1), then re-evaluate the PI line. */
-    c->cr  &= ~GCN_EXI_CR_TSTART;
-    c->csr |= GCN_EXI_CSR_TCINT;
+    /* Clear TSTART, then latch transfer-complete (EXI_Channel.cpp:210) for any
+     * device that completes synchronously, and re-evaluate the PI line. */
+    c->cr &= ~GCN_EXI_CR_TSTART;
+    if (set_tcint)
+        c->csr |= GCN_EXI_CSR_TCINT;
     exi_update_interrupts(exi);
 }
 

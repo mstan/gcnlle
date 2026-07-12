@@ -72,6 +72,7 @@
 #include "trace/trace.h"
 #include "mmio/mmio.h"
 #include "exi/exi.h"
+#include "memcard/memcard_image.h"   /* M4: format/load/validate a card .raw */
 #include "si/si.h"
 #include "pi/pi.h"
 #include "dsp/dsp.h"
@@ -157,6 +158,82 @@ static void sram_persist_to_file(void* user) {
     if (!gcn_exi_persist_save(ctx->path, ctx->exi->rtc_counter, ctx->exi->sram))
         fprintf(stderr, "gcn boot: WARNING — failed to write GCN_SRAM_FILE '%s'\n",
                 ctx->path);
+}
+
+/* ROADMAP M4: memory cards. Slot A (channel 0 dev0) and slot B (channel 1 dev0)
+ * are backed by a Dolphin-compatible flat .raw image. GCN_MEMCARD_A/B name a
+ * host file: loaded if it exists and validates, otherwise a blank 251-block
+ * (16 Mbit) card is formatted and the file created. With no env set, slot A
+ * still gets an in-memory formatted card so EXT reads 1 (matching the Dolphin
+ * oracle's "card in slot A" config — this preserves the validated boot), and
+ * slot B stays empty. Every guest write is flushed back to the file on chip
+ * deselect (card_persist_to_file). */
+typedef struct { const char* path[2]; } GcnCardPersistCtx;
+static GcnCardPersistCtx s_card_persist_ctx;
+
+static void card_persist_to_file(void* user, u32 ch, GcnMemcard* card) {
+    GcnCardPersistCtx* ctx = (GcnCardPersistCtx*)user;
+    if (ch < 2u && ctx->path[ch]) {
+        if (gcn_mc_image_save_file(ctx->path[ch], card->data, card->size_bytes))
+            card->dirty = 0;
+        else
+            fprintf(stderr, "gcn boot: WARNING — failed to persist memory card "
+                    "%c to '%s'\n", (char)('A' + ch), ctx->path[ch]);
+    } else {
+        card->dirty = 0;   /* in-memory card: writes live only in RAM */
+    }
+}
+
+/* Install a formatted/loaded memory card on `ch`. `path` (may be NULL) is the
+ * .raw backing. Returns the malloc'd card image (owned by `card` after
+ * gcn_memcard_init) or NULL on hard failure. */
+static void setup_memcard(GcnExi* exi, u32 ch, GcnMemcard* card, const char* path) {
+    /* Default to 128 Mbit / 2043-block (GetCardId 0x80) — the size Dolphin's
+     * oracle boots with, so the card's NintendoID response matches the oracle
+     * trace byte-for-byte (verified: oracle DATA read = 0x00000080). A .raw
+     * backing keeps its own on-file size. */
+    u32 sz = gcn_mc_image_bytes_for_mbits(GCN_MC_MBIT_2043);  /* 128 Mbit, 16 MiB */
+    u8* img = NULL;
+
+    if (path && *path) {
+        u8* file = NULL; u32 file_sz = 0;
+        if (gcn_seed_read_file(path, &file, &file_sz)) {
+            char err[128];
+            if (gcn_mc_image_valid_size(file_sz) &&
+                gcn_mc_image_check(file, file_sz, err, sizeof err)) {
+                img = file; sz = file_sz;
+                fprintf(stdout, "gcn boot: memory card %c loaded from '%s' (%u bytes)\n",
+                        (char)('A' + ch), path, file_sz);
+            } else {
+                fprintf(stdout, "gcn boot: memory card %c file '%s' invalid (%s) — "
+                        "reformatting\n", (char)('A' + ch), path,
+                        gcn_mc_image_valid_size(file_sz) ? err : "bad size");
+                free(file);
+            }
+        }
+    }
+
+    if (!img) {
+        img = (u8*)malloc(sz);
+        if (!img) { fprintf(stderr, "gcn boot: memory card %c alloc failed\n",
+                            (char)('A' + ch)); return; }
+        /* flash_id/bias/language/time feed only the (never-validated) header
+         * serial; zeros produce a card the IPL accepts. */
+        u8 flash_id[12] = {0};
+        gcn_mc_image_format(img, sz, flash_id, 0u, 0u, 0ull);
+        if (path && *path) {
+            gcn_mc_image_save_file(path, img, sz);
+            fprintf(stdout, "gcn boot: memory card %c formatted blank -> '%s' (%u bytes)\n",
+                    (char)('A' + ch), path, sz);
+        } else {
+            fprintf(stdout, "gcn boot: memory card %c formatted blank (in-memory, "
+                    "%u bytes)\n", (char)('A' + ch), sz);
+        }
+    }
+
+    gcn_memcard_init(card, img, sz);   /* takes ownership of img */
+    s_card_persist_ctx.path[ch] = (path && *path) ? path : NULL;
+    gcn_exi_set_memcard(exi, ch, card);
 }
 
 int main(int argc, char** argv) {
@@ -302,6 +379,15 @@ int main(int argc, char** argv) {
         fprintf(stdout, "gcn boot: GCN_RTC_HOST — RTC tracks the host clock "
                 "(enhancement mode; nondeterministic, not for oracle diffs)\n");
     }
+
+    /* ROADMAP M4: memory cards. Slot A defaults to a formatted card (EXT=1,
+     * matching the oracle); GCN_MEMCARD_A/B back either slot with a host .raw. */
+    static GcnMemcard card_a, card_b;
+    gcn_exi_set_card_persist(&exi, card_persist_to_file, &s_card_persist_ctx);
+    setup_memcard(&exi, 0u, &card_a, getenv("GCN_MEMCARD_A"));   /* slot A (default on) */
+    const char* mcb_path = getenv("GCN_MEMCARD_B");
+    if (mcb_path && *mcb_path)
+        setup_memcard(&exi, 1u, &card_b, mcb_path);              /* slot B (opt-in) */
 
     gcn_mmio_register(&bus, "EXI", GCN_EXI_BASE, GCN_EXI_REGISTER_BYTES,
                       gcn_exi_read, gcn_exi_write, &exi);
@@ -580,6 +666,14 @@ int main(int argc, char** argv) {
      * insurance against this function's own flush having failed earlier. */
     if (sram_path && *sram_path)
         sram_persist_to_file(&s_sram_persist_ctx);
+
+    /* M4: safety-net flush (every write already flushed on chip-deselect), then
+     * release the card images. gcn_memcard_free on a never-installed slot B is a
+     * safe free(NULL). */
+    if (card_a.dirty) card_persist_to_file(&s_card_persist_ctx, 0u, &card_a);
+    if (card_b.dirty) card_persist_to_file(&s_card_persist_ctx, 1u, &card_b);
+    gcn_memcard_free(&card_a);
+    gcn_memcard_free(&card_b);
 
     gcn_dsp_free(&dsp);
     gcn_exi_free(&exi);   /* no-op unless GCN_BOOT_BS1 owned a descrambled buffer */

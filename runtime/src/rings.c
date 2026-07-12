@@ -47,15 +47,32 @@ typedef struct {
     u8  data[32];
 } FifoEntry;
 
-static MmioEntry  s_mmio[GCN_MMIO_RING_CAP];
-static BlockEntry s_block[GCN_BLOCK_RING_CAP];
-static EventEntry s_event[GCN_EVENT_RING_CAP];
-static FifoEntry  s_fifo[GCN_FIFO_RING_CAP];
+typedef struct {
+    u64 seq;
+    u64 block;
+    u32 pc;
+    u32 address;
+    u32 length;
+    u32 data;
+    u8  channel;
+    u8  cs;
+    u8  command;
+    u8  rw;
+    u8  dma;
+    u8  _pad[3];
+} MemcardEntry;
+
+static MmioEntry    s_mmio[GCN_MMIO_RING_CAP];
+static BlockEntry   s_block[GCN_BLOCK_RING_CAP];
+static EventEntry   s_event[GCN_EVENT_RING_CAP];
+static FifoEntry    s_fifo[GCN_FIFO_RING_CAP];
+static MemcardEntry s_memcard[GCN_MEMCARD_RING_CAP];
 
 static u64 s_mmio_count;   /* total ever recorded (also the next write index)   */
 static u64 s_block_count;
 static u64 s_event_count;
 static u64 s_fifo_count;
+static u64 s_memcard_count;
 static u64 s_block_index;  /* monotonic retired-block counter (timeline stamp)  */
 
 void gcn_rings_init(void) {
@@ -63,7 +80,9 @@ void gcn_rings_init(void) {
     memset(s_block, 0, sizeof s_block);
     memset(s_event, 0, sizeof s_event);
     memset(s_fifo, 0, sizeof s_fifo);
+    memset(s_memcard, 0, sizeof s_memcard);
     s_mmio_count = s_block_count = s_event_count = s_fifo_count = 0;
+    s_memcard_count = 0;
     s_block_index = 0;
 }
 
@@ -96,6 +115,15 @@ void gcn_ring_fifo(u32 pc, u32 wptr, const u8* data32) {
     e->block = s_block_index;
     e->pc = pc; e->wptr = wptr;
     memcpy(e->data, data32, 32);
+}
+
+void gcn_ring_memcard(u32 pc, u8 channel, u8 cs, u8 command, u8 rw, u8 dma,
+                      u32 address, u32 length, u32 data) {
+    MemcardEntry* e = &s_memcard[s_memcard_count & (GCN_MEMCARD_RING_CAP - 1)];
+    e->seq = s_memcard_count++;
+    e->block = s_block_index;
+    e->pc = pc; e->address = address; e->length = length; e->data = data;
+    e->channel = channel; e->cs = cs; e->command = command; e->rw = rw; e->dma = dma;
 }
 
 u64 gcn_ring_block_index(void) { return s_block_index; }
@@ -187,6 +215,28 @@ int gcn_ring_fifo_json(char* out, int cap, int max_entries) {
         }
         n += snprintf(out + n, (size_t)(cap - n), "\"}");
         first = 0; emitted++;
+    }
+    n += snprintf(out + n, (size_t)(cap - n), "],\"count\":%d}\n", emitted);
+    return n;
+}
+
+int gcn_ring_memcard_json(char* out, int cap, int max_entries) {
+    int n = (int)emit_prefix(out, cap, "memcard", s_memcard_count);
+    if (n < 0 || n >= cap) return n;
+    u64 avail = s_memcard_count < GCN_MEMCARD_RING_CAP ? s_memcard_count : GCN_MEMCARD_RING_CAP;
+    if ((u64)max_entries < avail) avail = (u64)max_entries;
+    u64 start = s_memcard_count - avail;
+    int emitted = 0, first = 1;
+    for (u64 s = start; s < s_memcard_count; s++) {
+        MemcardEntry* e = &s_memcard[s & (GCN_MEMCARD_RING_CAP - 1)];
+        int w = snprintf(out + n, (size_t)(cap - n),
+            "%s{\"seq\":%llu,\"block\":%llu,\"pc\":%u,\"channel\":%u,\"cs\":%u,"
+            "\"command\":%u,\"rw\":%u,\"dma\":%u,\"address\":%u,\"length\":%u,\"data\":%u}",
+            first ? "" : ",", (unsigned long long)e->seq, (unsigned long long)e->block,
+            e->pc, e->channel, e->cs, e->command, e->rw, e->dma,
+            e->address, e->length, e->data);
+        if (w < 0 || n + w >= cap - 4) break;
+        n += w; first = 0; emitted++;
     }
     n += snprintf(out + n, (size_t)(cap - n), "],\"count\":%d}\n", emitted);
     return n;

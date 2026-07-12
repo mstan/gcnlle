@@ -81,6 +81,16 @@ add_executable(test_seed tests/test_seed.c)
 target_link_libraries(test_seed PRIVATE gcn_runtime_core)
 add_test(NAME seed_contract COMMAND $<TARGET_FILE:test_seed>)
 
+# M4: EXI memcard device model + GCMemcard image module. Both are standalone
+# (only libc + their own headers), so they build/test without the generated C.
+add_executable(test_memcard tests/test_memcard.c src/memcard.c)
+target_include_directories(test_memcard PRIVATE include)
+add_test(NAME memcard_device COMMAND $<TARGET_FILE:test_memcard>)
+
+add_executable(test_memcard_image tests/test_memcard_image.c src/memcard_image.c)
+target_include_directories(test_memcard_image PRIVATE include)
+add_test(NAME memcard_image COMMAND $<TARGET_FILE:test_memcard_image>)
+
 # ---------------------------------------------------------------------------
 # M0 execution target: link Track A's recompiled BS2 and run it.
 #
@@ -100,6 +110,8 @@ if(GCN_WITH_GENERATED)
     src/dispatch.c
     src/mmio.c
     src/exi.c
+    src/memcard.c
+    src/memcard_image.c
     src/si.c
     src/pi.c
     src/dsp.c

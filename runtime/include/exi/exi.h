@@ -30,6 +30,7 @@
 #define GCN_EXI_EXI_H
 
 #include "cpu/cpu.h"
+#include "memcard/memcard.h"   /* M4: EXI memory-card devices (slot A/B) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,6 +99,11 @@ typedef void (*GcnExiIrqFn)(void* user, int level);
  * default: zero overhead / byte-identical behavior when no file is configured. */
 typedef void (*GcnExiPersistFn)(void* user);
 
+/* M4: fired when a memory card on channel `ch` has been mutated (dirty) and is
+ * deselected — the host (boot.c) flushes card->data to its .raw path, then
+ * clears card->dirty. NULL by default (no persistence). */
+typedef void (*GcnExiCardPersistFn)(void* user, u32 ch, GcnMemcard* card);
+
 typedef struct GcnExi {
     GcnExiChannel channels[GCN_EXI_CHANNELS];
 
@@ -138,11 +144,17 @@ typedef struct GcnExi {
 
     /* EXT (device-present) is computed on each CSR read from the presence of the
      * device at chip-select 1 (Dolphin: GetDevice(1)->IsPresent()), not latched.
-     * This flag is that presence per channel: ch0 = a device occupies slot A (as
-     * in the Dolphin oracle's config, EXT reads 1), ch1 = slot B empty (EXT 0),
-     * ch2 = forced 0. When memory-card modelling lands (M4), this becomes the
-     * live card-inserted state; until then a menu card probe diverges loudly. */
+     * This flag is that presence per channel: ch0 = a device occupies slot A,
+     * ch1 = slot B. M4: this is now the LIVE memory-card-inserted state, set by
+     * gcn_exi_set_memcard from card[ch] (ch2 is always forced 0). */
     u8        dev_present[GCN_EXI_CHANNELS];
+
+    /* M4: memory-card device per channel (slot A = ch0 dev0 / cs one-hot 1;
+     * slot B = ch1 dev0). NULL = no card in that slot. Borrowed pointers —
+     * boot.c owns the GcnMemcard objects and their backing images. ch2 unused. */
+    GcnMemcard* card[GCN_EXI_CHANNELS];
+    GcnExiCardPersistFn card_persist;   /* NULL unless a .raw backing is set    */
+    void*               card_persist_user;
 
     int         irq_level;   /* last EXI->PI line level (edge detect for the ring) */
     GcnExiIrqFn irq;         /* sink for the EXI interrupt line (boot.c -> PI) */
@@ -203,6 +215,15 @@ void gcn_exi_set_rtc_host_mode(GcnExi* exi, int on);
  * (the gcn_exi_init default) means no persistence — every write path stays
  * exactly as it is today. */
 void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user);
+
+/* M4: install a memory card on channel `ch` (0 = slot A, 1 = slot B). `card`
+ * (borrowed; owned by the caller) becomes the device at chip-select one-hot 1;
+ * dev_present[ch] tracks card->present so the EXT bit reads correctly. Pass
+ * NULL to remove a card (dev_present[ch] -> 0). */
+void gcn_exi_set_memcard(GcnExi* exi, u32 ch, GcnMemcard* card);
+
+/* M4: register the memory-card write-back hook (see GcnExiCardPersistFn). */
+void gcn_exi_set_card_persist(GcnExi* exi, GcnExiCardPersistFn fn, void* user);
 
 /* ---- host-file persistence (ROADMAP M3: GCN_SRAM_FILE) --------------------
  * On-disk layout is the real GC "combined RTC+SRAM" blob, byte-identical to
