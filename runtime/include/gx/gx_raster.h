@@ -107,4 +107,9 @@ typedef struct {
 
 void gx_raster_get_pixel_stats(GxPixelStats* out);
 
+/* GCN_GX_TEV_CENSUS=1: print the distinct-shading-config census (draws +
+ * shaded pixels per config) — decides fused-path specialization targets.
+ * No-op unless the knob is on. Called from gx.c's shared stats cadence. */
+void gx_raster_print_census(void);
+
 #endif /* GCN_GX_GX_RASTER_H */

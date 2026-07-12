@@ -773,5 +773,9 @@ void gcn_gx_tick(u32 cycles) {
                 tc_tot > 0u ? 100.0 * (double)ps.texel_cache_hits / (double)tc_tot : 0.0);
             fflush(stderr);
         }
+
+        /* GCN_GX_TEV_CENSUS: per-config draw/pixel counters (no-op when off —
+         * the knob lives in gx_raster.c beside its data). */
+        gx_raster_print_census();
     }
 }

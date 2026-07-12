@@ -101,6 +101,26 @@ static u64 s_ps_tex_point;       /* ...of which point-sampled */
 static u64 s_ps_earlyz_rejected; /* raster_pixel_prep: early-Z rejected */
 static u64 s_ps_shaded;          /* tev_draw entries (own counter, see above) */
 static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
+
+/* ============================================================================
+ * GCN_GX_TEV_CENSUS=1: census of distinct per-draw shading configurations.
+ * Decides whether a fused specialized pixel path is worth building: if a
+ * handful of configs cover ~all shaded pixels, hand-fusing them (identical
+ * math, per-pixel selector switches folded to direct loads) is a large exact
+ * win; if configs are diverse, SIMD batching is the better attack. The
+ * signature hashes every field that determines the PIXEL-PATH CODE SHAPE
+ * (stage combiner words + enables + channel selection, alpha-test word,
+ * z/blend/dest-alpha state, counts) — NOT geometry or texture addresses,
+ * which vary per draw without changing the code path. A new config dumps its
+ * full field set once (see build_draw_cfg's census tail); per-config draw and
+ * shaded-pixel counters print on the shared cadence via
+ * gx_raster_print_census. Diagnostic only; default off; one untaken branch
+ * per draw (and one per pixel) when off. */
+#define GX_CENSUS_MAX 16
+typedef struct { int used; u32 hash; u64 draws, pixels; } GxCensusEntry;
+static int s_tev_census = -1;
+static GxCensusEntry s_census[GX_CENSUS_MAX];
+static int s_census_cur = -1;   /* index of the current draw's config, else -1 */
 static u64 s_ps_texel_cache_hits;   /* per-draw texel cache: decode_texel calls it satisfied */
 static u64 s_ps_texel_cache_misses; /* ...calls that had to fall through to a real decode */
 
@@ -1137,6 +1157,7 @@ static void blend_stage(Tev* t, u8* output) {
 static void tev_draw(Tev* t) {
     if (s_draw_stats) s_pixels_shaded++;    /* GCN_GX_STATS: pixels_shaded counter */
     if (s_pixel_stats) s_ps_shaded++;       /* GCN_GX_PIXEL_STATS: own shaded counter */
+    if (s_census_cur >= 0) s_census[s_census_cur].pixels++;  /* GCN_GX_TEV_CENSUS */
 
     u64 comb_t0 = 0, tex_before = 0;
     if (s_pixel_stats) { comb_t0 = __rdtsc(); tex_before = s_tsc_tex; }
@@ -2347,6 +2368,56 @@ static void build_draw_cfg(void) {
         tc->minlod = bits(mode1, 0, 8);
         tc->maxlod = bits(mode1, 8, 8);
     }
+
+    /* GCN_GX_TEV_CENSUS (see the block comment above this function). */
+    if (s_tev_census < 0) s_tev_census = getenv("GCN_GX_TEV_CENSUS") ? 1 : 0;
+    s_census_cur = -1;
+    if (s_tev_census) {
+        u32 h = 2166136261u;                     /* FNV-1a over shape fields */
+        #define CEN_MIX(v) do { h = (h ^ (u32)(v)) * 16777619u; } while (0)
+        CEN_MIX(s_cfg.numtevstages); CEN_MIX(s_cfg.numtexgens);
+        CEN_MIX(s_cfg.numcolchans);
+        CEN_MIX(s_cfg.zt_enable); CEN_MIX(s_cfg.zt_early); CEN_MIX(s_cfg.zt_func);
+        CEN_MIX(s_zt_upd); CEN_MIX(s_bm_cu); CEN_MIX(s_bm_au);
+        CEN_MIX(s_cfg.bm_blend_enable); CEN_MIX(s_cfg.bm_logic_enable);
+        CEN_MIX(s_cfg.bm_dither); CEN_MIX(s_cfg.bm_src_factor);
+        CEN_MIX(s_cfg.bm_dst_factor); CEN_MIX(s_cfg.bm_subtract);
+        CEN_MIX(s_cfg.bm_logic_mode);
+        CEN_MIX(s_cfg.da_enable); CEN_MIX(s_cfg.da_alpha);
+        CEN_MIX(s_bp[0xF3]);                     /* alpha-test word */
+        for (u32 st = 0; st <= s_cfg.numtevstages; st++) {
+            const TevStageCfg* sc = &s_cfg.stage[st];
+            CEN_MIX(sc->cc); CEN_MIX(sc->ac);    /* full combiner words */
+            CEN_MIX(sc->enable); CEN_MIX(sc->colorchan);
+        }
+        #undef CEN_MIX
+        int free_slot = -1;
+        for (int i = 0; i < GX_CENSUS_MAX; i++) {
+            if (s_census[i].used && s_census[i].hash == h) { s_census_cur = i; break; }
+            if (!s_census[i].used && free_slot < 0) free_slot = i;
+        }
+        if (s_census_cur < 0 && free_slot >= 0) {
+            s_census_cur = free_slot;
+            s_census[free_slot].used = 1;
+            s_census[free_slot].hash = h;
+            fprintf(stderr, "[gx-census] NEW config #%d hash=%08x stages=%u texgens=%u "
+                    "colchans=%u ztest=%u/%u/func%u zupd=%u blend=%u logic=%u/%u sub=%u "
+                    "dither=%u sf=%u df=%u da=%u/%u at=0x%06X",
+                    free_slot, h, s_cfg.numtevstages + 1u, s_cfg.numtexgens,
+                    s_cfg.numcolchans, s_cfg.zt_enable, s_cfg.zt_early, s_cfg.zt_func,
+                    s_zt_upd, s_cfg.bm_blend_enable, s_cfg.bm_logic_enable,
+                    s_cfg.bm_logic_mode, s_cfg.bm_subtract, s_cfg.bm_dither,
+                    s_cfg.bm_src_factor, s_cfg.bm_dst_factor,
+                    s_cfg.da_enable, s_cfg.da_alpha, s_bp[0xF3]);
+            for (u32 st = 0; st <= s_cfg.numtevstages; st++)
+                fprintf(stderr, " | st%u cc=%06X ac=%06X en=%u chan=%u",
+                        st, s_cfg.stage[st].cc, s_cfg.stage[st].ac,
+                        s_cfg.stage[st].enable, s_cfg.stage[st].colorchan);
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+        if (s_census_cur >= 0) s_census[s_census_cur].draws++;
+    }
 }
 
 /* Shared subset of build_draw_cfg() the EFB-copy path needs: pixel_format /
@@ -2505,6 +2576,28 @@ void gx_raster_get_pixel_stats(GxPixelStats* out) {
     out->blend_writes = s_ps_blend_writes;
     out->texel_cache_hits   = s_ps_texel_cache_hits;
     out->texel_cache_misses = s_ps_texel_cache_misses;
+}
+
+/* GCN_GX_TEV_CENSUS: dump the per-config draw/pixel counters (see the census
+ * comment near s_census). Called from gx.c's shared stats cadence; no-op
+ * unless the knob is on and at least one draw has been censused. */
+void gx_raster_print_census(void) {
+    if (s_tev_census != 1) return;
+    u64 total_px = 0;
+    for (int i = 0; i < GX_CENSUS_MAX; i++)
+        if (s_census[i].used) total_px += s_census[i].pixels;
+    if (total_px == 0) return;
+    fprintf(stderr, "[gx-census]");
+    for (int i = 0; i < GX_CENSUS_MAX; i++) {
+        if (!s_census[i].used) continue;
+        fprintf(stderr, " #%d:%08x draws=%llu px=%llu(%.1f%%)",
+                i, s_census[i].hash,
+                (unsigned long long)s_census[i].draws,
+                (unsigned long long)s_census[i].pixels,
+                100.0 * (double)s_census[i].pixels / (double)total_px);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 /* ============================================================================
