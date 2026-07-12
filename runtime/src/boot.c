@@ -184,6 +184,45 @@ static void card_persist_to_file(void* user, u32 ch, GcnMemcard* card) {
     }
 }
 
+/* Replicate Dolphin's SetCardFlashID (oracle: Core/HW/Sram.cpp:50-76). The
+ * console records each inserted card's "unlock identity" — a 12-byte flash id
+ * derived from the card's own header serial (the LCG inverse of the format-time
+ * keystream that produced the serial) — plus a one-byte checksum, in OSSramEx.
+ *
+ * This is load-bearing for the mount: the IPL's __CARDMountAsync, seeing a card
+ * whose ReadStatus reports already-unlocked (status bit 0x40, our 0xC1), does NOT
+ * re-run the unlock handshake — it TRUSTS the console-side SRAM record. It reads
+ * OSSramEx.flashID[slot], sums the 12 bytes, and requires
+ * flashIDCheckSum[slot] == (u8)~sum, else returns CARD_RESULT_IOERROR ("the
+ * object inserted cannot be used") BEFORE it ever issues SetInterrupt/ReadArray.
+ * A zero-filled SRAM (flashID all 0 -> ~sum == 0xFF) with a zero checksum fails
+ * that gate — which is exactly why our card never mounted while Dolphin's did
+ * (Dolphin runs SetCardFlashID from the memcard ctor; we didn't). Diagnosed with
+ * an independent SDK trace (session ChatGPT collab) and confirmed against
+ * Sram.cpp + EXI_DeviceMemoryCard.cpp:143-146.
+ *
+ * OSSramEx layout in our 0x40-byte SRAM image (== Dolphin settings+settings_ex,
+ * Sram.h): flash_id[2][12] at 0x14 / 0x20, flash_id_checksum[2] at 0x3A / 0x3B.
+ * These live in settings_ex, OUTSIDE the settings checksum's range
+ * (FixSRAMChecksums sums settings.rtc_bias..settings_ex), so writing them here
+ * does not perturb the SRAM the IPL already validated. `header20` is the card's
+ * first 20 bytes (serial[0..11] + format_time[12..19]). */
+static void set_card_flash_id(GcnExi* exi, u32 ch, const u8* header20) {
+    if (ch >= 2u) return;
+    u8* flash_id = exi->sram + 0x14u + ch * 12u;
+    u64 rand = 0;                                  /* swap64(&header20[12]) BE */
+    for (int i = 0; i < 8; i++) rand = (rand << 8) | header20[12 + i];
+    u8 csum = 0;
+    for (int i = 0; i < 12; i++) {
+        rand = ((rand * 0x41c64e6dULL) + 0x3039ULL) >> 16;
+        flash_id[i] = (u8)(header20[i] - ((u8)rand & 0xFFu));
+        csum = (u8)(csum + flash_id[i]);
+        rand = ((rand * 0x41c64e6dULL) + 0x3039ULL) >> 16;
+        rand &= 0x7FFFULL;
+    }
+    exi->sram[0x3Au + ch] = (u8)(csum ^ 0xFFu);
+}
+
 /* Install a formatted/loaded memory card on `ch`. `path` (may be NULL) is the
  * .raw backing. Returns the malloc'd card image (owned by `card` after
  * gcn_memcard_init) or NULL on hard failure. */
@@ -234,6 +273,12 @@ static void setup_memcard(GcnExi* exi, u32 ch, GcnMemcard* card, const char* pat
     gcn_memcard_init(card, img, sz);   /* takes ownership of img */
     s_card_persist_ctx.path[ch] = (path && *path) ? path : NULL;
     gcn_exi_set_memcard(exi, ch, card);
+
+    /* Record this card's flash id + checksum in OSSramEx so the IPL's mount gate
+     * (which trusts the console-side unlock identity for an already-unlocked card)
+     * passes instead of returning IOERROR. See set_card_flash_id above. Uses the
+     * card's first 20 header bytes (serial + format_time). */
+    set_card_flash_id(exi, ch, img);
 }
 
 int main(int argc, char** argv) {
