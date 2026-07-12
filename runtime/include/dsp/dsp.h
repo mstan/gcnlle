@@ -119,6 +119,10 @@ void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem
 void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user);
 void gcn_dsp_free(GcnDsp* dsp);
 void gcn_dsp_tick(u32 ppc_cycles);   /* advance the DSP core (called per block) */
+/* Run all owed DSP cycles now. Called before any CPU observation of DSP state
+ * (DSP MMIO, PI INTSR/INTMR, debug queries). No-op when batching is off or
+ * nothing is owed. Preserves the /6 remainder as still-owed. See dsp.c. */
+void gcn_dsp_flush(void);
 u32  gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 

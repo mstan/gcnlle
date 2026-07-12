@@ -12,6 +12,7 @@
 #include "debug/debug_server.h"
 #include "debug/rings.h"
 #include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
+#include "dsp/dsp.h"       /* gcn_dsp_flush: catch a batched core up before dsp_state peeks it */
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
 #include "si/si.h"         /* set_input: injected pad-report surface */
 
@@ -208,7 +209,10 @@ static void handle_line(Client* c, const char* line) {
     else if (!strcmp(cmd, "dsp_state")) {
         /* Live DSP-LLE core state: pc, control reg, and non-consuming peeks of
          * both mailboxes (bit 31 = mail pending). Diagnoses CPU<->DSP task
-         * handshake stalls without perturbing the run. */
+         * handshake stalls without perturbing the run. Flush first — a
+         * batched core's owed debt must be run before these peeks, or the
+         * answer reports a stale pc/mailbox. */
+        gcn_dsp_flush();
         n = snprintf(s_resp, GCN_DBG_RESP_CAP,
             "{\"ok\":true,\"pc\":%u,\"control\":%u,"
             "\"mbox_dsp_to_cpu\":%u,\"mbox_cpu_to_dsp\":%u}\n",

@@ -23,6 +23,19 @@
 /* The dispatch loop ticks one DSP (like the one VI/DI); registered at init. */
 static GcnDsp* s_dsp = NULL;
 
+/* Lazy DSP RunCycles batching (perf). dsp_lle_update() -> DSPCore::RunCycles()
+ * carries a measured ~330 ns FIXED per-call overhead (cache-cold re-entry into
+ * the interpreter) that was 89% of total runtime when paid once per executed
+ * PPC block (dispatch.c's per-block gcn_dsp_tick call). Instead of stepping the
+ * core every block, accumulate the PPC-cycle debt here and run the SAME total
+ * DSP cycles in far fewer, larger RunCycles calls (gcn_dsp_flush), flushing
+ * whenever the CPU is about to observe DSP state or the debt crosses
+ * s_batch_ppc. Total DSP cycles executed over a run is unchanged; only call
+ * granularity is. */
+static u32 s_owed_ppc = 0;      /* PPC-cycle debt not yet run on the DSP core */
+static int s_batch = -1;        /* GCN_DSP_BATCH: default on, "0" disables    */
+static u32 s_batch_ppc = 4096;  /* GCN_DSP_BATCH_PPC: flush cap (PPC cycles)  */
+
 void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user) {
     dsp->irq = fn;
     dsp->irq_user = user;
@@ -97,17 +110,79 @@ static void dsp_aid_tick(GcnDsp* dsp) {
     }
 }
 
+/* Run all owed DSP cycles now (declared in dsp.h). Called before any CPU
+ * observation of DSP state: DSP MMIO read/write (below), PI INTSR/INTMR
+ * (pi.c), and the debug_server dsp_state query — the exact points where the
+ * guest (or the debugger) could otherwise see a batched-but-not-yet-run core.
+ * No-op when batching is off (s_owed_ppc stays 0, see gcn_dsp_tick) or when
+ * nothing is owed. dsp_lle_update() itself divides by 6 for the DSP:CPU clock
+ * ratio (dsp_lle_c.cpp:132); truncating that division away here would lose
+ * sub-/6 cycles at every flush and change the total DSP cycles executed over
+ * the run, so only the WHOLE multiple-of-6 part of the debt is run now and the
+ * remainder stays owed — the same total executes regardless of where flushes
+ * land, only call granularity changes.
+ *
+ * Do NOT add flush call sites beyond the ones enumerated above (no
+ * EE-transition hook, no AI regs, no VI): the per-block s_batch_ppc cap
+ * already bounds how stale DSP-driven state can get on any path that isn't a
+ * direct observation. */
+void gcn_dsp_flush(void) {
+    u32 whole = s_owed_ppc - (s_owed_ppc % 6u);   /* keep the sub-/6 residue owed */
+    if (whole == 0u) return;
+    s_owed_ppc -= whole;
+    dsp_lle_update((int)whole);
+    /* A flush can complete a mailbox post or raise the core's interrupt
+     * request; project it to dsp->csr and the PI line immediately, exactly as
+     * the per-block path in gcn_dsp_tick does after every dsp_lle_update. The
+     * interrupt chain invariant is that a core step is always immediately
+     * followed by latch+update — a flush that skipped this would leave a
+     * freshly-posted mailbox or ARAM/AID condition visible to the caller (e.g.
+     * gcn_dsp_read of MBOX_OUT, just below) while the CSR/PI line still
+     * reported the pre-flush (stale) state until the next per-block tick. */
+    if (s_dsp) {
+        dsp_latch_mailbox_int(s_dsp);
+        dsp_update_interrupts(s_dsp);
+    }
+}
+
 void gcn_dsp_tick(u32 ppc_cycles) {
     /* bisect guard, read once (getenv per block was a measurable hot-path cost). */
     static int s_notick = -1;
     if (s_notick < 0) s_notick = getenv("GCN_DSP_NOTICK") ? 1 : 0;
     if (s_notick) return;
-    dsp_lle_update((int)ppc_cycles);
+
+    /* Batching config, read once (same lazy pattern as s_notick above). */
+    if (s_batch < 0) {
+        const char* e = getenv("GCN_DSP_BATCH");
+        s_batch = (e && !strcmp(e, "0")) ? 0 : 1;
+        const char* k = getenv("GCN_DSP_BATCH_PPC");
+        if (k && *k) {
+            u32 v = (u32)strtoul(k, NULL, 0);
+            s_batch_ppc = (v < 6u) ? 6u : v;   /* a cap under 6 could never flush a whole cycle */
+        }
+    }
+
+    if (s_batch) {
+        /* Accrue debt; run it in one larger RunCycles call once it crosses the
+         * cap, rather than a tiny one every block. RunCycles returning early on
+         * an idle/halted core (dsp_lle_c.cpp:129) reports the budget consumed
+         * BY DESIGN — a waiting DSP discards wall-clock rather than banking it
+         * — so debt is cleared at flush unconditionally; it is never re-credited
+         * based on how much the core actually stepped. */
+        s_owed_ppc += ppc_cycles;
+        if (s_owed_ppc >= s_batch_ppc)
+            gcn_dsp_flush();
+    } else {
+        dsp_lle_update((int)ppc_cycles);   /* legacy per-block path, byte-identical */
+    }
+
     /* Latch a pending DSP->CPU mailbox interrupt and (re)assert the PI line every
      * block. This is what lets the interrupt reach PI while the guest sits in the
      * OS idle loop waiting on it — delivery no longer depends on the guest
      * happening to read the CSR (see read_csr). Level-triggered re-assertion also
-     * restores the line after a W1C ack of a still-pending source. */
+     * restores the line after a W1C ack of a still-pending source. This cheap
+     * CPU-side bookkeeping stays PER BLOCK regardless of batching — only the
+     * expensive DSP core step above is deferred. */
     if (s_dsp) {
         dsp_latch_mailbox_int(s_dsp);
         dsp_aid_tick(s_dsp);
@@ -196,6 +271,11 @@ u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     (void)cpu; (void)size;
     GcnDsp* dsp = (GcnDsp*)user;
     u32 off = addr - GCN_DSP_BASE;
+    /* Catch the core up before any observation: mailbox reads (both boxes,
+     * both halves), CSR read, and the AR/AID register reads below must all see
+     * a core that has run every PPC cycle owed to it so far, not one still
+     * sitting on batched-but-unrun debt. */
+    gcn_dsp_flush();
     switch (off) {
     case GCN_DSP_MBOX_IN_H:  return dsp_lle_read_mbox_hi(1);  /* CPU->DSP box */
     case GCN_DSP_MBOX_IN_L:  return dsp_lle_read_mbox_lo(1);
@@ -248,6 +328,15 @@ static void write16_aid(GcnDsp* dsp, u32 off, u16 value) {
 void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     GcnDsp* dsp = (GcnDsp*)user;
     u32 off = addr - GCN_DSP_BASE;
+
+    /* Catch the core up before any write that a batched core could observe
+     * out of order: a mailbox write must not later be consumed by a core
+     * still running in its own past; a CSR write's DSP-owned bits run
+     * CheckExternalInterrupt synchronously (dsp_lle_write_control, below) and
+     * must act on a caught-up core; and the AR_CNT ARAM-DMA kick memcpys live
+     * ARAM the DSP accelerator writes during RunCycles, so the copy below must
+     * see a caught-up ARAM. */
+    gcn_dsp_flush();
 
     switch (off) {
     case GCN_DSP_MBOX_IN_H:  /* CPU->DSP mail (command) — a real handshake edge */

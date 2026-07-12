@@ -7,6 +7,7 @@
  */
 #include "pi/pi.h"
 #include "debug/rings.h"
+#include "dsp/dsp.h"   /* gcn_dsp_flush: catch the DSP core up before INTSR/INTMR observe it */
 
 #include <string.h>
 
@@ -77,8 +78,15 @@ u32 gcn_pi_read(void* user, CPUState* cpu, u32 addr, u8 size) {
     (void)cpu; (void)size;
     GcnPi* pi = (GcnPi*)user;
     u32 off = addr - GCN_PI_BASE;
-    if (off == GCN_PI_INTSR)
+    if (off == GCN_PI_INTSR) {
+        /* The guest can poll the cause word with MSR[EE]=0 (no exception
+         * delivery), so a batched DSP core must be caught up before this read
+         * — the DSP cause bit (0x40, INT_CAUSE_DSP) has to be fresh even
+         * though gcn_pi_deliver_external never ran to trigger a flush
+         * indirectly. */
+        gcn_dsp_flush();
         return pi->intsr;               /* live interrupt-cause word */
+    }
     if (off == GCN_PI_REVISION)
         return GCN_PI_REVISION_RETAIL;  /* read-only chipset revision */
     return pi->reg[pi_index(addr)];
@@ -90,6 +98,15 @@ void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     u32 off = addr - GCN_PI_BASE;
     if (off == GCN_PI_INTSR) {
         pi->intsr &= ~value;            /* write-1-to-clear; level sources re-assert */
+        return;
+    }
+    if (off == GCN_PI_INTMR) {
+        /* Unmasking a cause makes a pending-but-stale DSP interrupt (batched
+         * debt not yet run) newly deliverable, so catch the core up before the
+         * new mask takes effect — otherwise a real pending DSP condition could
+         * be missed for one more block. */
+        gcn_dsp_flush();
+        pi->reg[pi_index(addr)] = value;
         return;
     }
     if (off == GCN_PI_FIFO_RESET) {
