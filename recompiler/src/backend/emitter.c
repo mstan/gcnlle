@@ -1832,6 +1832,240 @@ static bool ppc_op_always_exits(PPCOpcode op) {
     return op == PPC_OP_B || op == PPC_OP_SC || op == PPC_OP_RFI;
 }
 
+/* Phase B (codegen speed campaign): whitelist of opcodes whose emitted body
+ * NEVER needs an accurate ctx->pc -- i.e. it is safe to elide the per-
+ * instruction `ctx->pc = 0x...;` stamp emit_function used to print
+ * unconditionally before every instruction. Derived by auditing every case
+ * emit_instruction_with_range can emit against cpu.h's helper prototypes and
+ * the real runtime implementations (recompiler/src/cpu/cpu.c,
+ * runtime/src/cpu_glue.c, memory.c, mmio.c):
+ *
+ *   - Pure register/CR/FPU/PS arithmetic and compares emit nothing but
+ *     `ctx->gpr/fpr/ps1/cr/xer/fpscr[...]` reads+writes, plus (for the
+ *     .-oe/.rc forms) calls to ppc_set_xer_ov/ppc_fpscr_updated/ppc_fres/
+ *     ppc_frsqrte/ppc_fma/ppc_fctiw/ppc_ps_res/ppc_ps_rsqrte -- every one of
+ *     those helpers takes CPUState* but (verified in cpu.c/cpu_glue.c) never
+ *     reads or writes cpu->pc, so ctx->pc is dead across the call.
+ *   - SYNC/EIEIO/ISYNC/TLBSYNC call ppc_memory_fence(void), which doesn't
+ *     even take a CPUState* -- structurally can't touch pc.
+ *   - DCBST/DCBF/DCBTST/DCBT/DCBI/ICBI emit only `(void)ctx;` (no-ops in
+ *     this model) -- nothing to observe.
+ *   - MFMSR/MTMSR/MFSR/MFSRIN/MTSR/MTSRIN/MFCR/MTCRF/MCRF/MCRXR and the CR
+ *     logical ops touch only their own named fields, no helper calls at all.
+ *   - B/BC/BCLR/BCCTR (ppc_op_is_branch) are deliberately NOT elided here --
+ *     they get their own entry via emit_direct_branch/emit_dynamic_branch,
+ *     which ALREADY write ctx->pc explicitly on every taken/exit path
+ *     (verified: emit_branch_condition/emit_direct_branch/emit_dynamic_branch
+ *     never *read* ctx->pc, so the pre-instruction stamp was always
+ *     redundant for them -- this table just makes that existing fact
+ *     explicit instead of re-deriving it ad hoc).
+ *
+ * Everything NOT in this whitelist is conservatively treated as pc-
+ * observing and keeps its stamp byte-identical to before Phase B. That
+ * covers, per the campaign's WHO OBSERVES ctx->pc enumeration:
+ *   - Memory access: every load/store (incl. float, paired-single quantized,
+ *     lswi/lswx/stswi/stswx/lmw/stmw, lwarx/stwcx/stfiwx, dcbz) bottoms out
+ *     in mem_readN/mem_writeN, which take only (ctx, addr) -- no cia
+ *     parameter -- and read ctx->pc directly to log the always-on rings,
+ *     the card-traffic ring, and the oracle trace (runtime/src/memory.c
+ *     gcn_trace_mmio, runtime/src/mmio.c gcn_ring_mmio/gcn_trace_mmio).
+ *   - SPR access (mftb/mfspr/mtspr/tlbie), dcbz_l, eciwx/ecowx, and sc/trap/
+ *     rfi all call ctx-taking runtime helpers that can raise ctx->exception
+ *     (ppc_take_exception, called through ppc_program_exception/ppc_dsi_
+ *     exception/ppc_alignment_exception, unconditionally OVERWRITES ctx->pc
+ *     to the exception vector using the explicitly-passed cia, not ctx->pc)
+ *     -- kept stamped per the class RULE (any ctx-taking helper call is
+ *     conservatively pc-observing) even where today's implementation
+ *     doesn't strictly need the pre-existing value, because (a) correctness
+ *     must win over elision on an ambiguous/low-frequency class and (b) it
+ *     keeps this table auditable against the RULE alone, not against every
+ *     runtime .c file's current internals.
+ *   - The unresolved-opcode default calls ppc_fallback_instruction, which
+ *     can invoke an opaque host callback (ctx->instruction_fallback) whose
+ *     behavior isn't visible here -- always kept stamped, along with
+ *     PPC_OP_UNKNOWN and any future opcode not yet added to either switch
+ *     (the `default: return false` below is deliberately the safe branch).
+ *
+ * Interrupt-delivery note (why eliding the stamp on PURE instructions is
+ * safe even though the dispatch loop delivers asynchronous interrupts using
+ * ctx->pc as the resume address): dispatch only ever reads ctx->pc for that
+ * purpose AFTER a dolrecomp_call return (runtime/src/dispatch.c), and every
+ * return path in generated code -- branch taken, exception guard, deadline
+ * yield, end-of-chunk fallthrough -- already writes ctx->pc explicitly
+ * before returning. A pc left stale between two PURE instructions inside a
+ * still-running chunk is never observed by anything. */
+static bool ppc_op_is_pc_pure(PPCOpcode op) {
+    switch (op) {
+    case PPC_OP_MULLI:
+    case PPC_OP_SUBFIC:
+    case PPC_OP_ADDI:
+    case PPC_OP_ADDIC:
+    case PPC_OP_ADDIC_DOT:
+    case PPC_OP_ADDIS:
+    case PPC_OP_CMPI:
+    case PPC_OP_CMPLI:
+    case PPC_OP_CMP:
+    case PPC_OP_CMPL:
+    case PPC_OP_ORI:
+    case PPC_OP_ORIS:
+    case PPC_OP_XORI:
+    case PPC_OP_XORIS:
+    case PPC_OP_ANDI:
+    case PPC_OP_ANDIS:
+    case PPC_OP_ADD:
+    case PPC_OP_ADDO:
+    case PPC_OP_ADDC:
+    case PPC_OP_ADDCO:
+    case PPC_OP_ADDE:
+    case PPC_OP_ADDEO:
+    case PPC_OP_ADDME:
+    case PPC_OP_ADDMEO:
+    case PPC_OP_ADDZE:
+    case PPC_OP_ADDZEO:
+    case PPC_OP_SUBF:
+    case PPC_OP_SUBFO:
+    case PPC_OP_SUBFC:
+    case PPC_OP_SUBFCO:
+    case PPC_OP_SUBFE:
+    case PPC_OP_SUBFEO:
+    case PPC_OP_SUBFME:
+    case PPC_OP_SUBFMEO:
+    case PPC_OP_SUBFZE:
+    case PPC_OP_SUBFZEO:
+    case PPC_OP_NEG:
+    case PPC_OP_NEGO:
+    case PPC_OP_MULLW:
+    case PPC_OP_MULLWO:
+    case PPC_OP_MULHW:
+    case PPC_OP_MULHWU:
+    case PPC_OP_DIVW:
+    case PPC_OP_DIVWO:
+    case PPC_OP_DIVWU:
+    case PPC_OP_DIVWUO:
+    case PPC_OP_AND:
+    case PPC_OP_ANDC:
+    case PPC_OP_OR:
+    case PPC_OP_ORC:
+    case PPC_OP_XOR:
+    case PPC_OP_NAND:
+    case PPC_OP_NOR:
+    case PPC_OP_EQV:
+    case PPC_OP_CNTLZW:
+    case PPC_OP_EXTSB:
+    case PPC_OP_EXTSH:
+    case PPC_OP_SLW:
+    case PPC_OP_SRW:
+    case PPC_OP_SRAW:
+    case PPC_OP_SRAWI:
+    case PPC_OP_RLWINM:
+    case PPC_OP_RLWNM:
+    case PPC_OP_RLWIMI:
+    case PPC_OP_FADDS:
+    case PPC_OP_FSUBS:
+    case PPC_OP_FMULS:
+    case PPC_OP_FDIVS:
+    case PPC_OP_FRES:
+    case PPC_OP_FMADDS:
+    case PPC_OP_FMSUBS:
+    case PPC_OP_FNMADDS:
+    case PPC_OP_FNMSUBS:
+    case PPC_OP_FADD:
+    case PPC_OP_FSUB:
+    case PPC_OP_FMUL:
+    case PPC_OP_FDIV:
+    case PPC_OP_FRSQRTE:
+    case PPC_OP_FMADD:
+    case PPC_OP_FMSUB:
+    case PPC_OP_FNMADD:
+    case PPC_OP_FNMSUB:
+    case PPC_OP_FCTIW:
+    case PPC_OP_FCTIWZ:
+    case PPC_OP_FMR:
+    case PPC_OP_FNEG:
+    case PPC_OP_FABS:
+    case PPC_OP_FNABS:
+    case PPC_OP_FRSP:
+    case PPC_OP_FSEL:
+    case PPC_OP_FCMPU:
+    case PPC_OP_FCMPO:
+    case PPC_OP_MTFSB0:
+    case PPC_OP_MTFSB1:
+    case PPC_OP_MCRFS:
+    case PPC_OP_MFFS:
+    case PPC_OP_MTFSF:
+    case PPC_OP_MTFSFI:
+    case PPC_OP_PS_ADD:
+    case PPC_OP_PS_SUB:
+    case PPC_OP_PS_MUL:
+    case PPC_OP_PS_DIV:
+    case PPC_OP_PS_RES:
+    case PPC_OP_PS_RSQRTE:
+    case PPC_OP_PS_MADD:
+    case PPC_OP_PS_MSUB:
+    case PPC_OP_PS_NMADD:
+    case PPC_OP_PS_NMSUB:
+    case PPC_OP_PS_NEG:
+    case PPC_OP_PS_ABS:
+    case PPC_OP_PS_NABS:
+    case PPC_OP_PS_MR:
+    case PPC_OP_PS_SUM0:
+    case PPC_OP_PS_SUM1:
+    case PPC_OP_PS_MULS0:
+    case PPC_OP_PS_MULS1:
+    case PPC_OP_PS_MADDS0:
+    case PPC_OP_PS_MADDS1:
+    case PPC_OP_PS_MERGE00:
+    case PPC_OP_PS_MERGE01:
+    case PPC_OP_PS_MERGE10:
+    case PPC_OP_PS_MERGE11:
+    case PPC_OP_PS_CMPU0:
+    case PPC_OP_PS_CMPO0:
+    case PPC_OP_PS_CMPU1:
+    case PPC_OP_PS_CMPO1:
+    case PPC_OP_PS_SEL:
+    case PPC_OP_DCBST:
+    case PPC_OP_DCBF:
+    case PPC_OP_DCBTST:
+    case PPC_OP_DCBT:
+    case PPC_OP_DCBI:
+    case PPC_OP_ICBI:
+    case PPC_OP_B:
+    case PPC_OP_BC:
+    case PPC_OP_BCLR:
+    case PPC_OP_BCCTR:
+    case PPC_OP_CRAND:
+    case PPC_OP_CRANDC:
+    case PPC_OP_CREQV:
+    case PPC_OP_CRNAND:
+    case PPC_OP_CRNOR:
+    case PPC_OP_CROR:
+    case PPC_OP_CRORC:
+    case PPC_OP_CRXOR:
+    case PPC_OP_MCRF:
+    case PPC_OP_MCRXR:
+    case PPC_OP_MFCR:
+    case PPC_OP_MTCRF:
+    case PPC_OP_MFMSR:
+    case PPC_OP_MTMSR:
+    case PPC_OP_MFSR:
+    case PPC_OP_MFSRIN:
+    case PPC_OP_MTSR:
+    case PPC_OP_MTSRIN:
+    case PPC_OP_SYNC:
+    case PPC_OP_EIEIO:
+    case PPC_OP_ISYNC:
+    case PPC_OP_TLBSYNC:
+        return true;
+    default:
+        /* Everything not explicitly whitelisted above -- every memory
+         * access, PSQ_L/PSQ_ST, LSWI/LSWX/STSWI/STSWX/LMW/STMW, LWARX/
+         * STWCX/STFIWX/DCBZ, DCBZ_L, MFTB/MFSPR/MTSPR/TLBIE, ECIWX/ECOWX,
+         * SC/RFI/TWI/TW, PPC_OP_UNKNOWN, and any opcode added later that
+         * isn't yet cased here -- stays pc-observing. */
+        return false;
+    }
+}
+
 /* Basic-block leaders and per-block cumulative cycle costs for `insts`.
  *
  * `is_leader[i]` marks instruction i as the start of a fresh block (cum[]
@@ -1932,7 +2166,22 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
         bool block_ends_here = (i + 1 == count) || is_leader[i + 1];
 
         fprintf(out, "label_%08X:\n", insts[i].address);
-        fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        /* Phase B (codegen speed campaign): the per-instruction ctx->pc
+         * store used to be unconditional here -- the single largest
+         * remaining per-instruction memory write after Phase A coalesced
+         * cycle charging. Emit it only when this instruction's body can
+         * actually observe ctx->pc (see ppc_op_is_pc_pure's derivation
+         * above); every switch-dispatch/goto entry above already lands on
+         * this label with ctx->pc already equal to insts[i].address (that's
+         * how the switch(ctx->pc) dispatch works), so skipping the stamp on
+         * a run of PURE instructions is a no-op until either (a) a later
+         * pc-observing instruction in the same block re-stamps accurately,
+         * or (b) an exit path (branch taken, guard, end-of-chunk) writes
+         * ctx->pc explicitly -- both of which happen on every path that can
+         * actually leave this chunk or call into the host. */
+        if (!insts[i].embedded_data && !ppc_op_is_pc_pure(insts[i].op)) {
+            fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        }
         /* Cycle cost is coalesced per basic block, charged at each exit
          * (return/goto emitted inside the instruction body, e.g. a taken
          * branch or an exception guard) rather than once per instruction:
