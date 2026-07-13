@@ -14,6 +14,10 @@
 #include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
 #include <string.h>
 #include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
+#include <windows.h>     /* G3 pipeline worker: CreateThread +
+                          * WaitOnAddress/WakeByAddressAll (same idiom as
+                          * gx_raster.c's GX-MT pool and dsp.c's worker). */
+#include <immintrin.h>   /* _mm_pause in the pipeline spin phases */
 
 /* Staging ("video buffer") capacity. Fifo.cpp keeps a linear buffer that
  * accumulates 32-byte chunks and is consumed a whole-command-at-a-time; leftover
@@ -140,6 +144,353 @@ static int note_once(u8* flag) {
     if (*flag) return 0;
     *flag = 1;
     return 1;
+}
+
+/* ============================================================================
+ * G3: CPU/GX pipeline (GCN_GX_PIPELINE=1, perf campaign 2 — see
+ * docs/PERF_CAMPAIGN_2.md and the recon notes therein).
+ *
+ * The split that keeps this exact: the CP FIFO STATE MACHINE is pure
+ * arithmetic (32-byte chunks, the per-tick drain budget, the breakpoint
+ * gate — no command decode involved), so it STAYS on the CPU thread inside
+ * gcn_gx_tick, byte-identical to the synchronous design: every CP register
+ * the guest can read (STATUS/RPTR/WPTR/RW_DIST, watermark interrupt state)
+ * is computed from CPU-side state at exactly the synchronous positions,
+ * with no cross-thread coordination at all. Only EXECUTION is deferred:
+ * the drained chunk bytes (already a snapshot — same memcpy the sync path
+ * does into the staging buffer) go into an SPSC ring; the worker decodes
+ * them (gx_run: XF/BP/CP-vertex state, draws incl. the nested GX-MT
+ * fork/join, EFB copies, TLUT snapshots) at its own pace.
+ *
+ * PE finish/token is the one observable that would drift (INTSR-visible,
+ * the guest polls INTSR constantly): a producer-side SCANNER sizes the
+ * top-level command stream as it is pushed and, on any LOAD_BP touching PE
+ * regs 0x45/0x47/0x48, records a FENCE at that command's end offset; the
+ * tick that pushed a fence waits for the worker to retire through it
+ * before returning — so the PE signal (raised by the worker mid-wait, on
+ * the PI struct the CPU is provably not touching while it spins here)
+ * lands in the SAME tick the synchronous design raised it. Boot cost: one
+ * short join per frame (SETDRAWDONE), full overlap inside the frame.
+ *
+ * The scanner only understands the fixed-size top-level opcodes (NOP,
+ * LOAD_CP/XF/INDX/BP, CALL_DL, 0x44, INVL_VC, unknown-1-byte). A top-level
+ * PRIMITIVE needs live VCD/VAT state to size (owned by the worker), so it
+ * POISONS the pipeline: drain fully, hand the staging leftover back to the
+ * CPU (scanner carry == worker leftover by construction: both are "bytes
+ * past the last whole top-level command"), and run synchronously from then
+ * on, loudly. The IPL never emits top-level primitives (all 994 observed
+ * draws live inside display lists — docs/GX_INVENTORY.md), so the boot
+ * never poisons; a future game that does gets bit-exact sync behavior and
+ * a log line instead of silent risk.
+ *
+ * Deliberate, gate-arbitrated residual (same class the DSP thread ships
+ * with, and the same model Dolphin's dual-core uses): CALL_DL bytes,
+ * indexed vertex arrays, textures and TLUT sources are read from guest RAM
+ * at WORKER execution time, not producer push time. If the guest mutated
+ * that memory between push and execution the result could differ from
+ * synchronous consumption — the four golden XFB hashes (repeat-run
+ * deterministic) + the oracle value+order diff are the arbiters, exactly
+ * as they were for GCN_DSP_THREAD. EFB->XFB copies also land in guest RAM
+ * from the worker: the end-of-run drain (boot.c, before GCN_MEM_DUMP), the
+ * debug-server screenshot drain, and the fifo-reset drain keep every
+ * gate-visible reader exact; the mid-run host-window present may see a
+ * field one frame stale, which is a visual non-event.
+ * ==========================================================================*/
+static u32 rd32(const u8* p);                                    /* defined below */
+static u32 gx_run(GcnGx* gx, const u8* data, u32 available);     /* defined below */
+
+#define GX_PIPE_CAP (1u << 20)   /* 1 MiB ring; multiple of 32 so chunks never wrap */
+static u8           s_pipe_ring[GX_PIPE_CAP];
+static volatile s64 s_pipe_produced = 0;   /* CPU: bytes pushed (always 32-aligned) */
+static volatile s64 s_pipe_retired  = 0;   /* worker: bytes fully decoded via gx_run */
+static volatile s64 s_pipe_done_upto = 0;  /* worker: produced-offset it has fully
+                                            * PROCESSED (pulled + gx_run ran) — a
+                                            * partial command tail keeps retired
+                                            * below this forever, so full drains
+                                            * wait on THIS, not on retired. */
+static volatile s32 s_pipe_parked   = 0;   /* worker inside WaitOnAddress            */
+static volatile s32 s_pipe_waiting  = 0;   /* CPU inside WaitOnAddress               */
+static volatile s32 s_pipe_quit     = 0;
+static HANDLE       s_pipe_h        = NULL;
+static int          s_pipe_on       = -1;  /* GCN_GX_PIPELINE=1 enables; -1 unresolved */
+static int          s_pipe_poisoned = 0;   /* scanner overflow (bug guard): permanent sync */
+static int          s_pipe_syncmode = 0;   /* unsizable top-level cmd (e.g. a top-level
+                                            * PRIM — the IPL draws one 4-vertex quad
+                                            * per frame outside any display list):
+                                            * execute synchronously until the scanner
+                                            * can re-seed from the staging leftover,
+                                            * then resume pipelining. Recoverable. */
+
+/* Producer-side scanner state: bytes of a top-level command split across
+ * chunk boundaries. Largest sizable command is LOAD_XF (5 + 16*4 = 69), so
+ * the worst carry leftover is 68 bytes (one byte short of whole) and the
+ * buffer must hold leftover + one chunk = 100; 128 for slack. */
+static u8  s_scan_carry[128];
+static u32 s_scan_carry_len = 0;
+static s64 s_scan_pos = 0;        /* cumulative stream offset of carry[0] */
+
+static DWORD WINAPI gx_pipe_worker(LPVOID param);
+
+static int gx_pipe_on(void) {
+    if (s_pipe_on < 0) {
+        const char* e = getenv("GCN_GX_PIPELINE");
+        s_pipe_on = (e && e[0] == '1') ? 1 : 0;
+        if (s_pipe_on) {
+            s_pipe_h = CreateThread(NULL, 0, gx_pipe_worker, NULL, 0, NULL);
+            if (!s_pipe_h) s_pipe_on = 0;
+        }
+    }
+    return s_pipe_on && !s_pipe_poisoned && !s_pipe_syncmode;
+}
+
+/* Wait until the worker has retired through `target` produced-bytes. */
+static void gx_pipe_wait_retired(s64 target) {
+    int spins = 0;
+    for (;;) {
+        s64 r = __atomic_load_n(&s_pipe_retired, __ATOMIC_ACQUIRE);
+        if (r >= target) return;
+        if (++spins < 16384) { _mm_pause(); continue; }
+        s64 expect = r;
+        __atomic_store_n(&s_pipe_waiting, 1, __ATOMIC_SEQ_CST);
+        WaitOnAddress((volatile VOID*)&s_pipe_retired, &expect, sizeof expect, INFINITE);
+        __atomic_store_n(&s_pipe_waiting, 0, __ATOMIC_SEQ_CST);
+    }
+}
+
+/* Public join: every whole command pushed so far is decoded (a partial
+ * command tail may legitimately remain in the worker's staging — exactly
+ * like the synchronous design's gx->buf leftover). Waits on done_upto, NOT
+ * retired: retired can never reach `produced` while a partial tail exists,
+ * and waiting on it deadlocked the first implementation. Called before any
+ * gate-visible read of GX-produced state that is not already fenced:
+ * end-of-run (boot.c pre-GCN_MEM_DUMP), debug-server screenshots, the PI
+ * fifo-reset hook (gp.c), and the poison transition below. */
+void gcn_gx_pipeline_drain(void) {
+    if (s_pipe_on != 1) return;
+    s64 target = __atomic_load_n(&s_pipe_produced, __ATOMIC_RELAXED);
+    int spins = 0;
+    for (;;) {
+        s64 d = __atomic_load_n(&s_pipe_done_upto, __ATOMIC_ACQUIRE);
+        if (d >= target) return;
+        if (++spins < 16384) { _mm_pause(); continue; }
+        s64 expect = d;
+        __atomic_store_n(&s_pipe_waiting, 1, __ATOMIC_SEQ_CST);
+        WaitOnAddress((volatile VOID*)&s_pipe_done_upto, &expect, sizeof expect, INFINITE);
+        __atomic_store_n(&s_pipe_waiting, 0, __ATOMIC_SEQ_CST);
+    }
+}
+
+static void gx_pipe_push_chunk(const u8* src) {
+    /* Ring-full backpressure (worker a full MiB behind): wait for space.
+     * retired <= pulled, so gating space on retired is conservative. */
+    s64 produced = s_pipe_produced;
+    gx_pipe_wait_retired(produced + GCN_CP_GATHER_PIPE_SIZE - (s64)GX_PIPE_CAP);
+    memcpy(s_pipe_ring + (produced & (GX_PIPE_CAP - 1)), src, GCN_CP_GATHER_PIPE_SIZE);
+    __atomic_store_n(&s_pipe_produced, produced + GCN_CP_GATHER_PIPE_SIZE,
+                     __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_pipe_parked, __ATOMIC_SEQ_CST))
+        WakeByAddressAll((PVOID)&s_pipe_produced);
+}
+
+/* Size one top-level command at data[0..len). Returns the command size, 0 if
+ * len doesn't yet hold enough to size it, or (u32)-1 for PRIM/unsizable
+ * (poison). Mirrors gx_run_command's sizes EXACTLY (incl. the NOP run and
+ * the unknown-opcode 1-byte advance). */
+static u32 gx_scan_command(const u8* data, u32 len, int* fence) {
+    if (len < 1u) return 0;
+    const u8 op = data[0];
+    switch (op) {
+    case GX_OP_NOP: {
+        u32 count = 1;
+        while (count < len && data[count] == GX_OP_NOP) count++;
+        /* A NOP run truncated by the chunk edge is fine to split: the next
+         * scan treats the continuation as a fresh NOP run — identical
+         * consumption to gx_run_command seeing it whole. */
+        return count;
+    }
+    case GX_OP_LOAD_CP_REG:  return len < 6u ? 0u : 6u;
+    case GX_OP_LOAD_XF_REG: {
+        if (len < 5u) return 0;
+        u32 n = ((rd32(&data[1]) >> 16) & 0xFu) + 1u;
+        return len < 5u + n * 4u ? 0u : 5u + n * 4u;
+    }
+    case GX_OP_LOAD_INDX_A: case GX_OP_LOAD_INDX_B:
+    case GX_OP_LOAD_INDX_C: case GX_OP_LOAD_INDX_D:
+        return len < 5u ? 0u : 5u;
+    case GX_OP_CALL_DL:      return len < 9u ? 0u : 9u;
+    case GX_OP_UNKNOWN_METRICS: return 1;
+    case GX_OP_INVL_VC:      return 1;
+    case GX_OP_LOAD_BP_REG:
+        if (len < 5u) return 0;
+        /* PE-observable BP writes: SETDRAWDONE (0x45), PE token (0x47),
+         * PE token+int (0x48). Conservative: fence on the register alone
+         * (value/mask semantics stay the worker's business — an extra
+         * fence only costs a short same-tick join, never exactness). */
+        if (data[1] == GX_BP_SETDRAWDONE || data[1] == GX_BP_PE_TOKEN_ID ||
+            data[1] == GX_BP_PE_TOKEN_INT_ID)
+            *fence = 1;
+        return 5;
+    default:
+        if (op >= GX_OP_PRIM_START && op <= GX_OP_PRIM_END)
+            return (u32)-1;   /* needs live VCD/VAT to size: poison */
+        return 1;             /* unknown: gx_run_command advances 1 byte too */
+    }
+}
+
+/* Scan a pushed chunk; returns the produced-offset of the last fence command
+ * end in this chunk (or 0 if none), sets *poison on a top-level PRIM. */
+static s64 gx_scan_chunk(const u8* chunk, s64 chunk_start_off, int* poison) {
+    s64 last_fence = 0;
+    /* Append to carry, then consume whole commands from the front. */
+    u32 take = GCN_CP_GATHER_PIPE_SIZE;
+    if (s_scan_carry_len + take > sizeof s_scan_carry) {
+        /* Cannot happen (max sizable command 69 => max leftover 68; 68+32
+         * fits 128): a scanner bug, not a stream feature. Permanent sync
+         * fallback, loudly. */
+        fprintf(stderr, "gx-pipe: scanner carry overflow (%u+%u) — BUG; "
+                        "permanent synchronous fallback\n",
+                s_scan_carry_len, take);
+        s_pipe_poisoned = 1;
+        *poison = 1;
+        return 0;
+    }
+    memcpy(s_scan_carry + s_scan_carry_len, chunk, take);
+    s_scan_carry_len += take;
+
+    u32 off = 0;
+    for (;;) {
+        int fence = 0;
+        u32 sz = gx_scan_command(s_scan_carry + off, s_scan_carry_len - off, &fence);
+        if (sz == 0u) break;
+        if (sz == (u32)-1) {
+            /* Expected once per frame (the IPL's top-level quad) — announce
+             * the first occurrence with context, then stay quiet. */
+            static int logged = 0;
+            if (!logged) {
+                u32 ctx = s_scan_carry_len - off; if (ctx > 12u) ctx = 12u;
+                fprintf(stderr, "gx-pipe: unsizable top-level opcode 0x%02X at "
+                                "stream offset %lld (sync-mode handoff; logged "
+                                "once); next:", s_scan_carry[off],
+                        (long long)(s_scan_pos + off));
+                for (u32 i = 0; i < ctx; i++)
+                    fprintf(stderr, " %02X", s_scan_carry[off + i]);
+                fprintf(stderr, "\n");
+                logged = 1;
+            }
+            *poison = 1; break;
+        }
+        off += sz;
+        if (fence) last_fence = s_scan_pos + off;
+        if (off >= s_scan_carry_len) break;
+    }
+    if (off) {
+        memmove(s_scan_carry, s_scan_carry + off, s_scan_carry_len - off);
+        s_scan_carry_len -= off;
+        s_scan_pos += off;
+    }
+    (void)chunk_start_off;
+    return last_fence;
+}
+
+static DWORD WINAPI gx_pipe_worker(LPVOID param) {
+    (void)param;
+    GcnGx* gx = &s_gx;
+    s64 pulled = 0;
+    for (;;) {
+        s64 produced = __atomic_load_n(&s_pipe_produced, __ATOMIC_ACQUIRE);
+        if (produced == pulled) {
+            if (__atomic_load_n(&s_pipe_quit, __ATOMIC_ACQUIRE)) return 0;
+            int spins = 0;
+            for (;;) {
+                produced = __atomic_load_n(&s_pipe_produced, __ATOMIC_ACQUIRE);
+                if (produced != pulled ||
+                    __atomic_load_n(&s_pipe_quit, __ATOMIC_ACQUIRE)) break;
+                if (++spins < 16384) { _mm_pause(); continue; }
+                s64 expect = produced;
+                __atomic_store_n(&s_pipe_parked, 1, __ATOMIC_SEQ_CST);
+                WaitOnAddress((volatile VOID*)&s_pipe_produced, &expect,
+                              sizeof expect, INFINITE);
+                __atomic_store_n(&s_pipe_parked, 0, __ATOMIC_SEQ_CST);
+            }
+            continue;
+        }
+        /* Pull as much as fits: contiguous ring run, capped by staging room.
+         * (Chunks are 32-aligned and CAP is a multiple of 32, so runs are
+         * whole chunks.) */
+        u32 room  = GX_BUF_CAP - gx->buf_len;
+        u32 avail = (u32)(produced - pulled);
+        u32 cont  = GX_PIPE_CAP - (u32)(pulled & (GX_PIPE_CAP - 1));
+        u32 take  = avail < cont ? avail : cont;
+        if (take > room) take = room & ~31u;
+        if (take == 0u) {
+            /* Staging full of one partial command — matches the sync path's
+             * loud halt; nothing can progress. */
+            static int warned = 0;
+            if (!warned) {
+                fprintf(stderr, "gx-pipe: staging overflow (single command > %u) "
+                                "— worker halted\n", (unsigned)GX_BUF_CAP);
+                warned = 1;
+            }
+            return 0;
+        }
+        memcpy(gx->buf + gx->buf_len, s_pipe_ring + (pulled & (GX_PIPE_CAP - 1)), take);
+        gx->buf_len += take;
+        pulled += take;
+
+        u32 consumed = gx_run(gx, gx->buf, gx->buf_len);
+        if (consumed > 0u) {
+            if (consumed < gx->buf_len)
+                memmove(gx->buf, gx->buf + consumed, gx->buf_len - consumed);
+            gx->buf_len -= consumed;
+        }
+        /* Retired = every pulled byte no longer sitting un-decoded in staging
+         * (fence waits key on this — fences are whole commands, so they
+         * always retire). done_upto = "processed everything through this
+         * produced offset" (full drains key on THIS — a partial-command tail
+         * legitimately never retires). */
+        __atomic_store_n(&s_pipe_retired, pulled - (s64)gx->buf_len, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&s_pipe_done_upto, pulled, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&s_pipe_waiting, __ATOMIC_SEQ_CST)) {
+            WakeByAddressAll((PVOID)&s_pipe_retired);
+            WakeByAddressAll((PVOID)&s_pipe_done_upto);
+        }
+    }
+}
+
+/* Sync-mode transition: an unsizable top-level command (the IPL draws one
+ * 4-vertex quad per frame OUTSIDE any display list, so this fires every
+ * frame). Drain the worker fully — after that the worker is parked-idle and
+ * the CPU owns all GX state race-free, so the tick's synchronous fall-
+ * through can execute from gx->buf exactly like the pre-pipeline design.
+ * gx_pipe_try_resume() re-seeds the scanner from the staging leftover at
+ * the end of each sync tick and turns the pipeline back on. */
+static void gx_pipe_enter_syncmode(void) {
+    static int announced = 0;
+    if (!announced) {
+        fprintf(stderr, "gx-pipe: unsizable top-level command — executing "
+                        "synchronously and re-seeding (recoverable; announced "
+                        "once)\n");
+        announced = 1;
+    }
+    gcn_gx_pipeline_drain();
+    s_pipe_syncmode = 1;
+}
+
+/* End-of-tick in sync mode: if the staging leftover (a partial top-level
+ * command) fits the scanner carry, adopt it as the new scan state and
+ * resume pipelining. Offset origin: scan_pos = produced - buf_len keeps
+ * fence offsets comparable with the worker's retired accounting
+ * (retired = pulled - buf_len; the leftover bytes never entered the ring,
+ * so both sides discount them identically). A leftover too large (tick
+ * budget ended mid-PRIM) just stays in sync mode another tick. */
+static void gx_pipe_try_resume(void) {
+    GcnGx* gx = &s_gx;
+    if (gx->buf_len > sizeof s_scan_carry)
+        return;
+    memcpy(s_scan_carry, gx->buf, gx->buf_len);
+    s_scan_carry_len = gx->buf_len;
+    s_scan_pos = __atomic_load_n(&s_pipe_produced, __ATOMIC_RELAXED) - (s64)gx->buf_len;
+    s_pipe_syncmode = 0;
 }
 
 /* ---- big-endian readers (FIFO bytes are GameCube big-endian) ---- */
@@ -648,7 +999,55 @@ void gcn_gx_tick(u32 cycles) {
      * drain work this function already does unconditionally every tick. */
     s_gx_ticks++;
 
-    u32 drained = 0;
+    /* G3 pipeline path: identical architectural drain (rptr/rw_dist/breakpoint
+     * arithmetic on the CPU-side CP state, same per-tick budget), but the
+     * snapshot bytes go to the worker's ring instead of being decoded here.
+     * The scanner sizes the stream for PE fences as it pushes. */
+    u32 drained = 0;   /* per-tick budget, shared by both paths so the poison
+                        * tick still drains at most GCN_GX_DRAIN_BYTES_PER_TICK
+                        * in total — byte-identical architectural consumption. */
+    if (gx_pipe_on()) {
+        s64 fence = 0;
+        int poison = 0;
+        while (drained < GCN_GX_DRAIN_BYTES_PER_TICK &&
+               gcn_cp_fifo_rw_distance(gx->cp) >= GCN_CP_GATHER_PIPE_SIZE &&
+               !gcn_cp_at_breakpoint(gx->cp)) {
+            u32 rptr = gcn_cp_fifo_read_pointer(gx->cp);
+            u32 phys = rptr & 0x1FFFFFFFu;
+            if ((u64)phys + GCN_CP_GATHER_PIPE_SIZE > (u64)gx->cpu->ram_size) {
+                static int warned = 0;
+                if (!warned) {
+                    fprintf(stderr, "gx: FIFO read pointer 0x%08X out of MEM1 range — "
+                                    "drain halted\n", rptr);
+                    warned = 1;
+                }
+                break;
+            }
+            const u8* chunk = gx->cpu->ram + phys;
+            s64 f = gx_scan_chunk(chunk, 0, &poison);
+            if (poison) {
+                /* Do NOT push this chunk; the synchronous fall-through takes
+                 * over from exactly here (nothing of this chunk was consumed
+                 * architecturally yet). Recoverable unless the scanner
+                 * itself overflowed (s_pipe_poisoned, a bug guard). */
+                gx_pipe_enter_syncmode();
+                break;
+            }
+            gx_pipe_push_chunk(chunk);
+            gcn_cp_gpu_consume_chunk(gx->cp);
+            drained += GCN_CP_GATHER_PIPE_SIZE;
+            if (f) fence = f;
+        }
+        if (fence)
+            gx_pipe_wait_retired(fence);   /* PE signal lands THIS tick, like sync */
+        if (!s_pipe_syncmode && !s_pipe_poisoned)
+            return;   /* (GCN_GX_STATS' tick-end print is skipped in pipeline
+                       * mode — its rdtsc buckets are meaningless split across
+                       * threads; use GCN_GX_PIPELINE=0 for GX profiling.) */
+        /* sync mode / poisoned: fall through into the synchronous loop below
+         * for the remainder of this tick's budget. */
+    }
+
     while (drained < GCN_GX_DRAIN_BYTES_PER_TICK &&
            gcn_cp_fifo_rw_distance(gx->cp) >= GCN_CP_GATHER_PIPE_SIZE &&
            !gcn_cp_at_breakpoint(gx->cp)) {
@@ -732,6 +1131,11 @@ void gcn_gx_tick(u32 cycles) {
             }
         }
     }
+
+    /* G3: sync-mode tick complete — the unsizable stretch has been executed
+     * synchronously; try to hand the stream back to the pipeline. */
+    if (s_pipe_on == 1 && s_pipe_syncmode && !s_pipe_poisoned)
+        gx_pipe_try_resume();
 
     /* Summary line every 2^20 ticks (matches GCN_DISPATCH_STATS' cadence) so
      * stderr stays sparse — this is a diagnostic window, not per-tick noise.

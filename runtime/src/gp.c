@@ -6,6 +6,7 @@
  * and burst.
  */
 #include "gp/gp.h"
+#include "gx/gx.h"         /* gcn_gx_pipeline_drain — fifo-reset join (G3) */
 #include "debug/rings.h"
 
 #include <stdio.h>
@@ -27,7 +28,12 @@ void gcn_gp_reset(void) {
     /* ProcessorInterface.cpp:118-119 / GPFifo::ResetGatherPipe:80-83 — drop any
      * partial staged bytes. (The CP-register ResetFifo Dolphin also runs on
      * PI_FIFO_RESET is deferred: the IPL boot path does not depend on it, and
-     * coupling it here would diverge loudly rather than silently — GX_PLAN.) */
+     * coupling it here would diverge loudly rather than silently — GX_PLAN.)
+     *
+     * G3: a fifo reset with pipelined-but-undecoded bytes queued would let
+     * pre-reset commands execute after the reset the synchronous design
+     * decoded them before — join first (no-op with the pipeline off). */
+    gcn_gx_pipeline_drain();
     if (s_gp)
         s_gp->count = 0;
 }

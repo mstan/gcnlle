@@ -13,6 +13,7 @@
 #include "debug/rings.h"
 #include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
 #include "dsp/dsp.h"       /* gcn_dsp_flush: catch a batched core up before dsp_state peeks it */
+#include "gx/gx.h"         /* gcn_gx_pipeline_drain — screenshot join (G3) */
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
 #include "vi/yuy2.h"       /* screenshot: YUY2->RGB (shared with host_window.c) */
 #include "si/si.h"         /* set_input: injected pad-report surface */
@@ -230,6 +231,9 @@ static void handle_line(Client* c, const char* line) {
          * programmed an XFB, report that honestly (no fake image). */
         u32 fb_addr, fb_w, fb_h, fb_stride;
         char path[512] = {0};
+        /* G3: retire pipelined GX work (pending EFB->XFB copies) so the
+         * screenshot reads the same bytes the synchronous design would. */
+        gcn_gx_pipeline_drain();
         if (!json_str(line, "path", path, sizeof path))
             snprintf(path, sizeof path, "_work/screenshot.ppm");
         if (!gcn_vi_xfb_info(&fb_addr, &fb_w, &fb_h, &fb_stride)) {

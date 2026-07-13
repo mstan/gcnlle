@@ -83,4 +83,11 @@ void gcn_gx_tick(u32 cycles);
  * Always valid (static storage), contents all-zero until the first TLUT load. */
 const u8* gcn_gx_tmem(void);
 
+/* G3 pipeline join (GCN_GX_PIPELINE=1, gx.c): block until the worker has
+ * decoded every FIFO byte pushed so far. No-op when the pipeline is off.
+ * Call before any gate-visible read of GX-produced state that PE fences
+ * don't already cover: end-of-run (pre-GCN_MEM_DUMP), debug-server
+ * screenshots, the PI fifo-reset hook. */
+void gcn_gx_pipeline_drain(void);
+
 #endif /* GCN_GX_GX_H */

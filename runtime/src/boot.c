@@ -731,6 +731,10 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     int still_live = gcn_dispatch_run(&cpu, run_blocks);
+    /* G3: retire any pipelined GX work before anything below (trace close,
+     * GCN_MEM_DUMP, XFB hashes) reads GX-produced RAM. No-op when the
+     * pipeline is off. */
+    gcn_gx_pipeline_drain();
     /* Don't park waiting on a TCP "quit" that may never come if what actually
      * ended the run was the host window closing (GCN_WINDOW=1, no debug
      * client attached). */
