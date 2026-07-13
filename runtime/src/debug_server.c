@@ -16,6 +16,7 @@
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
 #include "vi/yuy2.h"       /* screenshot: YUY2->RGB (shared with host_window.c) */
 #include "si/si.h"         /* set_input: injected pad-report surface */
+#include "di/di.h"         /* insert_disc/eject_disc: runtime disc mount lifecycle */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -300,6 +301,31 @@ static void handle_line(Client* c, const char* line) {
                 (unsigned)cur.buttons, (unsigned)cur.stick_x, (unsigned)cur.stick_y,
                 (unsigned)cur.substick_x, (unsigned)cur.substick_y,
                 (unsigned)cur.trigger_l, (unsigned)cur.trigger_r);
+        }
+    }
+    else if (!strcmp(cmd, "insert_disc")) {
+        /* ROADMAP M5: the deterministic "menu -> disc screen" driver. Mounts
+         * (or replaces the mounted) disc image and fires the cover edges
+         * exactly like gcn_di_set_disc always does (mirrors Dolphin's Change
+         * Disc / SetDisc — see di.h). Never reads the image into RAM. */
+        char path[512] = {0};
+        if (!json_str(line, "path", path, sizeof path)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":false,\"error\":\"missing path\"}\n");
+        } else if (!s_ctx.di) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":false,\"error\":\"DI not initialized\"}\n");
+        } else if (!gcn_di_set_disc(s_ctx.di, path)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"cannot mount disc\",\"path\":\"%s\"}\n", path);
+        } else {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":true,\"mounted\":\"%s\"}\n", path);
+        }
+    }
+    else if (!strcmp(cmd, "eject_disc")) {
+        if (!s_ctx.di) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":false,\"error\":\"DI not initialized\"}\n");
+        } else {
+            gcn_di_eject_disc(s_ctx.di);
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":true,\"ejected\":true}\n");
         }
     }
     else if (!strcmp(cmd, "quit")) {

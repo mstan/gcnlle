@@ -9,7 +9,12 @@
  * During IPL boot the oracle shows exactly these PI accesses:
  *   stage-1  W 0xCC003030 = 0x0245248A   (a config/mem-controller word)
  *            R 0xCC003024 -> 0           (reset code, read before any write)
- *            W 0xCC003024 = 1, then = 3  (reset-code sequencing)
+ *            W 0xCC003024 = 1, then = 3  (reset-code sequencing — ROADMAP M5:
+ *                                        the =3 write has bit 2 clear, which
+ *                                        is the real DVD-drive re-spin trigger,
+ *                                        see reset_drive_hook/GcnPiResetDriveFn
+ *                                        below and di.h's "drive re-spin
+ *                                        trigger" note)
  *   stage-2  R 0xCC00302C -> 0x246500B1  (Flipper/PI chipset revision)
  *            W 0xCC003004 = 0xF0/0xF8    (interrupt mask, once the menu runs)
  *
@@ -88,15 +93,30 @@
  * dependency direction as the irq trampolines. */
 typedef void (*GcnPiFifoResetFn)(void);
 
+/* ROADMAP M5: PI_RESET_CODE write hook (ProcessorInterface.cpp:145-160). GC
+ * path (not Wii): a write whose value has bit 2 clear (`~value & 0x4`) calls
+ * DVDInterface::ResetDrive(true) — the real hardware "re-spin the drive"
+ * signal. The IPL itself writes this register (=1 then =3) very early in
+ * stage-1 boot (see this header's trace note below); 3 has bit 2 clear, so
+ * THIS write is what advances a freshly-mounted disc from DiscChangeDetected
+ * to DiscIdNotRead — not a mount-time special case (see di.h). Set from
+ * boot.c to di.c's gcn_di_reset_drive_spinup so pi.c never takes a dependency
+ * on di.h — same no-arg idiom as GcnPiFifoResetFn/gcn_gp_reset. */
+typedef void (*GcnPiResetDriveFn)(void);
+
 typedef struct {
     u32 reg[GCN_PI_SIZE / 4];
     u32 intsr;                  /* live interrupt-cause word (not in reg[]) */
     GcnPiFifoResetFn fifo_reset_hook;  /* gather-pipe reset (PI_FIFO_RESET) */
+    GcnPiResetDriveFn reset_drive_hook; /* DVD drive re-spin (PI_RESET_CODE) */
 } GcnPi;
 
 void gcn_pi_init(GcnPi* pi);
 /* Register the gather-pipe reset hook fired on a PI_FIFO_RESET write. */
 void gcn_pi_set_fifo_reset_hook(GcnPi* pi, GcnPiFifoResetFn fn);
+/* Register the DVD drive re-spin hook fired on a PI_RESET_CODE write with bit
+ * 2 clear (see GcnPiResetDriveFn above). */
+void gcn_pi_set_reset_drive_hook(GcnPi* pi, GcnPiResetDriveFn fn);
 u32  gcn_pi_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 

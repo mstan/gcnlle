@@ -57,9 +57,19 @@ clock) and SRAM (persisted settings). Deliverable: the menu shows/sets **date
 host `.raw`/`.gci` files (Dolphin-compatible). Deliverable: **navigate,
 view, copy, delete** save blocks in the IPL's card manager.
 
-**M5 — Disc-load screen (stub).** Model DI enough to reach the "insert disc"
-screen. No game loading yet — that's a later phase. Deliverable: menu →
-disc screen transition.
+**M5 — Disc-load screen (stub). ✅ DONE (2026-07-13).** Model DI enough to
+reach the "insert disc" screen. No game loading yet — that's a later phase.
+Deliverable: menu → disc screen transition — DELIVERED: GCN_DISC boot mount
++ debug-server insert_disc/eject_disc hot-swap; the Game Play panel's "?"
+transitions to the firmware-drawn spinning disc-checking ring on cover-close
++ DiscID read (screenshot-verified, _work/m5e/m5f.png); disc-at-boot follows
+the real launch path to the (deliberately null) apploader boundary at
+0x80000000. Oracle: new disc-inserted Dolphin capture (oracle/
+dolphin_trace_disc.bat + --ipl-disc patch, traces/dolphin_disc_dummy_
+collapsed.trace) — runtime and Dolphin settle into the IDENTICAL terminal
+DI poll (pc 0x8133ACBC, DICVR reads 0x2) with the same-fixture dummy disc
+(tools/make_dummy_disc.py, oracle-symmetric). Discless goldens bit-exact
+throughout (no-disc remains the default).
 
 ## Observability (cross-cutting — must be in place before M2)
 

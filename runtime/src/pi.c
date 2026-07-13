@@ -32,6 +32,10 @@ void gcn_pi_set_fifo_reset_hook(GcnPi* pi, GcnPiFifoResetFn fn) {
     pi->fifo_reset_hook = fn;
 }
 
+void gcn_pi_set_reset_drive_hook(GcnPi* pi, GcnPiResetDriveFn fn) {
+    pi->reset_drive_hook = fn;
+}
+
 void gcn_pi_set_interrupt(GcnPi* pi, u32 cause_mask, int set) {
     if (set)
         pi->intsr |= cause_mask;
@@ -115,6 +119,16 @@ void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
         pi->reg[pi_index(addr)] = value;
         if ((value & 1u) && pi->fifo_reset_hook)
             pi->fifo_reset_hook();
+        return;
+    }
+    if (off == GCN_PI_RESETCODE) {
+        /* ProcessorInterface.cpp:145-160 PI_RESET_CODE ComplexWrite. GC path
+         * only (!IsWii is always true here): a write with bit 2 clear
+         * re-spins the DVD drive (ResetDrive(true)) — see pi.h's
+         * reset_drive_hook doc comment and di.h's "drive re-spin trigger". */
+        pi->reg[pi_index(addr)] = value;
+        if ((~value & 0x4u) && pi->reset_drive_hook)
+            pi->reset_drive_hook();
         return;
     }
     if (off == GCN_PI_FIFO_BASE || off == GCN_PI_FIFO_END ||

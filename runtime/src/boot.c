@@ -595,16 +595,39 @@ int main(int argc, char** argv) {
     gcn_mmio_register(&bus, "VI", GCN_VI_BASE, GCN_VI_SIZE,
                       gcn_vi_read, gcn_vi_write, &vi);
 
-    /* DI: the GameCube DVD drive with NO DISC INSERTED. The menu kicks a
-     * DVDReadDiskID (DICMDBUF0=0xA8000040, DICR=3) and polls DICVR every frame;
-     * with no disc the read completes with DEINT and DICVR bit 0 (cover open)
-     * reads 1, so the menu concludes "no disc" and proceeds. The drive
-     * interrupt line asserts INT_CAUSE_DI in the PI cause word. */
+    /* DI: the GameCube DVD drive. gcn_di_init always starts from the no-disc
+     * state (mirrors DVDInterface::Init's own ASSERT(!IsDiscInside()) — see
+     * di.h). With no disc the menu kicks a DVDReadDiskID (DICMDBUF0=
+     * 0xA8000040, DICR=3) and polls DICVR every frame; the read completes with
+     * DEINT and DICVR bit 0 (cover open) reads 1, so the menu concludes "no
+     * disc" and proceeds. The drive interrupt line asserts INT_CAUSE_DI in the
+     * PI cause word. The PI_RESET_CODE hook (below) is wired unconditionally —
+     * with no disc it's a byte-identical no-op (see di.h/pi.h) but it's the
+     * real hardware path a mounted disc uses to reach DiscIdNotRead. */
     static GcnDi di;
     gcn_di_init(&di);
     gcn_di_set_irq(&di, di_irq_to_pi, &pi);
     gcn_mmio_register(&bus, "DI", GCN_DI_BASE, GCN_DI_SIZE,
                       gcn_di_read, gcn_di_write, &di);
+    gcn_pi_set_reset_drive_hook(&pi, gcn_di_reset_drive_spinup);
+
+    /* ROADMAP M5: GCN_DISC=path mounts a disc image at boot, read-only,
+     * pread-style (the image is NOT read into RAM — di.c seeks+freads exactly
+     * the bytes each DI read command asks for; see di.h). Mirrors Dolphin's
+     * Boot.cpp SetDisc() call for "--boot-gc-ipl --disc", which runs AFTER
+     * DVDInterface::Init() — hence gcn_di_init() above always runs first, from
+     * the no-disc state, exactly like the oracle. Unset (default): no mount,
+     * byte-identical to before GCN_DISC existed — every existing golden
+     * depends on this (cover open, no disc). */
+    const char* disc_path = getenv("GCN_DISC");
+    if (disc_path && *disc_path) {
+        if (gcn_di_set_disc(&di, disc_path))
+            fprintf(stdout, "gcn boot: GCN_DISC — mounted '%s'\n", disc_path);
+        else
+            fprintf(stderr,
+                "gcn boot: GCN_DISC='%s' failed to mount — continuing with no disc\n",
+                disc_path);
+    }
 
     /* MI: pure u16 register file (memory-controller face). No interrupts this
      * increment; the IPL's observed traffic is a single MI_IRQMASK write. */
@@ -656,7 +679,7 @@ int main(int argc, char** argv) {
     /* Observability: bring up the always-on ring buffers and (if GCN_DEBUG_PORT
      * is set) the TCP debug query surface over them + live CPU/RAM state. */
     gcn_rings_init();
-    GcnDebugCtx dbg = { &cpu };
+    GcnDebugCtx dbg = { &cpu, &di };
     int dbg_port = gcn_debug_server_start(&dbg);
 
     /* GCN_WINDOW=1 (opt-in): native Win32 display + keyboard-pad window,
@@ -831,6 +854,7 @@ int main(int argc, char** argv) {
 
     gcn_dsp_free(&dsp);
     gcn_exi_free(&exi);   /* no-op unless GCN_BOOT_BS1 owned a descrambled buffer */
+    gcn_di_free(&di);     /* no-op unless GCN_DISC mounted an image */
     cpu_free(&cpu);
     free(payload);
     return 0;

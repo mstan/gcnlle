@@ -52,6 +52,16 @@ typedef enum {
     GCN_EV_ARAM_DMA   = 4,  /* Flipper AR DMA kick; detail = to_aram, aux = length  */
     GCN_EV_DSP_DMA    = 5,  /* DSP DMA (IDMA/DDMA); detail = ctl, aux = length       */
     GCN_EV_EXI_XFER   = 6,  /* EXI transfer; detail = channel, aux = payload         */
+    /* ROADMAP M5: DI (disc interface) events. Low-volume (a handful of
+     * commands per boot/menu transition, mount/eject rarer still), so a plain
+     * enum addition — same shape as GCN_EV_EXI_XFER — rather than a dedicated
+     * ring (contrast the high-volume memcard ring, GCN_MEMCARD_RING_CAP). */
+    GCN_EV_DI_CMD     = 7,  /* DI command issued (DICR TSTART write);
+                             * detail = opcode (cmdbuf[0]>>24),
+                             * aux = subcommand<<8 | resulting GCN_DI_INT_*    */
+    GCN_EV_DI_MOUNT   = 8,  /* disc mounted(detail=1)/ejected(detail=0), via
+                             * GCN_DISC at boot or the insert_disc/eject_disc
+                             * debug commands                                 */
 } GcnEventKind;
 
 /* Bring the rings up (clears all three, resets the block index). Idempotent. */

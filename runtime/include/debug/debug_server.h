@@ -21,6 +21,7 @@
 #define GCN_DEBUG_SERVER_H
 
 #include "cpu/cpu.h"
+#include "di/di.h"   /* ROADMAP M5: insert_disc/eject_disc reach into the DI device */
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +31,7 @@ extern "C" {
  * a command needing a NULL dependency returns an "unavailable" error. */
 typedef struct {
     CPUState* cpu;   /* regs + RAM (get_registers, read_ram, write_ram)        */
+    GcnDi*    di;     /* disc interface (insert_disc, eject_disc)              */
 } GcnDebugCtx;
 
 /* Start listening if GCN_DEBUG_PORT is set (else a no-op returning 0). Returns
