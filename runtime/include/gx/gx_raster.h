@@ -80,6 +80,13 @@ void gx_raster_efb_copy(const GxCpState* cp);
  * pointer may be NULL. */
 void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u64* draw_calls);
 
+/* GCN_GX_STATS=1 (same knob): further split of gx.c's own GX_STAT_EFB bucket
+ * (gx_raster_efb_copy's whole call, copy-encode + clear) into the clear-only
+ * slice (*tsc_efb_clear) and a per-clear call count. The copy-encode slice is
+ * just (the caller's own GX_STAT_EFB total) - *tsc_efb_clear. Same cadence/
+ * process-lifetime-cumulative contract as gx_raster_get_draw_stats above. */
+void gx_raster_get_efb_clear_stats(u64* tsc_efb_clear, u64* efb_clear_calls);
+
 /* GCN_GX_PIXEL_STATS=1 (own knob, separate from GCN_GX_STATS — see gx_raster.c
  * for why they must not share a cache/branch). Splits the triangle-scan wall
  * time (GCN_GX_STATS' own "tri" bucket) five ways: BLOCK (build_block per-2x2

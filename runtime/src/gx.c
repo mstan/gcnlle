@@ -758,6 +758,22 @@ void gcn_gx_tick(u32 cycles) {
             fflush(stderr);
         }
 
+        /* gx_raster.c's further split of the EFB bucket above (copy-encode vs
+         * scalar clear-rect) — sizing input for the efb_clear_rect SIMD task.
+         * Same cadence/one-print-site pattern as the DRAW-bucket split below. */
+        if (s_gxstats && s_gx_tsc[GX_STAT_EFB] > 0u) {
+            u64 tsc_efb_clear, efb_clear_calls;
+            gx_raster_get_efb_clear_stats(&tsc_efb_clear, &efb_clear_calls);
+            u64 efb_tot = s_gx_tsc[GX_STAT_EFB];
+            u64 tsc_efb_copy = (efb_tot > tsc_efb_clear) ? (efb_tot - tsc_efb_clear) : 0u;
+            fprintf(stderr,
+                "[gx-efb-stats] copy=%.1f%% clear=%.1f%%  | clear_calls=%llu\n",
+                100.0 * (double)tsc_efb_copy   / (double)efb_tot,
+                100.0 * (double)tsc_efb_clear  / (double)efb_tot,
+                (unsigned long long)efb_clear_calls);
+            fflush(stderr);
+        }
+
         /* gx_raster.c's own further split of the DRAW bucket above (vertex
          * load+transform+clip vs triangle scan/pixel) plus a pixels-shaded
          * counter — same cadence, piggybacked onto this tick so there is only

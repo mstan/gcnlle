@@ -72,6 +72,22 @@ static u64 s_tsc_tri;          /* triangle scan/pixel (draw_triangle, incl. all 
 static u64 s_pixels_shaded;    /* tev_draw() invocations (one per shaded pixel candidate) */
 static u64 s_draw_calls_stat;  /* gx_raster_draw calls counted (vtx bucket samples) */
 
+/* Further split of gx.c's own GX_STAT_EFB bucket (timed as a whole around
+ * the gx_raster_efb_copy call, which does copy-encode THEN `if (clear)
+ * efb_clear_rect()` — see that function's tail): how much of the EFB
+ * bucket's wall is the scanline copy/YUV-encode vs the scalar clear-rect
+ * fill. Sizing input for the efb_clear_rect SIMD task (residuals sweep) —
+ * same "measure before implementing" discipline as GCN_GX_TEV_CENSUS was for
+ * the fused-pixel task. Own accumulator, gated on the SAME s_draw_stats
+ * knob/env var gx.c's GX_STAT_EFB timing already uses (GCN_GX_STATS), timed
+ * only around the efb_clear_rect() call itself — the copy-encode share is
+ * then just (EFB bucket total, already tracked in gx.c) minus this. Zero
+ * cost when off: one untaken `if (s_draw_stats)` branch at the one call
+ * site, no rdtsc, no counter writes — same contract as every other stat
+ * knob in this file. */
+static u64 s_tsc_efb_clear;
+static u64 s_efb_clear_calls;
+
 /* Per-triangle scissored-bbox-area histogram (same GCN_GX_STATS knob): bucket
  * k holds triangles whose post-scissor bounding-box area is in [2^(k-1), 2^k)
  * pixels (bucket 0 = degenerate/empty-bbox early returns), with each bucket's
@@ -1603,6 +1619,39 @@ static void tev_draw(Tev* t) {
  * this config's cc/ac reference only RasColor/TexColor, both u8 0..255, no
  * TEV Reg/Konst operand, so the domain is 256 + 65536 = 65,792 combinations,
  * 0 mismatches).
+ *
+ * D1 RESIDUALS SWEEP (2026-07-13): with D covered, a re-run of
+ * GCN_GX_TEV_CENSUS=1 over the same boot-animation window (24,000,000
+ * blocks) found fused coverage at 94.1%, with exactly two configs left
+ * uncovered — the same two the D1 census first spotted (then hashed
+ * "40bead5f"/"8b773e26") but re-censused fresh rather than trusted from
+ * memory, per the project's "evaluate with data before implementing"
+ * discipline. That re-census caught a real mistake: both were assumed to be
+ * bm_blend_enable==0 ("write-through, no blend", implying a new no-blend
+ * fused_blend variant would be needed). The fresh dump shows otherwise —
+ * both already satisfy every existing blend precondition
+ * (fused_blend_common_match) bit-for-bit:
+ *
+ *   config E: hash=40bead5f stages=1 texgens=1 st0 cc=18428F ac=08F770       -- 3.6%->4.1%, rising
+ *   config F: hash=8b773e26 stages=1 texgens=0 st0 cc=00AFFF ac=00BFF0       -- 1.8%, ~flat
+ *   (both: blend=1 sf=4(SrcAlpha) df=5(InvSrcAlpha) da=0/0 dither=1
+ *    at=0x7F0000 — the SAME blend/alpha-test word set as A/B/C/D; no new
+ *    fused_blend_stage variant needed, both reuse it as-is)
+ *
+ * config E has texgens=1 like A/B/C/D, so it fits under the existing
+ * fused_common_match() unchanged — just a new stage signature. config F has
+ * texgens=0 (no texture unit sampled at all), which fused_common_match()'s
+ * numtexgens==1 check would reject — fused_common_match was split into a
+ * shared fused_blend_common_match() plus two thin callers (numtexgens==1 for
+ * A/B/C/D/E, numtexgens==0 for F) rather than special-cased, so the split is
+ * itself general infrastructure, not a one-off carve-out. See fused_pixel_E
+ * and fused_pixel_F's own derivation comments for the bit-exact brute-force
+ * verification of each (1.07 billion cases for E's two-register color lerp,
+ * 524,288 for E's alpha, 2048/256 for F's trivial RasColor passthrough).
+ * With E+F added, a re-run of GCN_GX_TEV_CENSUS=1 over the same window
+ * confirms 100.0% fused coverage: every one of the 8 censused configs shows
+ * fused=N(100.0%) and total_fused==total shaded pixels at every print in the
+ * run (2026-07-13).
  * ==========================================================================*/
 
 /* Folded BlendTev/BlendColor for configs A/B/C. Requires (checked once, at
@@ -1651,17 +1700,19 @@ static inline void fused_blend_stage(Tev* t, u8* output) {
 }
 
 /* Shared preconditions for every fused config (see the file-header derivation
- * table above): everything EXCEPT the per-stage cc/ac/enable/colorchan words
- * themselves, which each fused_pixel_* signature check below compares
- * separately (an exact cc/ac word match already pins every selector the fold
- * depends on — argA..D/aargA..D, bias, op, clamp, scale, dest, tswap_id,
- * rswap_id — in one comparison, since those are exactly the bits build_draw_cfg
- * extracted them from). swaptab[0] must still be checked separately: the cc/ac
- * match only pins tswap_id/rswap_id to 0, not what table entry 0 itself
- * currently holds (a separate BP-register-driven array) — see the derivation
- * table's "swaptab[0]==identity" note. */
-static int fused_common_match(void) {
-    return s_cfg.numtexgens == 1 && s_cfg.numcolchans == 1 &&
+ * table above): everything EXCEPT numtexgens (checked by the two callers
+ * below — the boot-animation D1 census's configs E/F needed a texgens==0
+ * variant, see their derivation comments) and the per-stage cc/ac/enable/
+ * colorchan words themselves, which each fused_pixel_* signature check below
+ * compares separately (an exact cc/ac word match already pins every selector
+ * the fold depends on — argA..D/aargA..D, bias, op, clamp, scale, dest,
+ * tswap_id, rswap_id — in one comparison, since those are exactly the bits
+ * build_draw_cfg extracted them from). swaptab[0] must still be checked
+ * separately: the cc/ac match only pins tswap_id/rswap_id to 0, not what
+ * table entry 0 itself currently holds (a separate BP-register-driven array)
+ * — see the derivation table's "swaptab[0]==identity" note. */
+static int fused_blend_common_match(void) {
+    return s_cfg.numcolchans == 1 &&
            s_cfg.zt_enable == 0 && s_cfg.zt_early == 0 &&
            s_cfg.da_enable == 0 &&
            s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
@@ -1671,6 +1722,19 @@ static int fused_common_match(void) {
            s_bp[0xF3] == 0x7F0000u &&
            s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
            s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3;
+}
+/* numtexgens==1 variant — configs A/B/C/D/E, every one of which actually
+ * samples a texture (their stage's enable==1 and numtexgens>0, so
+ * tev_draw's `if (numtexgens > 0) tex_sample_stat(...)` branch is live). */
+static int fused_common_match(void) {
+    return s_cfg.numtexgens == 1 && fused_blend_common_match();
+}
+/* numtexgens==0 variant — config F (see its derivation comment): no texture
+ * unit is ever sampled (tev_draw's own `else memset(texel,0,4)` branch is
+ * what the general path takes here), so TexColor plays no role in F's
+ * fold at all and this checks numtexgens==0 instead of ==1. */
+static int fused_common_match_notex(void) {
+    return s_cfg.numtexgens == 0 && fused_blend_common_match();
 }
 
 /* Exact per-stage cc/ac/enable/colorchan compare — see fused_common_match's
@@ -1947,6 +2011,169 @@ static void fused_pixel_D(Tev* t) {
     tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
 }
 
+/* ---- config E: stages=1, texgens=1, st0 cc=0x18428F ac=0x08F770 ----------
+ * (D1 EXTENSION cont'd, fresh GCN_GX_TEV_CENSUS=1 24,000,000-block boot-
+ * animation census, 2026-07-13 residuals sweep: this is the OLD "40bead5f"
+ * config from the D1 census note above — 3.6%..4.1% of pixels and rising
+ * across that window, same growth shape config D showed before its own
+ * fuse. NOTE: an earlier pass mis-assumed this config had bm_blend_enable==0
+ * ("write-through, no blend"); the actual census dump shows blend=1 sf=4
+ * df=5 da=0/0 dither=1 at=0x7F0000 — i.e. it already satisfies
+ * fused_common_match()'s existing blend preconditions bit-for-bit. No new
+ * blend variant needed; fused_blend_stage is reused as-is.
+ *
+ * cc=0x18428F bit-field decode:
+ *   argA=4(Reg[2].rgb, "Color1" TEV const register)  argB=2(Reg[1].rgb,
+ *   "Color0")  argC=8(TexColor.rgb)  argD=15(ZERO)=0
+ *   bias(c16)=0  op(c18)=0(add)  clamp(c19)=1(->clamp255)  scale(c20)=1  dest(c22)=0(Prev)
+ * ac=0x08F770 bit-field decode:
+ *   aargA=7(->0/ZERO)  aargB=5(RasColor.a)  aargC=6(StageKonst.a)  aargD=7(->0/ZERO)
+ *   bias(a16)=0  op(a18)=0(add)  clamp(a19)=1(->clamp255)  scale(a20)=0  dest(a22)=0(Prev)
+ *   tswap_id=0  rswap_id=0
+ *
+ * COLOR fold: draw_color_regular with A=Reg[2].ch, B=Reg[1].ch (both SIGNED
+ * 11-bit TEV registers, -1024..1023, read live every draw — same discipline
+ * as fused_core_C's K), C=X(=TexColor.ch, u8 0..255, the interpolation
+ * factor), D=0, bias=0, op=0, scale=1, clamp255. Unlike every prior fold,
+ * BOTH combiner operands are per-draw registers (not one register + one
+ * always-255/always-0 endpoint), so this is a genuine two-point lerp, not a
+ * degenerate replace/modulate identity — but the general formula itself is
+ * still exact integer algebra and distributes cleanly:
+ *   c = X + (X>>7)
+ *   A*(256-c) + B*c  ==  A*256 + c*(B-A)          (exact, no rounding: pure
+ *                                                   integer distributivity)
+ *   temp = (A*256 + c*(B-A)) << 1; temp += 128; temp >>= 8
+ *   Reg[Prev].ch = clamp255(temp)
+ * The rewritten form trades the general path's 2 multiplies for 1 subtract
+ * (A,B are per-draw-constant, but computed inline below rather than cached in
+ * s_cfg — same "read live, no extra per-draw state" style as fused_core_C's
+ * Reg[1] read) + 1 multiply, so it's still a strict reduction in per-pixel
+ * work. Overflow check: A*256 in [-262144,261888], c in [0,256], (B-A) in
+ * [-2047,2047], so c*(B-A) in [-524032,523776] — sum stays deep inside s32,
+ * matching the general path's own s32 `temp`. Verified bit-exact (not just
+ * "provably exact by algebra" — brute forced too, standalone checker, ALL of
+ * A,B in the full signed range [-1024,1023] (2048x2048) x ALL 256 texel
+ * values: 1,073,741,824 cases, 0 mismatches.
+ *
+ * ALPHA fold: A=0,B=Y(=RasColor.a, u8 0..255),C=K(=StageKonst.a — a SIGNED
+ * 11-bit per-stage konst, same live-read discipline as fused_pixel_B's aargB
+ * case, but used here as the INTERPOLATION FACTOR rather than a value
+ * operand — a role no prior fused config exercised, so verified as its own
+ * derivation, not reused from any other fold):
+ *   cc = K + ((u32)K >> 7)   -- K reinterpreted as u32 before the shift,
+ *                               exactly mirroring the general path's own
+ *                               `(u32)inC[i] >> 7` cast (this is NOT the same
+ *                               as an arithmetic shift on negative K; the
+ *                               fold transcribes the cast verbatim rather
+ *                               than reasoning about what it "means")
+ *   temp = (Y*(s32)cc + 128) >> 8;  Reg[Prev].a = clamp255(temp)
+ * (A=0 term drops out, so this is a direct 1-multiply transcription, no
+ * algebraic rewrite needed.) Verified bit-exact over the full domain: Y in
+ * [0,255] x K in the full signed range [-1024,1023] (524,288 cases, 0
+ * mismatches). */
+static void fused_pixel_E(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+
+    u32 texmap = s_cfg.stage[0].texmap;
+    u8 texel[4];
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+
+    u8 ras_a = t->Color[0][3];         /* colorchan==0, rswap_id==0 identity */
+    const TColor* reg2 = &t->Reg[2];   /* "Color1" TEV const register, per-draw */
+    const TColor* reg1 = &t->Reg[1];   /* "Color0" TEV const register, per-draw */
+    s32 konst_a = s_cfg.stage[0].stage_konst.a;
+
+    u8 output[4];
+    {
+        s32 c = texel[0] + (texel[0] >> 7);
+        s32 temp = ((s32)reg2->r << 8) + c * ((s32)reg1->r - (s32)reg2->r);
+        temp = (temp << 1) + 128; temp >>= 8;
+        output[RED_C] = (u8)clamp255((s16)temp);
+    }
+    {
+        s32 c = texel[1] + (texel[1] >> 7);
+        s32 temp = ((s32)reg2->g << 8) + c * ((s32)reg1->g - (s32)reg2->g);
+        temp = (temp << 1) + 128; temp >>= 8;
+        output[GRN_C] = (u8)clamp255((s16)temp);
+    }
+    {
+        s32 c = texel[2] + (texel[2] >> 7);
+        s32 temp = ((s32)reg2->b << 8) + c * ((s32)reg1->b - (s32)reg2->b);
+        temp = (temp << 1) + 128; temp >>= 8;
+        output[BLU_C] = (u8)clamp255((s16)temp);
+    }
+    {
+        u32 cc = (u32)konst_a + ((u32)konst_a >> 7);
+        s32 temp = (s32)ras_a * (s32)cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp255((s16)temp);
+    }
+
+    /* alpha test always passes -- see fused_pixel_A's identical derivation
+     * (same 0x7F0000 word, checked as part of fused_blend_common_match). */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* ---- config F: stages=1, texgens=0, st0 cc=0x00AFFF ac=0x00BFF0 ----------
+ * (D1 EXTENSION cont'd, same 24,000,000-block boot-animation census as
+ * config E above: the old "8b773e26" config, ~1.8% of pixels and roughly
+ * flat across the window. texgens=0 -- this draw has NO texture unit
+ * active at all, so it needs fused_common_match_notex() rather than the
+ * numtexgens==1 variant every other config uses.
+ *
+ * cc=0x00AFFF bit-field decode:
+ *   argA=10(RasColor.rgb)  argB=15(out of range -> 0/ZERO)  argC=15(->0/ZERO)
+ *   argD=15(->0/ZERO)
+ *   bias(c16)=0  op(c18)=0(add)  clamp(c19)=0(->clamp1024)  scale(c20)=0  dest(c22)=0(Prev)
+ * ac=0x00BFF0 bit-field decode:
+ *   aargA=5(RasColor.a)  aargB=7(->0/ZERO)  aargC=7(->0/ZERO)  aargD=7(->0/ZERO)
+ *   bias(a16)=0  op(a18)=0(add)  clamp(a19)=0(->clamp1024)  scale(a20)=0  dest(a22)=0(Prev)
+ *   tswap_id=0  rswap_id=0
+ *
+ * Stage `enable`==1 in the census dump, but numtexgens==0 means tev_draw's
+ * OWN `if (numtexgens > 0) tex_sample_stat(...) else memset(texel,0,4)`
+ * never takes the sampling branch for this draw -- texel is always zero, and
+ * neither cc nor ac's args reference TexColor/RawTexColor at all (argB/C/D
+ * and aargB/C/D are all the ZERO case), so this fold correctly never touches
+ * a texture at all, matching the general path exactly.
+ *
+ * COLOR fold: draw_color_regular with A=Y(=RasColor.ch),B=0,C=0,D=0,bias=0,
+ * op=0,scale=0,clamp1024 -- C=0 makes the interpolation factor `c` itself
+ * zero (0+(0>>7)=0), so temp = A*(256-0)+B*0 = A*256 exactly, and the
+ * trailing `(+128)>>8` is the same "compress by 256, add half, truncate"
+ * round-trip fused_pixel_A's/D's replace folds use: (A*256+128)>>8 == A for
+ * every A in 0..255, and clamp1024(A) == A since A is already u8-range.
+ * Reg[Prev].ch IS RasColor.ch bit-for-bit -- pure passthrough, the simplest
+ * fold in the file (no texture, no TEV register, no combiner math at all).
+ * Verified bit-exact for all 256 values of RasColor.ch, AND (extra margin,
+ * matching the file's "full possible range" discipline even though
+ * RasColor.ch is provably u8) over the full signed range A in [-1024,1023]
+ * against ref_color's clamp1024 branch: 2048 cases, 0 mismatches either way.
+ *
+ * ALPHA fold: A=Y(=RasColor.a),B=0,C=0,D=0,bias=0,op=0,scale=0,clamp1024 --
+ * identical shape to the color fold above (same (A*256+128)>>8==A identity,
+ * this time via clamp1024). Reg[Prev].a IS RasColor.a bit-for-bit. Verified
+ * for all 256 values, 0 mismatches. */
+static void fused_pixel_F(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+
+    /* colorchan==0, rswap_id==0 with swaptab[0]==identity (both checked at
+     * selection time) -> RasColor.{r,g,b,a} == t->Color[0][0..3] directly.
+     * No texture unit is sampled at all (texgens==0, see derivation). */
+    u8 output[4];
+    output[RED_C] = t->Color[0][0];
+    output[GRN_C] = t->Color[0][1];
+    output[BLU_C] = t->Color[0][2];
+    output[ALP_C] = t->Color[0][3];
+
+    /* alpha test always passes -- same 0x7F0000 word as every other fused
+     * config, checked as part of fused_blend_common_match. */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
 /* ============================================================================
  * Output vertex + rasterizer (Rasterizer.cpp).
  * ==========================================================================*/
@@ -2161,21 +2388,25 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
  *    (RasColor.r/g/b) at all, so their draws still skip the RGB evals below —
  *    the general path only ever reads those through SetRasColor/color_arg,
  *    which the fused functions bypass entirely (they never call tev_draw).
- *    fused_pixel_D is the one exception (its color fold IS RasColor.rgb, see
- *    its derivation comment): `fused_needs_ras_rgb` is set for it, so this
- *    function evaluates Color[0][0..2] for its draws exactly like
- *    raster_pixel_prep's own unconditional loop does — this is NOT dead work
- *    for a config-D draw, so it is not elided.
+ *    fused_pixel_D and fused_pixel_F are the exceptions (their color folds
+ *    ARE RasColor.rgb, see their derivation comments): `fused_needs_ras_rgb`
+ *    is set for both, so this function evaluates Color[0][0..2] for their
+ *    draws exactly like raster_pixel_prep's own unconditional loop does —
+ *    this is NOT dead work for a config-D/config-F draw, so it is not
+ *    elided. fused_pixel_E (the other D1-residuals-sweep addition) is like
+ *    A/B/C: its color fold reads TexColor/Reg[1]/Reg[2], never RasColor.rgb,
+ *    so it does NOT set fused_needs_ras_rgb and still skips this work.
  *
  * Stale-read hazard analysis (t->Position[2] and t->Color[0][0..2] are fields
  * of the single shared `s_tev`/Tev* instance reused across every pixel and
  * draw, so a skipped WRITE could in principle leak a PRIOR draw's/pixel's
  * value to a later READ):
- *  - Within a fused draw whose function doesn't need RasColor.rgb (A/B/C): no
- *    reader exists (see above), so whatever stale bytes sit in
+ *  - Within a fused draw whose function doesn't need RasColor.rgb (A/B/C/E):
+ *    no reader exists (see above), so whatever stale bytes sit in
  *    Position[2]/Color[0][0..2] are never observed. Not a hazard.
- *  - Within a config-D draw: Color[0][0..2] is freshly written below, every
- *    pixel, before fused_pixel_D reads it. Not a hazard either.
+ *  - Within a config-D or config-F draw: Color[0][0..2] is freshly written
+ *    below, every pixel, before fused_pixel_D/fused_pixel_F reads it. Not a
+ *    hazard either.
  *  - A later GENERAL-path draw: raster_pixel (unmodified) always calls the
  *    unmodified raster_pixel_prep first, which unconditionally recomputes and
  *    overwrites Position[2] and Color[i][0..3] for every one of its pixels
@@ -2187,9 +2418,10 @@ static void raster_pixel_prep_fused(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     RBPixel* p = &s_rb_w[t->wid].px[xi][yi];
     t->Position[0] = x; t->Position[1] = y;   /* Position[2]/z: skipped, see above */
     if (s_cfg.fused_needs_ras_rgb) {
-        /* fused_pixel_D needs the full RasColor -- same per-component loop
-         * body as raster_pixel_prep's general numcolchans loop, unrolled for
-         * comp 0..2 (comp 3 below is shared with the A/B/C case). */
+        /* fused_pixel_D/fused_pixel_F need the full RasColor -- same
+         * per-component loop body as raster_pixel_prep's general numcolchans
+         * loop, unrolled for comp 0..2 (comp 3 below is shared with the
+         * A/B/C/E case). */
         for (int comp = 0; comp < 3; comp++) {
             float c = slope_value(&s_ColorSlopes[0][comp], x, y);
             s16 cc = (s16)(c < 0 ? 0 : c > 255 ? 255 : c);
@@ -2536,11 +2768,12 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
      * reads RasColor.rgb — fused_common_match pins numcolchans==1 (so this
      * loop's `i` only ever reaches 0 when fused; the i==1 iteration simply
      * never runs, same as always) and every fused stage's colorchan==0, and
-     * fused_pixel_A/fused_core_C (shared by B/C) read only Color[0][3]
-     * (alpha) — never Color[0][0]/[1]/[2] (see the big comment above
-     * raster_pixel_prep_fused). fused_pixel_D is the exception: its color
-     * fold IS RasColor.rgb, so its draws (`s_cfg.fused_needs_ras_rgb`, set
-     * alongside `s_cfg.fused` in build_draw_cfg) must NOT skip comp 0..2 here
+     * fused_pixel_A/fused_core_C (shared by B/C) and fused_pixel_E read only
+     * Color[0][3] (alpha) — never Color[0][0]/[1]/[2] (see the big comment
+     * above raster_pixel_prep_fused). fused_pixel_D and fused_pixel_F are the
+     * exceptions: their color folds ARE RasColor.rgb, so their draws
+     * (`s_cfg.fused_needs_ras_rgb`, set alongside `s_cfg.fused` in
+     * build_draw_cfg) must NOT skip comp 0..2 here
      * — this triangle-level setup feeds raster_pixel_prep_fused's per-pixel
      * slope_value() reads of s_ColorSlopes[0][0..2], so skipping this and
      * fixing only the per-pixel side (or vice versa) would leave the other
@@ -3744,6 +3977,15 @@ static void build_draw_cfg(void) {
                    fused_stage_match(0, 0x08FCAFu, 0x08F2F0u, 1, 0)) {
             s_cfg.fused = fused_pixel_D;   /* D1 boot-animation config, see its derivation */
             s_cfg.fused_needs_ras_rgb = 1; /* reads RasColor.rgb -- see the field's comment */
+        } else if (s_cfg.numtevstages == 0 &&
+                   fused_stage_match(0, 0x18428Fu, 0x08F770u, 1, 0)) {
+            s_cfg.fused = fused_pixel_E;   /* D1 residuals-sweep config, see its derivation */
+        }
+    } else if (!s_no_fused && fused_common_match_notex()) {
+        if (s_cfg.numtevstages == 0 &&
+            fused_stage_match(0, 0x00AFFFu, 0x00BFF0u, 1, 0)) {
+            s_cfg.fused = fused_pixel_F;   /* D1 residuals-sweep config, see its derivation */
+            s_cfg.fused_needs_ras_rgb = 1; /* reads RasColor.rgb -- see the field's comment */
         }
     }
 
@@ -3949,6 +4191,16 @@ void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u6
     if (draw_calls) *draw_calls = s_draw_calls_stat;
 }
 
+/* Sibling getter for the EFB-bucket copy-vs-clear split (see s_tsc_efb_clear's
+ * comment near the top of the file). *tsc_efb_clear is the clear-only slice
+ * of gx.c's own GX_STAT_EFB accumulator; the caller derives the copy-encode
+ * slice as (GX_STAT_EFB total - *tsc_efb_clear). Zero if GCN_GX_STATS was
+ * never set. */
+void gx_raster_get_efb_clear_stats(u64* tsc_efb_clear, u64* efb_clear_calls) {
+    if (tsc_efb_clear) *tsc_efb_clear = s_tsc_efb_clear;
+    if (efb_clear_calls) *efb_clear_calls = s_efb_clear_calls;
+}
+
 /* Sibling getter for GCN_GX_PIXEL_STATS (own knob, see the big comment near
  * its statics). gx.c prints these as a "[gx-pixel-stats]" line at the same
  * 2^20-tick cadence as "[gx-stats]"/"[gx-draw-stats]". All zero if
@@ -4118,15 +4370,96 @@ static void efb_clear_rect(void) {
      * was set, regardless of format. */
     int use_fallback = !fmt_direct && !fmt_rgba6 && (s_bm_cu || s_bm_au);
 
-    for (int y = top; y <= bottom; y++) {
-        for (int x = left; x <= right; x++) {
-            u32 off = (u32)x + (u32)y * EFB_WIDTH;
-            /* SetColor honors color_update/alpha_update (bp 0x41, cached by
-             * build_efb_cfg() into the shared s_bm_cu/s_bm_au — this is a
-             * per-clear-rect constant, not a per-pixel one). */
-            if (clear_px) {
-                clear_px(off, cc);
-            } else if (use_fallback) {
+    /* ============================================================================
+     * SSE2 clear (perf task, CLAUDE.md gx-raster residuals sweep — queued
+     * since the EFB-copy SSE2 round). GCN_GX_STATS' new EFB copy-vs-clear
+     * split (gx.c's "[gx-efb-stats]" line) showed the scalar clear here is
+     * ~37.6% of the whole EFB bucket (~5.4% of total GX wall) on the boot
+     * animation, entirely from full-viewport clears on scene transitions —
+     * `left`/`top`/`right`/`bottom` are per-clear-rect CONSTANTS by this
+     * point, so both writes below are pure constant fills over a contiguous
+     * span, not a data-dependent per-pixel computation, which is what makes
+     * this an even simpler SIMD target than the EFB-copy encode.
+     *
+     * Color pass: scoped to EXACTLY the fmt_direct fast path (RGB8_Z24/
+     * Z24/RGB565_Z16 — same group get_pixel_color_direct/copy_getpx's SIMD
+     * already special-cases, and the only group the boot animation's clears
+     * are observed to use), and only when clear_px resolved to one of the
+     * two direct-format setters. Both set_pixel_color_only_direct and
+     * set_pixel_alpha_color_direct reduce to the IDENTICAL formula for a
+     * direct pixel_format (no separate alpha plane to special-case — see
+     * their definitions above), so checking clear_px against either is
+     * sufficient and there is exactly one SIMD formula to write, not two:
+     *   s_efb_color[off] = (s_efb_color[off] & 0xFF000000) | color_or
+     * where color_or == (u32)cc-as-le-word >> 8 is the SAME per-clear-rect
+     * constant clear_px would recompute from `cc` on every scalar call — cc
+     * never changes mid-clear, so it is hoisted out and computed once here.
+     * A straight AND-then-OR against a loaded 128-bit lane is byte-exact by
+     * construction (no rounding, no lane-width truncation risk at all: it's
+     * bitwise, not arithmetic), so no brute-force proof is needed here the
+     * way the arithmetic TEV folds needed one — this is not a NEW formula,
+     * it is the scalar formula run 4-wide. RGBA6_Z24 / any other s_pf, and
+     * the neither-cu-nor-au / unrecognized-format branches, keep the exact
+     * original scalar loop untouched (fmt_rgba6's bit-packing formulas do
+     * not reduce to a lane-independent AND/OR the way direct's does, so
+     * vectorizing them is out of scope here, same "only the observed fast
+     * path" call the EFB-copy SIMD task made for copy_getpx).
+     *
+     * Depth pass: SetPixelDepth has NO pixel_format branch at all
+     * (`s_efb_depth[off] = depth & 0x00ffffffu` unconditionally), so it is
+     * always a plain masked-constant fill and always SIMD-eligible whenever
+     * zmode.update_enable (s_zt_upd) is set — independent of which color
+     * path (or none) this clear took.
+     *
+     * Color and depth are split into two SEPARATE passes over the same
+     * (left..right, top..bottom) rect rather than kept fused in one x/y loop
+     * like the original: s_efb_color and s_efb_depth are disjoint arrays
+     * with no cross-array data dependency (a pixel's stored color never
+     * depends on any depth value or vice versa), and within a single clear
+     * every (x,y) location is visited exactly once, so neither the
+     * intra-array write order nor the relative color-vs-depth order at a
+     * given (x,y) can be observed by anything — the final byte contents of
+     * both arrays are identical to the original fused loop regardless of
+     * this split. This is what lets each pass pick SIMD-vs-scalar
+     * independently instead of forcing a lockstep stride between two
+     * formulas with different eligibility.
+     *
+     * GCN_GX_NO_SIMD=1 forces both passes to their scalar loops — the task's
+     * same-binary A/B exactness proof (SIMD-on vs GCN_GX_NO_SIMD=1, same
+     * executable, golden XFB hash must match either way), same knob the
+     * EFB-copy SIMD task already established. ==========================================================================*/
+    if (s_no_simd < 0) s_no_simd = getenv("GCN_GX_NO_SIMD") ? 1 : 0;
+
+    int simd_color_ok = !s_no_simd && fmt_direct &&
+                         (clear_px == set_pixel_color_only_direct ||
+                          clear_px == set_pixel_alpha_color_direct);
+    if (simd_color_ok) {
+        u32 src; memcpy(&src, cc, 4);
+        const __m128i vor   = _mm_set1_epi32((int)(src >> 8));
+        const __m128i vmask = _mm_set1_epi32((int)0xFF000000u);
+        for (int y = top; y <= bottom; y++) {
+            u32 rowoff = (u32)y * EFB_WIDTH;
+            int x = left;
+            for (; x + 4 <= right + 1; x += 4) {
+                u32 off = rowoff + (u32)x;
+                __m128i cur = _mm_loadu_si128((const __m128i*)&s_efb_color[off]);
+                _mm_storeu_si128((__m128i*)&s_efb_color[off],
+                                  _mm_or_si128(_mm_and_si128(cur, vmask), vor));
+            }
+            for (; x <= right; x++)
+                clear_px(rowoff + (u32)x, cc);   /* scalar remainder, identical formula */
+        }
+    } else if (clear_px) {
+        for (int y = top; y <= bottom; y++)
+            for (int x = left; x <= right; x++)
+                clear_px((u32)x + (u32)y * EFB_WIDTH, cc);
+    } else if (use_fallback) {
+        for (int y = top; y <= bottom; y++) {
+            for (int x = left; x <= right; x++) {
+                u32 off = (u32)x + (u32)y * EFB_WIDTH;
+                /* SetColor honors color_update/alpha_update (bp 0x41, cached
+                 * by build_efb_cfg() into the shared s_bm_cu/s_bm_au — a
+                 * per-clear-rect constant, not a per-pixel one). */
                 if (s_bm_cu) {
                     if (s_bm_au) SetPixelAlphaColor(off, cc);
                     else         SetPixelColorOnly(off, cc);
@@ -4134,8 +4467,28 @@ static void efb_clear_rect(void) {
                     SetPixelAlphaOnly(off, cc[ALP_C]);
                 }
             }
-            /* SetDepth honors zmode.update_enable (bp 0x40, cached as s_zt_upd). */
-            if (s_zt_upd) SetPixelDepth(off, clearZ);
+        }
+    }
+    /* else: neither clear_px nor use_fallback -> no color/alpha write this
+     * clear, matches the original (no Set* call at all in that case). */
+
+    if (s_zt_upd) {
+        /* SetDepth honors zmode.update_enable (bp 0x40, cached as s_zt_upd). */
+        u32 depth_val = clearZ & 0x00ffffffu;
+        if (!s_no_simd) {
+            const __m128i vd = _mm_set1_epi32((int)depth_val);
+            for (int y = top; y <= bottom; y++) {
+                u32 rowoff = (u32)y * EFB_WIDTH;
+                int x = left;
+                for (; x + 4 <= right + 1; x += 4)
+                    _mm_storeu_si128((__m128i*)&s_efb_depth[rowoff + (u32)x], vd);
+                for (; x <= right; x++)
+                    SetPixelDepth(rowoff + (u32)x, clearZ);
+            }
+        } else {
+            for (int y = top; y <= bottom; y++)
+                for (int x = left; x <= right; x++)
+                    SetPixelDepth((u32)x + (u32)y * EFB_WIDTH, clearZ);
         }
     }
 }
@@ -4361,6 +4714,12 @@ static inline __m128i simd_gather_odd2(__m128i lo, __m128i hi) {
 
 void gx_raster_efb_copy(const GxCpState* cp) {
     (void)cp;
+    /* Lazy-init same as gx_raster_draw's own copy (line ~4153): an EFB copy
+     * can be the very first GX-stats-relevant call of a run (e.g. a clear
+     * with no preceding draw), so this can't rely on gx_raster_draw having
+     * already resolved the knob. */
+    if (s_draw_stats < 0) s_draw_stats = getenv("GCN_GX_STATS") ? 1 : 0;
+
     /* Own decode of the pixel_format/color_update/alpha_update/z-update quad
      * this call's GetPixelColor/efb_clear_rect calls need — see build_efb_cfg. */
     build_efb_cfg();
@@ -4552,7 +4911,16 @@ void gx_raster_efb_copy(const GxCpState* cp) {
         TRAP(efbtex, "EFB->texture copy (copy_to_xfb=0)");
     }
 
-    if (clear) efb_clear_rect();
+    if (clear) {
+        if (s_draw_stats) {
+            u64 t0 = __rdtsc();
+            efb_clear_rect();
+            s_tsc_efb_clear += __rdtsc() - t0;
+            s_efb_clear_calls++;
+        } else {
+            efb_clear_rect();
+        }
+    }
 }
 
 /* ============================================================================
