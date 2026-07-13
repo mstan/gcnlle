@@ -78,6 +78,7 @@ target_link_libraries(dr_analysis PUBLIC dr_frontend)
 
 add_library(dr_backend STATIC
     src/backend/emitter.c
+    src/backend/ppc_cycles.c
     src/backend/dispatch.c
     src/backend/codegen.c
 )

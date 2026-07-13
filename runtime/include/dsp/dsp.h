@@ -123,6 +123,20 @@ void gcn_dsp_tick(u32 ppc_cycles);   /* advance the DSP core (called per block) 
  * (DSP MMIO, PI INTSR/INTMR, debug queries). No-op when batching is off or
  * nothing is owed. Preserves the /6 remainder as still-owed. See dsp.c. */
 void gcn_dsp_flush(void);
+/* Rate-limited flush for READ-side observation points (DSP-block MMIO reads,
+ * PI INTSR read / INTMR write): runs the core only once >= GCN_DSP_FLUSH_MIN
+ * (default 96) PPC cycles are owed — the uniform-charging world's
+ * per-poll-iteration staleness, preserved quantitatively now that derived
+ * cycle accuracy makes real poll loops observe many times more often per
+ * emulated second. WRITE paths keep the full gcn_dsp_flush (mail/CSR
+ * ordering). GCN_DSP_FLUSH_MIN=0 restores flush-every-observation (A/B). */
+void gcn_dsp_flush_lazy(void);
+/* Raise the lazy-flush threshold (derived mode only — dispatch.c calls this
+ * with the uniform world's 96-cycle per-iteration staleness once it resolves
+ * that real per-block cycle counts are in effect). Never called => 0 =>
+ * gcn_dsp_flush_lazy is byte-identical to gcn_dsp_flush (legacy contract).
+ * GCN_DSP_FLUSH_MIN overrides either way. */
+void gcn_dsp_set_flush_min(u32 ppc_cycles);
 u32  gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 

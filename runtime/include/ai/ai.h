@@ -74,19 +74,55 @@
 
 /* Sample-counter pacing (AudioInterface.cpp IncreaseSampleCount/Update:108-155):
  * AISCNT advances by one AIS sample every "cycles per sample" Gekko core cycles
- * while PSTAT=1, at the AISFR-selected rate. Same derivation style as the DSP
- * AID block pacing (dsp.h GCN_DSP_AID_TICKS_PER_BLOCK): 486 MHz nominal core
- * clock / rate = core cycles/sample, divided by the per-block core-cycle budget
- * the dispatch loop advances every device tick (GCN_CORE_CYCLES_PER_BLOCK = 96,
- * dispatch.c) to get the tick-accumulator threshold gcn_ai_tick counts against
- * (one call per executed block, mirroring gcn_dsp_tick's dsp_aid_tick):
+ * while PSTAT=1, at the AISFR-selected rate. Two pacing models coexist here —
+ * see dispatch.c's derived-cycle-accuracy A/B knob (GCN_CYCLES_UNIFORM) for
+ * which one a given run takes:
+ *
+ * LEGACY (gcn_ai_tick_legacy, calls-counted): before the recompiler emitted
+ * real per-instruction cycle counts, the dispatch loop had no per-block cycle
+ * count to pace against, only a call. So the threshold was derived by folding
+ * the fixed per-block device-cycle constant (GCN_CORE_CYCLES_PER_BLOCK = 96,
+ * dispatch.c) into a call count:
  *   48 kHz: 486,000,000 / 48000   = 10125    cycles/sample -> /96 ~= 105 ticks/sample
  *   32 kHz: 486,000,000 / 32000   = 15187.5  cycles/sample -> /96 ~= 158 ticks/sample
+ * i.e. the legacy threshold is really floor(10125/96)=105 and floor(15187.5/96)
+ * =158 CALLS, not cycles — an approximation of the true cycles/sample rate
+ * (105*96=10080 and 158*96=15168, both short of the true 10125/15187.5). This
+ * function and GCN_AI_TICKS_PER_SAMPLE_* are kept byte-for-bit unmodified
+ * (see gcn_ai_tick_legacy in ai.c) so GCN_CYCLES_UNIFORM=1 / pre-cycle-count
+ * generated code reproduce the pre-derived-accuracy golden XFB hashes exactly.
+ *
+ * DERIVED (gcn_ai_tick(cycles), cycle-accurate): now that the dispatch loop
+ * has a real per-block Gekko-core-cycle delta (CPUState.cycles, cpu.h), pace
+ * AISCNT against the TRUE cycles/sample rate directly instead of the
+ * 96-cycles/call-derived approximation above:
+ *   48 kHz: 486,000,000 / 48000   = 10125    cycles/sample  (exact integer)
+ *   32 kHz: 486,000,000 / 32000   = 15187.5  cycles/sample  (exact half-cycle)
+ * 32 kHz isn't integral, so the derived accumulator (GcnAi.cycle_accum_x2)
+ * and its threshold are carried in x2 fixed point (doubled) so the .5 is
+ * represented exactly, never rounded and never dropped — same "never lose or
+ * double-charge a cycle" remainder-carry discipline as dsp.c's /6 divide:
+ *   48 kHz: 10125    cycles/sample -> x2 threshold = 20250 (GCN_AI_CYCLES_PER_SAMPLE_48KHZ_X2)
+ *   32 kHz: 15187.5  cycles/sample -> x2 threshold = 30375 (GCN_AI_CYCLES_PER_SAMPLE_32KHZ_X2)
+ *
+ * NOTE: because 96 doesn't evenly divide 10125 (10125/96 = 105.46875), feeding
+ * a flat 96 cycles/call through the DERIVED threshold would first cross 10125
+ * on the 106th call (96*105=10080 < 10125 <= 96*106=10176) — ONE BLOCK LATER
+ * than the legacy path's 105th-call fire. The two models are deliberately
+ * NOT unified into one cycle-threshold function for exactly this reason: doing
+ * so would make the "byte-identical legacy fallback" requirement impossible to
+ * satisfy from cycle math alone. Keeping gcn_ai_tick_legacy as a wholly
+ * separate, untouched function is what makes GCN_CYCLES_UNIFORM=1 an EXACT
+ * reproduction rather than a close approximation.
+ *
  * Nominal timing only — the poll-collapsed oracle diff (--counter-polls) is
  * insensitive to the exact rate; what matters is that AISCNT ADVANCES and
  * AIINT PACES the guest. */
-#define GCN_AI_TICKS_PER_SAMPLE_48KHZ  105u
-#define GCN_AI_TICKS_PER_SAMPLE_32KHZ  158u
+#define GCN_AI_TICKS_PER_SAMPLE_48KHZ  105u   /* legacy: calls, not cycles */
+#define GCN_AI_TICKS_PER_SAMPLE_32KHZ  158u   /* legacy: calls, not cycles */
+
+#define GCN_AI_CYCLES_PER_SAMPLE_48KHZ_X2  20250u  /* derived: 2 * 10125 exact */
+#define GCN_AI_CYCLES_PER_SAMPLE_32KHZ_X2  30375u  /* derived: 2 * 15187.5 exact */
 
 /* Level change on the AI->PI interrupt line (level: 1 assert, 0 deassert). */
 typedef void (*GcnAiIrqFn)(void* user, int level);
@@ -96,7 +132,8 @@ typedef struct {
     u32 volume;         /* AIVR                                            */
     u32 sample_counter; /* AISCNT                                          */
     u32 int_timing;     /* AIIT                                            */
-    u32 tick_accum;     /* gcn_ai_tick accumulator (sample-period pacing)  */
+    u32 tick_accum;     /* gcn_ai_tick_legacy accumulator (calls-counted)  */
+    u64 cycle_accum_x2; /* gcn_ai_tick accumulator (x2 fixed-point cycles) */
     int irq_level;      /* last AI->PI line level (edge detect for the ring) */
     GcnAiIrqFn irq;     /* sink for the AI interrupt line (boot.c -> PI) */
     void*      irq_user;
@@ -113,9 +150,21 @@ void gcn_ai_init(GcnAi* ai);
 void gcn_ai_set_irq(GcnAi* ai, GcnAiIrqFn fn, void* user);
 u32  gcn_ai_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_ai_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
-/* Advance the AI sample counter one tick (called once per executed block from
- * dispatch.c, after gcn_dsp_tick — s_ai singleton pattern, see ai.c). No-op
- * while PSTAT=0 (IsPlaying() gate, AudioInterface.cpp:142/323-326). */
-void gcn_ai_tick(void);
+/* DERIVED cycle-accurate pacing: advance AISCNT by the real elapsed Gekko-core
+ * cycle delta (dispatch.c's ctx->cycles - prev_cycles for the block just run;
+ * same clock domain the 486 MHz derivation above uses directly, no scaling).
+ * Called once per executed block from dispatch.c, after gcn_dsp_tick — s_ai
+ * singleton pattern, see ai.c. No-op while PSTAT=0 (IsPlaying() gate,
+ * AudioInterface.cpp:142/323-326). Used only when dispatch.c is in derived
+ * mode (a real per-block cycle count is available and GCN_CYCLES_UNIFORM is
+ * not set) — see the ai.h derivation comment above for why this is a distinct
+ * function from gcn_ai_tick_legacy rather than a unified cycle threshold. */
+void gcn_ai_tick(u32 cycles);
+/* LEGACY calls-counted pacing: byte-for-bit the original gcn_ai_tick body
+ * (one call == one implicit 96-cycle tick, thresholds GCN_AI_TICKS_PER_SAMPLE_*
+ * in ai.h). Called once per executed block from dispatch.c ONLY in fallback
+ * mode (delta==0 / GCN_CYCLES_UNIFORM=1) so that mode reproduces the
+ * pre-derived-cycle-accuracy golden XFB hashes bit-for-bit — see dispatch.c. */
+void gcn_ai_tick_legacy(void);
 
 #endif /* GCN_AI_AI_H */

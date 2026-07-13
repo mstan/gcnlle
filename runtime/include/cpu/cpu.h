@@ -146,7 +146,22 @@ struct CPUState {
 
     /* ---- runtime-only bookkeeping (APPENDED; not part of the DolRecomp
      *      contract; safe because generated code never assumes sizeof). ---- */
-    u64 cycles;              /* retired-block / step accounting */
+    u64 cycles;              /* derived cycle accuracy: Dolphin-model Gekko core
+                              * cycles retired, incremented per emitted
+                              * instruction by the generated code (emitter.c),
+                              * consumed as a per-run delta by dispatch.c's
+                              * gcn_dispatch_charge. No longer runtime-only:
+                              * generated code names this field directly. */
+    u64 cycle_deadline;      /* deadline yield: generated code's taken BACKWARD
+                              * conditional branches stay in-chunk (goto) while
+                              * cycles < cycle_deadline and return to the
+                              * dispatch loop once it expires — so tight guest
+                              * loops run at native speed while device ticks
+                              * keep a bounded cycle granularity (the dispatch
+                              * loop sets this to cycles + quantum before every
+                              * dolrecomp_call; pre-expired == old always-return
+                              * control flow, which is exactly what the
+                              * GCN_CYCLES_UNIFORM baseline uses). */
     bool halted;             /* set by the dispatch driver on a terminal state */
     int halt_reason;         /* GCN_HALT_* */
 

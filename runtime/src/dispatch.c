@@ -28,28 +28,57 @@
 #include <mmsystem.h>    /* timeBeginPeriod — Sleep() granularity, GCN_THROTTLE only
                           * (winmm; see runtime/CMakeLists.txt gcn_boot link line) */
 
-/* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP core
+/* ===========================================================================
+ * DERIVED CYCLE ACCURACY (dispatch.c gcn_dispatch_charge, below)
+ *
+ * The recompiler now emits `ctx->cycles += N;` per instruction into every
+ * generated chunk (CPUState.cycles, cpu.h) — real, Dolphin-model-derived
+ * PPC/Gekko-core cycles retired by the block dolrecomp_call just ran. The
+ * constants immediately below (GCN_DSP_CYCLES_PER_BLOCK / GCN_TB_TICKS_
+ * PER_BLOCK / GCN_CORE_CYCLES_PER_BLOCK) are now FALLBACK-ONLY: they are the
+ * fixed per-block charges used only when no real per-block count is available
+ * (delta==0 — old generated code that never touches ctx->cycles) or the
+ * GCN_CYCLES_UNIFORM=1 A/B knob forces them on deliberately. See
+ * gcn_dispatch_charge's doc comment for the full derived-vs-fallback split
+ * and the exact ratio math (TB, DSP, AI). GCN_CORE_CYCLES_PER_BLOCK is ALSO
+ * still the value gcn_gx_tick receives in every mode (its `cycles` argument
+ * is accepted for signature symmetry only — GX drains a fixed byte budget per
+ * tick regardless, gx.h) — that constant is not part of the A/B knob at all.
+ * ===========================================================================*/
+
+/* FALLBACK ONLY (GCN_CYCLES_UNIFORM=1 / no per-block cycle count available).
+ * Nominal PPC-cycle budget handed to the DSP per executed block (the DSP core
  * advances ~1/6th of it). A recompiled block is only ~5-10 PPC cycles, so this
  * should be ~5-12 to track the true DSP:CPU clock ratio. The old value (600) ran
  * the DSP LLE core ~60-120x too fast per block, which — because the DSP core is
  * the single dominant runtime cost — made the whole emulation a slideshow
  * (~1 fps). 12 is the measured sweet spot: functional (boot animation/intro
  * sequencer unfreeze intact), oracle-clean (matched=19355, one benign PI
- * reorder), and ~20x faster. Override with GCN_DSP_CYCLES (dispatch.c). */
+ * reorder), and ~20x faster. Override with GCN_DSP_CYCLES (dispatch.c).
+ * DERIVED mode also uses this constant, but only as the denominator of a
+ * ratio (see gcn_dispatch_charge) — NOT as a flat per-block charge. */
 #define GCN_DSP_CYCLES_PER_BLOCK 12u
 
-/* Guest time-base ticks advanced per executed block. The real Gekko TB runs at
- * bus/4; we don't have per-block instruction counts here, so M0 uses a fixed
- * monotonic tick. This only needs to advance so that mftb-based delay loops
- * terminate — the oracle diff is MMIO value+order, insensitive to the exact TB
- * rate. Refine to a real cycle model once the recompiler emits per-block counts. */
+/* FALLBACK ONLY. Guest time-base ticks advanced per executed block. The real
+ * Gekko TB runs at bus/4; before derived cycle accuracy there was no per-block
+ * instruction count here, so this was a fixed monotonic tick. This only needs
+ * to advance so that mftb-based delay loops terminate — the oracle diff is
+ * MMIO value+order, insensitive to the exact TB rate. DERIVED mode instead
+ * charges ctx->timebase += real_core_cycle_delta/12 (see gcn_dispatch_charge);
+ * *12 below is exactly that same core:TB ratio, so
+ * GCN_CORE_CYCLES_PER_BLOCK/GCN_TB_TICKS_PER_BLOCK == 12 in the fallback
+ * constants too — the two modes agree on the clock ratio, only the per-block
+ * cycle COUNT feeding it changes (fixed vs. real). */
 #define GCN_TB_TICKS_PER_BLOCK 8u
 
-/* Monotonic device-clock cycles (Gekko core cycles, TB*12) advanced per block.
- * This is deliberately NOT ctx->timebase: the guest can WRITE the TB (mttbl/
- * mttbu — the IPL zeroes it during OS init), but hardware device clocks (the
- * VI 27 MHz pixel clock) keep running through a TB write. Deriving device time
- * from the writable TB made the beam jump backward when the IPL rebased it. */
+/* FALLBACK ONLY. Monotonic device-clock cycles (Gekko core cycles, TB*12)
+ * advanced per block. This is deliberately NOT ctx->timebase: the guest can
+ * WRITE the TB (mttbl/mttbu — the IPL zeroes it during OS init), but hardware
+ * device clocks (the VI 27 MHz pixel clock) keep running through a TB write.
+ * Deriving device time from the writable TB made the beam jump backward when
+ * the IPL rebased it. DERIVED mode charges device_cycles += the real core-
+ * cycle delta directly (1:1, no scaling — device_cycles already IS core-clock
+ * cycles) instead of this flat constant. */
 #define GCN_CORE_CYCLES_PER_BLOCK (GCN_TB_TICKS_PER_BLOCK * 12u)
 
 /* GCN_THROTTLE=1: pace EMULATED time to WALL-CLOCK time. Free-run today runs
@@ -155,6 +184,99 @@ const u8* gcn_dispatch_bs1_snapshot(u32* len_out) {
     return s_bs1_snap;
 }
 
+/* Resolve one executed block's device-cycle charges from ctx->cycles (the
+ * recompiler's per-instruction `ctx->cycles += N` accumulation, cpu.h) and
+ * fold ctx->timebase / *device_cycles directly. Returns the cycle count the
+ * caller should hand to gcn_dsp_tick (*dsp_cycles_out) and, when the return
+ * value is non-zero ("derived mode"), the cycle count for gcn_ai_tick
+ * (*ai_cycles_out) — when the return value is 0 ("fallback mode") the caller
+ * must call gcn_ai_tick_legacy() instead (ai.h derivation comment explains
+ * why AI can't share one cycle-threshold function across both modes).
+ *
+ * FALLBACK / A-B KNOB (return 0): if delta == 0 — old generated code that
+ * never touches ctx->cycles, which stays 0 forever, so every delta reads 0;
+ * a real per-instruction-counted run always retires >= 1 instruction per
+ * block, so a genuine derived delta is always >= 1 — OR env
+ * GCN_CYCLES_UNIFORM=1 is set (lazy -1-sentinel getenv, same idiom as
+ * gx_raster.c's s_no_fused/s_no_simd), charge EXACTLY today's fixed
+ * per-block constants. This is the recalibration A/B baseline: with
+ * GCN_CYCLES_UNIFORM=1, or against any generated.h built before the
+ * recompiler emitted cycle counts, this function's output — and therefore
+ * the whole dispatch loop's device timing — MUST be byte-for-bit identical
+ * to the pre-derived-cycle-accuracy code, and the run MUST reproduce the
+ * pre-change golden XFB hashes bit-for-bit. If a future change to this
+ * fallback branch ever changes that output, it is a regression regardless of
+ * how it affects the derived branch.
+ *
+ * DERIVED (return 1): see the three per-device comments inline below for the
+ * TB, DSP and AI ratio derivations. */
+static inline int gcn_dispatch_charge(CPUState* ctx, u64* prev_cycles,
+                                       u64* tb_remainder, u64* dsp_remainder,
+                                       u64* device_cycles, u32 dsp_cycles_per_block,
+                                       int uniform, u32* dsp_cycles_out,
+                                       u32* ai_cycles_out) {
+    u64 cycles_now = ctx->cycles;
+    u64 delta = cycles_now - *prev_cycles;
+    *prev_cycles = cycles_now;
+
+    if (delta == 0 || uniform) {
+        ctx->timebase   += GCN_TB_TICKS_PER_BLOCK;
+        *device_cycles  += GCN_CORE_CYCLES_PER_BLOCK;
+        *dsp_cycles_out  = dsp_cycles_per_block;
+        *ai_cycles_out   = 0;   /* unused by the caller (gcn_ai_tick_legacy takes
+                                  * no argument) — set anyway so the out-param is
+                                  * never left uninitialized on this path. */
+        return 0;
+    }
+
+    /* TB: bus/4 = 40.5 MHz; core = 486 MHz -> core:TB ratio = 12:1 (486/40.5
+     * == 12, exactly GCN_CORE_CYCLES_PER_BLOCK/GCN_TB_TICKS_PER_BLOCK above —
+     * the derived and fallback constants agree on this ratio, confirming it's
+     * the right one to carry forward). Charge floor(delta/12) and carry the
+     * sub-12 remainder forward in *tb_remainder so the running TB total across
+     * many blocks never loses or double-charges a cycle — same remainder-
+     * carry idiom as dsp.c's gcn_dsp_flush /6 divide (dsp.c:118-133). */
+    { u64 numer = delta + *tb_remainder;
+      u64 tb_delta = numer / 12u;
+      *tb_remainder = numer % 12u;
+      ctx->timebase += tb_delta; }
+
+    /* Device clock (VI beam, etc.): device_cycles IS the Gekko core clock, the
+     * exact same domain ctx->cycles counts — 1:1 passthrough, no scaling.
+     * gcn_vi_tick already takes this as an absolute monotonic running total
+     * and tolerates variable per-call increments (vi.h). */
+    *device_cycles += delta;
+
+    /* DSP: dsp_lle_update() consumes plain PPC/Gekko-core cycles and divides
+     * by 6 internally for the DSP:CPU clock ratio (dsp.c gcn_dsp_flush
+     * comment, dsp_lle_c.cpp:132) — the SAME units ctx->cycles already
+     * counts. The faithful feed is therefore delta itself (identity), NOT a
+     * fixed per-block constant re-derived from anything else: the old
+     * GCN_DSP_CYCLES_PER_BLOCK=12 was never a real DSP:CPU ratio, it was a
+     * hand-tuned STAND-IN for "a recompiled block's true retired PPC-cycle
+     * count" (see that constant's comment) back when no real count was
+     * available — ctx->cycles now supplies that real count directly, so the
+     * stand-in is superseded, not scaled.
+     *   GCN_DSP_CYCLES still needs to work, though: it used to replace the
+     * flat per-block constant outright (dsp_cycles_per_block, above), so here
+     * it instead SCALES the identity feed by dsp_cycles_per_block/12 — with
+     * the env unset, dsp_cycles_per_block == GCN_DSP_CYCLES_PER_BLOCK (12),
+     * ratio == 12/12 == 1, and delta passes through completely unscaled
+     * (exact, not merely close: delta*12 is always an exact multiple of 12).
+     * Remainder-carried in *dsp_remainder exactly like TB above so an
+     * override ratio never loses or double-charges a cycle either. */
+    { u64 numer = delta * (u64)dsp_cycles_per_block + *dsp_remainder;
+      u64 dsp_delta = numer / GCN_DSP_CYCLES_PER_BLOCK;
+      *dsp_remainder = numer % GCN_DSP_CYCLES_PER_BLOCK;
+      *dsp_cycles_out = (u32)dsp_delta; }
+
+    /* AI: same core-clock domain as device_cycles, 1:1 passthrough — ai.c's
+     * gcn_ai_tick converts this into x2-fixed-point AISCNT pacing against the
+     * true 10125/15187.5 cycles/sample rate (ai.h derivation comment). */
+    *ai_cycles_out = (u32)delta;
+    return 1;
+}
+
 /* Own the run loop (rather than the generated static-inline dolrecomp_run_blocks)
  * so we can advance the time base between blocks — otherwise mftb reads a frozen
  * TB and firmware delay loops spin forever. */
@@ -162,12 +284,50 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     u32 blocks = 0;
     static u64 device_cycles = 0;   /* monotonic across nested/repeated runs */
 
+    /* Derived cycle accuracy: state for gcn_dispatch_charge, all monotonic /
+     * persistent across nested-or-repeated gcn_dispatch_run calls, same as
+     * device_cycles above.
+     *   prev_cycles   — last block's ctx->cycles snapshot, so the delta this
+     *                   iteration reflects ONLY the block that just ran.
+     *   tb_remainder  — sub-12 core-cycle residue not yet folded into
+     *                   ctx->timebase (derived mode's /12 TB divide).
+     *   dsp_remainder — fixed-point residue for the derived mode DSP ratio.
+     * ctx->cycles only ever grows (cpu.h), so prev_cycles starts at 0 exactly
+     * like it. */
+    static u64 prev_cycles = 0;
+    static u64 tb_remainder = 0;
+    static u64 dsp_remainder = 0;
+
+    /* Timing-mode selection. UNIFORM (the fixed legacy per-block constants)
+     * is the DEFAULT: it is the fully-validated configuration (goldens,
+     * oracle, interactive real-time play) and the fast one — derived mode
+     * currently runs ~0.4x real-time because it genuinely executes every
+     * real delay-loop iteration (block-exec dominates its profile; making
+     * that fast is a future codegen campaign). GCN_CYCLES_DERIVED=1 opts
+     * into real Dolphin-model per-block cycle costs ("derived cycle
+     * accuracy for when we need it"): its own golden anchors + oracle gate
+     * cover it, and it additionally arms the DSP lazy-flush threshold at
+     * the uniform world's per-iteration staleness (gcn_dsp_set_flush_min —
+     * never armed in uniform mode, where flush-per-observation is part of
+     * the validated contract). GCN_CYCLES_UNIFORM=1 still forces uniform
+     * explicitly (compat with the recalibration-era A/B scripts). */
+    static int s_cycles_uniform = -1;
+    if (s_cycles_uniform < 0) {
+        const char* d = getenv("GCN_CYCLES_DERIVED");
+        int derived_req = (d && *d && *d != '0') && !getenv("GCN_CYCLES_UNIFORM");
+        s_cycles_uniform = derived_req ? 0 : 1;
+        if (derived_req)
+            gcn_dsp_set_flush_min(96u);   /* see gcn_dsp_flush_lazy (dsp.c) */
+    }
+
     /* DSP cycles advanced per executed block. The DSP-LLE core is the dominant
      * runtime cost (running the DSP ucode/spin ~100 cycles per CPU block), and
      * the fixed 600 PPC-cycle value was heavily over-provisioned: a recompiled
      * block is only ~5-10 PPC cycles, so 600 ran the DSP ~60-100x faster than the
      * true ~1/6 DSP:CPU ratio warrants. GCN_DSP_CYCLES overrides it (0 keeps the
-     * DSP ticking but does no work). Read ONCE here, not per block. */
+     * DSP ticking but does no work). Read ONCE here, not per block. Derived mode
+     * also reads this (gcn_dispatch_charge) — see that function's DSP comment
+     * for how the override applies as a ratio rather than a flat charge there. */
     u32 dsp_cycles_per_block = GCN_DSP_CYCLES_PER_BLOCK;
     { const char* e = getenv("GCN_DSP_CYCLES");
       if (e && *e) dsp_cycles_per_block = (u32)strtoul(e, NULL, 0); }
@@ -245,6 +405,30 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
 
         u32 pending = ctx->exception;
         ctx->exception = 0;
+
+        /* Deadline yield (derived cycle accuracy, part 2): generated taken
+         * BACKWARD conditional branches stay in-chunk (goto) while
+         * ctx->cycles < ctx->cycle_deadline and only return here once the
+         * quantum expires — so a real 5-cycle guest delay loop no longer pays
+         * a full host dispatch+device round-trip per iteration. The quantum
+         * (GCN_CYCLE_QUANTUM, core cycles) defaults to 96 — EXACTLY the
+         * per-block device-tick granularity the old uniform charging had
+         * (GCN_CORE_CYCLES_PER_BLOCK), so device event precision is preserved
+         * by default and any coarser setting is a separately-gated choice.
+         * Uniform/fallback mode sets a PRE-EXPIRED deadline (0): the emitted
+         * `cycles < deadline` goto can then never fire, reproducing the old
+         * always-return control flow bit-for-bit — required for the
+         * GCN_CYCLES_UNIFORM golden baseline to stay exact. */
+        {
+            static u64 s_quantum = 0;
+            if (s_quantum == 0) {
+                const char* q = getenv("GCN_CYCLE_QUANTUM");
+                u64 v = q && *q ? strtoull(q, NULL, 0) : 0;
+                s_quantum = v ? v : (u64)GCN_CORE_CYCLES_PER_BLOCK;
+            }
+            ctx->cycle_deadline = s_cycles_uniform ? 0 : ctx->cycles + s_quantum;
+        }
+
         /* GCN_DISPATCH_STATS=1: rdtsc-based wall attribution of the per-block
          * loop across block-exec and each device tick, printed every 2^20
          * blocks. Shares (not absolute ns) are the product — the tsc frequency
@@ -254,11 +438,14 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
             int ok = dolrecomp_call(ctx, ctx->pc);
             u64 t1 = __rdtsc(); s_tsc[0] += t1 - t0;
             if (!ok) { ctx->exception = pending; return 0; }
-            ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
-            device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
-            gcn_dsp_tick(dsp_cycles_per_block);
+            u32 dsp_cycles, ai_cycles;
+            int derived = gcn_dispatch_charge(ctx, &prev_cycles, &tb_remainder,
+                                               &dsp_remainder, &device_cycles,
+                                               dsp_cycles_per_block, s_cycles_uniform,
+                                               &dsp_cycles, &ai_cycles);
+            gcn_dsp_tick(dsp_cycles);
             u64 t2 = __rdtsc(); s_tsc[1] += t2 - t1;
-            gcn_ai_tick();
+            if (derived) gcn_ai_tick(ai_cycles); else gcn_ai_tick_legacy();
             u64 t3 = __rdtsc(); s_tsc[2] += t3 - t2;
             gcn_vi_tick(device_cycles);
             u64 t4 = __rdtsc(); s_tsc[3] += t4 - t3;
@@ -281,13 +468,21 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
             ctx->exception = pending;
             return 0;
         }
-        ctx->timebase += GCN_TB_TICKS_PER_BLOCK;
-        device_cycles += GCN_CORE_CYCLES_PER_BLOCK;
+        /* Resolves ctx->timebase / device_cycles and this block's DSP/AI
+         * charges — fallback (fixed legacy constants, byte-identical to
+         * before derived cycle accuracy) or derived (real per-block
+         * ctx->cycles delta) per gcn_dispatch_charge's doc comment above. */
+        u32 dsp_cycles, ai_cycles;
+        int derived = gcn_dispatch_charge(ctx, &prev_cycles, &tb_remainder,
+                                           &dsp_remainder, &device_cycles,
+                                           dsp_cycles_per_block, s_cycles_uniform,
+                                           &dsp_cycles, &ai_cycles);
         /* Accrues DSP-cycle debt and flushes it at CPU observation points or
          * the K-cycle cap (default 4096 PPC cycles, GCN_DSP_BATCH_PPC) —
          * no longer runs the DSP core every block; see gcn_dsp_flush (dsp.c). */
-        gcn_dsp_tick(dsp_cycles_per_block);
-        gcn_ai_tick();                            /* pace AISCNT / AIINT while PSTAT=1 */
+        gcn_dsp_tick(dsp_cycles);
+        if (derived) gcn_ai_tick(ai_cycles);      /* pace AISCNT / AIINT while PSTAT=1 */
+        else         gcn_ai_tick_legacy();
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
         gcn_di_tick();                           /* complete a deferred DI command */
         gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */

@@ -50,12 +50,18 @@ static void write_control(GcnAi* ai, u32 val) {
      * ComplexWrite:250-259: "ai.m_last_cpu_time = core_timing.GetTicks()" on
      * ANY PSTAT value change, start or stop) — our equivalent is zeroing the
      * tick accumulator so a stale partial sample period never carries across
-     * a play/stop transition. */
-    if ((val & GCN_AI_CR_PSTAT) != (ai->control & GCN_AI_CR_PSTAT))
+     * a play/stop transition. Both accumulators are kept zeroed together
+     * regardless of which pacing model (legacy calls-counted / derived
+     * cycle-accurate) the current run is actually exercising — the idle one
+     * costs nothing and this keeps a mode never seeing the other's residue. */
+    if ((val & GCN_AI_CR_PSTAT) != (ai->control & GCN_AI_CR_PSTAT)) {
         ai->tick_accum = 0;
+        ai->cycle_accum_x2 = 0;
+    }
     if (val & GCN_AI_CR_SCRESET) {
         ai->sample_counter = 0;   /* RegisterMMIO :268-275 */
         ai->tick_accum = 0;
+        ai->cycle_accum_x2 = 0;
     }
     ai->control = nv;
     /* AIINT W1C ack and AIINTMSK change both move the line (AudioInterface.cpp
@@ -87,6 +93,7 @@ void gcn_ai_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
          * ("ai.m_last_cpu_time = core_timing.GetTicks()"). */
         ai->sample_counter = value;
         ai->tick_accum = 0;
+        ai->cycle_accum_x2 = 0;
         break;
     case GCN_AI_INTTIMING: ai->int_timing = value; break;
     default: break;
@@ -95,11 +102,8 @@ void gcn_ai_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
 
 /* ---- sample counter / AIINT pacing (AudioInterface.cpp IncreaseSampleCount /
  * GenerateAudioInterrupt:102-123) ----
- * Called once per executed block from dispatch.c (after gcn_dsp_tick), same
- * singleton-tick pattern as gcn_vi_tick/gcn_dsp_tick. No-op while PSTAT=0
- * (IsPlaying() gate). While playing, accumulates ticks until one AIS sample
- * period (rate-selected threshold, ai.h) elapses, then advances AISCNT by
- * exactly one sample and re-runs Dolphin's wraparound-safe compare:
+ * Shared by both pacing models below: advances AISCNT by exactly one sample
+ * and re-runs Dolphin's wraparound-safe compare:
  *   old = sample_counter(before) + 1
  *   new = sample_counter(before) + amount     (amount == 1 here)
  *   fire if (int_timing - old) <= (new - old)
@@ -107,17 +111,7 @@ void gcn_ai_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
  * int_timing == sample_counter(after) — i.e. AIINT latches the tick AISCNT
  * reaches AIIT, and (per ai.h) unconditionally of AIINTVLD, exactly as
  * Dolphin's IncreaseSampleCount does. */
-static void ai_tick_once(GcnAi* ai) {
-    if (!(ai->control & GCN_AI_CR_PSTAT))
-        return;   /* Update():142 / IsPlaying():323-326 */
-
-    u32 ticks_per_sample = (ai->control & GCN_AI_CR_AISFR)
-                               ? GCN_AI_TICKS_PER_SAMPLE_48KHZ
-                               : GCN_AI_TICKS_PER_SAMPLE_32KHZ;
-    if (++ai->tick_accum < ticks_per_sample)
-        return;
-    ai->tick_accum = 0;
-
+static void ai_advance_sample(GcnAi* ai) {
     u32 old = ai->sample_counter + 1;          /* IncreaseSampleCount:113 */
     ai->sample_counter += 1;                   /* amount = 1 sample/tick  */
     if ((ai->int_timing - old) <= (ai->sample_counter - old)) {
@@ -126,7 +120,48 @@ static void ai_tick_once(GcnAi* ai) {
     }
 }
 
-void gcn_ai_tick(void) {
-    if (s_ai)
-        ai_tick_once(s_ai);
+/* LEGACY calls-counted pacing (ai.h derivation comment). Called once per
+ * executed block from dispatch.c's fallback path (after gcn_dsp_tick), same
+ * singleton-tick pattern as gcn_vi_tick/gcn_dsp_tick. No-op while PSTAT=0
+ * (IsPlaying() gate). While playing, accumulates ONE CALL (not cycles) until
+ * ticks_per_sample calls elapse, then fires one sample — byte-for-bit the
+ * pre-derived-cycle-accuracy body, unmodified, so GCN_CYCLES_UNIFORM=1
+ * reproduces the pre-existing golden XFB hashes exactly. */
+void gcn_ai_tick_legacy(void) {
+    GcnAi* ai = s_ai;
+    if (!ai || !(ai->control & GCN_AI_CR_PSTAT))
+        return;   /* Update():142 / IsPlaying():323-326 */
+
+    u32 ticks_per_sample = (ai->control & GCN_AI_CR_AISFR)
+                               ? GCN_AI_TICKS_PER_SAMPLE_48KHZ
+                               : GCN_AI_TICKS_PER_SAMPLE_32KHZ;
+    if (++ai->tick_accum < ticks_per_sample)
+        return;
+    ai->tick_accum = 0;
+    ai_advance_sample(ai);
+}
+
+/* DERIVED cycle-accurate pacing (ai.h derivation comment). `cycles` is the
+ * real elapsed Gekko-core-cycle delta for the block just run (dispatch.c's
+ * ctx->cycles - prev_cycles) — the same 486 MHz clock domain the x2
+ * thresholds below are derived against, so no additional scaling is applied
+ * (mirroring gcn_dsp_tick's PPC-cycle passthrough, dsp.c). Accumulates in x2
+ * fixed point (never rounds, never drops a half-cycle) and loops so a
+ * larger-than-one-sample delta (a big block, or a caller batching several
+ * blocks' worth of cycles) still fires every sample it crossed, not just one —
+ * unlike the legacy per-call counter, cycle deltas aren't bounded to "one tick
+ * per call" so this must not assume a single crossing per invocation. */
+void gcn_ai_tick(u32 cycles) {
+    GcnAi* ai = s_ai;
+    if (!ai || !(ai->control & GCN_AI_CR_PSTAT))
+        return;   /* Update():142 / IsPlaying():323-326 */
+
+    u32 threshold_x2 = (ai->control & GCN_AI_CR_AISFR)
+                            ? GCN_AI_CYCLES_PER_SAMPLE_48KHZ_X2
+                            : GCN_AI_CYCLES_PER_SAMPLE_32KHZ_X2;
+    ai->cycle_accum_x2 += (u64)cycles * 2u;
+    while (ai->cycle_accum_x2 >= threshold_x2) {
+        ai->cycle_accum_x2 -= threshold_x2;
+        ai_advance_sample(ai);
+    }
 }

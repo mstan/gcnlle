@@ -129,6 +129,7 @@ static void dsp_aid_tick(GcnDsp* dsp) {
 void gcn_dsp_flush(void) {
     u32 whole = s_owed_ppc - (s_owed_ppc % 6u);   /* keep the sub-/6 residue owed */
     if (whole == 0u) return;
+
     s_owed_ppc -= whole;
     dsp_lle_update((int)whole);
     /* A flush can complete a mailbox post or raise the core's interrupt
@@ -143,6 +144,38 @@ void gcn_dsp_flush(void) {
         dsp_latch_mailbox_int(s_dsp);
         dsp_update_interrupts(s_dsp);
     }
+}
+
+/* Lazy observation flush (derived cycle accuracy follow-up). Under real
+ * per-block cycle costs the guest's genuine busy-wait loops observe DSP-
+ * coupled state (PI INTSR, the DSP->CPU mailbox) every few cycles — many
+ * times more often per emulated second than the uniform-charging world the
+ * flush-per-observation contract was validated in — and every flush pays
+ * ~750ns of RunCycles entry for a core that then mostly discards its budget
+ * at the idle check ([dsp-stats]: 97% idle-discarded). Rather than classify
+ * loops (an idle-park attempt hung the boot: analyzer-marked "idle" loops
+ * can be SELF-PROGRESSING countdown waits that Dolphin's per-call preamble
+ * steps still advance), bound the flush RATE quantitatively: run the core
+ * only once >= GCN_DSP_FLUSH_MIN owed PPC cycles have accrued (default 96 —
+ * exactly one uniform-world block, i.e. the same worst-case staleness every
+ * observation already had when each poll-loop iteration charged 96 cycles
+ * and the DSP advanced once per iteration). Progress is preserved (the core
+ * still runs every 96 owed cycles and at the gcn_dsp_tick cap), writes are
+ * NEVER lazy (gcn_dsp_write keeps the full flush — mail ordering), and
+ * GCN_DSP_FLUSH_MIN=0 restores flush-every-observation for A/B. */
+static u32 s_flush_min = 0;   /* 0 = flush-every-observation (the legacy
+                               * contract, and the UNIFORM-mode default);
+                               * dispatch.c raises it via
+                               * gcn_dsp_set_flush_min ONLY in derived mode. */
+
+void gcn_dsp_set_flush_min(u32 ppc_cycles) {
+    const char* e = getenv("GCN_DSP_FLUSH_MIN");   /* explicit override wins */
+    s_flush_min = (e && *e) ? (u32)strtoul(e, NULL, 0) : ppc_cycles;
+}
+
+void gcn_dsp_flush_lazy(void) {
+    if (s_owed_ppc < s_flush_min) return;
+    gcn_dsp_flush();
 }
 
 void gcn_dsp_tick(u32 ppc_cycles) {
@@ -275,7 +308,7 @@ u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
      * both halves), CSR read, and the AR/AID register reads below must all see
      * a core that has run every PPC cycle owed to it so far, not one still
      * sitting on batched-but-unrun debt. */
-    gcn_dsp_flush();
+    gcn_dsp_flush_lazy();
     switch (off) {
     case GCN_DSP_MBOX_IN_H:  return dsp_lle_read_mbox_hi(1);  /* CPU->DSP box */
     case GCN_DSP_MBOX_IN_L:  return dsp_lle_read_mbox_lo(1);

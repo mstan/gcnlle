@@ -93,6 +93,23 @@ struct CPUState {
     u32 ram_size;
     u8* mem2;
     u32 mem2_size;
+
+    /* Derived-cycle-accuracy pacing: every emitted instruction charges its
+     * Dolphin-derived cost here (recompiler/src/backend/ppc_cycles.c,
+     * `emit_function`'s `ctx->cycles += Nu;` right after each label). This
+     * is no longer runtime-only bookkeeping the way `halted`/`halt_reason`
+     * are in runtime/include/cpu/cpu.h (ABI.md "trailing runtime-only
+     * fields") — generated code now references `ctx->cycles`
+     * unconditionally, so this reference host needs the field too for the
+     * codegen_compile test to keep compiling generated output standalone. */
+    u64 cycles;
+    /* Deadline yield: generated code's taken BACKWARD conditional branches
+     * whose target is inside the same chunk stay in-function (goto) while
+     * cycles < cycle_deadline, and fall back to `ctx->pc = target; return;`
+     * once the deadline expires (recompiler/src/backend/emitter.c). Mirrors
+     * runtime/include/cpu/cpu.h's `cycle_deadline` field for the same
+     * codegen_compile-standalone-compile reason as `cycles` above. */
+    u64 cycle_deadline;
 };
 
 bool cpu_init(CPUState* cpu);

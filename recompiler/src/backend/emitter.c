@@ -2,6 +2,7 @@
 // Copyright (C) 2026 ExpansionPak
 
 #include "emitter.h"
+#include "ppc_cycles.h"
 
 static u32 cr_field_shift(u8 crf) {
     return 4u * (7u - (u32)crf);
@@ -306,16 +307,64 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
     return target >= func_start && target < func_end && ((target - func_start) & 3u) == 0;
 }
 
-static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target) {
+static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target,
+                               bool conditional) {
     bool local_backward = local_target && inst->branch_target <= inst->address;
 
     if (inst->lk) {
+        /* bl / bcl: call semantics (return address in LR). Always returns to
+         * the dispatch loop, taken-conditional-backward or not -- unchanged
+         * by deadline yield, same as bctrl/bclrl below. */
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
         fprintf(out, "            return;\n");
         return;
     }
     if (local_backward) {
+        /* Deadline yield (derived cycle accuracy). Only a TAKEN CONDITIONAL
+         * (bc, including bdnz/bdz) backward edge inside this chunk can form
+         * a tight guest delay loop, so only `conditional` gets the
+         * in-function goto; a plain unconditional `b` (conditional==false)
+         * falls through unchanged to the same `ctx->pc = ...; return;` it
+         * always emitted -- changing that would alter GCN_CYCLES_UNIFORM
+         * block counts for no benefit (an unconditional backward edge is an
+         * infinite loop unless something else exits the chunk first, so
+         * bounding it here buys nothing bc/bdnz doesn't already cover).
+         *
+         * Bookkeeping enumeration -- what the goto path skips relative to
+         * the return path, and why it's safe for up to GCN_CYCLE_QUANTUM
+         * cycles of guest time:
+         *   - The emitter puts NOTHING else on the return path for a plain
+         *     (non-lk) conditional branch -- no inline interrupt check, no
+         *     extra bookkeeping between `ctx->pc = ...` and `return;`. So
+         *     there is nothing here for the goto path to replicate.
+         *   - The dispatch loop (runtime/src/dispatch.c) does its per-return
+         *     work only on an actual return: it drains/latches
+         *     ctx->exception (`pending = ctx->exception; ctx->exception =
+         *     0;`) and ticks VI/DI/GX/DSP/AI, which is also where a PI
+         *     interrupt gets raised into ctx->exception for the NEXT return
+         *     to observe. None of that runs while we stay on the goto path.
+         *     That is precisely what ctx->cycle_deadline bounds: the
+         *     dispatch loop sets it to ctx->cycles + the quantum before
+         *     every dolrecomp_call, so device ticks / interrupt delivery can
+         *     lag real guest progress by at most one quantum, never
+         *     unboundedly.
+         *   - CTR-decrementing forms (bdnz/bdz) already had their
+         *     `ctx->ctr--` executed by emit_branch_condition BEFORE this
+         *     function is even called (see the `if (ctr_ok && cr_ok) {`
+         *     wrapper the PPC_OP_BC case emits around us) -- unconditionally,
+         *     whether the branch is taken or not. So CTR decrements exactly
+         *     once per iteration on both the goto and the return path.
+         *
+         * Pre-expired deadline (ctx->cycle_deadline <= ctx->cycles, e.g. the
+         * GCN_CYCLES_UNIFORM baseline's 0) makes `ctx->cycles <
+         * ctx->cycle_deadline` always false, so this goto NEVER fires and
+         * the emitted control flow reproduces the pre-change always-return
+         * behavior byte-for-byte. */
+        if (conditional) {
+            fprintf(out, "            if (ctx->cycles < ctx->cycle_deadline) goto label_%08X;\n",
+                    inst->branch_target);
+        }
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
         fprintf(out, "            return;\n");
     } else if (local_target) {
@@ -1526,7 +1575,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_B:
         fprintf(out, "    {\n");
         emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target));
+                           branch_target_is_local(func_start, func_end, inst->branch_target),
+                           false /* conditional: plain b never gets the deadline goto */);
         fprintf(out, "    }\n");
         break;
 
@@ -1535,7 +1585,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_branch_condition(out, inst->bo, inst->bi);
         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
         emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target));
+                           branch_target_is_local(func_start, func_end, inst->branch_target),
+                           true /* conditional: eligible for the deadline goto (bdnz/bdz too) */);
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
@@ -1732,6 +1783,18 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     for (i = 0; i < count; i++) {
         fprintf(out, "label_%08X:\n", insts[i].address);
         fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        /* Cycle cost is charged per-instruction, not once per run of the
+         * chunk function: every `label_%08X:` above is a switch-dispatch
+         * entry point (see the `switch (ctx->pc)` at the top of this
+         * function), so execution can resume mid-function at any
+         * instruction — e.g. after a call returns here, or a branch targets
+         * a label in the middle of this run. A single cycle charge at the
+         * top of the function would over/under-count whenever control
+         * enters below the first label. Per-instruction placement is the
+         * only placement that stays exact under that dispatch model.
+         * Cost values are Dolphin's own oracle timing model — see
+         * ppc_cycles.c. */
+        fprintf(out, "    ctx->cycles += %uu;\n", dr_ppc_num_cycles(insts[i].op));
         emit_instruction_with_range(out, &insts[i], func_addr, func_end);
     }
 
