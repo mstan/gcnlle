@@ -105,6 +105,33 @@ if(GCN_WITH_GENERATED)
   endif()
   file(GLOB GCN_GENERATED_CHUNKS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/generated/chunks/*.c)
+  # Phase D2 (codegen speed campaign, static analysis): -fopt-info-missed on a
+  # representative 16KB chunk (chunk_0000, ~4096 case labels/one giant
+  # function) showed 66% (797/1206) of the Phase C
+  # dolrecomp_mem_read/write*_fast calls -- the `static inline` helpers whose
+  # entire point is to get inlined into a branchless RAM-window check on the
+  # hot path -- were NOT actually inlined at plain -O2. Root cause: GCC's
+  # large-function-growth/inline-unit-growth budgets are sized for ordinary
+  # functions and get exhausted partway through a single 4096-instruction
+  # function, so only the FIRST fraction of call sites get inlined and the
+  # rest silently fall back to a real CALL, defeating Phase C's inlining
+  # premise for roughly two-thirds of memory accesses in a chunk this size.
+  # Raising the three budgets below (scoped to ONLY the generated chunk TUs,
+  # never globally -- these are giant-function-specific, would be the wrong
+  # default for every other TU in this project) cuts uninlined fast-path
+  # calls from 797 to 391 (-51%) on the same representative chunk, at a
+  # measured +30% instruction count / +60% compile time for that one file
+  # (verified: `-fno-jump-tables` and raw `-O3` were also measured and are
+  # NOT adopted here -- see Phase D2 report for the full comparison table).
+  # The remaining 391 are blocked by GCC's cold/unlikely-call heuristics, not
+  # a size budget, and closing that gap needs riskier global flags (branch-
+  # probability heuristics) not attempted here. This is a static, mechanical
+  # measurement (real CALL instructions removed on the hot RAM-hit path);
+  # the actual wall-clock effect needs the coordinator's boot-time/rdtsc
+  # attribution harness (see docs/ROADMAP.md), not asserted from this alone.
+  set_source_files_properties(${GCN_GENERATED_CHUNKS} PROPERTIES
+    COMPILE_OPTIONS "--param;large-function-insns=20000;--param;large-function-growth=250;--param;inline-unit-growth=100"
+  )
   add_executable(gcn_boot
     src/boot.c
     src/dispatch.c

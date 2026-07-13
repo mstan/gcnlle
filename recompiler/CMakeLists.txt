@@ -161,3 +161,25 @@ add_test(NAME codegen_compile
         -DHOST_BUILD_CONFIG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/codegen_compile.cmake
 )
+
+# Phase D2 (codegen speed campaign): real link+execute exactness proof for
+# the in-chunk bl/blr shadow-call-stack fast path (emitter.c's
+# emit_direct_branch lk-branch push / emit_dynamic_branch is_blr_class pop).
+# Generates a synthetic chunk (test_bl_shadow_gen.c), links it with the fixed
+# harness (test_bl_shadow_harness.c), and RUNS it -- see bl_shadow_run.cmake
+# and the harness's own header comment for what it asserts.
+add_executable(test_bl_shadow_gen tests/test_bl_shadow_gen.c)
+target_link_libraries(test_bl_shadow_gen PRIVATE dr_backend)
+add_test(NAME bl_shadow_exactness
+    COMMAND ${CMAKE_COMMAND}
+        -DGENERATOR_EXE=$<TARGET_FILE:test_bl_shadow_gen>
+        -DOUTPUT_C=${CMAKE_CURRENT_BINARY_DIR}/bl_shadow_check.c
+        -DHARNESS_SRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bl_shadow_harness.c
+        -DREPO_SRC=${CMAKE_CURRENT_SOURCE_DIR}/src
+        -DHOST_GENERATOR=${CMAKE_GENERATOR}
+        -DHOST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
+        -DHOST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
+        -DHOST_C_COMPILER=${CMAKE_C_COMPILER}
+        -DHOST_BUILD_CONFIG=$<CONFIG>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/bl_shadow_run.cmake
+)

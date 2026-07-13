@@ -356,7 +356,8 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
 }
 
 static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target,
-                               bool conditional, u32 cycle_charge) {
+                               bool conditional, u32 cycle_charge,
+                               u32 func_start, u32 func_end) {
     bool local_backward = local_target && inst->branch_target <= inst->address;
 
     /* Every path below leaves this instruction's block (either an actual
@@ -369,11 +370,55 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target
      * per-instruction charging would have accumulated through this branch
      * instruction itself. */
     if (inst->lk) {
-        /* bl / bcl: call semantics (return address in LR). Always returns to
-         * the dispatch loop, taken-conditional-backward or not -- unchanged
-         * by deadline yield, same as bctrl/bclrl below. */
+        /* bl / bcl: call semantics (return address in LR). LR is updated to
+         * the exact same value on EVERY path below -- the fast in-chunk-call
+         * path and the always-correct fallback agree on architectural state
+         * byte-for-byte; they only differ in which host C construct reaches
+         * the next instruction.
+         *
+         * Fast path (in-chunk call): when both the callee AND the return
+         * site are local labels of THIS chunk function (branch_target_is_
+         * local checked for both -- a bl as the chunk's last instruction has
+         * no local return label and always falls back), push the return
+         * label + architectural return PC onto the bounded, function-local
+         * shadow stack (dr_ret_lbl/dr_ret_pc/dr_ret_sp, declared once at the
+         * top of every emit_function body -- see its doc comment) and `goto`
+         * the callee directly, skipping the dispatch-loop round trip
+         * (runtime/src/dispatch.c: dolrecomp_call -> chunk lookup -> switch
+         * (ctx->pc) re-dispatch) this call would otherwise pay. blr later
+         * pops the matching entry the same way a local backward branch
+         * reuses its own label (see local_backward below) -- this is the
+         * SAME `goto label_X` mechanism already proven for local branches,
+         * just entered via a shadow-stack lookup at the return instruction
+         * instead of a compile-time-resolved target.
+         *
+         * Gated on `ctx->cycles < ctx->cycle_deadline`, exactly like the
+         * backward-branch goto below: a chain of in-chunk calls (or a
+         * call inside a guest loop) must still yield to the dispatch loop
+         * at least once per quantum, so device ticks / interrupt delivery
+         * lag by no more than one quantum -- identical bound to what
+         * backward branches already accept. Pre-expired deadline (the
+         * GCN_CYCLES_UNIFORM baseline's ctx->cycle_deadline == 0) makes the
+         * check always false, so this fast path NEVER fires there and the
+         * emitted control flow is byte-for-byte the pre-existing always-
+         * return shape -- the golden baseline is untouched by construction,
+         * same guarantee the backward-branch goto already relies on.
+         *
+         * Shadow-full (dr_ret_sp == DOLRECOMP_BL_SHADOW_DEPTH) also falls
+         * back to the plain return -- a full shadow is not an error, just a
+         * missed optimization for this one call. */
+        bool local_call = local_target &&
+                           branch_target_is_local(func_start, func_end, inst->address + 4u);
         fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
+        if (local_call) {
+            fprintf(out, "            if (dr_ret_sp < DOLRECOMP_BL_SHADOW_DEPTH && ctx->cycles < ctx->cycle_deadline) {\n");
+            fprintf(out, "                dr_ret_pc[dr_ret_sp] = 0x%08Xu;\n", inst->address + 4);
+            fprintf(out, "                dr_ret_lbl[dr_ret_sp] = &&label_%08X;\n", inst->address + 4);
+            fprintf(out, "                dr_ret_sp++;\n");
+            fprintf(out, "                goto label_%08X;\n", inst->branch_target);
+            fprintf(out, "            }\n");
+        }
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
         fprintf(out, "            return;\n");
         return;
@@ -440,17 +485,49 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target
 }
 
 static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
-                                const char* target_expr, u32 cycle_charge) {
+                                const char* target_expr, u32 cycle_charge,
+                                bool is_blr_class) {
     fprintf(out, "    {\n");
     fprintf(out, "        u32 target = %s;\n", target_expr);
     emit_branch_condition(out, inst->bo, inst->bi);
     fprintf(out, "        if (ctr_ok && cr_ok) {\n");
-    /* Taken path leaves this block via return -- charge the block-leader..
-     * here cumulative cost once. The not-taken path falls through to the
-     * next instruction and is covered by emit_function's block-boundary
-     * flush (bclr/bcctr always start a fresh leader on the instruction that
-     * follows them, so that flush fires exactly here). */
+    /* Taken path leaves this block via return (or, for the blr shadow-pop
+     * fast path below, a `goto` back into this same chunk function) --
+     * charge the block-leader..here cumulative cost once. The not-taken
+     * path falls through to the next instruction and is covered by
+     * emit_function's block-boundary flush (bclr/bcctr always start a
+     * fresh leader on the instruction that follows them, so that flush
+     * fires exactly here). */
     fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
+    if (is_blr_class) {
+        /* Shadow-stack pop: this fires only when a same-chunk bl already
+         * pushed a matching entry (see emit_direct_branch's local_call
+         * path) -- dr_ret_pc[dr_ret_sp-1] is architecturally exactly the
+         * `target` this blr computed from ctx->lr, so jumping straight to
+         * the remembered label is observably identical to the fallback
+         * (`ctx->pc = target; return;`) reaching the same label via the
+         * dispatch loop's switch(ctx->pc) re-entry -- just without the
+         * round trip. Any mismatch (target didn't come from an in-chunk
+         * bl, shadow empty, or this chunk invocation never pushed at all)
+         * falls straight through to the untouched, always-correct
+         * fallback below.
+         *
+         * Deadline-gated exactly like the bl push side and the backward-
+         * branch goto: bounds a bl/blr call-chain (or a guest loop that
+         * calls a leaf function every iteration) to the same one-quantum
+         * dispatch-loop lag those already accept, and pins this fast path
+         * off entirely under the GCN_CYCLES_UNIFORM golden baseline
+         * (ctx->cycle_deadline == 0) for the same byte-for-byte reason
+         * documented at the bl push site. */
+        fprintf(out, "            if (dr_ret_sp > 0 && target == dr_ret_pc[dr_ret_sp - 1] &&\n");
+        fprintf(out, "                ctx->cycles < ctx->cycle_deadline) {\n");
+        fprintf(out, "                void* dr_ret_target = dr_ret_lbl[--dr_ret_sp];\n");
+        if (inst->lk) {
+            fprintf(out, "                ctx->lr = 0x%08Xu;\n", inst->address + 4);
+        }
+        fprintf(out, "                goto *dr_ret_target;\n");
+        fprintf(out, "            }\n");
+    }
     if (inst->lk) {
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
     }
@@ -507,6 +584,18 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "\n"
         "#define DOLRECOMP_CPU_%s 1\n"
         "#define DOLRECOMP_CPU_NAME \"%s\"\n"
+        "\n"
+        /* In-chunk bl/blr fast path (codegen speed campaign, Phase D2): bounded
+         * depth of the per-invocation shadow call stack every emit_function
+         * body declares (dr_ret_lbl/dr_ret_pc/dr_ret_sp) -- see emit_direct_
+         * branch's lk-branch handling and emit_dynamic_branch's is_blr_class
+         * handling for the push/pop sites and their exactness argument. A
+         * deeper guest call chain than this simply spills to the pre-existing,
+         * always-correct dispatch-loop return for the calls past the limit --
+         * never a correctness bound, only how much of a call chain can skip
+         * the round trip. Sized generously above realistic non-recursive IPL
+         * call depth while staying tiny (<1KB) per chunk-function stack frame. */
+        "#define DOLRECOMP_BL_SHADOW_DEPTH 32\n"
         "\n"
         "#include <string.h>\n"
         "#include <math.h>\n"
@@ -1807,7 +1896,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_direct_branch(out, inst,
                            branch_target_is_local(func_start, func_end, inst->branch_target),
                            false /* conditional: plain b never gets the deadline goto */,
-                           cycle_charge);
+                           cycle_charge, func_start, func_end);
         fprintf(out, "    }\n");
         break;
 
@@ -1818,17 +1907,24 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_direct_branch(out, inst,
                            branch_target_is_local(func_start, func_end, inst->branch_target),
                            true /* conditional: eligible for the deadline goto (bdnz/bdz too) */,
-                           cycle_charge);
+                           cycle_charge, func_start, func_end);
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
 
     case PPC_OP_BCLR:
-        emit_dynamic_branch(out, inst, "ctx->lr & ~3u", cycle_charge);
+        /* is_blr_class=true: the canonical return instruction. Eligible for
+         * the shadow-stack pop fast path -- see emit_dynamic_branch. */
+        emit_dynamic_branch(out, inst, "ctx->lr & ~3u", cycle_charge, true);
         break;
 
     case PPC_OP_BCCTR:
-        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u", cycle_charge);
+        /* bcctr targets CTR, not LR -- computed jump / tail-call idiom, not
+         * architecturally a "return". Deliberately NOT wired to the shadow
+         * stack: matching by coincidental ctx->ctr == some pushed return PC
+         * would be semantically bogus (bcctr never pops a call frame on real
+         * hardware), so it keeps the original always-return codegen. */
+        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u", cycle_charge, false);
         break;
 
     case PPC_OP_TWI:
@@ -2423,6 +2519,22 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     }
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
+    /* In-chunk bl/blr fast-path shadow call stack (see emit_direct_branch's
+     * lk-branch handling and emit_dynamic_branch's is_blr_class handling).
+     * Declared UNCONDITIONALLY, before the switch, so `dr_ret_sp = 0` runs on
+     * EVERY entry into this function regardless of which case the switch
+     * lands on -- including a mid-function dispatch-loop re-entry landing
+     * past this declaration, which in C never re-runs a skipped initializer.
+     * Putting the declaration (and its zero-init) ahead of the switch instead
+     * is what makes "reset shadow at function entry" true unconditionally: a
+     * fresh empty shadow on every call to func_%08X, guest recursion included
+     * (each nested dolrecomp_call gets its own C stack frame's dr_ret_*, same
+     * as any other automatic-storage local). The arrays themselves need no
+     * initializer -- they are only ever read at indices the matching push
+     * already wrote in THIS SAME invocation. */
+    fprintf(out, "    void* dr_ret_lbl[DOLRECOMP_BL_SHADOW_DEPTH];\n");
+    fprintf(out, "    u32 dr_ret_pc[DOLRECOMP_BL_SHADOW_DEPTH];\n");
+    fprintf(out, "    u32 dr_ret_sp = 0;\n");
     fprintf(out, "    switch (ctx->pc) {\n");
     for (i = 0; i < count; i++) {
         /* Every label below is a valid switch-dispatch entry point (a call

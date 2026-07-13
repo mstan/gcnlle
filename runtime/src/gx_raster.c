@@ -389,6 +389,16 @@ typedef struct {
      * (same-binary A/B against the general path — see build_draw_cfg). */
     void (*fused)(Tev* t);
 
+    /* 1 iff the selected `fused` function reads RasColor.r/g/b (Color[0][0..2])
+     * -- true only for fused_pixel_D so far; fused_pixel_A/B/C's fused_core_C
+     * only ever reads Color[0][3] (RasColor.a), which is why
+     * raster_pixel_prep_fused's RGB-slope skip was safe for them (see its big
+     * comment). fused_pixel_D's color fold consumes RasColor.rgb directly, so
+     * raster_pixel_prep_fused must evaluate those 3 slopes too when this is
+     * set -- gated per-draw instead of unconditionally, so A/B/C draws keep
+     * the dead-work elision. Meaningless when `fused` is NULL. */
+    int fused_needs_ras_rgb;
+
     /* GX-MT: 1 iff this draw's pixel program is provably free of pixel-to-
      * pixel Tev-state carry, i.e. its pixels may be partitioned across
      * workers in any order with byte-identical results. Computed once per
@@ -1576,6 +1586,23 @@ static void tev_draw(Tev* t) {
  * for its own bit-field decode and formula. Blend folding (fused_blend_stage,
  * below) was verified the same way (200,000 random trials + an exhaustive
  * sweep over the source-alpha byte, 0 mismatches).
+ *
+ * D1 EXTENSION (2026-07-13): GCN_GX_TEV_CENSUS=1 over the BOOT ANIMATION
+ * (rolling-cube G-logo, 24,000,000-block budget, mid-animation) showed A/B/C
+ * above cover only 82.5% cumulative / ~63% and falling instantaneously by the
+ * end of that window — the animation's dominant per-window growth is a NEW
+ * config not present in the menu census:
+ *
+ *   config D: hash=9851f9ff stages=1 texgens=1 st0 cc=08FCAF ac=08F2F0       -- rising
+ *   (same draw-global word set as A/B/C above: fused_common_match's
+ *    precondition list, unchanged)
+ *
+ * fused_pixel_D below folds it the same way, verified bit-exact the same way
+ * (standalone transcription of draw_color_regular/draw_alpha_regular, brute
+ * force over the full domain — see fused_pixel_D's own derivation comment;
+ * this config's cc/ac reference only RasColor/TexColor, both u8 0..255, no
+ * TEV Reg/Konst operand, so the domain is 256 + 65536 = 65,792 combinations,
+ * 0 mismatches).
  * ==========================================================================*/
 
 /* Folded BlendTev/BlendColor for configs A/B/C. Requires (checked once, at
@@ -1850,6 +1877,76 @@ static void fused_pixel_B(Tev* t) {
     tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
 }
 
+/* ---- config D: stages=1, texgens=1, st0 cc=0x08FCAF ac=0x08F2F0 ----------
+ * (D1 boot-animation census, see the file-header "D1 EXTENSION" note above)
+ *
+ * cc=0x08FCAF bit-field decode (bits() same as build_draw_cfg):
+ *   argA=15(ZERO)=0  argB=12(ONE)=255  argC=10(RasColor.rgb)  argD=15(ZERO)=0
+ *   bias(c16)=0  op(c18)=0(add)  clamp(c19)=1(->clamp255)  scale(c20)=0  dest(c22)=0(Prev)
+ * ac=0x08F2F0 bit-field decode:
+ *   aargA=7(->0/ZERO)  aargB=4(TexColor.a)  aargC=5(RasColor.a)  aargD=7(->0/ZERO)
+ *   bias(a16)=0  op(a18)=0(add)  clamp(a19)=1(->clamp255)  scale(a20)=0  dest(a22)=0(Prev)
+ *   tswap_id=0  rswap_id=0
+ *
+ * COLOR fold: draw_color_regular with A=0,B=255(ONE),C=Y(=RasColor.ch),D=0,
+ * bias=0,op=0,scale=0 -- the mirror image of config A's color fold (there B
+ * carried the interpolated value and C was the always-255 factor; here B is
+ * the always-255 endpoint and C -- RasColor.ch -- drives the interpolation
+ * factor): cc=Y+(Y>>7); ((255*cc+128)>>8) clamped to 0..255 reproduces Y
+ * exactly for every Y in 0..255, the same "compress the factor, decompress
+ * against a full-scale endpoint" round-trip config A's/B's stage1's replace
+ * folds use. Verified for all 256 values, 0 mismatches -- Reg[Prev].ch IS
+ * RasColor.ch bit-for-bit; the texture is sampled only for its alpha channel
+ * (aargB below) and never touches color at all.
+ *
+ * ALPHA fold: A=0,B=X(=TexColor.a),C=Y(=RasColor.a),D=0,bias=0,op=0,scale=0:
+ *   cc = Y + (Y>>7);  temp = (X*cc + 128) >> 8;  Reg[Prev].a = clamp255(temp)
+ * Same shape as config A/C's alpha fold but with B/C's roles swapped --
+ * TexColor.a supplies the interpolated VALUE here, RasColor.a supplies the
+ * FACTOR (config A/C have it the other way around). The two are NOT
+ * interchangeable formulas in general (the v+(v>>7) factor approximation
+ * doesn't commute with which operand it's built from), so this was verified
+ * as its own derivation, not reused from config A/C's alpha fold. Verified
+ * bit-exact over the full X,Y in [0,255]x[0,255] (65536 cases, 0
+ * mismatches). Neither operand is a TEV Reg[]/Konst[] value (no signed
+ * 11-bit range involved in this stage's cc/ac at all), so 0..255 is already
+ * the full domain -- see the standalone checker referenced in the file-header
+ * "D1 EXTENSION" note. */
+static void fused_pixel_D(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+
+    u32 texmap = s_cfg.stage[0].texmap;
+    /* texcoordSel is provably 0 whenever numtexgens==1 (build_draw_cfg clamps
+     * sc->texcoordSel to 0 if it's >= numtexgens, and numtexgens==1 is part
+     * of this config's signature) -- same reasoning as fused_pixel_A. */
+    u8 texel[4];
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+
+    /* colorchan==0, rswap_id==0 with swaptab[0]==identity (both checked at
+     * selection time) -> RasColor.{r,g,b,a} == t->Color[0][0..3] directly. */
+    u8 output[4];
+    { s32 Y = t->Color[0][0]; s32 cc = Y + (Y >> 7); s32 temp = 255 * cc; temp += 128; temp >>= 8;
+      output[RED_C] = (u8)clamp255((s16)temp); }
+    { s32 Y = t->Color[0][1]; s32 cc = Y + (Y >> 7); s32 temp = 255 * cc; temp += 128; temp >>= 8;
+      output[GRN_C] = (u8)clamp255((s16)temp); }
+    { s32 Y = t->Color[0][2]; s32 cc = Y + (Y >> 7); s32 temp = 255 * cc; temp += 128; temp >>= 8;
+      output[BLU_C] = (u8)clamp255((s16)temp); }
+    {
+        s32 X = texel[3];             /* tswap_id==0 identity -> TexColor.a == texel[3] */
+        s32 Y = t->Color[0][3];
+        s32 cc = Y + (Y >> 7);
+        s32 temp = X * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp255((s16)temp);
+    }
+
+    /* alpha test: same 0x7F0000 word as A/B/C (part of fused_common_match) ->
+     * comp0==comp1==CMP_ALWAYS, always passes. No alpha_test() call needed. */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
 /* ============================================================================
  * Output vertex + rasterizer (Rasterizer.cpp).
  * ==========================================================================*/
@@ -2054,20 +2151,31 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
  *    offset, Dither) and never Position[2]. So z has zero readers on a fused
  *    draw's pixels, in either the early or late position.
  *  - the 3 RGB color-slope evals (Color[0][0..2]; comp 3/alpha is unaffected
- *    and still evaluated below). fused_common_match pins numcolchans==1 (so
- *    channel 1 is never touched even by the general path) and every fused
- *    stage's colorchan==0. fused_pixel_A/fused_core_C (shared by B and C) are
- *    read in full above: each reads exactly `t->Color[0][3]` for RasColor.a
- *    and never references Color[0][0]/[1]/[2] (RasColor.r/g/b) at all — the
- *    general path only ever reads those through SetRasColor/color_arg, which
- *    the fused functions bypass entirely (they never call tev_draw).
+ *    and always evaluated below), UNLESS the selected fused function actually
+ *    reads RasColor.rgb — tracked per-draw by `s_cfg.fused_needs_ras_rgb` (set
+ *    alongside `s_cfg.fused` in build_draw_cfg's tail). fused_common_match
+ *    pins numcolchans==1 (so channel 1 is never touched even by the general
+ *    path) and every fused stage's colorchan==0. fused_pixel_A/fused_core_C
+ *    (shared by B and C) are read in full above: each reads exactly
+ *    `t->Color[0][3]` for RasColor.a and never references Color[0][0]/[1]/[2]
+ *    (RasColor.r/g/b) at all, so their draws still skip the RGB evals below —
+ *    the general path only ever reads those through SetRasColor/color_arg,
+ *    which the fused functions bypass entirely (they never call tev_draw).
+ *    fused_pixel_D is the one exception (its color fold IS RasColor.rgb, see
+ *    its derivation comment): `fused_needs_ras_rgb` is set for it, so this
+ *    function evaluates Color[0][0..2] for its draws exactly like
+ *    raster_pixel_prep's own unconditional loop does — this is NOT dead work
+ *    for a config-D draw, so it is not elided.
  *
  * Stale-read hazard analysis (t->Position[2] and t->Color[0][0..2] are fields
  * of the single shared `s_tev`/Tev* instance reused across every pixel and
  * draw, so a skipped WRITE could in principle leak a PRIOR draw's/pixel's
  * value to a later READ):
- *  - Within a fused draw: no reader exists (see above), so whatever stale
- *    bytes sit in Position[2]/Color[0][0..2] are never observed. Not a hazard.
+ *  - Within a fused draw whose function doesn't need RasColor.rgb (A/B/C): no
+ *    reader exists (see above), so whatever stale bytes sit in
+ *    Position[2]/Color[0][0..2] are never observed. Not a hazard.
+ *  - Within a config-D draw: Color[0][0..2] is freshly written below, every
+ *    pixel, before fused_pixel_D reads it. Not a hazard either.
  *  - A later GENERAL-path draw: raster_pixel (unmodified) always calls the
  *    unmodified raster_pixel_prep first, which unconditionally recomputes and
  *    overwrites Position[2] and Color[i][0..3] for every one of its pixels
@@ -2078,9 +2186,18 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
 static void raster_pixel_prep_fused(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     RBPixel* p = &s_rb_w[t->wid].px[xi][yi];
     t->Position[0] = x; t->Position[1] = y;   /* Position[2]/z: skipped, see above */
+    if (s_cfg.fused_needs_ras_rgb) {
+        /* fused_pixel_D needs the full RasColor -- same per-component loop
+         * body as raster_pixel_prep's general numcolchans loop, unrolled for
+         * comp 0..2 (comp 3 below is shared with the A/B/C case). */
+        for (int comp = 0; comp < 3; comp++) {
+            float c = slope_value(&s_ColorSlopes[0][comp], x, y);
+            s16 cc = (s16)(c < 0 ? 0 : c > 255 ? 255 : c);
+            t->Color[0][comp] = (u8)cc;
+        }
+    }
     {
-        /* Channel-0 alpha only (comp 3) — the only Color[0] component any
-         * fused_pixel_A/B/C ever reads (via fused_core_C's `ras_a`). */
+        /* Channel-0 alpha (comp 3) — every fused_pixel_A/B/C/D reads this. */
         float c = slope_value(&s_ColorSlopes[0][3], x, y);
         s16 cc = (s16)(c < 0 ? 0 : c > 255 ? 255 : c);
         t->Color[0][3] = (u8)cc;
@@ -2415,16 +2532,24 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
                    1.0f / v2->projectedPosition[3] };
     s_WSlope = make_slope(w[0], w[1], w[2], &ctx);
     /* Dead-slope-setup skip continued: the 3 RGB (comp 0..2) color-slope
-     * evals are provably dead on a fused draw too — fused_common_match pins
-     * numcolchans==1 (so this loop's `i` only ever reaches 0 when fused; the
-     * i==1 iteration simply never runs, same as always) and every fused
-     * stage's colorchan==0, and raster_pixel_prep_fused/fused_pixel_A/B/C
-     * read only Color[0][3] (alpha) — never Color[0][0]/[1]/[2] (see the big
-     * comment above raster_pixel_prep_fused). comp 3 (alpha) is unaffected
-     * and still evaluated either way. General path: s_cfg.fused is NULL, so
-     * comp starts at 0 exactly as before — byte-identical. */
+     * evals are provably dead on a fused draw whose selected function never
+     * reads RasColor.rgb — fused_common_match pins numcolchans==1 (so this
+     * loop's `i` only ever reaches 0 when fused; the i==1 iteration simply
+     * never runs, same as always) and every fused stage's colorchan==0, and
+     * fused_pixel_A/fused_core_C (shared by B/C) read only Color[0][3]
+     * (alpha) — never Color[0][0]/[1]/[2] (see the big comment above
+     * raster_pixel_prep_fused). fused_pixel_D is the exception: its color
+     * fold IS RasColor.rgb, so its draws (`s_cfg.fused_needs_ras_rgb`, set
+     * alongside `s_cfg.fused` in build_draw_cfg) must NOT skip comp 0..2 here
+     * — this triangle-level setup feeds raster_pixel_prep_fused's per-pixel
+     * slope_value() reads of s_ColorSlopes[0][0..2], so skipping this and
+     * fixing only the per-pixel side (or vice versa) would leave the other
+     * half of the pipeline reading/writing a slope that was never built.
+     * comp 3 (alpha) is unaffected and still evaluated either way. General
+     * path: s_cfg.fused is NULL, so comp starts at 0 exactly as before —
+     * byte-identical. */
     for (u32 i = 0; i < s_cfg.numcolchans; i++)
-        for (int comp = (s_cfg.fused ? 3 : 0); comp < 4; comp++)
+        for (int comp = ((s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ? 3 : 0); comp < 4; comp++)
             s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
                                                 v2->color[i][comp], &ctx);
     for (u32 i = 0; i < s_cfg.numtexgens; i++) {
@@ -3603,6 +3728,7 @@ static void build_draw_cfg(void) {
 
     if (s_no_fused < 0) s_no_fused = getenv("GCN_GX_NO_FUSED") ? 1 : 0;
     s_cfg.fused = NULL;
+    s_cfg.fused_needs_ras_rgb = 0;
     if (!s_no_fused && fused_common_match()) {
         if (s_cfg.numtevstages == 0 &&
             fused_stage_match(0, 0x00F8CFu, 0x00F670u, 1, 0)) {
@@ -3614,6 +3740,10 @@ static void build_draw_cfg(void) {
                    fused_stage_match(0, 0x18F28Fu, 0x08F670u, 1, 0) &&
                    fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0)) {
             s_cfg.fused = fused_pixel_B;
+        } else if (s_cfg.numtevstages == 0 &&
+                   fused_stage_match(0, 0x08FCAFu, 0x08F2F0u, 1, 0)) {
+            s_cfg.fused = fused_pixel_D;   /* D1 boot-animation config, see its derivation */
+            s_cfg.fused_needs_ras_rgb = 1; /* reads RasColor.rgb -- see the field's comment */
         }
     }
 
