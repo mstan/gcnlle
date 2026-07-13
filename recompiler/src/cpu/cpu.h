@@ -94,12 +94,16 @@ struct CPUState {
     u8* mem2;
     u32 mem2_size;
 
-    /* Derived-cycle-accuracy pacing: every emitted instruction charges its
-     * Dolphin-derived cost here (recompiler/src/backend/ppc_cycles.c,
-     * `emit_function`'s `ctx->cycles += Nu;` right after each label). This
-     * is no longer runtime-only bookkeeping the way `halted`/`halt_reason`
-     * are in runtime/include/cpu/cpu.h (ABI.md "trailing runtime-only
-     * fields") — generated code now references `ctx->cycles`
+    /* Derived-cycle-accuracy pacing: every basic block charges its
+     * Dolphin-derived cost (recompiler/src/backend/ppc_cycles.c) here in one
+     * coalesced `ctx->cycles += Nu;` at each block exit, with a matching
+     * retroactive `ctx->cycles -= Pu;` on the switch-dispatch entry path for
+     * any mid-block re-entry (recompiler/src/backend/emitter.c,
+     * `emit_function`/`compute_block_costs`) -- exact per-instruction value
+     * at every point control can leave a chunk, without a per-instruction
+     * add. This is no longer runtime-only bookkeeping the way `halted`/
+     * `halt_reason` are in runtime/include/cpu/cpu.h (ABI.md "trailing
+     * runtime-only fields") — generated code now references `ctx->cycles`
      * unconditionally, so this reference host needs the field too for the
      * codegen_compile test to keep compiling generated output standalone. */
     u64 cycles;

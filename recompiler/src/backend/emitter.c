@@ -3,6 +3,8 @@
 
 #include "emitter.h"
 #include "ppc_cycles.h"
+#include <stdlib.h>
+#include <string.h>
 
 static u32 cr_field_shift(u8 crf) {
     return 4u * (7u - (u32)crf);
@@ -233,7 +235,7 @@ static void emit_fstorex(FILE* out, const PPCInst* inst, bool single,
 }
 
 static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
-                          bool update) {
+                          bool update, u32 cycle_charge) {
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     if (indexed) {
@@ -245,7 +247,12 @@ static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
     fprintf(out, "        ppc_psq_load(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
             inst->rD, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false", inst->address);
-    fprintf(out, "        if (ctx->exception) return;\n");
+    /* Premature exit mid-block: charge this instruction's block-leader..here
+     * prefix (see emit_function's cum[]/PREFIX design note) before leaving,
+     * since the block's normal end-of-block charge is never reached on this
+     * path. */
+    fprintf(out, "        if (ctx->exception) { ctx->cycles += %uu; return; }\n",
+            cycle_charge);
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
     }
@@ -253,7 +260,7 @@ static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
 }
 
 static void emit_psq_store(FILE* out, const PPCInst* inst, bool indexed,
-                           bool update) {
+                           bool update, u32 cycle_charge) {
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     if (indexed) {
@@ -265,7 +272,8 @@ static void emit_psq_store(FILE* out, const PPCInst* inst, bool indexed,
     fprintf(out, "        ppc_psq_store(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
             inst->rS, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false", inst->address);
-    fprintf(out, "        if (ctx->exception) return;\n");
+    fprintf(out, "        if (ctx->exception) { ctx->cycles += %uu; return; }\n",
+            cycle_charge);
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
     }
@@ -308,19 +316,30 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
 }
 
 static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target,
-                               bool conditional) {
+                               bool conditional, u32 cycle_charge) {
     bool local_backward = local_target && inst->branch_target <= inst->address;
 
+    /* Every path below leaves this instruction's block (either an actual
+     * `return` out of the chunk function, or a `goto` to another block's
+     * label), so each one charges this instruction's block-leader..here
+     * cumulative cost (`cycle_charge`, emit_function's cum[i]) exactly once,
+     * before the exit. On the deadline-goto path specifically, the charge
+     * MUST land before the `if (ctx->cycles < ctx->cycle_deadline)` check --
+     * that check has to observe the fully-charged value, matching what
+     * per-instruction charging would have accumulated through this branch
+     * instruction itself. */
     if (inst->lk) {
         /* bl / bcl: call semantics (return address in LR). Always returns to
          * the dispatch loop, taken-conditional-backward or not -- unchanged
          * by deadline yield, same as bctrl/bclrl below. */
+        fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
         fprintf(out, "            return;\n");
         return;
     }
     if (local_backward) {
+        fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
         /* Deadline yield (derived cycle accuracy). Only a TAKEN CONDITIONAL
          * (bc, including bdnz/bdz) backward edge inside this chunk can form
          * a tight guest delay loop, so only `conditional` gets the
@@ -336,8 +355,11 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target
          * cycles of guest time:
          *   - The emitter puts NOTHING else on the return path for a plain
          *     (non-lk) conditional branch -- no inline interrupt check, no
-         *     extra bookkeeping between `ctx->pc = ...` and `return;`. So
-         *     there is nothing here for the goto path to replicate.
+         *     extra bookkeeping between `ctx->pc = ...` and `return;` besides
+         *     the `ctx->cycles += cycle_charge;` above, which is shared by
+         *     both the goto and return outcomes (it runs before the `if`,
+         *     so it's charged exactly once regardless of which fires). So
+         *     there is nothing else here for the goto path to replicate.
          *   - The dispatch loop (runtime/src/dispatch.c) does its per-return
          *     work only on an actual return: it drains/latches
          *     ctx->exception (`pending = ctx->exception; ctx->exception =
@@ -368,19 +390,27 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
         fprintf(out, "            return;\n");
     } else if (local_target) {
+        fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "            goto label_%08X;\n", inst->branch_target);
     } else {
+        fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
         fprintf(out, "            return;\n");
     }
 }
 
 static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
-                                const char* target_expr) {
+                                const char* target_expr, u32 cycle_charge) {
     fprintf(out, "    {\n");
     fprintf(out, "        u32 target = %s;\n", target_expr);
     emit_branch_condition(out, inst->bo, inst->bi);
     fprintf(out, "        if (ctr_ok && cr_ok) {\n");
+    /* Taken path leaves this block via return -- charge the block-leader..
+     * here cumulative cost once. The not-taken path falls through to the
+     * next instruction and is covered by emit_function's block-boundary
+     * flush (bclr/bcctr always start a fresh leader on the instruction that
+     * follows them, so that flush fires exactly here). */
+    fprintf(out, "            ctx->cycles += %uu;\n", cycle_charge);
     if (inst->lk) {
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
     }
@@ -498,7 +528,8 @@ void emit_footer(FILE* out) {
 }
 
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
-                                        u32 func_start, u32 func_end) {
+                                        u32 func_start, u32 func_end,
+                                        u32 cycle_charge) {
     char disasm[64];
     ppc_disasm(disasm, sizeof(disasm), inst);
     fprintf(out, "    // %08X: %s\n", inst->address, disasm);
@@ -1400,10 +1431,10 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_LFDX:  emit_floadx(out, inst, false, false); break;
     case PPC_OP_LFDUX: emit_floadx(out, inst, false, true); break;
 
-    case PPC_OP_PSQ_L:   emit_psq_load(out, inst, false, false); break;
-    case PPC_OP_PSQ_LU:  emit_psq_load(out, inst, false, true); break;
-    case PPC_OP_PSQ_LX:  emit_psq_load(out, inst, true,  false); break;
-    case PPC_OP_PSQ_LUX: emit_psq_load(out, inst, true,  true); break;
+    case PPC_OP_PSQ_L:   emit_psq_load(out, inst, false, false, cycle_charge); break;
+    case PPC_OP_PSQ_LU:  emit_psq_load(out, inst, false, true, cycle_charge); break;
+    case PPC_OP_PSQ_LX:  emit_psq_load(out, inst, true,  false, cycle_charge); break;
+    case PPC_OP_PSQ_LUX: emit_psq_load(out, inst, true,  true, cycle_charge); break;
 
     case PPC_OP_STW:  emit_store(out, inst, "mem_write32", "u32", false); break;
     case PPC_OP_STWU: emit_store(out, inst, "mem_write32", "u32", true); break;
@@ -1429,10 +1460,10 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_STFDX:  emit_fstorex(out, inst, false, false); break;
     case PPC_OP_STFDUX: emit_fstorex(out, inst, false, true); break;
 
-    case PPC_OP_PSQ_ST:   emit_psq_store(out, inst, false, false); break;
-    case PPC_OP_PSQ_STU:  emit_psq_store(out, inst, false, true); break;
-    case PPC_OP_PSQ_STX:  emit_psq_store(out, inst, true,  false); break;
-    case PPC_OP_PSQ_STUX: emit_psq_store(out, inst, true,  true); break;
+    case PPC_OP_PSQ_ST:   emit_psq_store(out, inst, false, false, cycle_charge); break;
+    case PPC_OP_PSQ_STU:  emit_psq_store(out, inst, false, true, cycle_charge); break;
+    case PPC_OP_PSQ_STX:  emit_psq_store(out, inst, true,  false, cycle_charge); break;
+    case PPC_OP_PSQ_STUX: emit_psq_store(out, inst, true,  true, cycle_charge); break;
 
     case PPC_OP_STWBRX:
         fprintf(out, "    {\n");
@@ -1465,6 +1496,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
             fprintf(out, "        for (u32 r = 0; r < reg_count; r++) {\n");
             fprintf(out, "            u32 reg = (%uu + r) & 31u;\n", inst->rD);
             fprintf(out, "            if (reg == %uu || reg == %uu) {\n", inst->rA, inst->rB);
+            fprintf(out, "                ctx->cycles += %uu;\n", cycle_charge);
             fprintf(out, "                ppc_program_exception(ctx, PPC_PROGRAM_ILLEGAL, 0x%08Xu);\n",
                     inst->address);
             fprintf(out, "                return;\n");
@@ -1539,7 +1571,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_xform_ea(out, inst->rA, inst->rB, false);
         fprintf(out, ";\n");
         fprintf(out, "        ppc_dcbz_l(ctx, ea, 0x%08Xu);\n", inst->address);
-        fprintf(out, "        if (ctx->exception) return;\n");
+        fprintf(out, "        if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         fprintf(out, "    }\n");
         break;
 
@@ -1576,7 +1608,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "    {\n");
         emit_direct_branch(out, inst,
                            branch_target_is_local(func_start, func_end, inst->branch_target),
-                           false /* conditional: plain b never gets the deadline goto */);
+                           false /* conditional: plain b never gets the deadline goto */,
+                           cycle_charge);
         fprintf(out, "    }\n");
         break;
 
@@ -1586,22 +1619,24 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
         emit_direct_branch(out, inst,
                            branch_target_is_local(func_start, func_end, inst->branch_target),
-                           true /* conditional: eligible for the deadline goto (bdnz/bdz too) */);
+                           true /* conditional: eligible for the deadline goto (bdnz/bdz too) */,
+                           cycle_charge);
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
 
     case PPC_OP_BCLR:
-        emit_dynamic_branch(out, inst, "ctx->lr & ~3u");
+        emit_dynamic_branch(out, inst, "ctx->lr & ~3u", cycle_charge);
         break;
 
     case PPC_OP_BCCTR:
-        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u");
+        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u", cycle_charge);
         break;
 
     case PPC_OP_TWI:
         fprintf(out, "    if (ppc_trap_condition(%uu, ctx->gpr[%u], (u32)(s32)%d)) {\n",
                 inst->to, inst->rA, (int)inst->simm);
+        fprintf(out, "        ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "        ppc_program_exception(ctx, PPC_PROGRAM_TRAP, 0x%08Xu);\n", inst->address);
         fprintf(out, "        return;\n");
         fprintf(out, "    }\n");
@@ -1610,17 +1645,20 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_TW:
         fprintf(out, "    if (ppc_trap_condition(%uu, ctx->gpr[%u], ctx->gpr[%u])) {\n",
                 inst->to, inst->rA, inst->rB);
+        fprintf(out, "        ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "        ppc_program_exception(ctx, PPC_PROGRAM_TRAP, 0x%08Xu);\n", inst->address);
         fprintf(out, "        return;\n");
         fprintf(out, "    }\n");
         break;
 
     case PPC_OP_SC:
+        fprintf(out, "    ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "    ppc_system_call_exception(ctx, 0x%08Xu);\n", inst->address);
         fprintf(out, "    return;\n");
         break;
 
     case PPC_OP_RFI:
+        fprintf(out, "    ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "    ppc_rfi(ctx, 0x%08Xu);\n", inst->address);
         fprintf(out, "    return;\n");
         break;
@@ -1704,24 +1742,24 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_MFTB:
         fprintf(out, "    ctx->gpr[%u] = ppc_mftb(ctx, %uu, 0x%08Xu);\n",
                 inst->rD, inst->spr, inst->address);
-        fprintf(out, "    if (ctx->exception) return;\n");
+        fprintf(out, "    if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         break;
 
     case PPC_OP_MFSPR:
         fprintf(out, "    ctx->gpr[%u] = ppc_mfspr(ctx, %uu, 0x%08Xu);\n",
                 inst->rD, inst->spr, inst->address);
-        fprintf(out, "    if (ctx->exception) return;\n");
+        fprintf(out, "    if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         break;
 
     case PPC_OP_MTSPR:
         fprintf(out, "    ppc_mtspr(ctx, %uu, ctx->gpr[%u], 0x%08Xu);\n",
                 inst->spr, inst->rS, inst->address);
-        fprintf(out, "    if (ctx->exception) return;\n");
+        fprintf(out, "    if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         break;
 
     case PPC_OP_TLBIE:
         fprintf(out, "    ppc_tlbie(ctx, ctx->gpr[%u], 0x%08Xu);\n", inst->rB, inst->address);
-        fprintf(out, "    if (ctx->exception) return;\n");
+        fprintf(out, "    if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         break;
 
     case PPC_OP_SYNC:
@@ -1737,7 +1775,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_xform_ea(out, inst->rA, inst->rB, false);
         fprintf(out, ";\n");
         fprintf(out, "        u32 value = ppc_eciwx(ctx, ea, 0x%08Xu);\n", inst->address);
-        fprintf(out, "        if (ctx->exception) return;\n");
+        fprintf(out, "        if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         fprintf(out, "        ctx->gpr[%u] = value;\n", inst->rD);
         fprintf(out, "    }\n");
         break;
@@ -1749,11 +1787,12 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, ";\n");
         fprintf(out, "        ppc_ecowx(ctx, ea, ctx->gpr[%u], 0x%08Xu);\n",
                 inst->rS, inst->address);
-        fprintf(out, "        if (ctx->exception) return;\n");
+        fprintf(out, "        if (ctx->exception) { ctx->cycles += %uu; return; }\n", cycle_charge);
         fprintf(out, "    }\n");
         break;
 
     default:
+        fprintf(out, "    ctx->cycles += %uu;\n", cycle_charge);
         fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
                 inst->raw, inst->address);
         fprintf(out, "    return;\n");
@@ -1764,40 +1803,162 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 }
 
 void emit_instruction(FILE* out, const PPCInst* inst) {
-    emit_instruction_with_range(out, inst, 0, (u32)-1);
+    /* Standalone single-instruction emission has no surrounding chunk/block
+     * context (no switch-dispatch entry compensation, no block-exit flush --
+     * see emit_function for that machinery), so this instruction is its own
+     * one-instruction "block": charge exactly its own cost at any exit. */
+    emit_instruction_with_range(out, inst, 0, (u32)-1, dr_ppc_num_cycles(inst->op));
+}
+
+/* A "branch" for basic-block boundary purposes: any instruction that can
+ * transfer control away from plain sequential flow, statically (b/bc, whose
+ * targets can be resolved to a local label) or dynamically (bclr/bcctr,
+ * whose target is never resolvable at emit time). bl/bcl (the lk forms of
+ * b/bc) count too: they always return to the dispatch loop rather than
+ * falling straight through in this chunk, but a *later* dispatch can land
+ * back on the instruction right after them (the callee's blr targets LR,
+ * i.e. this address), which is exactly the re-entry case leader rule (c)
+ * below exists to cover. */
+static bool ppc_op_is_branch(PPCOpcode op) {
+    return op == PPC_OP_B || op == PPC_OP_BC || op == PPC_OP_BCLR || op == PPC_OP_BCCTR;
+}
+
+/* An instruction whose every emitted exit path already carries its own
+ * `ctx->cycles += ...;` charge (see emit_direct_branch/emit_instruction_with_
+ * range's PPC_OP_SC/PPC_OP_RFI cases) and never falls through to more code in
+ * this chunk on ANY path -- so emit_function's per-block fallthrough flush
+ * would only ever reach unreachable code after these and must be skipped. */
+static bool ppc_op_always_exits(PPCOpcode op) {
+    return op == PPC_OP_B || op == PPC_OP_SC || op == PPC_OP_RFI;
+}
+
+/* Basic-block leaders and per-block cumulative cycle costs for `insts`.
+ *
+ * `is_leader[i]` marks instruction i as the start of a fresh block (cum[]
+ * resets there): the chunk's first instruction, a local branch target of
+ * b/bc, or the instruction immediately following any branch (b/bc/bclr/
+ * bcctr, lk or not -- see ppc_op_is_branch).
+ *
+ * `cum[i]` is the running sum of dr_ppc_num_cycles() from instruction i's
+ * block leader through i, inclusive -- i.e. exactly what old per-instruction
+ * charging would have accumulated in ctx->cycles by the time i's own charge
+ * had applied, given execution started at the leader and ran straight
+ * through to i. `cum[i] - dr_ppc_num_cycles(insts[i].op)` (computed by the
+ * caller where needed) is therefore the PREFIX a switch-dispatch entry
+ * directly at i must retroactively subtract, since the block-exit charge
+ * this scheme applies always assumes execution started at the leader.
+ *
+ * Both arrays must be pre-sized to `count` by the caller; a `count == 0`
+ * chunk leaves them untouched. */
+static void compute_block_costs(const PPCInst* insts, u32 count, u32 func_start,
+                                u32 func_end, bool* is_leader, u32* cum) {
+    u32 i;
+
+    if (count == 0)
+        return;
+
+    memset(is_leader, 0, count * sizeof(bool));
+
+    is_leader[0] = true; /* rule (a): chunk start */
+
+    for (i = 0; i < count; i++) { /* rule (b): local branch targets of b/bc */
+        if (insts[i].op == PPC_OP_B || insts[i].op == PPC_OP_BC) {
+            u32 target = insts[i].branch_target;
+            if (branch_target_is_local(func_start, func_end, target)) {
+                u32 k = (target - func_start) / 4u;
+                if (k < count)
+                    is_leader[k] = true;
+            }
+        }
+    }
+
+    for (i = 0; i < count; i++) { /* rule (c): instruction after any branch */
+        if (ppc_op_is_branch(insts[i].op) && i + 1 < count)
+            is_leader[i + 1] = true;
+    }
+
+    {
+        u32 running = 0;
+        for (i = 0; i < count; i++) {
+            u32 cost = dr_ppc_num_cycles(insts[i].op);
+            if (is_leader[i])
+                running = 0;
+            running += cost;
+            cum[i] = running;
+        }
+    }
 }
 
 void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     u32 i;
     u32 func_end = func_addr + count * 4u;
+    bool* is_leader = NULL;
+    u32* cum = NULL;
+
+    if (count > 0) {
+        is_leader = (bool*)malloc(count * sizeof(bool));
+        cum = (u32*)malloc(count * sizeof(u32));
+        if (!is_leader || !cum) {
+            fprintf(stderr, "error: out of memory computing block cycle costs\n");
+            free(is_leader);
+            free(cum);
+            exit(1);
+        }
+        compute_block_costs(insts, count, func_addr, func_end, is_leader, cum);
+    }
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
     fprintf(out, "    switch (ctx->pc) {\n");
     for (i = 0; i < count; i++) {
-        fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
-                insts[i].address, insts[i].address);
+        /* Every label below is a valid switch-dispatch entry point (a call
+         * return, an external tail branch, ...), not just this chunk's block
+         * leaders -- so a dispatch landing mid-block must retroactively
+         * undo the PREFIX of the block-exit charge (see compute_block_costs)
+         * that assumed it started at the leader. Leaders (PREFIX == 0) skip
+         * the subtraction; it would be a no-op anyway. */
+        u32 prefix = cum[i] - dr_ppc_num_cycles(insts[i].op);
+        if (prefix != 0) {
+            fprintf(out, "    case 0x%08Xu: ctx->cycles -= %uu; goto label_%08X;\n",
+                    insts[i].address, prefix, insts[i].address);
+        } else {
+            fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
+                    insts[i].address, insts[i].address);
+        }
     }
     fprintf(out, "    default: return;\n");
     fprintf(out, "    }\n");
 
     for (i = 0; i < count; i++) {
+        bool block_ends_here = (i + 1 == count) || is_leader[i + 1];
+
         fprintf(out, "label_%08X:\n", insts[i].address);
         fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
-        /* Cycle cost is charged per-instruction, not once per run of the
-         * chunk function: every `label_%08X:` above is a switch-dispatch
-         * entry point (see the `switch (ctx->pc)` at the top of this
-         * function), so execution can resume mid-function at any
-         * instruction — e.g. after a call returns here, or a branch targets
-         * a label in the middle of this run. A single cycle charge at the
-         * top of the function would over/under-count whenever control
-         * enters below the first label. Per-instruction placement is the
-         * only placement that stays exact under that dispatch model.
-         * Cost values are Dolphin's own oracle timing model — see
-         * ppc_cycles.c. */
-        fprintf(out, "    ctx->cycles += %uu;\n", dr_ppc_num_cycles(insts[i].op));
-        emit_instruction_with_range(out, &insts[i], func_addr, func_end);
+        /* Cycle cost is coalesced per basic block, charged at each exit
+         * (return/goto emitted inside the instruction body, e.g. a taken
+         * branch or an exception guard) rather than once per instruction:
+         * see compute_block_costs and the exit charges wired through
+         * emit_instruction_with_range/emit_direct_branch/emit_dynamic_branch/
+         * emit_psq_load/emit_psq_store. This label's own switch-dispatch
+         * entry above already retroactively adjusts for mid-block entry, so
+         * the charge below (cum[i], the block-leader..here inclusive sum)
+         * is exact regardless of where execution actually entered. Cost
+         * values are Dolphin's own oracle timing model — see ppc_cycles.c. */
+        emit_instruction_with_range(out, &insts[i], func_addr, func_end, cum[i]);
+
+        if (block_ends_here && !ppc_op_always_exits(insts[i].op)) {
+            /* This instruction can fall through (on at least one path) into
+             * a fresh block (the next instruction is a leader, or this is
+             * the chunk's last instruction) without itself emitting an exit
+             * charge on that path -- flush the block's accumulated cost
+             * here so it isn't silently dropped. Exit paths that already
+             * charged and returned/goto'd never reach this line. */
+            fprintf(out, "    ctx->cycles += %uu;\n", cum[i]);
+        }
     }
 
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
     fprintf(out, "}\n\n");
+
+    free(is_leader);
+    free(cum);
 }
