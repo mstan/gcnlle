@@ -131,8 +131,11 @@ static void test_codegen_supports_jumptable(const char* code) {
           "no opcode falls back to interpreter");
     check(strstr(code, "ctx->ctr & ~3u") != NULL,
           "bctr lowers to a computed target from CTR");
+    /* E1 (perf campaign 2): every in-chunk return goes through DR_RET()
+     * (spill the dr_cycles local, then return) -- the dispatcher handoff
+     * shape is `ctx->pc = target;` + DR_RET() now. */
     check(strstr(code, "ctx->pc = target;") != NULL &&
-          strstr(code, "return;") != NULL,
+          strstr(code, "DR_RET();") != NULL,
           "computed branch hands the target to the dispatcher");
     /* Phase C: lwzx (a plain indexed load) is now inlined through the
      * fast-path helper instead of calling mem_read32 directly -- see
@@ -140,7 +143,8 @@ static void test_codegen_supports_jumptable(const char* code) {
      * own fallback still bottoms out in mem_read32 for the non-RAM case, so
      * the underlying "this is a memory read" semantic is unchanged; only
      * the emitted call shape moved. */
-    check(strstr(code, "dolrecomp_mem_read32_fast(ctx, ea,") != NULL,
+    /* E1: fast helpers take the function's hoisted RAM base (dr_ram). */
+    check(strstr(code, "dolrecomp_mem_read32_fast(ctx, dr_ram, ea,") != NULL,
           "lwzx table load lowers to a memory read");
     check(strstr(code, "ppc_mtspr(ctx, 9u, ctx->gpr[12]") != NULL,
           "mtctr loads the table entry into CTR");
