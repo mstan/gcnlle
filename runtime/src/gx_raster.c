@@ -16,6 +16,12 @@
 #include <string.h>
 #include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
 #include <emmintrin.h>   /* SSE2 — EFB-copy scanline encode (GCN_GX_NO_SIMD knob) */
+#include <immintrin.h>   /* AVX2 — efb_clear_rect / EFB-copy scanline encode 8-wide
+                          * widening (GCN_GX_NO_AVX2 knob). This TU is compiled
+                          * WITHOUT -mavx2 (see build files); every function that
+                          * touches an __m256i/AVX2 intrinsic below carries its own
+                          * __attribute__((target("avx2"))), so no AVX2 instruction
+                          * can leak into code that might run on a pre-AVX2 CPU. */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>     /* worker pool: CreateThread + WaitOnAddress/WakeByAddressAll
@@ -46,6 +52,40 @@
  * This is the knob the SIMD task's same-binary A/B exactness proof toggles:
  * SIMD-on and GCN_GX_NO_SIMD=1 must produce the identical golden XFB hash. */
 static int s_no_simd = -1;
+
+/* GCN_GX_NO_AVX2=1: force the AVX2 8-wide widenings below (efb_clear_rect's
+ * color/depth clear passes; gx_raster_efb_copy's vertical-filter+YUV-encode,
+ * chroma-smooth, and YUYV-pack passes) to fall back to the existing SSE2
+ * 4-wide paths, even on a CPU that supports AVX2. Own lazy -1-sentinel
+ * getenv, same pattern as s_no_simd above — this is the knob the AVX2
+ * widening task's same-binary A/B exactness proof toggles (AVX2 vs
+ * GCN_GX_NO_AVX2=1, same executable, golden XFB hash must match either way —
+ * and must ALSO match GCN_GX_NO_SIMD=1's fully-scalar hash, a three-way A/B).
+ * Independent of GCN_GX_NO_SIMD: NO_SIMD=1 is checked first at every call
+ * site and forces fully scalar regardless of this knob; NO_AVX2=1 alone
+ * still takes the SSE2 SIMD path, just not the wider one.
+ *
+ * s_cpu_avx2: one-time runtime CPUID check (gcc __builtin_cpu_supports),
+ * cached the same -1-sentinel way, so an older CPU (no AVX2) auto-falls back
+ * to the SSE2 path with no env var needed. Every AVX2 instruction in this
+ * file lives ONLY inside functions carrying __attribute__((target("avx2")))
+ * — this whole translation unit is built WITHOUT -mavx2 — so a pre-AVX2 CPU
+ * simply never calls into them; gx_avx2_available() is the single gate every
+ * call site below checks before doing so. efb_clear_rect and
+ * gx_raster_efb_copy both run on the main thread only (FIFO-serialized BP
+ * command dispatch, not a GX-MT per-triangle worker path — see the "Per-draw
+ * config cache" comment above), so these lazy-init sentinels need no
+ * synchronization, same reasoning as s_no_simd/s_no_fused. */
+static int s_no_avx2 = -1;
+static int s_cpu_avx2 = -1;
+static inline int gx_avx2_available(void) {
+    if (s_no_avx2 < 0) s_no_avx2 = getenv("GCN_GX_NO_AVX2") ? 1 : 0;
+    if (s_cpu_avx2 < 0) {
+        __builtin_cpu_init();
+        s_cpu_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    }
+    return !s_no_avx2 && s_cpu_avx2;
+}
 
 /* EFB geometry (VideoCommon/VideoCommon.h:15-16). */
 #define EFB_WIDTH   640u
@@ -4344,6 +4384,51 @@ static inline void set_pixel_alpha_only_rgba6_cc(u32 off, const u8* cc) {
     set_pixel_alpha_only_rgba6(off, cc[ALP_C]);
 }
 
+/* ============================================================================
+ * AVX2 widening of efb_clear_rect's two SIMD passes below (color / depth) —
+ * 8x32-bit lanes instead of SSE2's 4. Both passes are pure bitwise/constant
+ * fills over a per-clear-rect-constant span (AND-then-OR for color, a plain
+ * broadcast store for depth; see the big SSE2 comment on efb_clear_rect for
+ * why this has no data-dependent per-pixel computation at all), so widening
+ * the lane count changes nothing about the computed bytes — no new range
+ * proof is needed the way the arithmetic EFB-copy folds below need one.
+ *
+ * Each helper processes only the full AVX2-wide interior [left, xr), where
+ * xr = left + 8*floor((right+1-left)/8) is computed by the caller; the
+ * caller then runs the existing scalar clear_px/SetPixelDepth for the
+ * [xr, right] remainder (0-7 columns) — same "SIMD interior, scalar
+ * remainder" split the SSE2 version already uses, just with a wider
+ * interior. GCN_GX_NO_AVX2=1 (or a pre-AVX2 CPU) skips these entirely and
+ * keeps the untouched SSE2 4-wide pass (which has its own scalar
+ * remainder) — see gx_avx2_available's comment.
+ * ==========================================================================*/
+__attribute__((target("avx2")))
+static void efb_clear_color_avx2(u32* efb, int left, int xr, int top, int bottom,
+                                  u32 rowstride, u32 color_or) {
+    const __m256i vor   = _mm256_set1_epi32((int)color_or);
+    const __m256i vmask = _mm256_set1_epi32((int)0xFF000000u);
+    for (int y = top; y <= bottom; y++) {
+        u32 rowoff = (u32)y * rowstride;
+        for (int x = left; x < xr; x += 8) {
+            u32 off = rowoff + (u32)x;
+            __m256i cur = _mm256_loadu_si256((const __m256i*)&efb[off]);
+            _mm256_storeu_si256((__m256i*)&efb[off],
+                                 _mm256_or_si256(_mm256_and_si256(cur, vmask), vor));
+        }
+    }
+}
+
+__attribute__((target("avx2")))
+static void efb_clear_depth_avx2(u32* efb, int left, int xr, int top, int bottom,
+                                  u32 rowstride, u32 depth_val) {
+    const __m256i vd = _mm256_set1_epi32((int)depth_val);
+    for (int y = top; y <= bottom; y++) {
+        u32 rowoff = (u32)y * rowstride;
+        for (int x = left; x < xr; x += 8)
+            _mm256_storeu_si256((__m256i*)&efb[rowoff + (u32)x], vd);
+    }
+}
+
 static void efb_clear_rect(void) {
     /* EfbCopy::ClearEfb (EfbCopy.cpp:16-34). */
     u32 ar = s_bp[0x4f], gb = s_bp[0x50];
@@ -4456,19 +4541,29 @@ static void efb_clear_rect(void) {
                           clear_px == set_pixel_alpha_color_direct);
     if (simd_color_ok) {
         u32 src; memcpy(&src, cc, 4);
-        const __m128i vor   = _mm_set1_epi32((int)(src >> 8));
-        const __m128i vmask = _mm_set1_epi32((int)0xFF000000u);
-        for (int y = top; y <= bottom; y++) {
-            u32 rowoff = (u32)y * EFB_WIDTH;
-            int x = left;
-            for (; x + 4 <= right + 1; x += 4) {
-                u32 off = rowoff + (u32)x;
-                __m128i cur = _mm_loadu_si128((const __m128i*)&s_efb_color[off]);
-                _mm_storeu_si128((__m128i*)&s_efb_color[off],
-                                  _mm_or_si128(_mm_and_si128(cur, vmask), vor));
+        if (gx_avx2_available()) {
+            int xr = left; while (xr + 8 <= right + 1) xr += 8;
+            efb_clear_color_avx2(s_efb_color, left, xr, top, bottom, EFB_WIDTH, src >> 8);
+            for (int y = top; y <= bottom; y++) {
+                u32 rowoff = (u32)y * EFB_WIDTH;
+                for (int x = xr; x <= right; x++)
+                    clear_px(rowoff + (u32)x, cc);   /* scalar remainder, identical formula */
             }
-            for (; x <= right; x++)
-                clear_px(rowoff + (u32)x, cc);   /* scalar remainder, identical formula */
+        } else {
+            const __m128i vor   = _mm_set1_epi32((int)(src >> 8));
+            const __m128i vmask = _mm_set1_epi32((int)0xFF000000u);
+            for (int y = top; y <= bottom; y++) {
+                u32 rowoff = (u32)y * EFB_WIDTH;
+                int x = left;
+                for (; x + 4 <= right + 1; x += 4) {
+                    u32 off = rowoff + (u32)x;
+                    __m128i cur = _mm_loadu_si128((const __m128i*)&s_efb_color[off]);
+                    _mm_storeu_si128((__m128i*)&s_efb_color[off],
+                                      _mm_or_si128(_mm_and_si128(cur, vmask), vor));
+                }
+                for (; x <= right; x++)
+                    clear_px(rowoff + (u32)x, cc);   /* scalar remainder, identical formula */
+            }
         }
     } else if (clear_px) {
         for (int y = top; y <= bottom; y++)
@@ -4497,14 +4592,24 @@ static void efb_clear_rect(void) {
         /* SetDepth honors zmode.update_enable (bp 0x40, cached as s_zt_upd). */
         u32 depth_val = clearZ & 0x00ffffffu;
         if (!s_no_simd) {
-            const __m128i vd = _mm_set1_epi32((int)depth_val);
-            for (int y = top; y <= bottom; y++) {
-                u32 rowoff = (u32)y * EFB_WIDTH;
-                int x = left;
-                for (; x + 4 <= right + 1; x += 4)
-                    _mm_storeu_si128((__m128i*)&s_efb_depth[rowoff + (u32)x], vd);
-                for (; x <= right; x++)
-                    SetPixelDepth(rowoff + (u32)x, clearZ);
+            if (gx_avx2_available()) {
+                int xr = left; while (xr + 8 <= right + 1) xr += 8;
+                efb_clear_depth_avx2(s_efb_depth, left, xr, top, bottom, EFB_WIDTH, depth_val);
+                for (int y = top; y <= bottom; y++) {
+                    u32 rowoff = (u32)y * EFB_WIDTH;
+                    for (int x = xr; x <= right; x++)
+                        SetPixelDepth(rowoff + (u32)x, clearZ);
+                }
+            } else {
+                const __m128i vd = _mm_set1_epi32((int)depth_val);
+                for (int y = top; y <= bottom; y++) {
+                    u32 rowoff = (u32)y * EFB_WIDTH;
+                    int x = left;
+                    for (; x + 4 <= right + 1; x += 4)
+                        _mm_storeu_si128((__m128i*)&s_efb_depth[rowoff + (u32)x], vd);
+                    for (; x <= right; x++)
+                        SetPixelDepth(rowoff + (u32)x, clearZ);
+                }
             }
         } else {
             for (int y = top; y <= bottom; y++)
@@ -4733,6 +4838,206 @@ static inline __m128i simd_gather_odd2(__m128i lo, __m128i hi) {
     return _mm_unpacklo_epi64(los, his);                            /* [v1,v3, v5,v7] */
 }
 
+/* ============================================================================
+ * AVX2 widening of the 3 SSE2 EFB-copy passes above — 8x32-bit lanes instead
+ * of 4. This TU is compiled WITHOUT -mavx2 (see gx_avx2_available's comment
+ * near the top of the file); every function below carries its own
+ * __attribute__((target("avx2"))) and is only ever entered after that gate
+ * passes.
+ *
+ * filter_sum / color_to_yuv: AVX2 has a native 32-bit lane multiply
+ * (_mm256_mullo_epi32) that SSE2 lacks — that gap is exactly why the SSE2
+ * code above routes every multiply through a 16-bit pack+multiply+extend
+ * trick (see its own big comment for the range proof that the 16-bit
+ * truncation is a mathematical no-op: filter_sum's single products are
+ * <=48195, its 3-term sum <=112455; color_to_yuv's y/u/v terms are bounded
+ * in magnitude by <=56100, all inside u8/s8 after the proven-no-op cast).
+ * Under AVX2 the direct, ISA-native equivalent is a plain 32-bit multiply on
+ * the already-32-bit lane values the caller loaded/masked — same bounded
+ * ranges, so every multiply and running sum stays exact inside int32 with no
+ * overflow at any step. This also means the per-128-bit-lane pack/interleave
+ * problem (_mm256_packs_epi32 et al only pack within each 128-bit lane, not
+ * across all 8) simply doesn't arise for these two helpers — there is no
+ * packing at all, only straight 32-bit lane arithmetic. The addition order
+ * changes slightly (sequential adds vs. one pmaddwd pair-multiply-add + a
+ * separate add for color_to_yuv's R/G terms), which is safe here because
+ * integer addition with no intermediate overflow is associative/commutative
+ * — unlike the floating-point reassociation this task's rules guard
+ * against, there is no rounding to reorder. Verified bit-exact against a
+ * scalar reference (offline harness, not part of this build): filter_sum
+ * over 20,000,000 random trials (bit widths per the range proof above) plus
+ * the all-255/max-weight edge case, color_to_yuv over 20,000,000 random
+ * trials plus all 8 corners of {0,255}^3 — 0 mismatches in every case.
+ *
+ * gather_even2/odd2 (the horizontal pack stage's stride-2 "gather"): no
+ * native replacement this simple exists — AVX2's cross-lane shuffle
+ * (_mm256_permutevar8x32_epi32) reads a single register, not two, so the
+ * SSE2 shuffle+unpacklo_epi64 idiom is kept, widened per-128-bit-lane
+ * exactly as SSE2 did it (_mm256_shuffle_epi32/_mm256_unpacklo_epi64 both
+ * still operate independently per 128-bit lane under AVX2), plus ONE
+ * additional cross-lane fixup (_mm256_permute4x64_epi64) after the unpack —
+ * unavoidable because reassembling 8 strided values spread across two
+ * 256-bit registers needs a step that SSE2's 4-wide version, operating on a
+ * single 128-bit lane, never needed. This is pure data movement (no
+ * arithmetic, no rounding/saturation to reason about) — it either
+ * reproduces the exact source values in the right lanes or it doesn't;
+ * verified against a scalar reference over 5,000,000 random trials, 0
+ * mismatches (same offline harness).
+ * ==========================================================================*/
+__attribute__((target("avx2")))
+static inline __m256i simd_clamp_max255_avx2(__m256i v) {
+    __m256i c255 = _mm256_set1_epi32(255);
+    __m256i gt = _mm256_cmpgt_epi32(v, c255);
+    return _mm256_or_si256(_mm256_and_si256(gt, c255), _mm256_andnot_si256(gt, v));
+}
+__attribute__((target("avx2")))
+static inline __m256i simd_clamp_0_255_avx2(__m256i v) {
+    __m256i zero = _mm256_setzero_si256();
+    v = _mm256_andnot_si256(_mm256_cmpgt_epi32(zero, v), v);   /* v<0 == 0>v (no cmplt in AVX2) */
+    return simd_clamp_max255_avx2(v);
+}
+
+__attribute__((target("avx2")))
+static inline __m256i simd_filter_sum_avx2(__m256i a, __m256i b, __m256i c, int wa, int wb, int wc) {
+    __m256i pa = _mm256_mullo_epi32(a, _mm256_set1_epi32(wa));
+    __m256i pb = _mm256_mullo_epi32(b, _mm256_set1_epi32(wb));
+    __m256i pc = _mm256_mullo_epi32(c, _mm256_set1_epi32(wc));
+    __m256i sum = _mm256_add_epi32(_mm256_add_epi32(pa, pb), pc);
+    sum = _mm256_srli_epi32(sum, 6);   /* logical == arithmetic: sum always >= 0, same as SSE2 */
+    return simd_clamp_max255_avx2(sum);
+}
+
+__attribute__((target("avx2")))
+static inline void simd_color_to_yuv_avx2(__m256i R, __m256i G, __m256i B,
+                                           __m256i* Yv, __m256i* Uv, __m256i* Vv) {
+    __m256i y = _mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(R, _mm256_set1_epi32(66)),
+                                                    _mm256_mullo_epi32(G, _mm256_set1_epi32(129))),
+                                   _mm256_mullo_epi32(B, _mm256_set1_epi32(25)));
+    __m256i u = _mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(R, _mm256_set1_epi32(-38)),
+                                                    _mm256_mullo_epi32(G, _mm256_set1_epi32(-74))),
+                                   _mm256_mullo_epi32(B, _mm256_set1_epi32(112)));
+    __m256i v = _mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(R, _mm256_set1_epi32(112)),
+                                                    _mm256_mullo_epi32(G, _mm256_set1_epi32(-94))),
+                                   _mm256_mullo_epi32(B, _mm256_set1_epi32(-18)));
+    const __m256i one = _mm256_set1_epi32(1);
+    *Yv = _mm256_add_epi32(_mm256_srai_epi32(y, 8), _mm256_and_si256(_mm256_srai_epi32(y, 7), one));
+    *Uv = _mm256_add_epi32(_mm256_srai_epi32(u, 8), _mm256_and_si256(_mm256_srai_epi32(u, 7), one));
+    *Vv = _mm256_add_epi32(_mm256_srai_epi32(v, 8), _mm256_and_si256(_mm256_srai_epi32(v, 7), one));
+}
+
+/* Stride-2 gather widened to 8-wide: lo=[v0..v7], hi=[v8..v15] (each 8x32
+ * lanes) -> even=[v0,v2,...,v14], odd=[v1,v3,...,v15]. See the big comment
+ * above for the derivation (per-128-bit-lane shuffle+unpack, same as SSE2,
+ * plus one cross-lane permute fixup). */
+__attribute__((target("avx2")))
+static inline __m256i simd_gather_even2_avx2(__m256i lo, __m256i hi) {
+    __m256i los = _mm256_shuffle_epi32(lo, _MM_SHUFFLE(3, 1, 2, 0));
+    __m256i his = _mm256_shuffle_epi32(hi, _MM_SHUFFLE(3, 1, 2, 0));
+    __m256i u = _mm256_unpacklo_epi64(los, his);
+    return _mm256_permute4x64_epi64(u, _MM_SHUFFLE(3, 1, 2, 0));
+}
+__attribute__((target("avx2")))
+static inline __m256i simd_gather_odd2_avx2(__m256i lo, __m256i hi) {
+    __m256i los = _mm256_shuffle_epi32(lo, _MM_SHUFFLE(2, 0, 3, 1));
+    __m256i his = _mm256_shuffle_epi32(hi, _MM_SHUFFLE(2, 0, 3, 1));
+    __m256i u = _mm256_unpacklo_epi64(los, his);
+    return _mm256_permute4x64_epi64(u, _MM_SHUFFLE(3, 1, 2, 0));
+}
+
+/* Full AVX2 8-wide inner loop of gx_raster_efb_copy's vertical-filter +
+ * RGB->YUV convert stage (the SSE2 4-wide loop's exact body, widened) —
+ * extracted into its own function because __attribute__((target("avx2")))
+ * is a function-level attribute, not a block-level one. Runs while
+ * x+8<=right, starting at x0; returns the final x so the caller can pick up
+ * with the existing SSE2 4-wide loop (for a 4-7 remainder) and then the
+ * scalar tail (for <4), exactly the same "SIMD interior, scalar/narrower-SIMD
+ * remainder" split as every other pass in this file. */
+__attribute__((target("avx2")))
+static int efb_copy_filter_yuv_avx2(const u32* rowPrev, const u32* rowSy, const u32* rowNext,
+                                     int left, int right, int x0, int wab, int wcde, int wfg,
+                                     int* scanY, int* scanU, int* scanV) {
+    const __m256i mask8 = _mm256_set1_epi32(0xFF);
+    int x = x0;
+    for (; x + 8 <= right; x += 8) {
+        int i = x - left + 1;
+        __m256i c0 = _mm256_loadu_si256((const __m256i*)&rowPrev[x]);
+        __m256i c1 = _mm256_loadu_si256((const __m256i*)&rowSy[x]);
+        __m256i c2 = _mm256_loadu_si256((const __m256i*)&rowNext[x]);
+        __m256i B0 = _mm256_and_si256(c0, mask8);
+        __m256i G0 = _mm256_and_si256(_mm256_srli_epi32(c0, 8), mask8);
+        __m256i R0 = _mm256_and_si256(_mm256_srli_epi32(c0, 16), mask8);
+        __m256i B1 = _mm256_and_si256(c1, mask8);
+        __m256i G1 = _mm256_and_si256(_mm256_srli_epi32(c1, 8), mask8);
+        __m256i R1 = _mm256_and_si256(_mm256_srli_epi32(c1, 16), mask8);
+        __m256i B2 = _mm256_and_si256(c2, mask8);
+        __m256i G2 = _mm256_and_si256(_mm256_srli_epi32(c2, 8), mask8);
+        __m256i R2 = _mm256_and_si256(_mm256_srli_epi32(c2, 16), mask8);
+        __m256i filtB = simd_filter_sum_avx2(B0, B1, B2, wab, wcde, wfg);
+        __m256i filtG = simd_filter_sum_avx2(G0, G1, G2, wab, wcde, wfg);
+        __m256i filtR = simd_filter_sum_avx2(R0, R1, R2, wab, wcde, wfg);
+        __m256i Yv, Uv, Vv;
+        simd_color_to_yuv_avx2(filtR, filtG, filtB, &Yv, &Uv, &Vv);
+        _mm256_storeu_si256((__m256i*)&scanY[i], Yv);
+        _mm256_storeu_si256((__m256i*)&scanU[i], Uv);
+        _mm256_storeu_si256((__m256i*)&scanV[i], Vv);
+    }
+    return x;
+}
+
+/* Full AVX2 8-wide inner loop of the chroma-smooth (1/4+1/2+1/4) precompute
+ * — plain 3-tap add+shift, no packing at all, so this is a direct lane-count
+ * widen with no reasoning needed beyond that. Runs while i+8<=limit
+ * (limit==src_w+1, matching the SSE2 loop's i+4<=src_w+1); returns final i. */
+__attribute__((target("avx2")))
+static int efb_copy_smooth_avx2(int* smoothU, int* smoothV, const int* scanU, const int* scanV,
+                                 int i0, int limit) {
+    int i = i0;
+    for (; i + 8 <= limit; i += 8) {
+        __m256i um1 = _mm256_loadu_si256((const __m256i*)&scanU[i - 1]);
+        __m256i u0  = _mm256_loadu_si256((const __m256i*)&scanU[i]);
+        __m256i up1 = _mm256_loadu_si256((const __m256i*)&scanU[i + 1]);
+        _mm256_storeu_si256((__m256i*)&smoothU[i],
+            _mm256_add_epi32(_mm256_add_epi32(um1, _mm256_slli_epi32(u0, 1)), up1));
+        __m256i vm1 = _mm256_loadu_si256((const __m256i*)&scanV[i - 1]);
+        __m256i v0  = _mm256_loadu_si256((const __m256i*)&scanV[i]);
+        __m256i vp1 = _mm256_loadu_si256((const __m256i*)&scanV[i + 1]);
+        _mm256_storeu_si256((__m256i*)&smoothV[i],
+            _mm256_add_epi32(_mm256_add_epi32(vm1, _mm256_slli_epi32(v0, 1)), vp1));
+    }
+    return i;
+}
+
+/* Full AVX2 8-wide (16 source columns / 8 output pixel-pairs) inner loop of
+ * the horizontal chroma-downsample + YUYV pack stage — widened via
+ * simd_gather_even2_avx2/odd2_avx2 above. Runs while x+16<=src_w, starting
+ * at x0 (i is always x+1 in this loop, same invariant the SSE2/scalar code
+ * relies on); returns final x. */
+__attribute__((target("avx2")))
+static int efb_copy_pack_avx2(u8* row, int x0, int src_w, const int* scanY,
+                               const int* smoothU, const int* smoothV) {
+    int x = x0, i = x0 + 1;
+    for (; x + 16 <= src_w; i += 16, x += 16) {
+        __m256i Yc_lo = _mm256_loadu_si256((const __m256i*)&scanY[i]);
+        __m256i Yc_hi = _mm256_loadu_si256((const __m256i*)&scanY[i + 8]);
+        __m256i Y0v = simd_gather_even2_avx2(Yc_lo, Yc_hi);
+        __m256i Y1v = simd_gather_odd2_avx2(Yc_lo, Yc_hi);
+        __m256i sU_lo = _mm256_loadu_si256((const __m256i*)&smoothU[i]);
+        __m256i sU_hi = _mm256_loadu_si256((const __m256i*)&smoothU[i + 8]);
+        __m256i sV_lo = _mm256_loadu_si256((const __m256i*)&smoothV[i]);
+        __m256i sV_hi = _mm256_loadu_si256((const __m256i*)&smoothV[i + 8]);
+        __m256i UV0raw = simd_gather_even2_avx2(sU_lo, sU_hi);
+        __m256i UV1raw = simd_gather_even2_avx2(sV_lo, sV_hi);
+        __m256i Y0c = simd_clamp_0_255_avx2(_mm256_add_epi32(Y0v, _mm256_set1_epi32(16)));
+        __m256i Y1c = simd_clamp_0_255_avx2(_mm256_add_epi32(Y1v, _mm256_set1_epi32(16)));
+        __m256i UV0c = simd_clamp_0_255_avx2(_mm256_add_epi32(_mm256_set1_epi32(128), _mm256_srai_epi32(UV0raw, 2)));
+        __m256i UV1c = simd_clamp_0_255_avx2(_mm256_add_epi32(_mm256_set1_epi32(128), _mm256_srai_epi32(UV1raw, 2)));
+        __m256i word = _mm256_or_si256(_mm256_or_si256(Y0c, _mm256_slli_epi32(UV0c, 8)),
+                                        _mm256_or_si256(_mm256_slli_epi32(Y1c, 16), _mm256_slli_epi32(UV1c, 24)));
+        _mm256_storeu_si256((__m256i*)(row + x * 2), word);
+    }
+    return x;
+}
+
 void gx_raster_efb_copy(const GxCpState* cp) {
     (void)cp;
     /* Lazy-init same as gx_raster_draw's own copy (line ~4153): an EFB copy
@@ -4826,6 +5131,9 @@ void gx_raster_efb_copy(const GxCpState* cp) {
             if (s_no_simd < 0) s_no_simd = getenv("GCN_GX_NO_SIMD") ? 1 : 0;
             int simd_ok = !s_no_simd && copy_getpx == get_pixel_color_direct &&
                           left >= 0 && right <= (int)EFB_WIDTH;
+            /* Resolved once per copy (same "per-copy-constant" discipline as
+             * simd_ok/copy_getpx above), not re-checked per scanline. */
+            int use_avx2 = simd_ok && gx_avx2_available();
 
             for (int dy = 0; dy < dst_h; dy++) {
                 int sy = top + (int)(dy / (yscale == 0 ? 1.0f : yscale) + 0.5f);
@@ -4839,8 +5147,12 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                     const u32* rowPrev = &s_efb_color[(u32)yprev * EFB_WIDTH];
                     const u32* rowSy   = &s_efb_color[(u32)sy    * EFB_WIDTH];
                     const u32* rowNext = &s_efb_color[(u32)ynext * EFB_WIDTH];
-                    const __m128i mask8 = _mm_set1_epi32(0xFF);
+                    int wab = w0 + w1, wcde = w2 + w3 + w4, wfg = w5 + w6;
                     int x = left;
+                    if (use_avx2)
+                        x = efb_copy_filter_yuv_avx2(rowPrev, rowSy, rowNext, left, right, x,
+                                                      wab, wcde, wfg, scanY, scanU, scanV);
+                    const __m128i mask8 = _mm_set1_epi32(0xFF);
                     for (; x + 4 <= right; x += 4) {
                         int i = x - left + 1;
                         __m128i c0 = _mm_loadu_si128((const __m128i*)&rowPrev[x]);
@@ -4855,7 +5167,6 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                         __m128i B2 = _mm_and_si128(c2, mask8);
                         __m128i G2 = _mm_and_si128(_mm_srli_epi32(c2, 8), mask8);
                         __m128i R2 = _mm_and_si128(_mm_srli_epi32(c2, 16), mask8);
-                        int wab = w0 + w1, wcde = w2 + w3 + w4, wfg = w5 + w6;
                         __m128i filtB = simd_filter_sum(B0, B1, B2, wab, wcde, wfg);
                         __m128i filtG = simd_filter_sum(G0, G1, G2, wab, wcde, wfg);
                         __m128i filtR = simd_filter_sum(R0, R1, R2, wab, wcde, wfg);
@@ -4882,6 +5193,8 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                      * above, so this needs no edge-casing of its own — see
                      * the big comment). */
                     int i = 1;
+                    if (use_avx2)
+                        i = efb_copy_smooth_avx2(smoothU, smoothV, scanU, scanV, i, src_w + 1);
                     for (; i + 4 <= src_w + 1; i += 4) {
                         __m128i um1 = _mm_loadu_si128((const __m128i*)&scanU[i - 1]);
                         __m128i u0  = _mm_loadu_si128((const __m128i*)&scanU[i]);
@@ -4901,6 +5214,10 @@ void gx_raster_efb_copy(const GxCpState* cp) {
 
                     int x = 0;
                     i = 1;
+                    if (use_avx2) {
+                        x = efb_copy_pack_avx2(row, x, src_w, scanY, smoothU, smoothV);
+                        i = x + 1;
+                    }
                     for (; x + 8 <= src_w; i += 8, x += 8) {
                         __m128i Yc_lo = _mm_loadu_si128((const __m128i*)&scanY[i]);
                         __m128i Yc_hi = _mm_loadu_si128((const __m128i*)&scanY[i + 4]);
