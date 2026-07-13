@@ -173,4 +173,32 @@ if(GCN_WITH_GENERATED)
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm
                          user32 gdi32 opengl32)
+
+  # E2 (perf campaign 2): profile-guided optimization. The boot is fully
+  # deterministic, which makes it an ideal PGO training input, and the
+  # block-exec plateau evidence (E1 flat, write-through micro-model negative)
+  # points at code layout / branch weights / inlining decisions in the
+  # 4096-label chunk megafunctions — exactly PGO's domain. Two-phase:
+  #   cmake -DGCN_PGO=GEN  -> instrumented build (-fprofile-update=atomic:
+  #                           GX-MT workers + the DSP worker write counters
+  #                           concurrently)
+  #   <run training boots: uniform 8M + derived 24M/56M>
+  #   cmake -DGCN_PGO=USE  -> optimized build reading pgo-data/
+  # Off (empty) by default — the plain build stays the dev-loop default; PGO
+  # is a release-shaping step (adds a full extra compile + training run).
+  set(GCN_PGO "" CACHE STRING "PGO for gcn_boot: GEN (instrument), USE (apply pgo-data/), empty = off")
+  if(GCN_PGO STREQUAL "GEN")
+    set(GCN_PGO_FLAGS -fprofile-generate=${CMAKE_BINARY_DIR}/pgo-data -fprofile-update=atomic)
+  elseif(GCN_PGO STREQUAL "USE")
+    # -fprofile-correction: tolerate the small counter races atomic updates
+    # can still leave between threads; -Wno-missing-profile: TUs never
+    # executed in training (cold debug paths) are expected, not an error.
+    set(GCN_PGO_FLAGS -fprofile-use=${CMAKE_BINARY_DIR}/pgo-data -fprofile-correction -Wno-missing-profile)
+  endif()
+  if(DEFINED GCN_PGO_FLAGS)
+    target_compile_options(gcn_boot PRIVATE ${GCN_PGO_FLAGS})
+    target_link_options(gcn_boot PRIVATE ${GCN_PGO_FLAGS})
+    target_compile_options(gcn_runtime_core PRIVATE ${GCN_PGO_FLAGS})
+    target_compile_options(gcn_dsp_lle PRIVATE ${GCN_PGO_FLAGS})
+  endif()
 endif()

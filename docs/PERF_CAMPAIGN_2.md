@@ -108,6 +108,25 @@ Consequences:
 - GX at 23% still gets the AVX2 pass (in flight), expected 1.3-1.8× on the
   fused loops ≈ 5-8% of wall.
 
+## E2 (PGO) result — the win (2026-07-13)
+
+Two-phase build (`-DGCN_PGO=GEN` → train on uniform 8M + derived 24M/56M +
+one thread-off derived 12M → `-DGCN_PGO=USE`, 201 .gcda TU profiles) in a
+separate `runtime/build-pgo` dir; the plain build stays the dev default.
+Result: **all four golden hashes bit-identical, oracle counts unchanged, and
+min-of-6 interleaved 12M derived 3.475 → 2.986 s (~14%; every PGO sample
+beat every plain sample)**. vs the session-best plain 3.329 s it is still
+~10%. This confirms the layout/branch-weight hypothesis for the block-exec
+plateau (E1's memory-traffic theory measured flat; PGO's whole-program
+reshaping is what moved it). Attribution on the PGO binary: block-exec 51.6 /
+gx 20.8 / dsp 19.0 / other ~8.5 (same shape, smaller pie).
+
+Campaign scoreboard (12M derived, HIGH-priority min): pre-campaign 3.332 s →
+post E1+AVX2+DSP-thread+PGO ≈ 2.99 s (measured on a noisier machine — the
+honest gain is ~10-14%), i.e. derived ≈ 0.50× real-time. Remaining distance
+to 1.0× is architectural: the CPU/GX pipeline (G3, ceiling 1.76×) is the
+next campaign phase; G2 tile tuning is the smaller follow-up.
+
 ## Rejected / deferred
 
 - musttail chunk chaining: GCC 15 feature; dispatch is per-quantum (measure
