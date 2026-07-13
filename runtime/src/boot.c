@@ -268,6 +268,38 @@ static u32 memcard_mbits_bytes_from_env(const char* env_name) {
 /* Install a formatted/loaded memory card on `ch`. `path` (may be NULL) is the
  * .raw backing. Returns the malloc'd card image (owned by `card` after
  * gcn_memcard_init) or NULL on hard failure. */
+/* [auto-create/reformat] Mint a FACTORY-BLANK card image — all 0xFF, the real
+ * erased-flash state, NO header/directory/BAT. Deliberately does NOT call
+ * gcn_mc_image_format(): writing a valid header is the IPL's OWN card
+ * manager's job the first time it sees an unformatted card (LLE-first —
+ * PRINCIPLES.md "the firmware does it", not us). A real GameCube shows "this
+ * card is unformatted, format it?" for a brand-new card AND for one whose
+ * header no longer validates; both cases route here so the observable flow
+ * is the same single one. Returns the malloc'd image (persisted to `path`)
+ * or NULL on alloc/write failure — the caller's last-resort in-memory
+ * pre-formatted fallback covers that. */
+static u8* mint_factory_blank(u32 ch, const char* path, u32* out_sz) {
+    char env_name[24];
+    u32 blank_sz;
+    u8* blank;
+    snprintf(env_name, sizeof env_name, "GCN_MEMCARD_%c_MBITS", (char)('A' + ch));
+    blank_sz = memcard_mbits_bytes_from_env(env_name);
+    blank = (u8*)malloc(blank_sz);
+    if (!blank) return NULL;
+    memset(blank, 0xFF, blank_sz);
+    if (!gcn_mc_image_save_file(path, blank, blank_sz)) {
+        fprintf(stderr, "gcn boot: memory card %c: failed to write "
+                "factory-blank image to '%s' — falling back to an "
+                "in-memory pre-formatted card\n", (char)('A' + ch), path);
+        free(blank);
+        return NULL;
+    }
+    fprintf(stdout, "gcn boot: created factory-blank memory card at '%s' (%u Mbit)\n",
+            path, blank_sz / 131072u);   /* 131072 B/Mbit (GCN_MC_BLOCK_SIZE * GCN_MC_BLOCKS_PER_MBIT) */
+    *out_sz = blank_sz;
+    return blank;
+}
+
 static void setup_memcard(GcnExi* exi, u32 ch, GcnMemcard* card, const char* path) {
     /* Default to 128 Mbit / 2043-block (GetCardId 0x80) — the size Dolphin's
      * oracle boots with, so the card's NintendoID response matches the oracle
@@ -296,48 +328,36 @@ static void setup_memcard(GcnExi* exi, u32 ch, GcnMemcard* card, const char* pat
                     fprintf(stdout, "gcn boot: memory card %c loaded from '%s' (%u bytes)\n",
                             (char)('A' + ch), path, file_sz);
                 } else {
+                    /* Corrupt/invalid existing file: same real-hardware
+                     * scenario as a brand-new card (the console can't read a
+                     * valid header either way), so it takes the SAME path —
+                     * mint factory-blank, let the IPL offer to format.
+                     * Previously this silently pre-formatted in the runtime
+                     * (the bottom fallback), which a real console never does. */
                     fprintf(stdout, "gcn boot: memory card %c file '%s' invalid (%s) — "
-                            "reformatting\n", (char)('A' + ch), path,
+                            "minting factory-blank; the IPL will offer to format it\n",
+                            (char)('A' + ch), path,
                             gcn_mc_image_valid_size(file_sz) ? err : "bad size");
                     free(file);
+                    img = mint_factory_blank(ch, path, &sz);
                 }
+            } else {
+                /* gcn_seed_read_file itself failed (zero-length/unreadable):
+                 * also "no valid card here" — same unified mint path. */
+                img = mint_factory_blank(ch, path, &sz);
             }
-            /* else: gcn_seed_read_file itself failed (e.g. zero-length or
-             * unreadable) — img stays NULL and falls to the formatted-blank
-             * fallback below, same as before this feature existed. */
         } else {
-            /* [auto-create] Path names a card that has never existed: mint a
-             * FACTORY-BLANK image — all 0xFF, the real erased-flash state,
-             * NO header/directory/BAT. Deliberately do NOT call
-             * gcn_mc_image_format() here: writing a valid header is the
-             * IPL's OWN card manager's job the first time it sees an
-             * unformatted card (LLE-first — PRINCIPLES.md "the firmware does
-             * it", not us). A real GameCube shows "this card is unformatted,
-             * format it?" for a brand-new card; so should this one. */
-            char env_name[24];
-            u32 blank_sz;
-            u8* blank;
-            snprintf(env_name, sizeof env_name, "GCN_MEMCARD_%c_MBITS", (char)('A' + ch));
-            blank_sz = memcard_mbits_bytes_from_env(env_name);
-            blank = (u8*)malloc(blank_sz);
-            if (blank) {
-                memset(blank, 0xFF, blank_sz);
-                if (gcn_mc_image_save_file(path, blank, blank_sz)) {
-                    img = blank; sz = blank_sz;
-                    fprintf(stdout,
-                        "gcn boot: created factory-blank memory card at '%s' (%u Mbit)\n",
-                        path, blank_sz / 131072u);   /* 131072 B/Mbit (GCN_MC_BLOCK_SIZE * GCN_MC_BLOCKS_PER_MBIT) */
-                } else {
-                    fprintf(stderr, "gcn boot: memory card %c: failed to write "
-                            "factory-blank image to '%s' — falling back to an "
-                            "in-memory pre-formatted card\n", (char)('A' + ch), path);
-                    free(blank);
-                }
-            }
+            /* Path names a card that has never existed. */
+            img = mint_factory_blank(ch, path, &sz);
         }
     }
 
     if (!img) {
+        /* Reached only when no path was given at all (the documented fixture
+         * convenience keeping slot A's oracle-matched default boot working)
+         * or when mint_factory_blank couldn't allocate/persist. Every
+         * "a path was given but no valid card is there" case goes through
+         * the unified mint-and-let-the-IPL-format path above. */
         img = (u8*)malloc(sz);
         if (!img) { fprintf(stderr, "gcn boot: memory card %c alloc failed\n",
                             (char)('A' + ch)); return; }
