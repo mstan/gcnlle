@@ -135,6 +135,8 @@ if(GCN_WITH_GENERATED)
   # verbatim — one algorithm, one compiled object, two consumers).
   target_include_directories(gcn_boot PRIVATE include generated)
   # ws2_32: Winsock for the TCP debug server (debug_server.c).
+  # synchronization: WaitOnAddress/WakeByAddressAll for the GX-MT worker
+  # pool's hybrid spin/sleep wait (gx_raster.c).
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
-                         ipl_descramble_core ws2_32)
+                         ipl_descramble_core ws2_32 synchronization)
 endif()

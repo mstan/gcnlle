@@ -118,4 +118,10 @@ void gx_raster_print_census(void);
  * unless the knob is on. Called from gx.c's shared stats cadence. */
 void gx_raster_print_area_hist(void);
 
+/* GCN_GX_MT_STATS=1: GX-MT fork/join accounting (fork counts, main-thread
+ * scan/join/publish split). Main-thread-only counters — does NOT force the
+ * rasterizer serial, so it measures the real parallel run. No-op unless the
+ * knob is on. Called from gx.c's shared stats cadence. */
+void gx_raster_print_mt_stats(void);
+
 #endif /* GCN_GX_GX_RASTER_H */

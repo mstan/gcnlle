@@ -781,5 +781,9 @@ void gcn_gx_tick(u32 cycles) {
         /* GCN_GX_STATS: per-triangle bbox-area histogram (no-op when off —
          * same convention as the census above). */
         gx_raster_print_area_hist();
+
+        /* GCN_GX_MT_STATS: GX-MT fork/join accounting (no-op when off; does
+         * not force serial — main-thread-only counters). */
+        gx_raster_print_mt_stats();
     }
 }

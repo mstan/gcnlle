@@ -16,6 +16,29 @@
 #include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
 #include <emmintrin.h>   /* SSE2 — EFB-copy scanline encode (GCN_GX_NO_SIMD knob) */
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>     /* worker pool: CreateThread + WaitOnAddress/WakeByAddressAll
+                          * (tile-parallel rasterizer — see the GX-MT block comment
+                          * above gx_mt_worker) */
+
+/* ============================================================================
+ * Tile-parallel rasterizer (GX-MT) — compile-time worker ceiling. The actual
+ * count is resolved once per process from GCN_GX_THREADS (see gx_mt_resolve):
+ *   unset/0 -> auto (logical cores / 2, capped at 8)
+ *   1       -> serial (the same-binary A/B knob: identical pixel math, one
+ *              thread, byte-identical XFB by construction)
+ *   N       -> N threads (main participates; N-1 spawned workers), <= this cap.
+ * Every piece of per-pixel mutable state is per-worker (s_tev_w / s_rb_w /
+ * s_texel_cache_w below); everything else the pixel path touches during a
+ * forked scan is either read-only for the duration of the draw (s_cfg, s_bp,
+ * s_xf, slopes, guest RAM textures — the CPU is stalled inside the dispatch
+ * loop while gx_raster_draw runs) or per-pixel-location EFB state whose rows
+ * are owned by exactly one worker (interleaved block rows, see
+ * scan_block_rows). Fork/join is per TRIANGLE, so cross-triangle write order
+ * at any EFB location is the serial order by construction.
+ * ==========================================================================*/
+#define GX_MT_MAX 16
+
 /* GCN_GX_NO_SIMD=1: force the EFB-copy scanline encode (gx_raster_efb_copy)
  * to always take its scalar path, even when the SIMD preconditions hold.
  * Own lazy -1-sentinel getenv, same pattern as s_no_fused (see its comment).
@@ -162,9 +185,11 @@ static int s_no_fused = -1;
 static u64 s_ps_texel_cache_misses; /* ...calls that had to fall through to a real decode */
 
 /* ---- one-time trap logging ------------------------------------------------ */
+/* Atomic exchange rather than plain load/store: trap sites are reachable from
+ * GX-MT worker threads (per-pixel/per-sample paths), and two workers hitting
+ * the same first-ever trap concurrently must still print exactly once. */
 static int trap_once(int* flag, const char* what) {
-    if (*flag) return 0;
-    *flag = 1;
+    if (__atomic_exchange_n(flag, 1, __ATOMIC_RELAXED)) return 0;
     fprintf(stderr, "gx_raster: UNIMPLEMENTED/out-of-scope: %s — trapped once\n",
             what);
     return 1;
@@ -177,8 +202,7 @@ static int trap_once(int* flag, const char* what) {
  * misses loud, transcribe never guess). */
 #define TRAPF(field, fmt, ...) do { \
         static int field = 0; \
-        if (!field) { \
-            field = 1; \
+        if (!__atomic_exchange_n(&field, 1, __ATOMIC_RELAXED)) { \
             fprintf(stderr, "gx_raster: UNIMPLEMENTED/out-of-scope: " fmt \
                     " — trapped once\n", __VA_ARGS__); \
         } \
@@ -359,6 +383,13 @@ typedef struct {
      * tev_draw() when set. GCN_GX_NO_FUSED=1 forces this to always stay NULL
      * (same-binary A/B against the general path — see build_draw_cfg). */
     void (*fused)(Tev* t);
+
+    /* GX-MT: 1 iff this draw's pixel program is provably free of pixel-to-
+     * pixel Tev-state carry, i.e. its pixels may be partitioned across
+     * workers in any order with byte-identical results. Computed once per
+     * draw by draw_parallel_ok() (see its proof comment); draws that fail
+     * scan serially on worker 0 exactly as before. */
+    int parallel_ok;
 } DrawCfg;
 
 static DrawCfg s_cfg;
@@ -881,12 +912,21 @@ typedef struct {
     u8  rgba[4];  /* decode_texel's exact out[4] for that (texmap,iS,iT) */
 } TexelCacheEntry;
 
-static TexelCacheEntry s_texel_cache[TEXEL_CACHE_SIZE];
+/* One private cache per GX-MT worker (row = worker id; serial mode only ever
+ * touches row 0, which is byte-for-byte the old single cache). The cache is a
+ * pure memo over the deterministic decode_texel, so per-worker instances
+ * return identical bytes to the shared one — they exist only so workers never
+ * write shared lines. Each 48KB row is a multiple of 64B, so rows never share
+ * a cache line either. */
+static TexelCacheEntry s_texel_cache_w[GX_MT_MAX][TEXEL_CACHE_SIZE]
+        __attribute__((aligned(64)));
 
 /* 0 is reserved as the "slot never written since last full clear" sentinel
  * (see the wraparound handling in build_draw_cfg) — so the very first real
  * draw must not use generation 0 either; build_draw_cfg's pre-increment
- * (0 -> 1 on the first call) already guarantees that. */
+ * (0 -> 1 on the first call) already guarantees that. The generation is
+ * SHARED across workers: only the main thread ever writes it (once per draw,
+ * while no fork is in flight), workers just compare against it. */
 static u32 s_texel_cache_gen;
 
 static inline u32 texel_cache_key(u32 texmap, u32 iS, u32 iT) {
@@ -901,11 +941,11 @@ static inline u32 texel_cache_index(u32 texmap, u32 iS, u32 iT) {
  * directly, though a repo-wide grep found no other caller) so callers of
  * decode_texel that might not share tex_sample's per-draw-frozen-texmap
  * invariant are unaffected by construction, not just by accident. */
-static inline void decode_texel_cached(u32 texmap, u32 fmt, const u8* src, u32 src_len,
+static inline void decode_texel_cached(int wid, u32 texmap, u32 fmt, const u8* src, u32 src_len,
                                         int iS, int iT, int w1, u8 out[4]) {
     u32 key = texel_cache_key(texmap, (u32)iS, (u32)iT);
     u32 idx = texel_cache_index(texmap, (u32)iS, (u32)iT);
-    TexelCacheEntry* e = &s_texel_cache[idx];
+    TexelCacheEntry* e = &s_texel_cache_w[wid][idx];
 
     if (e->gen == s_texel_cache_gen && e->key == key) {
         /* Hit: byte-identical to the decode_texel call this replaces (see the
@@ -922,7 +962,7 @@ static inline void decode_texel_cached(u32 texmap, u32 fmt, const u8* src, u32 s
     if (s_pixel_stats) s_ps_texel_cache_misses++;
 }
 
-static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
+static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     /* tx_mode0/mode1/image0/image3 field extraction is per-draw-constant (BP
      * loads never interleave with a draw's vertex payload) — decoded once by
      * build_draw_cfg() into s_cfg.tex[texmap] instead of every sample. Trap
@@ -971,10 +1011,10 @@ static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
          * pixels in a scanline and adjacent samples' own 4 taps repeat the
          * same (texmap,iS,iT) constantly, this is exactly what the cache
          * memoizes. */
-        decode_texel_cached(texmap, fmt, src, src_len, iS,  iT,  w1, v00);
-        decode_texel_cached(texmap, fmt, src, src_len, iS1, iT,  w1, v10);
-        decode_texel_cached(texmap, fmt, src, src_len, iS,  iT1, w1, v01);
-        decode_texel_cached(texmap, fmt, src, src_len, iS1, iT1, w1, v11);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT,  w1, v00);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT,  w1, v10);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT1, w1, v01);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT1, w1, v11);
         for (int c = 0; c < 4; c++) {
             u32 acc = v00[c] * (u32)((128 - fS) * (128 - fT)) +
                       v10[c] * (u32)((fS)       * (128 - fT)) +
@@ -985,7 +1025,7 @@ static void tex_sample(u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     } else {
         int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
         int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
-        decode_texel_cached(texmap, fmt, src, src_len, iS, iT, w1, out);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS, iT, w1, out);
     }
 }
 
@@ -1012,7 +1052,13 @@ struct Tev {   /* tagged (not anonymous) so the DrawCfg::fused forward
     s32    TexCoordS, TexCoordT;
     u8     AlphaBump;
     s32    TextureLod[16];  int TextureLinear[16];
-};   /* Tev already named by the forward `typedef struct Tev Tev;` above */
+    int    wid;             /* GX-MT worker id owning this instance — indexes
+                             * s_texel_cache_w/s_rb_w so the whole per-pixel
+                             * path stays parameterized by the one Tev* it
+                             * already threads everywhere. 0 in serial mode. */
+} __attribute__((aligned(64)));   /* sizeof rounds up to a 64B multiple, so
+                * adjacent s_tev_w[] workers never share a cache line */
+   /* Tev already named by the forward `typedef struct Tev Tev;` above */
 
 static const s16 s_Bias[4]   = { 0, 128, -128, 0 };
 static const u8  s_LShift[4] = { 0, 1, 2, 0 };
@@ -1257,15 +1303,15 @@ static inline void tev_stats_enter(int fused) {
  * itself (was tev_draw's inline if/else). Used by tev_draw's stage loop AND
  * every fused function's one tex_sample call (config A/B/C all sample
  * exactly once per pixel — see the fused derivation comments). */
-static inline void tev_sample_stat(u32 texmap, s32 texS, s32 texT, int linear, u8* texel) {
+static inline void tev_sample_stat(int wid, u32 texmap, s32 texS, s32 texT, int linear, u8* texel) {
     if (s_pixel_stats) {
         s_ps_tex_calls++;
         if (linear) s_ps_tex_linear++; else s_ps_tex_point++;
         u64 tex_t0 = __rdtsc();
-        tex_sample(texmap, texS, texT, linear, texel);
+        tex_sample(wid, texmap, texS, texT, linear, texel);
         s_tsc_tex += __rdtsc() - tex_t0;
     } else {
-        tex_sample(texmap, texS, texT, linear, texel);
+        tex_sample(wid, texmap, texS, texT, linear, texel);
     }
 }
 
@@ -1338,7 +1384,7 @@ static void tev_draw(Tev* t) {
         if (enable) {
             u8 texel[4];
             if (numtexgens > 0) {
-                tev_sample_stat(texmap, t->TexCoordS, t->TexCoordT,
+                tev_sample_stat(t->wid, texmap, t->TexCoordS, t->TexCoordT,
                                  t->TextureLinear[stage], texel);
             } else {
                 memset(texel, 0, 4);
@@ -1564,7 +1610,7 @@ static void fused_pixel_A(Tev* t) {
      * of this config's signature), so UvS[0]/UvT[0] is the only possible
      * index — no need to read sc->texcoordSel at all. */
     u8 texel[4];
-    tev_sample_stat(texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
 
     /* colorchan==0, rswap_id==0 with swaptab[0]==identity (both checked at
      * selection time) -> RasColor.a == t->Color[0][3] directly. */
@@ -1620,7 +1666,7 @@ static void fused_pixel_A(Tev* t) {
 static inline void fused_core_C(Tev* t, u8 output[4]) {
     u32 texmap = s_cfg.stage[0].texmap;
     u8 texel[4];
-    tev_sample_stat(texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
 
     u8 ras_a = t->Color[0][3];         /* colorchan==0, rswap_id==0 identity */
     const TColor* reg1 = &t->Reg[1];   /* "Color0" TEV const register, per-draw */
@@ -1737,7 +1783,15 @@ typedef struct {
 
 typedef struct { float f0, dfdx, dfdy; s32 x0, y0; float xOff, yOff; } Slope;
 
-static Tev    s_tev;
+/* One Tev per GX-MT worker. s_tev_w[0] is the ONLY instance the serial path
+ * ever touches (it is the old single s_tev, renamed); workers 1..n-1 receive
+ * a copy of it at each fork (Reg/Konst are the per-draw template loaded by
+ * tev_load_registers — see the parallel_ok analysis in build_draw_cfg for why
+ * a template copy is exact). Tev's own aligned(64) keeps workers off each
+ * other's cache lines. */
+static Tev    s_tev_w[GX_MT_MAX];
+/* Per-TRIANGLE setup outputs, written by the main thread before any fork and
+ * read-only for the whole scan (workers included) — shared by design. */
 static Slope  s_ZSlope, s_WSlope, s_ColorSlopes[2][4], s_TexSlopes[8][3];
 
 static float slope_value(const Slope* s, s32 x, s32 y) {
@@ -1779,15 +1833,20 @@ static int s_scissor_xoff, s_scissor_yoff;
 
 #define BLK 2
 typedef struct { float InvW; float Uv[8][2]; } RBPixel;
-static RBPixel s_rb[BLK][BLK];
+/* One 2x2 block buffer per GX-MT worker (indexed by Tev.wid, like the texel
+ * cache); aligned so adjacent workers' buffers never share a cache line.
+ * Serial mode only ever touches [0] — the old single s_rb. */
+typedef struct { RBPixel px[BLK][BLK]; } __attribute__((aligned(64))) RBBlock;
+static RBBlock s_rb_w[GX_MT_MAX];
 
 static void calc_lod(Tev* t, s32* lodp, int* linear, u32 texmap, u32 texcoord) {
     /* tx_mode0/mode1 fields are per-draw-constant; s_cfg.tex[texmap] carries
      * them (build_draw_cfg), so this no longer re-reads BP per block. */
     const TexUnitCfg* tc = &s_cfg.tex[texmap];
-    float* uv00 = s_rb[0][0].Uv[texcoord];
-    float* uv10 = s_rb[1][0].Uv[texcoord];
-    float* uv01 = s_rb[0][1].Uv[texcoord];
+    RBPixel (*rb)[BLK] = s_rb_w[t->wid].px;
+    float* uv00 = rb[0][0].Uv[texcoord];
+    float* uv10 = rb[1][0].Uv[texcoord];
+    float* uv01 = rb[0][1].Uv[texcoord];
     float dudx = fabsf(uv00[0] - uv10[0]);
     float dvdx = fabsf(uv00[1] - uv10[1]);
     float dudy = fabsf(uv00[0] - uv01[0]);
@@ -1806,9 +1865,10 @@ static void calc_lod(Tev* t, s32* lodp, int* linear, u32 texmap, u32 texcoord) {
 
 static void build_block(Tev* t, s32 bx, s32 by) {
     u32 numtexgens = s_cfg.numtexgens;
+    RBPixel (*rb)[BLK] = s_rb_w[t->wid].px;
     for (s32 yi = 0; yi < BLK; yi++) {
         for (s32 xi = 0; xi < BLK; xi++) {
-            RBPixel* p = &s_rb[xi][yi];
+            RBPixel* p = &rb[xi][yi];
             s32 x = xi + bx, y = yi + by;
             float invW = 1.0f / slope_value(&s_WSlope, x, y);
             p->InvW = invW;
@@ -1843,7 +1903,7 @@ static int raster_pixel_prep(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
     if (s_cfg.zt_enable && s_cfg.zt_early) {
         if (!ZCompare((u16)x, (u16)y, (u32)z)) return 0;
     }
-    RBPixel* p = &s_rb[xi][yi];
+    RBPixel* p = &s_rb_w[t->wid].px[xi][yi];
     t->Position[0] = x; t->Position[1] = y; t->Position[2] = z;
     for (u32 i = 0; i < s_cfg.numcolchans; i++)
         for (int comp = 0; comp < 4; comp++) {
@@ -1935,7 +1995,7 @@ static void raster_pixel(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
  *    either direction.
  * ==========================================================================*/
 static void raster_pixel_prep_fused(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
-    RBPixel* p = &s_rb[xi][yi];
+    RBPixel* p = &s_rb_w[t->wid].px[xi][yi];
     t->Position[0] = x; t->Position[1] = y;   /* Position[2]/z: skipped, see above */
     {
         /* Channel-0 alpha only (comp 3) — the only Color[0] component any
@@ -1978,16 +2038,229 @@ static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
     s_ZSlope = make_slope(v0->screenPosition[2], v1->screenPosition[2], v2->screenPosition[2], &ctx);
 }
 
-static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
-    /* Fused-path pixel-fn selection, hoisted OUT of the pixel loops below:
-     * s_cfg.fused is set once per DRAW by build_draw_cfg (never mid-draw), so
-     * reading it once per TRIANGLE here — instead of once per pixel, as
-     * tev_shade's own s_cfg.fused check already effectively did before this
-     * task — is enough; no per-pixel re-check of s_cfg remains on this path.
-     * See the big comment above raster_pixel_prep_fused for what this
+/* ============================================================================
+ * GX-MT: tile-parallel triangle scan (see the GX-MT block comment at the top
+ * of the file for the state-ownership argument, and draw_parallel_ok() in
+ * build_draw_cfg for the per-draw carry-freedom proof that gates every fork).
+ *
+ * Partition: block row k (y = block_miny + k*BLK) belongs to worker
+ * (k mod nthreads). Every EFB pixel of the triangle is therefore scanned by
+ * exactly one worker, in that worker's ordinary top-to-bottom/left-to-right
+ * order — and since a triangle covers any pixel at most once, per-location
+ * write ORDER across triangles is enforced by the join below, making the
+ * result byte-identical to the serial scan regardless of thread scheduling.
+ * With nthreads==1 / row0==0 / rowstride==1 the loop below IS the old serial
+ * loop, same iteration sequence, same arithmetic.
+ * ==========================================================================*/
+typedef struct {   /* everything the scan loop needs that is per-triangle */
+    s32 block_minx, block_miny, minx, maxx, miny, maxy;
+    s32 C1, C2, C3;
+    s32 DX12, DX23, DX31, DY12, DY23, DY31;
+    s32 FDX12, FDX23, FDX31, FDY12, FDY23, FDY31;
+} TriScan;
+
+static void scan_one_block_row(Tev* t, const TriScan* ts, s32 y) {
+    /* Fused-path pixel-fn selection, hoisted out of the pixel loops:
+     * s_cfg.fused is set once per DRAW by build_draw_cfg (never mid-draw). See
+     * the big comment above raster_pixel_prep_fused for what the fused
      * specialization skips and why it's provably dead work. */
     void (*pixel_fn)(Tev*, s32, s32, s32, s32) = s_cfg.fused ? raster_pixel_fused : raster_pixel;
 
+    {
+        for (s32 x = ts->block_minx; x < ts->maxx; x += BLK) {
+            s32 x1_ = x + BLK - 1, y1_ = y + BLK - 1;
+            s32 x0 = x << 4, xx1 = x1_ << 4, y0 = y << 4, yy1 = y1_ << 4;
+            int a00 = ts->C1 + ts->DX12 * y0 - ts->DY12 * x0 > 0, a10 = ts->C1 + ts->DX12 * y0 - ts->DY12 * xx1 > 0;
+            int a01 = ts->C1 + ts->DX12 * yy1 - ts->DY12 * x0 > 0, a11 = ts->C1 + ts->DX12 * yy1 - ts->DY12 * xx1 > 0;
+            int a = (a00) | (a10 << 1) | (a01 << 2) | (a11 << 3);
+            int b00 = ts->C2 + ts->DX23 * y0 - ts->DY23 * x0 > 0, b10 = ts->C2 + ts->DX23 * y0 - ts->DY23 * xx1 > 0;
+            int b01 = ts->C2 + ts->DX23 * yy1 - ts->DY23 * x0 > 0, b11 = ts->C2 + ts->DX23 * yy1 - ts->DY23 * xx1 > 0;
+            int bb = (b00) | (b10 << 1) | (b01 << 2) | (b11 << 3);
+            int c00 = ts->C3 + ts->DX31 * y0 - ts->DY31 * x0 > 0, c10 = ts->C3 + ts->DX31 * y0 - ts->DY31 * xx1 > 0;
+            int c01 = ts->C3 + ts->DX31 * yy1 - ts->DY31 * x0 > 0, c11 = ts->C3 + ts->DX31 * yy1 - ts->DY31 * xx1 > 0;
+            int cc = (c00) | (c10 << 1) | (c01 << 2) | (c11 << 3);
+            if (a == 0 || bb == 0 || cc == 0) continue;
+
+            build_block_timed(t, x, y);
+            if (a == 0xF && bb == 0xF && cc == 0xF && x >= ts->minx && x1_ < ts->maxx && y >= ts->miny && y1_ < ts->maxy) {
+                for (s32 iy = 0; iy < BLK; iy++)
+                    for (s32 ix = 0; ix < BLK; ix++)
+                        pixel_fn(t, x + ix, y + iy, ix, iy);
+            } else {
+                s32 CY1 = ts->C1 + ts->DX12 * y0 - ts->DY12 * x0;
+                s32 CY2 = ts->C2 + ts->DX23 * y0 - ts->DY23 * x0;
+                s32 CY3 = ts->C3 + ts->DX31 * y0 - ts->DY31 * x0;
+                for (s32 iy = 0; iy < BLK; iy++) {
+                    s32 CX1 = CY1, CX2 = CY2, CX3 = CY3;
+                    for (s32 ix = 0; ix < BLK; ix++) {
+                        if (CX1 > 0 && CX2 > 0 && CX3 > 0) {
+                            if (x + ix >= ts->minx && x + ix < ts->maxx && y + iy >= ts->miny && y + iy < ts->maxy)
+                                pixel_fn(t, x + ix, y + iy, ix, iy);
+                        }
+                        CX1 -= ts->FDY12; CX2 -= ts->FDY23; CX3 -= ts->FDY31;
+                    }
+                    CY1 += ts->FDX12; CY2 += ts->FDX23; CY3 += ts->FDX31;
+                }
+            }
+        }
+    }
+}
+
+/* Serial scan: all block rows in order — with one worker this is the old
+ * single loop, same iteration sequence, same arithmetic. */
+static void scan_block_rows_serial(Tev* t, const TriScan* ts) {
+    for (s32 y = ts->block_miny; y < ts->maxy; y += BLK)
+        scan_one_block_row(t, ts, y);
+}
+
+/* ---- GX-MT worker pool ----------------------------------------------------
+ * Spawned once per process by gx_mt_resolve() (first gx_raster_draw). Workers
+ * hybrid-wait on s_mt_epoch: spin briefly (a draw burst publishes forks
+ * back-to-back, often < 1ms apart), then WaitOnAddress so idle frames cost no
+ * CPU.
+ *
+ * Row distribution is DYNAMIC: every participant (main included) grabs the
+ * next unclaimed block row via fetch_add(s_mt_row_next) and bumps
+ * s_mt_rows_done after finishing it; the join condition is rows_done ==
+ * nrows, NOT "all workers checked in". This makes stragglers harmless: a
+ * worker that wakes late (or whose pinned core is busy with background load)
+ * simply grabs fewer rows — or none — and the fork completes without it.
+ * (The first, static row0/stride split waited for every worker's check-in,
+ * so one preempted or still-waking worker gated every fork — measured as
+ * join-wait >> scan on a loaded desktop.) Which worker scans a row only
+ * selects which private Tev/rb/texel-cache computes it; the bytes are
+ * identical, so dynamic assignment does not affect exactness.
+ *
+ * Publication protocol per forked triangle (main thread):
+ *   1. copy the per-draw Tev template into every worker's s_tev_w[i]
+ *   2. s_mt_job = triangle, s_mt_nrows = row count, rows_done = 0
+ *   3. s_mt_row_next = 0 (RELEASE — after 1+2; a worker that grabs a row
+ *      therefore sees the fully-written job it belongs to)
+ *   4. s_mt_epoch++ (RELEASE) + WakeByAddressAll
+ *   5. grab rows itself, then spin until rows_done == nrows (ACQUIRE — every
+ *      row's EFB writes are release-published by its rows_done increment)
+ * A stale-epoch worker is safe by the same counter: between forks
+ * fetch_add returns >= nrows (row space exhausted -> idle), and once step 3
+ * lands it returns a valid row of the NEW job, never a torn one. */
+static int s_mt_threads = -1;   /* resolved count incl. main thread; 1 = serial */
+static u32 s_mt_min_area = 2048; /* fork gate, px of post-scissor bbox
+                                  * (GCN_GX_MT_MIN_AREA). Default from the
+                                  * [gx-area-hist] measurement: >= 2^11 covers
+                                  * ~92% of scan wall in ~5.9K forks/boot. */
+static TriScan s_mt_job;
+static s32 s_mt_nrows;               /* block rows in s_mt_job (pre-publish) */
+static volatile s32 s_mt_epoch;
+static volatile s32 s_mt_row_next;   /* next unclaimed block-row index */
+static volatile s32 s_mt_rows_done;  /* completed block rows this fork */
+
+/* Grab-and-scan loop shared by main and workers during a fork. */
+static void scan_rows_dynamic(Tev* t, const TriScan* ts) {
+    for (;;) {
+        s32 k = __atomic_fetch_add(&s_mt_row_next, 1, __ATOMIC_ACQUIRE);
+        if (k >= s_mt_nrows) return;
+        scan_one_block_row(t, ts, ts->block_miny + k * BLK);
+        __atomic_add_fetch(&s_mt_rows_done, 1, __ATOMIC_RELEASE);
+    }
+}
+
+/* GCN_GX_MT_STATS=1: fork/join accounting. Unlike the per-pixel stats knobs
+ * this does NOT force serial — every counter below is written by the MAIN
+ * thread only (at fork/join boundaries, never inside the pixel path), so it
+ * is MT-safe by construction and measures the real parallel run. Printed by
+ * gx_raster_print_mt_stats() on gx.c's shared stats cadence. */
+static int s_mt_stats = -1;
+static u64 s_mt_forks;          /* forked triangles */
+static u64 s_mt_serial_tris;    /* triangles scanned serially (any reason) */
+static u64 s_mt_fork_tsc;       /* main-thread wall inside the whole fork path
+                                 * (template copies + publish + own scan + join) */
+static u64 s_mt_scan_tsc;       /* ...of which: main's own scan_block_rows */
+static u64 s_mt_join_tsc;       /* ...of which: join spin after own scan done */
+
+static DWORD WINAPI gx_mt_worker(LPVOID arg) {
+    const int wid = (int)(intptr_t)arg;
+    s32 seen = 0;
+    for (;;) {
+        s32 e;
+        int spins = 0;
+        while ((e = __atomic_load_n(&s_mt_epoch, __ATOMIC_ACQUIRE)) == seen) {
+            if (++spins < 16384) { _mm_pause(); continue; }
+            s32 cmp = seen;
+            WaitOnAddress((volatile VOID*)&s_mt_epoch, &cmp, sizeof cmp, INFINITE);
+            spins = 0;
+        }
+        seen = e;
+        scan_rows_dynamic(&s_tev_w[wid], &s_mt_job);
+    }
+    return 0;   /* unreachable — workers live for the whole process */
+}
+
+static void gx_mt_resolve(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const int ncpu = (int)si.dwNumberOfProcessors;
+    const char* e = getenv("GCN_GX_THREADS");
+    int n = e ? atoi(e) : 0;
+    if (n <= 0) {
+        n = ncpu / 2;   /* one worker per physical core (SMT/2) */
+        if (n > 8) n = 8;
+        if (n < 1) n = 1;
+    }
+    if (n > GX_MT_MAX) n = GX_MT_MAX;
+    /* The per-pixel stats/census knobs accumulate into SHARED counters from
+     * inside the pixel path — exact only single-threaded. They are
+     * measurement modes, so they win: force serial rather than race the
+     * counters. (GCN_DISPATCH_STATS is unaffected — it measures outside the
+     * rasterizer and keeps working, now timing the parallel wall.) */
+    if (n > 1 && (s_draw_stats == 1 || s_pixel_stats == 1 ||
+                  getenv("GCN_GX_TEV_CENSUS"))) {
+        fprintf(stderr, "gx_raster: GX-MT forced serial — a GX stats/census knob is on\n");
+        n = 1;
+    }
+    { const char* a = getenv("GCN_GX_MT_MIN_AREA");
+      if (a) { long v = atol(a); if (v > 0) s_mt_min_area = (u32)v; } }
+    s_mt_stats = getenv("GCN_GX_MT_STATS") ? 1 : 0;   /* MT-safe, see s_mt_stats */
+    /* Affinity: one distinct PHYSICAL core per thread (Windows enumerates SMT
+     * siblings as adjacent logical pairs, so even indices are distinct
+     * cores). Without pinning, the scheduler regularly parks an idle-SPINNING
+     * worker on the main thread's SMT sibling, and the spin steals core
+     * throughput from EVERYTHING the main thread runs (CPU blocks, DSP, GX
+     * decode, its own row scan) — measured as the whole MT win evaporating
+     * (main's row-scan share cost ~2.2-2.7x fair, [gx-mt-stats]).
+     *
+     * Main goes on the LAST physical core, workers on cores 0..n-2: logical
+     * CPU 0 is where Windows concentrates interrupts/DPCs and stray threads,
+     * and pinning MAIN there measurably inflated every non-GX dispatch
+     * bucket (GCN_DISPATCH_STATS: dsp/block-exec ~+38% vs serial). A worker
+     * on the noisy core just grabs fewer rows (the dynamic distribution
+     * absorbs it); main must not share its core with anything. Skipped when
+     * there aren't enough logical CPUs for the even mapping — better
+     * unpinned than workers time-slicing one core. */
+    const int pin = (2 * (n - 1) < ncpu);
+    if (n > 1 && pin)
+        SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << (ncpu - 2));
+    for (int i = 1; i < n; i++) {
+        HANDLE h = CreateThread(NULL, 0, gx_mt_worker, (LPVOID)(intptr_t)i, 0, NULL);
+        if (!h) {
+            fprintf(stderr, "gx_raster: GX-MT CreateThread(%d) failed; continuing with %d thread(s)\n",
+                    i, i);
+            n = i;   /* workers 1..i-1 exist; dynamic rows cover the rest */
+            break;
+        }
+        if (pin)
+            SetThreadAffinityMask(h, (DWORD_PTR)1 << (2 * (i - 1)));
+        CloseHandle(h);   /* never joined — workers live for the process */
+    }
+    if (n > 1)
+        fprintf(stderr, "gx_raster: GX-MT %d threads (fork at bbox >= %u px; "
+                "GCN_GX_THREADS=1 to disable)\n", n, s_mt_min_area);
+    s_mt_threads = n;
+}
+
+static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
+    /* Setup only — edge equations, bbox/scissor clamp, slopes. The pixel
+     * loops (and the fused-path pixel-fn selection, hoisted per triangle)
+     * live in scan_block_rows(), which the tail below runs either serially
+     * (worker 0, the exact old loop) or forked across the GX-MT pool. */
     if (s_draw_stats) s_last_tri_area = 0;   /* bucket 0 unless the bbox clamp below survives */
 
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
@@ -2055,52 +2328,59 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
         s_TexSlopes[i][2] = make_slope(v0->texCoords[i][2]*w[0], v1->texCoords[i][2]*w[1], v2->texCoords[i][2]*w[2], &ctx);
     }
 
-    s32 C1 = DY12 * X1 - DX12 * Y1;
-    s32 C2 = DY23 * X2 - DX23 * Y2;
-    s32 C3 = DY31 * X3 - DX31 * Y3;
-    if (DY12 < 0 || (DY12 == 0 && DX12 > 0)) C1++;
-    if (DY23 < 0 || (DY23 == 0 && DX23 > 0)) C2++;
-    if (DY31 < 0 || (DY31 == 0 && DX31 > 0)) C3++;
+    TriScan ts;
+    ts.C1 = DY12 * X1 - DX12 * Y1;
+    ts.C2 = DY23 * X2 - DX23 * Y2;
+    ts.C3 = DY31 * X3 - DX31 * Y3;
+    if (DY12 < 0 || (DY12 == 0 && DX12 > 0)) ts.C1++;
+    if (DY23 < 0 || (DY23 == 0 && DX23 > 0)) ts.C2++;
+    if (DY31 < 0 || (DY31 == 0 && DX31 > 0)) ts.C3++;
 
-    s32 block_minx = minx & ~(BLK - 1);
-    s32 block_miny = miny & ~(BLK - 1);
-    for (s32 y = block_miny; y < maxy; y += BLK) {
-        for (s32 x = block_minx; x < maxx; x += BLK) {
-            s32 x1_ = x + BLK - 1, y1_ = y + BLK - 1;
-            s32 x0 = x << 4, xx1 = x1_ << 4, y0 = y << 4, yy1 = y1_ << 4;
-            int a00 = C1 + DX12 * y0 - DY12 * x0 > 0, a10 = C1 + DX12 * y0 - DY12 * xx1 > 0;
-            int a01 = C1 + DX12 * yy1 - DY12 * x0 > 0, a11 = C1 + DX12 * yy1 - DY12 * xx1 > 0;
-            int a = (a00) | (a10 << 1) | (a01 << 2) | (a11 << 3);
-            int b00 = C2 + DX23 * y0 - DY23 * x0 > 0, b10 = C2 + DX23 * y0 - DY23 * xx1 > 0;
-            int b01 = C2 + DX23 * yy1 - DY23 * x0 > 0, b11 = C2 + DX23 * yy1 - DY23 * xx1 > 0;
-            int bb = (b00) | (b10 << 1) | (b01 << 2) | (b11 << 3);
-            int c00 = C3 + DX31 * y0 - DY31 * x0 > 0, c10 = C3 + DX31 * y0 - DY31 * xx1 > 0;
-            int c01 = C3 + DX31 * yy1 - DY31 * x0 > 0, c11 = C3 + DX31 * yy1 - DY31 * xx1 > 0;
-            int cc = (c00) | (c10 << 1) | (c01 << 2) | (c11 << 3);
-            if (a == 0 || bb == 0 || cc == 0) continue;
+    ts.block_minx = minx & ~(BLK - 1);
+    ts.block_miny = miny & ~(BLK - 1);
+    ts.minx = minx; ts.maxx = maxx; ts.miny = miny; ts.maxy = maxy;
+    ts.DX12 = DX12; ts.DX23 = DX23; ts.DX31 = DX31;
+    ts.DY12 = DY12; ts.DY23 = DY23; ts.DY31 = DY31;
+    ts.FDX12 = FDX12; ts.FDX23 = FDX23; ts.FDX31 = FDX31;
+    ts.FDY12 = FDY12; ts.FDY23 = FDY23; ts.FDY31 = FDY31;
 
-            build_block_timed(t, x, y);
-            if (a == 0xF && bb == 0xF && cc == 0xF && x >= minx && x1_ < maxx && y >= miny && y1_ < maxy) {
-                for (s32 iy = 0; iy < BLK; iy++)
-                    for (s32 ix = 0; ix < BLK; ix++)
-                        pixel_fn(t, x + ix, y + iy, ix, iy);
-            } else {
-                s32 CY1 = C1 + DX12 * y0 - DY12 * x0;
-                s32 CY2 = C2 + DX23 * y0 - DY23 * x0;
-                s32 CY3 = C3 + DX31 * y0 - DY31 * x0;
-                for (s32 iy = 0; iy < BLK; iy++) {
-                    s32 CX1 = CY1, CX2 = CY2, CX3 = CY3;
-                    for (s32 ix = 0; ix < BLK; ix++) {
-                        if (CX1 > 0 && CX2 > 0 && CX3 > 0) {
-                            if (x + ix >= minx && x + ix < maxx && y + iy >= miny && y + iy < maxy)
-                                pixel_fn(t, x + ix, y + iy, ix, iy);
-                        }
-                        CX1 -= FDY12; CX2 -= FDY23; CX3 -= FDY31;
-                    }
-                    CY1 += FDX12; CY2 += FDX23; CY3 += FDX31;
-                }
-            }
+    /* GX-MT fork gate: enough pixels to amortize a fork/join (measured via
+     * [gx-area-hist], see s_mt_min_area), and a draw whose pixel program is
+     * provably carry-free (draw_parallel_ok). Everything else scans serially
+     * on worker 0 — the exact old loop. */
+    if (s_mt_threads > 1 && s_cfg.parallel_ok &&
+        (u32)((maxx - minx) * (maxy - miny)) >= s_mt_min_area) {
+        u64 t0 = s_mt_stats == 1 ? __rdtsc() : 0;
+        for (int i = 1; i < s_mt_threads; i++) {
+            s_tev_w[i] = s_tev_w[0];   /* per-draw template: Reg/Konst et al. */
+            s_tev_w[i].wid = i;
         }
+        s32 nrows = (ts.maxy - ts.block_miny + BLK - 1) / BLK;
+        s_mt_job = ts;
+        s_mt_nrows = nrows;
+        __atomic_store_n(&s_mt_rows_done, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_mt_row_next, 0, __ATOMIC_RELEASE);  /* publishes job+nrows */
+        __atomic_add_fetch(&s_mt_epoch, 1, __ATOMIC_RELEASE);
+        WakeByAddressAll((PVOID)&s_mt_epoch);
+        if (s_mt_stats != 1) {
+            scan_rows_dynamic(t, &ts);
+            while (__atomic_load_n(&s_mt_rows_done, __ATOMIC_ACQUIRE) != nrows)
+                _mm_pause();
+        } else {
+            u64 t1 = __rdtsc();
+            scan_rows_dynamic(t, &ts);
+            u64 t2 = __rdtsc();
+            while (__atomic_load_n(&s_mt_rows_done, __ATOMIC_ACQUIRE) != nrows)
+                _mm_pause();
+            u64 t3 = __rdtsc();
+            s_mt_forks++;
+            s_mt_scan_tsc += t2 - t1;
+            s_mt_join_tsc += t3 - t2;
+            s_mt_fork_tsc += t3 - t0;
+        }
+    } else {
+        if (s_mt_stats == 1) s_mt_serial_tris++;
+        scan_block_rows_serial(t, &ts);
     }
 }
 
@@ -2840,16 +3120,118 @@ static void recompute_scissor(void) {
  * GetPixelColor for why this is exact rather than approximate. Must run AFTER
  * tev_load_registers(&s_tev): stage_konst resolution reads s_tev.Konst[],
  * which that call just (re)loaded from bp 0xE0-0xE7. */
+/* ============================================================================
+ * GX-MT per-draw carry-freedom analysis. A draw may be scanned by multiple
+ * workers iff NO pixel's shading reads Tev state left behind by an earlier
+ * pixel. tev_draw's per-stage order is: (1) tex sample if `enable` (writes
+ * TexColor), (2) StageKonst copy and (3) RasColor recompute — both
+ * UNCONDITIONAL, so both are always defined before any read below — then
+ * (4) the four color_arg + four alpha_arg reads, then (5) the Reg[c22].rgb /
+ * Reg[a22].a writes (regular AND compare variants both write their dest
+ * unconditionally). The fused paths are proven exact folds of this same
+ * program, so the analysis on the decoded cfg words covers them too.
+ *
+ * A read is carry-free iff the component is either (a) already written
+ * earlier in the SAME pixel's stage sequence, or (b) a per-draw constant:
+ * Reg/Konst are reloaded from BP by tev_load_registers at every draw entry,
+ * so a Reg component the program never writes is constant across the draw's
+ * pixels (and a worker's template copy of it is exact). TexColor and the
+ * rasterized Color[chan] channels are NOT reloaded per draw, so reading one
+ * before this pixel defines it means inheriting the PREVIOUS pixel's (or
+ * previous draw's) value -> not partitionable; scan serially. The TRAPs
+ * below additionally flag the cross-draw flavor of that carry when GX-MT is
+ * active, because after any forked draw even the SERIAL fallback's carry-in
+ * value could differ from true-serial history — none of the IPL's 8 censused
+ * configs does this (verified: traps never fire on the golden runs), and the
+ * byte-exact XFB gate arbitrates.
+ * ==========================================================================*/
+static int draw_parallel_ok(void) {
+    u8 reg_rgb_w[4] = {0,0,0,0}, reg_a_w[4] = {0,0,0,0};       /* written anywhere */
+    u8 reg_rgb_def[4] = {0,0,0,0}, reg_a_def[4] = {0,0,0,0};   /* defined so far this pixel */
+    int texc_def = 0;
+
+    for (u32 st = 0; st <= s_cfg.numtevstages; st++) {
+        reg_rgb_w[s_cfg.stage[st].c22] = 1;
+        reg_a_w[s_cfg.stage[st].a22] = 1;
+    }
+    for (u32 st = 0; st <= s_cfg.numtevstages; st++) {
+        const TevStageCfg* sc = &s_cfg.stage[st];
+        if (sc->enable) texc_def = 1;   /* (1) runs before this stage's reads */
+
+        /* Rasterized color channel: raster_pixel_prep only writes
+         * Color[i] for i < numcolchans each pixel, so a stage selecting a
+         * channel >= numcolchans reads a stale value carried across pixels
+         * (and draws) — Dolphin semantics our serial path preserves, but not
+         * partitionable. (colorchan 7 loads zeros; others trap in tev_draw.) */
+        if ((sc->colorchan == 0 || sc->colorchan == 1) &&
+            sc->colorchan >= s_cfg.numcolchans) {
+            if (s_mt_threads > 1)
+                TRAP(mt_colorchan_carry, "GX-MT: stage reads a color channel "
+                     "raster_pixel_prep does not write (carry) — serial fallback; "
+                     "cross-draw carry-in after a forked draw is not serial-exact, "
+                     "golden gate arbitrates");
+            return 0;
+        }
+
+        const u32 cargs[4] = { sc->argA, sc->argB, sc->argC, sc->argD };
+        for (int i = 0; i < 4; i++) {
+            u32 a = cargs[i];
+            switch (a) {
+            case 0: case 2: case 4: case 6:       /* Reg[a>>1].rgb */
+                if (reg_rgb_w[a >> 1] && !reg_rgb_def[a >> 1]) return 0;
+                break;
+            case 1: case 3: case 5: case 7:       /* Reg[(a-1)>>1].a */
+                if (reg_a_w[(a - 1) >> 1] && !reg_a_def[(a - 1) >> 1]) return 0;
+                break;
+            case 8: case 9:                        /* TexColor.rgb / .a */
+                if (!texc_def) {
+                    if (s_mt_threads > 1)
+                        TRAP(mt_texc_carry, "GX-MT: stage reads TexColor before "
+                             "any enabled stage writes it (carry) — serial "
+                             "fallback; cross-draw carry-in after a forked draw "
+                             "is not serial-exact, golden gate arbitrates");
+                    return 0;
+                }
+                break;
+            default: break;   /* 10/11 RasColor (recomputed this stage),
+                               * 12/13 constants, 14 StageKonst (per-draw),
+                               * 15 zero — all carry-free */
+            }
+        }
+        const u32 aargs[4] = { sc->aargA, sc->aargB, sc->aargC, sc->aargD };
+        for (int i = 0; i < 4; i++) {
+            u32 a = aargs[i];
+            if (a <= 3) {                          /* Reg[a].a */
+                if (reg_a_w[a] && !reg_a_def[a]) return 0;
+            } else if (a == 4) {                   /* TexColor.a */
+                if (!texc_def) {
+                    if (s_mt_threads > 1)
+                        TRAP(mt_texca_carry, "GX-MT: stage reads TexColor.a before "
+                             "any enabled stage writes it (carry) — serial "
+                             "fallback; cross-draw carry-in after a forked draw "
+                             "is not serial-exact, golden gate arbitrates");
+                    return 0;
+                }
+            }
+            /* 5 RasColor.a, 6 StageKonst.a, 7 zero — carry-free */
+        }
+
+        reg_rgb_def[sc->c22] = 1;                  /* (5) this stage's writes */
+        reg_a_def[sc->a22] = 1;
+    }
+    return 1;
+}
+
 static void build_draw_cfg(void) {
     /* Bump the per-draw texel cache's generation (see the big "Per-draw texel
      * cache" comment above tex_sample) — this is the ENTIRE invalidation cost
      * for a new draw: one integer increment, no memset. Skip stored-gen 0 (it
      * is the "slot never written since last full clear" sentinel); on the
      * u32 wraparound that lands exactly on 0, pay for one full-table clear
-     * (a few dozen KB memset — happens once every ~4 billion draws, i.e.
-     * never in practice) and resume at 1. */
+     * (under a MB across all worker caches — happens once every ~4 billion
+     * draws, i.e. never in practice) and resume at 1. */
     if (++s_texel_cache_gen == 0) {
-        memset(s_texel_cache, 0, sizeof s_texel_cache);
+        memset(s_texel_cache_w, 0, sizeof s_texel_cache_w);
         s_texel_cache_gen = 1;
     }
 
@@ -2914,9 +3296,9 @@ static void build_draw_cfg(void) {
         u32 kc = odd ? bits(ksel, 14, 5) : bits(ksel, 4, 5);
         u32 ka = odd ? bits(ksel, 19, 5) : bits(ksel, 9, 5);
         { s16 r, g, b, a;
-          konst_lookup(&s_tev, kc, &r, &g, &b, &a);
+          konst_lookup(&s_tev_w[0], kc, &r, &g, &b, &a);
           sc->stage_konst.r = r; sc->stage_konst.g = g; sc->stage_konst.b = b;
-          konst_lookup(&s_tev, ka, &r, &g, &b, &a); sc->stage_konst.a = a; }
+          konst_lookup(&s_tev_w[0], ka, &r, &g, &b, &a); sc->stage_konst.a = a; }
 
         sc->argA = bits(cc, 12, 4); sc->argB = bits(cc, 8, 4);
         sc->argC = bits(cc, 4, 4);  sc->argD = bits(cc, 0, 4);
@@ -2976,6 +3358,10 @@ static void build_draw_cfg(void) {
      * (s_cfg.stage[1].stage_konst.a), it is never assumed to be any
      * particular number, so there is nothing about it to pin in a signature
      * beyond the cc/ac match already pinning WHICH selector case applies. */
+    /* GX-MT: per-draw carry-freedom verdict (see draw_parallel_ok's proof
+     * comment above) — gates every fork this draw's triangles could take. */
+    s_cfg.parallel_ok = draw_parallel_ok();
+
     if (s_no_fused < 0) s_no_fused = getenv("GCN_GX_NO_FUSED") ? 1 : 0;
     s_cfg.fused = NULL;
     if (!s_no_fused && fused_common_match()) {
@@ -3090,7 +3476,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
     if (nverts < 3) return;
 
     recompute_scissor();
-    tev_load_registers(&s_tev);
+    tev_load_registers(&s_tev_w[0]);
     build_draw_cfg();
 
     /* SetupUnit vertex assembly (SetupUnit.cpp:12-130): v0 stays in store[0]
@@ -3118,7 +3504,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
              * hand against the transcribed steps below), so additional quads
              * in the same draw call repeat identically. */
             if (counter < 2) { counter++; writep = pv[counter]; continue; }
-            process_triangle(&s_tev, pv[0], pv[1], pv[2]);
+            process_triangle(&s_tev_w[0], pv[0], pv[1], pv[2]);
             counter++;
             counter &= 3;
             writep = &store[counter & 1];
@@ -3128,7 +3514,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
         } else {
             /* SetupTriFan (SetupUnit.cpp:114-130). */
             if (counter < 2) { counter++; writep = pv[counter]; continue; }
-            process_triangle(&s_tev, pv[0], pv[1], pv[2]);
+            process_triangle(&s_tev_w[0], pv[0], pv[1], pv[2]);
             counter++;
             pv[1] = pv[2];
             pv[2] = &store[2 - (counter & 1)];
@@ -3152,6 +3538,11 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
      * why the two knobs must never share a branch. */
     if (s_pixel_stats < 0)
         s_pixel_stats = getenv("GCN_GX_PIXEL_STATS") ? 1 : 0;
+
+    /* GX-MT: resolve thread count + spawn workers once, AFTER the stats knobs
+     * above (it must see them to force serial under measurement modes). */
+    if (s_mt_threads < 0)
+        gx_mt_resolve();
 
     if (!s_draw_stats) {
         gx_raster_draw_impl(cp, prim, vat, verts, nverts, vstride);
@@ -3230,6 +3621,24 @@ void gx_raster_print_census(void) {
     fprintf(stderr, " | total_fused=%llu/%llu(%.1f%%)\n",
             (unsigned long long)total_fused, (unsigned long long)total_px,
             100.0 * (double)total_fused / (double)total_px);
+    fflush(stderr);
+}
+
+/* GCN_GX_MT_STATS: fork/join accounting (see s_mt_stats — main-thread-only
+ * counters, safe and meaningful under a real MT run, unlike the per-pixel
+ * knobs which force serial). fork% of triangles, and the main thread's
+ * average per-fork cost split into own-scan vs join-wait vs publish overhead. */
+void gx_raster_print_mt_stats(void) {
+    if (s_mt_stats != 1 || s_mt_forks == 0) return;
+    u64 pub = s_mt_fork_tsc - s_mt_scan_tsc - s_mt_join_tsc;
+    fprintf(stderr,
+        "[gx-mt-stats] threads=%d forks=%llu serial_tris=%llu"
+        "  per-fork tsc: scan=%llu join=%llu publish=%llu\n",
+        s_mt_threads,
+        (unsigned long long)s_mt_forks, (unsigned long long)s_mt_serial_tris,
+        (unsigned long long)(s_mt_scan_tsc / s_mt_forks),
+        (unsigned long long)(s_mt_join_tsc / s_mt_forks),
+        (unsigned long long)(pub / s_mt_forks));
     fflush(stderr);
 }
 
@@ -3774,5 +4183,7 @@ void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
     s_cpu = cpu; s_bp = bp; s_xf = xf;
     memset(s_efb_color, 0, sizeof s_efb_color);
     memset(s_efb_depth, 0, sizeof s_efb_depth);
-    memset(&s_tev, 0, sizeof s_tev);
+    memset(s_tev_w, 0, sizeof s_tev_w);
+    for (int i = 0; i < GX_MT_MAX; i++)
+        s_tev_w[i].wid = i;   /* indexes s_texel_cache_w/s_rb_w; see Tev.wid */
 }
