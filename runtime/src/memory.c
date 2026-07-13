@@ -237,7 +237,32 @@ static void mmio_note(CPUState* cpu, u32 addr, u32 value, u8 size, int is_write)
             is_write ? "write" : "read", (unsigned)(size * 8u), addr);
 }
 
-u64 mem_read64(CPUState* cpu, u32 addr) {
+/* Phase C (codegen speed campaign): the emitter now inlines the RAM-hit fast
+ * path directly into generated code (dolrecomp_mem_read*_fast/dolrecomp_mem_
+ * write*_fast, emitted per-TU by recompiler/src/backend/emitter.c's
+ * emit_header_for_cpu) for every plain load/store, so these functions are
+ * now the SLOW path for those opcodes -- reached only for MMIO/ROM-window-
+ * miss/MEM2/unmapped addresses -- plus the full path (fast-window-check +
+ * slow) for every opcode the emitter still keeps on an unconditional call
+ * (lwarx/stwcx/lswi/lswx/stswi/stswx/lmw/stmw/dcbz/lwbrx/lhbrx/stwbrx/sthbrx,
+ * and cpu_glue.c's psq_* / dcbz_l/eciwx/ecowx helpers, which call the
+ * *_legacy 2/3-arg form since they don't carry a per-call cia of their own --
+ * their own caller stays pc-stamped by ppc_op_is_pc_pure's conservative
+ * "calls another CPUState helper" class, so cpu->pc IS the correct cia at
+ * that point, exactly like every other *_legacy caller).
+ *
+ * ABI: every mem_read* / mem_write* now takes the calling instruction's own
+ * address as `cia` (see cpu.h's macro-dispatch comment for the *_cia/
+ * *_legacy mechanism). The RAM fast path below (gcn_mem_resolve + rom
+ * window) never touches cpu->pc; only the MMIO/external/unmapped slow
+ * branch does, via `cpu->pc = cia;` BEFORE dispatching to external_read/
+ * external_write/mmio_note, so every consumer of cpu->pc downstream of
+ * those calls (gcn_trace_mmio, the always-on rings, mmio.c's device
+ * dispatch, the card-traffic ring, the oracle trace) observes exactly the
+ * value the emitter's old unconditional pre-instruction pc-stamp used to
+ * guarantee. See runtime/ABI.md sec. 3. */
+
+u64 mem_read64_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (host && avail >= 8) return read_be64(host);
@@ -245,16 +270,19 @@ u64 mem_read64(CPUState* cpu, u32 addr) {
         const u8* rom = rom_window_resolve(cpu, addr, &avail);
         if (rom && avail >= 8) return read_be64(rom);
     }
+    cpu->pc = cia;
     if (cpu->external_read)
         return cpu->external_read(cpu, addr, 8);
     mmio_note(cpu, addr, 0u, 8, 0);
     return 0;
 }
+u64 mem_read64_legacy(CPUState* cpu, u32 addr) { return mem_read64_cia(cpu, addr, cpu->pc); }
 
-void mem_write64(CPUState* cpu, u32 addr, u64 value) {
+void mem_write64_cia(CPUState* cpu, u32 addr, u64 value, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 8) {
+        cpu->pc = cia;
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 8); return; }
         mmio_note(cpu, addr, (u32)value, 8, 1);
         return;
@@ -262,8 +290,9 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
     clear_matching_reservation(cpu, addr);
     write_be64(host, value);
 }
+void mem_write64_legacy(CPUState* cpu, u32 addr, u64 value) { mem_write64_cia(cpu, addr, value, cpu->pc); }
 
-u32 mem_read32(CPUState* cpu, u32 addr) {
+u32 mem_read32_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (host && avail >= 4) return read_be32(host);
@@ -271,16 +300,19 @@ u32 mem_read32(CPUState* cpu, u32 addr) {
         const u8* rom = rom_window_resolve(cpu, addr, &avail);
         if (rom && avail >= 4) return read_be32(rom);
     }
+    cpu->pc = cia;
     if (cpu->external_read)
         return (u32)cpu->external_read(cpu, addr, 4);
     mmio_note(cpu, addr, 0u, 4, 0);
     return 0;
 }
+u32 mem_read32_legacy(CPUState* cpu, u32 addr) { return mem_read32_cia(cpu, addr, cpu->pc); }
 
-void mem_write32(CPUState* cpu, u32 addr, u32 value) {
+void mem_write32_cia(CPUState* cpu, u32 addr, u32 value, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 4) {
+        cpu->pc = cia;
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 4); return; }
         mmio_note(cpu, addr, value, 4, 1);
         return;
@@ -288,8 +320,9 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
     clear_matching_reservation(cpu, addr);
     write_be32(host, value);
 }
+void mem_write32_legacy(CPUState* cpu, u32 addr, u32 value) { mem_write32_cia(cpu, addr, value, cpu->pc); }
 
-u16 mem_read16(CPUState* cpu, u32 addr) {
+u16 mem_read16_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (host && avail >= 2) return read_be16(host);
@@ -297,16 +330,19 @@ u16 mem_read16(CPUState* cpu, u32 addr) {
         const u8* rom = rom_window_resolve(cpu, addr, &avail);
         if (rom && avail >= 2) return read_be16(rom);
     }
+    cpu->pc = cia;
     if (cpu->external_read)
         return (u16)cpu->external_read(cpu, addr, 2);
     mmio_note(cpu, addr, 0u, 2, 0);
     return 0;
 }
+u16 mem_read16_legacy(CPUState* cpu, u32 addr) { return mem_read16_cia(cpu, addr, cpu->pc); }
 
-void mem_write16(CPUState* cpu, u32 addr, u16 value) {
+void mem_write16_cia(CPUState* cpu, u32 addr, u16 value, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 2) {
+        cpu->pc = cia;
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 2); return; }
         mmio_note(cpu, addr, value, 2, 1);
         return;
@@ -314,8 +350,9 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
     clear_matching_reservation(cpu, addr);
     write_be16(host, value);
 }
+void mem_write16_legacy(CPUState* cpu, u32 addr, u16 value) { mem_write16_cia(cpu, addr, value, cpu->pc); }
 
-u8 mem_read8(CPUState* cpu, u32 addr) {
+u8 mem_read8_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (host) return *host;
@@ -323,16 +360,19 @@ u8 mem_read8(CPUState* cpu, u32 addr) {
         const u8* rom = rom_window_resolve(cpu, addr, &avail);
         if (rom) return *rom;
     }
+    cpu->pc = cia;
     if (cpu->external_read)
         return (u8)cpu->external_read(cpu, addr, 1);
     mmio_note(cpu, addr, 0u, 1, 0);
     return 0;
 }
+u8 mem_read8_legacy(CPUState* cpu, u32 addr) { return mem_read8_cia(cpu, addr, cpu->pc); }
 
-void mem_write8(CPUState* cpu, u32 addr, u8 value) {
+void mem_write8_cia(CPUState* cpu, u32 addr, u8 value, u32 cia) {
     u32 avail;
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host) {
+        cpu->pc = cia;
         if (cpu->external_write) { cpu->external_write(cpu, addr, value, 1); return; }
         mmio_note(cpu, addr, value, 1, 1);
         return;
@@ -340,3 +380,4 @@ void mem_write8(CPUState* cpu, u32 addr, u8 value) {
     clear_matching_reservation(cpu, addr);
     *host = value;
 }
+void mem_write8_legacy(CPUState* cpu, u32 addr, u8 value) { mem_write8_cia(cpu, addr, value, cpu->pc); }

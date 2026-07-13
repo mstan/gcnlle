@@ -189,15 +189,60 @@ void cpu_reset(CPUState* cpu);
 
 /* --- bus primitives the generated C links against (implemented in memory.c).
  *     Faithful big-endian; RAM-backed accesses swap, everything else routes to
- *     the external device callbacks above. --- */
-u64  mem_read64(CPUState* cpu, u32 addr);
-void mem_write64(CPUState* cpu, u32 addr, u64 value);
-u32  mem_read32(CPUState* cpu, u32 addr);
-void mem_write32(CPUState* cpu, u32 addr, u32 value);
-u16  mem_read16(CPUState* cpu, u32 addr);
-void mem_write16(CPUState* cpu, u32 addr, u16 value);
-u8   mem_read8(CPUState* cpu, u32 addr);
-void mem_write8(CPUState* cpu, u32 addr, u8 value);
+ *     the external device callbacks above. ---
+ *
+ * Phase C (codegen speed campaign): the canonical ABI is now cia-taking --
+ * every mem_read* / mem_write* call carries the originating instruction's own
+ * address ("cia"). The slow (MMIO/ROM-window-miss/unmapped) branch stamps
+ * `cpu->pc = cia;` before dispatching to external_read/external_write/the
+ * unmapped-access warning, so every consumer of cpu->pc downstream of that
+ * (gcn_trace_mmio, the always-on rings, mmio.c's device dispatch, the
+ * card-traffic ring, the oracle trace) sees exactly the value the emitter's
+ * old unconditional pre-instruction pc-stamp used to guarantee. The RAM-hit
+ * fast path never touches cpu->pc.
+ *
+ * The bare `mem_read32(...)`-style identifiers below are function-like
+ * macros that dispatch on ARGUMENT COUNT to either the new 3/4-arg *_cia
+ * implementation or a 2/3-arg *_legacy wrapper (cia = cpu->pc, i.e. the
+ * pre-Phase-C convention of pre-stamping ctx->pc before every memory op).
+ * This is what lets callers that don't carry a cia -- runtime/src/di.c's
+ * synthesized DMA writes, runtime/tests/test_seed.c, and any bank emitted
+ * by the OLD (pre-Phase-C) recompiler -- keep compiling unmodified against
+ * the SAME identifier the Phase-C emitter now calls with an extra argument.
+ * New code should always pass cia explicitly; the *_legacy overload exists
+ * ONLY for that transition and is never the target of a newly-written call.
+ * See ABI.md sec. 3 for the full citation. */
+u64  mem_read64_cia   (CPUState* cpu, u32 addr, u32 cia);
+u64  mem_read64_legacy(CPUState* cpu, u32 addr);
+void mem_write64_cia   (CPUState* cpu, u32 addr, u64 value, u32 cia);
+void mem_write64_legacy(CPUState* cpu, u32 addr, u64 value);
+u32  mem_read32_cia   (CPUState* cpu, u32 addr, u32 cia);
+u32  mem_read32_legacy(CPUState* cpu, u32 addr);
+void mem_write32_cia   (CPUState* cpu, u32 addr, u32 value, u32 cia);
+void mem_write32_legacy(CPUState* cpu, u32 addr, u32 value);
+u16  mem_read16_cia   (CPUState* cpu, u32 addr, u32 cia);
+u16  mem_read16_legacy(CPUState* cpu, u32 addr);
+void mem_write16_cia   (CPUState* cpu, u32 addr, u16 value, u32 cia);
+void mem_write16_legacy(CPUState* cpu, u32 addr, u16 value);
+u8   mem_read8_cia   (CPUState* cpu, u32 addr, u32 cia);
+u8   mem_read8_legacy(CPUState* cpu, u32 addr);
+void mem_write8_cia   (CPUState* cpu, u32 addr, u8 value, u32 cia);
+void mem_write8_legacy(CPUState* cpu, u32 addr, u8 value);
+
+/* Arity-dispatch: an N-arg call site picks *_legacy; an (N+1)-arg call site
+ * (trailing cia) picks *_cia. Standard "overload by __VA_ARGS__ count"
+ * preprocessor trick -- reads take 2 (legacy) or 3 (cia) args, writes take
+ * 3 (legacy) or 4 (cia). */
+#define GCN_MEM_PICK_R(_1,_2,_3,NAME,...) NAME
+#define GCN_MEM_PICK_W(_1,_2,_3,_4,NAME,...) NAME
+#define mem_read64(...)  GCN_MEM_PICK_R(__VA_ARGS__, mem_read64_cia,  mem_read64_legacy )(__VA_ARGS__)
+#define mem_read32(...)  GCN_MEM_PICK_R(__VA_ARGS__, mem_read32_cia,  mem_read32_legacy )(__VA_ARGS__)
+#define mem_read16(...)  GCN_MEM_PICK_R(__VA_ARGS__, mem_read16_cia,  mem_read16_legacy )(__VA_ARGS__)
+#define mem_read8(...)   GCN_MEM_PICK_R(__VA_ARGS__, mem_read8_cia,   mem_read8_legacy  )(__VA_ARGS__)
+#define mem_write64(...) GCN_MEM_PICK_W(__VA_ARGS__, mem_write64_cia, mem_write64_legacy)(__VA_ARGS__)
+#define mem_write32(...) GCN_MEM_PICK_W(__VA_ARGS__, mem_write32_cia, mem_write32_legacy)(__VA_ARGS__)
+#define mem_write16(...) GCN_MEM_PICK_W(__VA_ARGS__, mem_write16_cia, mem_write16_legacy)(__VA_ARGS__)
+#define mem_write8(...)  GCN_MEM_PICK_W(__VA_ARGS__, mem_write8_cia,  mem_write8_legacy )(__VA_ARGS__)
 
 /* --- PPC semantic helpers the generated C links against (cpu_glue.c). ---
  *     Prototypes mirror recompiler/src/cpu/cpu.h exactly. */

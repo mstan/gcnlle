@@ -104,30 +104,108 @@ typedef bool(*PPCHostCall)(CPUState*, u32 address);
 
 ## 3. Memory accessor signatures (bus primitives)
 
-Generated loads/stores call these free functions with the `ctx` pointer **[BK
-emitter.c `emit_load/emit_store/emit_fload/...`, e.g. `mem_write32(ctx, ea,
-(u32)ctx->gpr[%u])`]**. Implemented in `runtime/src/memory.c`:
+**Phase C (codegen speed campaign) update.** The ABI is now **cia-taking**:
+every generated load/store passes the originating instruction's own address
+("cia") into `mem_read*`/`mem_write*`. Two things changed together:
+
+1. **Plain loads/stores are inlined.** LWZ/LBZ/LHZ/LHA (+U/X/UX forms),
+   STW/STB/STH (+U/X/UX forms), and LFS/LFD/STFS/STFD (+U/X/UX forms) no
+   longer call `mem_read*`/`mem_write*` directly. The emitter
+   (`emit_load_fast`/`emit_store_fast`/`emit_fload_fast`/`emit_fstore_fast`
+   and their `X`-form siblings) instead calls a `static inline` fast-path
+   helper emitted per-TU by `emit_header_for_cpu`
+   (`dolrecomp_mem_read8/16/32/64_fast`, `dolrecomp_mem_write8/16/32/64_fast`)
+   that replicates `memory.c`'s RAM-hit fast path directly against
+   `ctx->ram` — gcc inlines it (same translation unit) — and falls back to
+   the real `mem_read*`/`mem_write*` bus primitive, passed cia explicitly,
+   only for the non-RAM case. Opcodes deliberately kept off the inline path
+   (reservation/string/multi-register semantics, or genuinely rare):
+   LWARX/STWCX/STFIWX, LSWI/LSWX/STSWI/STSWX, LMW/STMW, DCBZ,
+   LWBRX/LHBRX/STWBRX/STHBRX — these still call `mem_read*`/`mem_write*`
+   unconditionally, but that call now also carries cia.
+2. **The pre-instruction `ctx->pc` stamp is gone for all of the above.**
+   Phase B's `ppc_op_is_pc_pure` whitelist (`recompiler/src/backend/emitter.c`)
+   now includes every opcode in
+   this list, because their `mem_read*`/`mem_write*` call (fast-path
+   fallback or direct) carries cia explicitly — the stamp was the only
+   reason `ctx->pc` needed to be accurate at that point, and it no longer
+   is. PSQ_L/PSQ_LU/PSQ_LX/PSQ_LUX/PSQ_ST/PSQ_STU/PSQ_STX/PSQ_STUX are
+   NOT included: `ppc_psq_load`/`ppc_psq_store` (`cpu_glue.c`) call
+   `mem_read*`/`mem_write*` internally without a per-op cia of their own, so
+   PSQ stays in the conservative "calls another CPUState helper" class and
+   keeps its pre-stamp, exactly as Phase B left it.
+
+Canonical (implemented in `runtime/src/memory.c`):
 
 ```c
-u64  mem_read64 (CPUState*, u32 addr);
-void mem_write64(CPUState*, u32 addr, u64 value);
-u32  mem_read32 (CPUState*, u32 addr);
-void mem_write32(CPUState*, u32 addr, u32 value);
-u16  mem_read16 (CPUState*, u32 addr);
-void mem_write16(CPUState*, u32 addr, u16 value);
-u8   mem_read8  (CPUState*, u32 addr);
-void mem_write8 (CPUState*, u32 addr, u8  value);
+u64  mem_read64_cia (CPUState*, u32 addr, u32 cia);
+void mem_write64_cia(CPUState*, u32 addr, u64 value, u32 cia);
+u32  mem_read32_cia (CPUState*, u32 addr, u32 cia);
+void mem_write32_cia(CPUState*, u32 addr, u32 value, u32 cia);
+u16  mem_read16_cia (CPUState*, u32 addr, u32 cia);
+void mem_write16_cia(CPUState*, u32 addr, u16 value, u32 cia);
+u8   mem_read8_cia  (CPUState*, u32 addr, u32 cia);
+void mem_write8_cia (CPUState*, u32 addr, u8  value, u32 cia);
 ```
+
+**Transitional macro dispatch.** `cpu.h` also declares `*_legacy` overloads
+(`mem_read32_legacy(cpu, addr)`, `mem_write32_legacy(cpu, addr, value)`, ...)
+that forward `cia = cpu->pc` — i.e. exactly the pre-Phase-C convention of the
+emitter pre-stamping `ctx->pc` before every memory op. The bare identifiers
+(`mem_read32`, `mem_write32`, ...) are function-like macros that dispatch on
+**argument count** to either the `*_cia` or `*_legacy` function:
+
+```c
+#define GCN_MEM_PICK_R(_1,_2,_3,NAME,...) NAME
+#define mem_read32(...) GCN_MEM_PICK_R(__VA_ARGS__, mem_read32_cia, mem_read32_legacy)(__VA_ARGS__)
+```
+
+This is what lets a bank emitted by the OLD (pre-Phase-C) recompiler — which
+calls `mem_read32(ctx, ea)` (2 args) — keep compiling and running correctly
+against the NEW headers without being regenerated: the 2-arg call resolves
+to `mem_read32_legacy`, which reads `cpu->pc` for cia (accurate, because
+those old banks still pre-stamp `ctx->pc` before every memory op — Phase C
+never touched their `ppc_op_is_pc_pure` decision, since they were compiled
+by the OLD emitter). The same mechanism covers hand-written runtime callers
+that don't carry a per-call cia: `runtime/src/di.c`'s synthesized DMA writes
+and `cpu_glue.c`'s `ppc_psq_load`/`ppc_psq_store`/`ppc_dcbz_l` internals.
+**New code should always call the `*_cia` shape (3/4 args) explicitly or go
+through the bare identifier with cia supplied; the `*_legacy` overload is a
+transition aid, never a new call site's target.**
 
 Semantics we guarantee (mirror of **[CPU]**, faithful/boring per PRINCIPLES):
 - **Big-endian** value semantics against a little-endian host (swap on RAM
   access; `read_be*/write_be*` in `common/types.h`).
 - MEM1 = 24 MB at `0x80000000` (`GC_RAM_BASE`); the **uncached mirror** at
-  `0xC0000000` (`GC_RAM_UNCACHED`) addresses the SAME bytes.
+  `0xC0000000` (`GC_RAM_UNCACHED`) addresses the SAME bytes; a **third,
+  physical/real-mode mirror** at addresses `< GC_MAIN_RAM_SIZE` (used by
+  exception handlers and BS1's pre-`MSR[DR]` bring-up, entered with
+  `MSR[IR]=MSR[DR]=0`) addresses the SAME bytes too — `gcn_mem_resolve`
+  checks all three, and so does every `dolrecomp_mem_read*_fast`/
+  `dolrecomp_mem_write*_fast` inline helper.
 - Any access NOT backed by flat RAM routes to `external_read/external_write`
   (the device layer). With no device installed we warn loudly and return 0 —
   never a silent fake. (We deliberately do **not** copy reshine's `mem.c`
   fake-the-answer forcing such as `0x80000044 -> 0xFFFF`.)
+- The slow (non-RAM) branch of `mem_read*_cia`/`mem_write*_cia` does
+  `cpu->pc = cia;` BEFORE dispatching to `external_read`/`external_write`/the
+  unmapped-access warning, so every consumer of `cpu->pc` downstream (the
+  always-on rings, `mmio.c`'s device dispatch, the card-traffic ring, the
+  oracle trace) observes exactly the value the old unconditional
+  pre-instruction pc-stamp guaranteed. The RAM-hit fast path (both the
+  inline helper and `mem_read*_cia`/`mem_write*_cia`'s own RAM branch) never
+  touches `cpu->pc`.
+- Update-form (`...U`/`...UX`) writeback to `rA` is **unconditional** on
+  every path — `mem_read*`/`mem_write*` never signal a fault back to the
+  caller for this opcode class (an unmapped/MMIO access routes to the
+  device layer or warns and returns 0; it never raises `ctx->exception` the
+  way `psq_load`/`psq_store`/`dcbz_l` do), so there is no fault path to
+  guard the writeback against. A faulting `lwzu`'s `rA` update happens
+  exactly as it did before Phase C.
+- Reservation-clear (`lwarx`/`stwcx.`) fires on **every** RAM-hit store,
+  including ones reached through the inline fast path — the
+  `dolrecomp_mem_write*_fast` helpers replicate `mem_write*`'s
+  `clear_matching_reservation` check before writing, not just the slow path.
 
 Lifecycle (also `memory.c`, mirror of **[CPU]**):
 `bool cpu_init(CPUState*)`, `bool cpu_alloc_mem2(CPUState*, u32)`,

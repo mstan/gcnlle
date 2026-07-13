@@ -134,7 +134,13 @@ static void test_codegen_supports_jumptable(const char* code) {
     check(strstr(code, "ctx->pc = target;") != NULL &&
           strstr(code, "return;") != NULL,
           "computed branch hands the target to the dispatcher");
-    check(strstr(code, "mem_read32(ctx, ea)") != NULL,
+    /* Phase C: lwzx (a plain indexed load) is now inlined through the
+     * fast-path helper instead of calling mem_read32 directly -- see
+     * emit_loadx_fast/dolrecomp_mem_read32_fast in emitter.c. The helper's
+     * own fallback still bottoms out in mem_read32 for the non-RAM case, so
+     * the underlying "this is a memory read" semantic is unchanged; only
+     * the emitted call shape moved. */
+    check(strstr(code, "dolrecomp_mem_read32_fast(ctx, ea,") != NULL,
           "lwzx table load lowers to a memory read");
     check(strstr(code, "ppc_mtspr(ctx, 9u, ctx->gpr[12]") != NULL,
           "mtctr loads the table entry into CTR");

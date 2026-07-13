@@ -168,10 +168,18 @@ static u32 exception_msr(u32 old_msr, u32 exception) {
     return next;
 }
 
-u64 mem_read64(CPUState* cpu, u32 addr) {
+/* Phase C: cia-taking canonical implementations, plus *_legacy wrappers
+ * (cia = cpu->pc) for callers still using the pre-Phase-C 2/3-arg shape --
+ * see cpu.h's mem_read* / mem_write* macro-dispatch comment. The slow
+ * (unmapped/external) branch stamps cpu->pc = cia before it could be
+ * observed by anything (there is no device/trace layer in this reference
+ * host to observe it, but the stamp is kept for parity with runtime/src/
+ * memory.c's identical contract -- see runtime/ABI.md sec. 3). */
+u64 mem_read64_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 8) {
+        cpu->pc = cia;
         if (cpu->external_read)
             return cpu->external_read(cpu, addr, 8);
         fprintf(stderr, "warn: read64 from unmapped 0x%08X\n", addr);
@@ -179,11 +187,13 @@ u64 mem_read64(CPUState* cpu, u32 addr) {
     }
     return read_be64(host);
 }
+u64 mem_read64_legacy(CPUState* cpu, u32 addr) { return mem_read64_cia(cpu, addr, cpu->pc); }
 
-void mem_write64(CPUState* cpu, u32 addr, u64 value) {
+void mem_write64_cia(CPUState* cpu, u32 addr, u64 value, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 8) {
+        cpu->pc = cia;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 8);
             return;
@@ -194,11 +204,13 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
     clear_matching_reservation(cpu, addr);
     write_be64(host, value);
 }
+void mem_write64_legacy(CPUState* cpu, u32 addr, u64 value) { mem_write64_cia(cpu, addr, value, cpu->pc); }
 
-u32 mem_read32(CPUState* cpu, u32 addr) {
+u32 mem_read32_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 4) {
+        cpu->pc = cia;
         if (cpu->external_read)
             return (u32)cpu->external_read(cpu, addr, 4);
         fprintf(stderr, "warn: read32 from unmapped 0x%08X\n", addr);
@@ -206,11 +218,13 @@ u32 mem_read32(CPUState* cpu, u32 addr) {
     }
     return read_be32(host);
 }
+u32 mem_read32_legacy(CPUState* cpu, u32 addr) { return mem_read32_cia(cpu, addr, cpu->pc); }
 
-void mem_write32(CPUState* cpu, u32 addr, u32 value) {
+void mem_write32_cia(CPUState* cpu, u32 addr, u32 value, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 4) {
+        cpu->pc = cia;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 4);
             return;
@@ -221,11 +235,13 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
     clear_matching_reservation(cpu, addr);
     write_be32(host, value);
 }
+void mem_write32_legacy(CPUState* cpu, u32 addr, u32 value) { mem_write32_cia(cpu, addr, value, cpu->pc); }
 
-u16 mem_read16(CPUState* cpu, u32 addr) {
+u16 mem_read16_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 2) {
+        cpu->pc = cia;
         if (cpu->external_read)
             return (u16)cpu->external_read(cpu, addr, 2);
         fprintf(stderr, "warn: read16 from unmapped 0x%08X\n", addr);
@@ -233,11 +249,13 @@ u16 mem_read16(CPUState* cpu, u32 addr) {
     }
     return read_be16(host);
 }
+u16 mem_read16_legacy(CPUState* cpu, u32 addr) { return mem_read16_cia(cpu, addr, cpu->pc); }
 
-void mem_write16(CPUState* cpu, u32 addr, u16 value) {
+void mem_write16_cia(CPUState* cpu, u32 addr, u16 value, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 2) {
+        cpu->pc = cia;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 2);
             return;
@@ -248,11 +266,13 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
     clear_matching_reservation(cpu, addr);
     write_be16(host, value);
 }
+void mem_write16_legacy(CPUState* cpu, u32 addr, u16 value) { mem_write16_cia(cpu, addr, value, cpu->pc); }
 
-u8 mem_read8(CPUState* cpu, u32 addr) {
+u8 mem_read8_cia(CPUState* cpu, u32 addr, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host) {
+        cpu->pc = cia;
         if (cpu->external_read)
             return (u8)cpu->external_read(cpu, addr, 1);
         fprintf(stderr, "warn: read8 from unmapped 0x%08X\n", addr);
@@ -260,11 +280,13 @@ u8 mem_read8(CPUState* cpu, u32 addr) {
     }
     return *host;
 }
+u8 mem_read8_legacy(CPUState* cpu, u32 addr) { return mem_read8_cia(cpu, addr, cpu->pc); }
 
-void mem_write8(CPUState* cpu, u32 addr, u8 value) {
+void mem_write8_cia(CPUState* cpu, u32 addr, u8 value, u32 cia) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host) {
+        cpu->pc = cia;
         if (cpu->external_write) {
             cpu->external_write(cpu, addr, value, 1);
             return;
@@ -275,6 +297,7 @@ void mem_write8(CPUState* cpu, u32 addr, u8 value) {
     clear_matching_reservation(cpu, addr);
     *host = value;
 }
+void mem_write8_legacy(CPUState* cpu, u32 addr, u8 value) { mem_write8_cia(cpu, addr, value, cpu->pc); }
 
 bool ppc_add_overflowed(u32 a, u32 b, u32 result) {
     return (((a ^ result) & (b ^ result)) >> 31) != 0;

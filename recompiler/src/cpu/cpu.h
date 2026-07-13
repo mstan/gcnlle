@@ -121,14 +121,51 @@ bool cpu_alloc_mem2(CPUState* cpu, u32 size); //mem 2 only exists after first al
 void cpu_free(CPUState* cpu);
 void cpu_reset(CPUState* cpu);
 
-u64  mem_read64(CPUState* cpu, u32 addr);
-void mem_write64(CPUState* cpu, u32 addr, u64 value);
-u32  mem_read32(CPUState* cpu, u32 addr);
-void mem_write32(CPUState* cpu, u32 addr, u32 value);
-u16  mem_read16(CPUState* cpu, u32 addr);
-void mem_write16(CPUState* cpu, u32 addr, u16 value);
-u8   mem_read8(CPUState* cpu, u32 addr);
-void mem_write8(CPUState* cpu, u32 addr, u8 value);
+/* Phase C (codegen speed campaign): the canonical ABI is now cia-taking --
+ * every mem_read* / mem_write* call carries the originating instruction's own
+ * address ("cia"), which the slow (MMIO/unmapped) branch stamps into
+ * cpu->pc before dispatching to external_read/external_write (see cpu.c).
+ * The bare `mem_read32(...)`-style identifiers below are function-like
+ * macros that dispatch on ARGUMENT COUNT to either the new 3/4-arg *_cia
+ * implementation or a 2/3-arg *_legacy wrapper (cia = cpu->pc, i.e. the
+ * pre-Phase-C convention of the emitter pre-stamping ctx->pc before every
+ * memory op) -- this is what lets callers that don't carry a cia (this
+ * repo's own test_pc_reference.c/test_jumptables.c, and any pre-Phase-C
+ * generated bank) keep compiling unmodified against the SAME identifier the
+ * Phase-C emitter now calls with an extra argument. New code should always
+ * pass cia explicitly; the *_legacy overload exists ONLY for that transition
+ * and is never the target of a newly-written call. */
+u64  mem_read64_cia   (CPUState* cpu, u32 addr, u32 cia);
+u64  mem_read64_legacy(CPUState* cpu, u32 addr);
+void mem_write64_cia   (CPUState* cpu, u32 addr, u64 value, u32 cia);
+void mem_write64_legacy(CPUState* cpu, u32 addr, u64 value);
+u32  mem_read32_cia   (CPUState* cpu, u32 addr, u32 cia);
+u32  mem_read32_legacy(CPUState* cpu, u32 addr);
+void mem_write32_cia   (CPUState* cpu, u32 addr, u32 value, u32 cia);
+void mem_write32_legacy(CPUState* cpu, u32 addr, u32 value);
+u16  mem_read16_cia   (CPUState* cpu, u32 addr, u32 cia);
+u16  mem_read16_legacy(CPUState* cpu, u32 addr);
+void mem_write16_cia   (CPUState* cpu, u32 addr, u16 value, u32 cia);
+void mem_write16_legacy(CPUState* cpu, u32 addr, u16 value);
+u8   mem_read8_cia   (CPUState* cpu, u32 addr, u32 cia);
+u8   mem_read8_legacy(CPUState* cpu, u32 addr);
+void mem_write8_cia   (CPUState* cpu, u32 addr, u8 value, u32 cia);
+void mem_write8_legacy(CPUState* cpu, u32 addr, u8 value);
+
+/* Arity-dispatch: an N-arg call site picks *_legacy; an (N+1)-arg call site
+ * (trailing cia) picks *_cia. Standard "overload by __VA_ARGS__ count"
+ * preprocessor trick -- reads take 2 (legacy) or 3 (cia) args, writes take
+ * 3 (legacy) or 4 (cia). */
+#define GCN_MEM_PICK_R(_1,_2,_3,NAME,...) NAME
+#define GCN_MEM_PICK_W(_1,_2,_3,_4,NAME,...) NAME
+#define mem_read64(...)  GCN_MEM_PICK_R(__VA_ARGS__, mem_read64_cia,  mem_read64_legacy )(__VA_ARGS__)
+#define mem_read32(...)  GCN_MEM_PICK_R(__VA_ARGS__, mem_read32_cia,  mem_read32_legacy )(__VA_ARGS__)
+#define mem_read16(...)  GCN_MEM_PICK_R(__VA_ARGS__, mem_read16_cia,  mem_read16_legacy )(__VA_ARGS__)
+#define mem_read8(...)   GCN_MEM_PICK_R(__VA_ARGS__, mem_read8_cia,   mem_read8_legacy  )(__VA_ARGS__)
+#define mem_write64(...) GCN_MEM_PICK_W(__VA_ARGS__, mem_write64_cia, mem_write64_legacy)(__VA_ARGS__)
+#define mem_write32(...) GCN_MEM_PICK_W(__VA_ARGS__, mem_write32_cia, mem_write32_legacy)(__VA_ARGS__)
+#define mem_write16(...) GCN_MEM_PICK_W(__VA_ARGS__, mem_write16_cia, mem_write16_legacy)(__VA_ARGS__)
+#define mem_write8(...)  GCN_MEM_PICK_W(__VA_ARGS__, mem_write8_cia,  mem_write8_legacy )(__VA_ARGS__)
 
 f64 ppc_approx_reciprocal(f64 value);
 f64 ppc_approx_rsqrt(f64 value);
