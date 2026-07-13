@@ -168,7 +168,9 @@ if(GCN_WITH_GENERATED)
   # winmm: timeBeginPeriod for GCN_THROTTLE's Sleep() granularity (dispatch.c).
   # user32/gdi32: window class/message pump + StretchDIBits for the opt-in
   # GCN_WINDOW=1 native display window (host_window.c).
+  # opengl32: WGL context + fixed-function GL 1.1 present path (GCN_GL,
+  # default ON) alongside the GDI one, same file.
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm
-                         user32 gdi32)
+                         user32 gdi32 opengl32)
 endif()

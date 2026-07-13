@@ -144,13 +144,21 @@ void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter) {
     exi->rtc_counter = rtc_counter;
 }
 
-/* [ENHANCEMENT] Host-clock RTC (see exi.h). GC epoch = 2000-01-01 00:00:00 UTC
- * = Unix 0x386D4380 (Dolphin EXI_DeviceIPL.h:27 GC_EPOCH; GetEmulatedTime does
- * the same unix-minus-epoch conversion). */
+/* [ENHANCEMENT] Host-clock RTC (see exi.h). GC epoch = 2000-01-01 00:00:00
+ * = Unix 0x386D4380 (Dolphin EXI_DeviceIPL.h:27 GC_EPOCH). The counter is fed
+ * LOCAL time, not UTC: on real hardware the user sets the clock to their wall
+ * time (SRAM counterBias is a game-facing correction, 0 in our fixture), and
+ * Dolphin feeds the IPL GetLocalTimeSinceJan1970 (unix + tz/DST offset) for
+ * the same reason — so the calendar screen shows the host's actual clock. */
 #define GCN_EXI_GC_EPOCH_UNIX 0x386D4380u
 
 static u32 exi_rtc_host_now(const GcnExi* exi) {
-    return (u32)((u64)time(NULL) - GCN_EXI_GC_EPOCH_UNIX)
+    time_t now = time(NULL);
+    struct tm* lt = localtime(&now);
+    /* _mkgmtime(localtime(t)) - t = the host's UTC offset incl. DST (mingw/
+     * MSVC CRT; the POSIX spelling is timegm). */
+    time_t tz_off = lt ? (_mkgmtime(lt) - now) : 0;
+    return (u32)((u64)(now + tz_off) - GCN_EXI_GC_EPOCH_UNIX)
            + (u32)exi->rtc_host_offset;
 }
 

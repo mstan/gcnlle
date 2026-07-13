@@ -121,10 +121,11 @@ typedef struct GcnExi {
     u32       rtc_counter;
 
     /* [ENHANCEMENT, opt-in] Host-clock RTC (GCN_RTC_HOST=1): RTC reads return
-     * the live host wall clock converted to the GC epoch — seconds since
-     * 2000-01-01 00:00:00 UTC, i.e. unix_time - 0x386D4380 (Dolphin
-     * EXI_DeviceIPL.h:27 GC_EPOCH; its GetEmulatedTime does this same
-     * conversion) — plus rtc_host_offset, which an RTC_WRITE adjusts so the
+     * the live host wall clock converted to the GC epoch — LOCAL seconds
+     * since 2000-01-01 00:00:00 (unix_time + tz/DST offset - 0x386D4380;
+     * Dolphin EXI_DeviceIPL.h:27 GC_EPOCH, fed local time via
+     * GetLocalTimeSinceJan1970 for the same IPL-shows-wall-clock reason)
+     * — plus rtc_host_offset, which an RTC_WRITE adjusts so the
      * guest can still "set the clock" relative to host time (we never touch
      * the host clock). DEFAULT OFF: reads serve the deterministic fixture
      * counter, byte-identical to before — host mode is a per-run convenience

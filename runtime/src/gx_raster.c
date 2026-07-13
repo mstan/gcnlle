@@ -3159,12 +3159,33 @@ static void get_normmat(u8 idx, float* m) { for (int i = 0; i < 9; i++) m[i] = x
 static void get_texmat(u8 idx, float* m) { for (int i = 0; i < 12; i++) m[i] = xf_f((u32)idx * 4 + i); }
 static void get_postmat(u8 idx, float* m) { for (int i = 0; i < 12; i++) m[i] = xf_f(0x500 + (u32)idx * 4 + i); }
 
+/* [ENHANCEMENT, opt-in] GCN_ASPECT=16:9 / 21:9 — Dolphin-style widescreen
+ * hack: scale the PERSPECTIVE projection's X row by (4/3)/target so the
+ * frustum captures a wider FOV; the host window (host_window.c, same env)
+ * widens the display by the inverse, netting undistorted, wider 3D.
+ * Ortho/2D content is deliberately untouched (it takes the display stretch —
+ * the classic trade-off). Unset/anything else returns 0 (off) and the
+ * projection math below is UNTOUCHED — not even a *1.0f — so the default
+ * raster stays bit-identical (golden gates never set GCN_ASPECT). */
+static float gx_aspect_persp_xscale(void) {
+    static float s_scale = -1.0f;
+    if (s_scale < 0.0f) {
+        const char* e = getenv("GCN_ASPECT");
+        if (e && strcmp(e, "16:9") == 0)      s_scale = (4.0f/3.0f) / (16.0f/9.0f);
+        else if (e && strcmp(e, "21:9") == 0) s_scale = (4.0f/3.0f) / (21.0f/9.0f);
+        else                                  s_scale = 0.0f;   /* off */
+    }
+    return s_scale;
+}
+
 static void tf_position(const InVtx* in, OutVtx* out) {
     float m[12]; get_posmat(in->posMtx, m);
     mul_vec3_mat34(in->position, m, out->mvPosition);
     u32 ptype = s_xf[0x1026];      /* ProjectionType (0 persp, 1 ortho) */
     float p[6]; for (int i = 0; i < 6; i++) p[i] = xf_f(0x1020 + i);
     if (ptype == 0) {              /* Perspective (MultipleVec3Perspective) */
+        float aspect_k = gx_aspect_persp_xscale();
+        if (aspect_k > 0.0f) { p[0] *= aspect_k; p[1] *= aspect_k; }
         out->projectedPosition[0] = p[0]*out->mvPosition[0] + p[1]*out->mvPosition[2];
         out->projectedPosition[1] = p[2]*out->mvPosition[1] + p[3]*out->mvPosition[2];
         out->projectedPosition[2] = (p[4]*out->mvPosition[2] + p[5]) * (1.0f - 1e-7f);
