@@ -70,7 +70,9 @@ void OSD_AddMessage(std::string /*str*/, u32 /*ms*/) {}
 bool OnThread() { return false; }
 bool IsWiiHost() { return false; }
 
-void InterruptRequest() { g_dsp_int_pending = 1; }
+// Release-store: pairs with the acquire exchange in dsp_lle_take_interrupt —
+// the GCN_DSP_THREAD worker raises this from its own thread.
+void InterruptRequest() { __atomic_store_n((int*)&g_dsp_int_pending, 1, __ATOMIC_RELEASE); }
 
 void CodeLoaded(DSPCore& dsp, u32 addr, size_t size)
 {

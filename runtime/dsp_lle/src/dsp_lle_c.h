@@ -32,6 +32,13 @@ uint32_t dsp_lle_peek_mbox_cpu(void);
 /* Advance the DSP; ppc_cycles is the PPC-side period (DSP runs ~1/6th). */
 void     dsp_lle_update(int ppc_cycles);
 
+/* Raw CR_HALT test on control_reg — the exact condition dsp_lle_update's
+ * halt-skip fast path checks (NOT dsp_lle_read_control, which carries
+ * CR_INIT_CODE timebase side effects). Lets the GCN_DSP_THREAD grant path
+ * discard halted-core windows without a worker round trip; caller must hold
+ * the core quiesced (worker drained). */
+int      dsp_lle_halted(void);
+
 
 /* Observability (debug_server "dsp_state"): current DSP program counter and a
  * non-consuming peek of the DSP->CPU mailbox (Dolphin Mailbox::DSP — the box

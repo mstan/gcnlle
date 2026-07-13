@@ -131,6 +131,18 @@ void gcn_dsp_flush(void);
  * emulated second. WRITE paths keep the full gcn_dsp_flush (mail/CSR
  * ordering). GCN_DSP_FLUSH_MIN=0 restores flush-every-observation (A/B). */
 void gcn_dsp_flush_lazy(void);
+/* PI-side variant of the lazy flush (INTSR read / INTMR write). Identical to
+ * gcn_dsp_flush_lazy except its declined (<min) branch does NOT wait out an
+ * in-flight GCN_DSP_THREAD grant: those PI paths read/write only CPU-side PI
+ * state — never core state — and interrupt visibility rides the per-tick
+ * latch in both the threaded and synchronous designs, so there is nothing a
+ * drain would make coherent there. Draining anyway (the first threaded
+ * implementation did) serializes the CPU against the worker at every guest
+ * INTSR idle-loop poll and forfeits nearly the whole async window. DSP-block
+ * MMIO reads must keep the draining gcn_dsp_flush_lazy: their declined
+ * branch still reads core state (mailboxes/CSR) directly afterwards.
+ * Single-threaded (GCN_DSP_THREAD unset) the two are byte-identical. */
+void gcn_dsp_flush_lazy_pi(void);
 /* Raise the lazy-flush threshold (derived mode only — dispatch.c calls this
  * with the uniform world's 96-cycle per-iteration staleness once it resolves
  * that real per-block cycle counts are in effect). Never called => 0 =>

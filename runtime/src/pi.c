@@ -88,7 +88,7 @@ u32 gcn_pi_read(void* user, CPUState* cpu, u32 addr, u8 size) {
          * — the DSP cause bit (0x40, INT_CAUSE_DSP) has to be fresh even
          * though gcn_pi_deliver_external never ran to trigger a flush
          * indirectly. */
-        gcn_dsp_flush_lazy();
+        gcn_dsp_flush_lazy_pi();
         return pi->intsr;               /* live interrupt-cause word */
     }
     if (off == GCN_PI_REVISION)
@@ -109,7 +109,7 @@ void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
          * debt not yet run) newly deliverable, so catch the core up before the
          * new mask takes effect — otherwise a real pending DSP condition could
          * be missed for one more block. */
-        gcn_dsp_flush_lazy();
+        gcn_dsp_flush_lazy_pi();
         pi->reg[pi_index(addr)] = value;
         return;
     }

@@ -183,10 +183,16 @@ void dsp_lle_update(int ppc_cycles) {
   }
 }
 
+int dsp_lle_halted(void) {
+  return g_core && (g_core->DSPState().control_reg & CR_HALT) != 0;
+}
+
 int dsp_lle_take_interrupt(void) {
-  int p = g_dsp_int_pending;
-  g_dsp_int_pending = 0;
-  return p;
+  // Atomic exchange: with the GCN_DSP_THREAD worker the flag is set by
+  // Host::InterruptRequest on the worker thread (host.cpp) and consumed here
+  // on the CPU thread; a plain read+clear could lose a set that lands
+  // between the two. Equivalent single-threaded.
+  return __atomic_exchange_n((int*)&g_dsp_int_pending, 0, __ATOMIC_ACQ_REL);
 }
 
 }  // extern "C"

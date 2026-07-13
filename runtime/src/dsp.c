@@ -19,6 +19,10 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>     /* [PERF] DSP worker thread: CreateThread +
+                          * WaitOnAddress/WakeByAddressAll — same futex-style
+                          * idiom as gx_raster.c's GX-MT pool. */
+#include <immintrin.h>   /* _mm_pause in the spin phases */
 
 /* The dispatch loop ticks one DSP (like the one VI/DI); registered at init. */
 static GcnDsp* s_dsp = NULL;
@@ -35,6 +39,126 @@ static GcnDsp* s_dsp = NULL;
 static u32 s_owed_ppc = 0;      /* PPC-cycle debt not yet run on the DSP core */
 static int s_batch = -1;        /* GCN_DSP_BATCH: default on, "0" disables    */
 static u32 s_batch_ppc = 4096;  /* GCN_DSP_BATCH_PPC: flush cap (PPC cycles)  */
+
+/* ---- [PERF, opt-in] DSP worker thread (GCN_DSP_THREAD=1) ----
+ *
+ * Attribution at perf-campaign-2/E1 (12M-block derived boot): the DSP bucket
+ * is ~20% of wall — 240k flush calls x ~62 interpreted ROM-idle-loop steps
+ * each (~0.53 s of pc=0x0033 mail-wait spinning; halt-skip doesn't apply
+ * because the core isn't halted, it's busy-waiting). That work is pure core
+ * execution with no CPU-visible effect until a flush point, so it can run on
+ * a worker while the CPU executes guest blocks.
+ *
+ * Grant/drain contract (the exactness argument):
+ *   - GRANT: at exactly the points the synchronous design called
+ *     gcn_dsp_flush (batch cap / full-flush sites), the whole-multiple-of-6
+ *     part of the debt is handed to the worker (cumulative counter,
+ *     release-store + wake). The batch-cap grant does NOT wait — that window
+ *     is where the overlap comes from.
+ *   - DRAIN: before ANY CPU observation of core state — every path that
+ *     flushed (or lazily declined with owed<min) in the synchronous design —
+ *     wait until consumed == granted (acquire). At every observation point
+ *     the guest therefore sees exactly the synchronous state: all cycles up
+ *     to the last cap executed, the sub-min residue not. The <min lazy
+ *     branch drains but does NOT grant the residue, mirroring the
+ *     synchronous "skip" exactly.
+ *   - The core (g_dsp, mailboxes, ARAM, control) is touched by exactly ONE
+ *     thread at a time: the worker only between grant and drain, the CPU
+ *     only after a drain (all dsp_lle_* MMIO calls sit behind drained
+ *     paths). The consumed release/acquire pair is the fence that also
+ *     covers the ucode's host DMA writes into MEM1/ARAM.
+ *
+ * Known, deliberate divergence risk (why this is opt-in until gates prove
+ * it): a DSP->CPU interrupt raised INSIDE an async window latches when the
+ * worker actually sets g_dsp_int_pending (a few µs into the window) instead
+ * of at the cap tick — never EARLIER than synchronous, at most ~one batch
+ * window (4096 PPC cycles) LATER, and only for interrupt-driven flows (mail
+ * handshakes always ride drained read/write paths and stay exact). The
+ * arbiter is the standing gate set: all four golden XFB hashes + oracle
+ * value+order counts, run with the thread on. NOT an idle-skip and NOT a
+ * park: every granted cycle executes on the real core, in order, exactly
+ * once — only the wall-clock location of that execution moves. */
+static volatile s64 s_thr_granted  = 0;  /* cumulative whole-of-6 PPC cycles granted  */
+static volatile s64 s_thr_consumed = 0;  /* cumulative cycles the worker has executed */
+static volatile s32 s_thr_quit     = 0;
+static volatile s32 s_thr_parked   = 0;  /* worker is inside WaitOnAddress             */
+static volatile s32 s_thr_waiting  = 0;  /* CPU drain is inside WaitOnAddress          */
+static HANDLE       s_thr_h        = NULL;
+static int          s_thr_on       = -1; /* GCN_DSP_THREAD=1 enables; resolved once */
+
+/* Wake elision: WakeByAddressAll is a syscall; at ~240k grants per 12M-block
+ * boot paying it unconditionally is measurable. Each side advertises when it
+ * is actually parked, and the other side only syscalls then. The advertise-
+ * then-WaitOnAddress order makes the elision safe: if the flag read races to
+ * 0 while the sleeper is between advertising and sleeping, the sleeper's
+ * WaitOnAddress compare sees the already-updated counter and returns
+ * immediately — a missed wake is impossible by construction. */
+static DWORD WINAPI dsp_thread_main(LPVOID param) {
+    (void)param;
+    s64 consumed = 0;   /* worker-private mirror of s_thr_consumed */
+    for (;;) {
+        s64 granted = __atomic_load_n(&s_thr_granted, __ATOMIC_ACQUIRE);
+        if (granted == consumed) {
+            if (__atomic_load_n(&s_thr_quit, __ATOMIC_ACQUIRE)) return 0;
+            int spins = 0;
+            for (;;) {
+                granted = __atomic_load_n(&s_thr_granted, __ATOMIC_ACQUIRE);
+                if (granted != consumed ||
+                    __atomic_load_n(&s_thr_quit, __ATOMIC_ACQUIRE)) break;
+                if (++spins < 16384) { _mm_pause(); continue; }
+                s64 expect = granted;
+                __atomic_store_n(&s_thr_parked, 1, __ATOMIC_SEQ_CST);
+                WaitOnAddress((volatile VOID*)&s_thr_granted, &expect,
+                              sizeof expect, INFINITE);
+                __atomic_store_n(&s_thr_parked, 0, __ATOMIC_SEQ_CST);
+            }
+            continue;
+        }
+        dsp_lle_update((int)(granted - consumed));
+        consumed = granted;
+        __atomic_store_n(&s_thr_consumed, consumed, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&s_thr_waiting, __ATOMIC_SEQ_CST))
+            WakeByAddressAll((PVOID)&s_thr_consumed);
+    }
+}
+
+static int dsp_thread_on(void) {
+    if (s_thr_on < 0) {
+        /* Default ON (GCN_DSP_THREAD=0 forces the synchronous path) — same
+         * policy as GX-MT: a bit-exactness-gated perf feature, validated on
+         * all four golden hashes (deterministic across repeat runs) + oracle
+         * value+order counts in both cycle modes, thread on AND off. */
+        const char* e = getenv("GCN_DSP_THREAD");
+        s_thr_on = (e && e[0] == '0') ? 0 : 1;
+        if (s_thr_on) {
+            s_thr_h = CreateThread(NULL, 0, dsp_thread_main, NULL, 0, NULL);
+            if (!s_thr_h) s_thr_on = 0;   /* creation failure = stay synchronous */
+        }
+    }
+    return s_thr_on;
+}
+
+static void dsp_thread_grant(u32 whole_ppc) {
+    __atomic_store_n(&s_thr_granted, s_thr_granted + (s64)whole_ppc,
+                     __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_thr_parked, __ATOMIC_SEQ_CST))
+        WakeByAddressAll((PVOID)&s_thr_granted);
+}
+
+static void dsp_thread_drain(void) {
+    s64 granted = __atomic_load_n(&s_thr_granted, __ATOMIC_RELAXED);
+    int spins = 0;
+    for (;;) {
+        s64 c = __atomic_load_n(&s_thr_consumed, __ATOMIC_ACQUIRE);
+        if (c == granted) return;
+        if (++spins < 16384) { _mm_pause(); continue; }
+        s64 expect = c;
+        __atomic_store_n(&s_thr_waiting, 1, __ATOMIC_SEQ_CST);
+        WaitOnAddress((volatile VOID*)&s_thr_consumed, &expect,
+                      sizeof expect, INFINITE);
+        __atomic_store_n(&s_thr_waiting, 0, __ATOMIC_SEQ_CST);
+    }
+}
 
 void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user) {
     dsp->irq = fn;
@@ -81,6 +205,15 @@ void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem
 
 void gcn_dsp_free(GcnDsp* dsp) {
     (void)dsp;
+    if (s_thr_on == 1 && s_thr_h) {
+        /* Retire the worker BEFORE the core it executes on is deleted. */
+        dsp_thread_drain();
+        __atomic_store_n(&s_thr_quit, 1, __ATOMIC_RELEASE);
+        WakeByAddressAll((PVOID)&s_thr_granted);
+        WaitForSingleObject(s_thr_h, 2000);
+        CloseHandle(s_thr_h);
+        s_thr_h = NULL;
+    }
     dsp_lle_shutdown();   /* frees the shared ARAM */
 }
 
@@ -127,6 +260,15 @@ static void dsp_aid_tick(GcnDsp* dsp) {
  * already bounds how stale DSP-driven state can get on any path that isn't a
  * direct observation. */
 void gcn_dsp_flush(void) {
+    /* Threaded (GCN_DSP_THREAD=1): quiesce any in-flight batch-cap grant
+     * first, then run the residue inline exactly like the synchronous
+     * design. Full flushes carry small residues (the tick cap grants
+     * everything >= 4096 away asynchronously), and a grant+drain round trip
+     * through a parked worker costs a kernel wake — inline is both simpler
+     * and faster here. With the worker drained the core is exclusively
+     * ours, so the inline dsp_lle_update below is race-free. */
+    if (dsp_thread_on()) dsp_thread_drain();
+
     u32 whole = s_owed_ppc - (s_owed_ppc % 6u);   /* keep the sub-/6 residue owed */
     if (whole == 0u) return;
 
@@ -174,7 +316,21 @@ void gcn_dsp_set_flush_min(u32 ppc_cycles) {
 }
 
 void gcn_dsp_flush_lazy(void) {
-    if (s_owed_ppc < s_flush_min) return;
+    if (s_owed_ppc < s_flush_min) {
+        /* Declined lazy flush ahead of a DSP-block MMIO read: the caller
+         * reads core state (mailboxes/CSR) directly next, so an in-flight
+         * grant must be waited out — both for coherence (sync semantics =
+         * everything up to the last cap executed) and because the worker
+         * would otherwise be mutating the core under the read. Granting
+         * nothing preserves the residue-unexecuted contract. */
+        if (dsp_thread_on()) dsp_thread_drain();
+        return;
+    }
+    gcn_dsp_flush();
+}
+
+void gcn_dsp_flush_lazy_pi(void) {
+    if (s_owed_ppc < s_flush_min) return;   /* no core access follows — see dsp.h */
     gcn_dsp_flush();
 }
 
@@ -203,8 +359,30 @@ void gcn_dsp_tick(u32 ppc_cycles) {
          * — so debt is cleared at flush unconditionally; it is never re-credited
          * based on how much the core actually stepped. */
         s_owed_ppc += ppc_cycles;
-        if (s_owed_ppc >= s_batch_ppc)
-            gcn_dsp_flush();
+        if (s_owed_ppc >= s_batch_ppc) {
+            if (dsp_thread_on()) {
+                /* The overlap point: grant without waiting. The worker burns
+                 * the (overwhelmingly idle-loop) cycles while the CPU keeps
+                 * executing guest blocks; every core-observing path drains.
+                 * Halted-core windows are discarded outright when the worker
+                 * is idle (safe to peek control_reg then): dsp_lle_update's
+                 * halt-skip would no-op the whole grant anyway, so skipping
+                 * the round trip is byte-identical and saves the wake. */
+                u32 whole = s_owed_ppc - (s_owed_ppc % 6u);
+                if (whole) {
+                    if (__atomic_load_n(&s_thr_consumed, __ATOMIC_ACQUIRE) ==
+                            __atomic_load_n(&s_thr_granted, __ATOMIC_RELAXED) &&
+                        dsp_lle_halted()) {
+                        s_owed_ppc -= whole;
+                    } else {
+                        s_owed_ppc -= whole;
+                        dsp_thread_grant(whole);
+                    }
+                }
+            } else {
+                gcn_dsp_flush();
+            }
+        }
     } else {
         dsp_lle_update((int)ppc_cycles);   /* legacy per-block path, byte-identical */
     }

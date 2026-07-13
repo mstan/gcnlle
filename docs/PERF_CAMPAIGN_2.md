@@ -79,6 +79,35 @@ win soundly, so restrict-on-ctx is rejected.
   validated flush set) is understood — implement only if CPU/GX work leaves
   idle core capacity. (Goal item kept, sequenced last deliberately.)
 
+## E1 result + evidence-driven re-plan (2026-07-13, post-E1)
+
+E1 landed exactness-clean (all four goldens bit-identical, oracle counts
+unchanged, ctest 12/12) but measured FLAT: 3.373 s vs 3.332 s baseline
+(overlapping min-of-6 distributions). Two follow-up experiments explain it:
+
+1. Fresh `GCN_DISPATCH_STATS` attribution (the recorded 47.8/43.1 split was
+   STALE — it predated the fused_pixel_E/F + efb_clear SSE2 commit):
+   **block-exec 48.6 / gx 23.0 / dsp 19.7 / other 8.8**. The DSP is the #2
+   bucket: `[dsp-stats]` shows 240k flush calls × ~62 interpreted ROM-idle
+   steps (pc=0x0033 mail-wait, NOT halted so halt-skip can't help) ≈ 0.53 s.
+2. Micro-model variant C (scratchpad alias_c.c): write-through GPR locals
+   emit MORE instructions (154→166) for only 3 fewer memory refs. L1-hot
+   ctx loads are ~free under OOO; the aliasing tax was never the bottleneck.
+
+Consequences:
+- **E3 (GPR promotion) demoted** — micro-evidence says don't pay the
+  139-site emitter refactor for it. Block-exec is more plausibly I-cache/
+  layout/branch bound (1.3 MB single-function TUs, dense entry switches),
+  which is exactly PGO's domain → **E2 (PGO) is the next codegen move**,
+  and it should also re-decide the E1 always_inline calls with real counts.
+- **DSP worker thread promoted to #2** (it was demoted on the stale ~9%
+  devices number): grant/drain design implemented behind GCN_DSP_THREAD=1 —
+  batch-cap grants run async on a worker, every CPU observation path drains
+  first; known risk = interrupt-latch lag ≤ one batch window, arbitrated by
+  the standing gates. Expected recovery ≈ up to ~17% of wall.
+- GX at 23% still gets the AVX2 pass (in flight), expected 1.3-1.8× on the
+  fused loops ≈ 5-8% of wall.
+
 ## Rejected / deferred
 
 - musttail chunk chaining: GCC 15 feature; dispatch is per-quantum (measure
