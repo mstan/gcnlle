@@ -8,6 +8,7 @@
  * make misses loud).
  */
 #include "gx/gx_raster.h"
+#include "gx/gx.h"       /* gcn_gx_tmem() — TLUT reads for paletted textures */
 
 #include <math.h>
 #include <stdio.h>
@@ -343,6 +344,10 @@ typedef struct {
     s32 lod_bias_half;          /* sext(TX_SETMODE0[16:9], 8) >> 1, precomputed */
     u32 minlod, maxlod;         /* TX_SETMODE1 bits 0-8 / 8-8 */
     u32 image0_raw, image3_raw; /* raw TX_SETIMAGE0/3 (for trap-log messages) */
+    const u8* tlut;             /* palette base inside modeled TMEM (TX_SETTLUT
+                                  * tmem_offset<<9); only meaningful for
+                                  * C4/C8/C14X2 — stale-but-harmless otherwise */
+    u32 tlutfmt;                /* TX_SETTLUT format: 0 IA8, 1 RGB565, 2 RGB5A3 */
     u32 img_base;               /* (image3_raw & 0xFFFFFF) << 5, UNMASKED (matches
                                   * the original inline trap-log expression) */
     u32 phys;                   /* img_base & 0x1FFFFFFF (the actual MEM1 offset) */
@@ -705,19 +710,93 @@ static int wrap_coord(int coord, u32 wrap, int size) {
 
 static inline u8 safe_u8(const u8* src, u32 len, u32 off) { return (off < len) ? src[off] : 0; }
 
+/* DecodePixel_Paletted (TextureDecoder_Common.cpp): one 16-bit TLUT entry ->
+ * RGBA. `entry` points at the entry's 2 bytes inside modeled TMEM. IA8 reads
+ * the raw transmission bytes ([A, I] — Dolphin's DecodePixel_IA8 takes the
+ * UNSWAPPED little-endian read, same convention as the direct IA8 texture
+ * case below); RGB565/RGB5A3 swap to the true big-endian value first
+ * (be_u16) and then share the exact bit decode of their direct-format twins.
+ * An out-of-range tlut format (3) returns 0, as Dolphin's default: does. */
+static void decode_tlut_pixel(const u8* entry, u32 tlutfmt, u8 out[4]) {
+    switch (tlutfmt) {
+    case 0: {                                     /* IA8 */
+        out[0] = out[1] = out[2] = entry[1]; out[3] = entry[0];
+        break;
+    }
+    case 1: {                                     /* RGB565 */
+        u16 val = be_u16(entry);
+        out[0] = Convert5To8((u8)((val >> 11) & 0x1Fu));
+        out[1] = Convert6To8((u8)((val >> 5) & 0x3Fu));
+        out[2] = Convert5To8((u8)(val & 0x1Fu));
+        out[3] = 0xFFu;
+        break;
+    }
+    case 2: {                                     /* RGB5A3 */
+        u16 val = be_u16(entry);
+        if (val & 0x8000u) {
+            out[0] = Convert5To8((u8)((val >> 10) & 0x1Fu));
+            out[1] = Convert5To8((u8)((val >> 5) & 0x1Fu));
+            out[2] = Convert5To8((u8)(val & 0x1Fu));
+            out[3] = 0xFFu;
+        } else {
+            out[3] = Convert3To8((u8)((val >> 12) & 0x7u));
+            out[0] = Convert4To8((u8)((val >> 8) & 0xFu));
+            out[1] = Convert4To8((u8)((val >> 4) & 0xFu));
+            out[2] = Convert4To8((u8)(val & 0xFu));
+        }
+        break;
+    }
+    default: out[0] = out[1] = out[2] = out[3] = 0; break;
+    }
+}
+
 /* Per-texel decode (TextureDecoder_Common.cpp TexDecoder_DecodeTexel:361-639,
- * transcribed exactly for the 7 non-paletted formats the menu uses). `out` is
- * RGBA (matches the rest of the TEV pipeline's texel[4] convention). Endianness
- * note: RGB565/RGB5A3/CMPR color1/color2 explicitly Common::swap16 the raw
- * 16-bit read before decoding (so we reconstruct the true big-endian value via
- * be_u16); IA8 does NOT swap (DecodePixel_IA8 takes the raw unswapped read), so
- * on Dolphin's little-endian host alpha ends up as the FIRST transmitted byte
- * and intensity the second — reproduced here with direct byte indexing rather
- * than be_u16, to match the oracle bit-for-bit rather than the "IA" name. */
+ * transcribed exactly: the 7 direct formats the menu frame uses plus the
+ * paletted C4/C8/C14X2 family, which index a TLUT inside modeled TMEM
+ * (`tlut` = entry 0 of this texture's palette, `tlutfmt` its entry format —
+ * both from TX_SETTLUT via build_draw_cfg; ignored by direct formats). The
+ * TLUT pointer is always within TMEM: max reachable byte (tmem_offset
+ * 0x3FF<<9 + C14X2 index 16383*2+1) < 1MB, the same bound Dolphin
+ * static_asserts, so entry reads need no per-access length check. `out` is
+ * RGBA (matches the rest of the TEV pipeline's texel[4] convention).
+ * Endianness note: RGB565/RGB5A3/CMPR color1/color2 explicitly
+ * Common::swap16 the raw 16-bit read before decoding (so we reconstruct the
+ * true big-endian value via be_u16); IA8 does NOT swap (DecodePixel_IA8
+ * takes the raw unswapped read), so on Dolphin's little-endian host alpha
+ * ends up as the FIRST transmitted byte and intensity the second —
+ * reproduced here with direct byte indexing rather than be_u16, to match
+ * the oracle bit-for-bit rather than the "IA" name. */
 static void decode_texel(u32 fmt, const u8* src, u32 src_len, int s, int t,
-                         int image_w_minus_1, u8 out[4]) {
+                         int image_w_minus_1, const u8* tlut, u32 tlutfmt,
+                         u8 out[4]) {
     u32 ss = (u32)s, tt = (u32)t, iw1 = (u32)image_w_minus_1;
     switch (fmt) {
+    case TEXFMT_C4: {   /* 8x8 blocks, 4bpp — same tiling as I4, value is a TLUT index */
+        u32 sBlk = ss >> 3, tBlk = tt >> 3, widthBlks = (iw1 >> 3) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 5;
+        u32 blkOff = ((tt & 7) << 3) + (ss & 7);
+        int rs = (blkOff & 1) ? 0 : 4;
+        u8 val = (u8)((safe_u8(src, src_len, base + (blkOff >> 1)) >> rs) & 0xFu);
+        decode_tlut_pixel(tlut + (u32)val * 2u, tlutfmt, out);
+        break;
+    }
+    case TEXFMT_C8: {   /* 8x4 blocks, 8bpp — same tiling as I8 */
+        u32 sBlk = ss >> 3, tBlk = tt >> 2, widthBlks = (iw1 >> 3) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 5;
+        u32 blkOff = ((tt & 3) << 3) + (ss & 7);
+        u8 val = safe_u8(src, src_len, base + blkOff);
+        decode_tlut_pixel(tlut + (u32)val * 2u, tlutfmt, out);
+        break;
+    }
+    case TEXFMT_C14X2: { /* 4x4 blocks, 16bpp — big-endian read, low 14 bits index */
+        u32 sBlk = ss >> 2, tBlk = tt >> 2, widthBlks = (iw1 >> 2) + 1;
+        u32 base = (tBlk * widthBlks + sBlk) << 4;
+        u32 blkOff = ((tt & 3) << 2) + (ss & 3);
+        u32 offset = (base + blkOff) << 1;
+        u16 val = (offset + 1 < src_len) ? (u16)(be_u16(&src[offset]) & 0x3FFFu) : 0;
+        decode_tlut_pixel(tlut + (u32)val * 2u, tlutfmt, out);
+        break;
+    }
     case TEXFMT_I4: {
         u32 sBlk = ss >> 3, tBlk = tt >> 3, widthBlks = (iw1 >> 3) + 1;
         u32 base = (tBlk * widthBlks + sBlk) << 5;
@@ -942,20 +1021,25 @@ static inline u32 texel_cache_index(u32 texmap, u32 iS, u32 iT) {
  * decode_texel that might not share tex_sample's per-draw-frozen-texmap
  * invariant are unaffected by construction, not just by accident. */
 static inline void decode_texel_cached(int wid, u32 texmap, u32 fmt, const u8* src, u32 src_len,
-                                        int iS, int iT, int w1, u8 out[4]) {
+                                        int iS, int iT, int w1, const u8* tlut, u32 tlutfmt,
+                                        u8 out[4]) {
     u32 key = texel_cache_key(texmap, (u32)iS, (u32)iT);
     u32 idx = texel_cache_index(texmap, (u32)iS, (u32)iT);
     TexelCacheEntry* e = &s_texel_cache_w[wid][idx];
 
     if (e->gen == s_texel_cache_gen && e->key == key) {
         /* Hit: byte-identical to the decode_texel call this replaces (see the
-         * EXACTNESS argument above) — no recompute, just copy the 4 bytes. */
+         * EXACTNESS argument above) — no recompute, just copy the 4 bytes.
+         * TLUT contents are frozen for the whole draw (LOADTLUT is a BP
+         * command, FIFO-serialized like every other per-draw-constant this
+         * cache already relies on), so a paletted texel is as cacheable as a
+         * direct one. */
         out[0] = e->rgba[0]; out[1] = e->rgba[1]; out[2] = e->rgba[2]; out[3] = e->rgba[3];
         if (s_pixel_stats) s_ps_texel_cache_hits++;
         return;
     }
 
-    decode_texel(fmt, src, src_len, iS, iT, w1, out);
+    decode_texel(fmt, src, src_len, iS, iT, w1, tlut, tlutfmt, out);
     e->key = key;
     e->gen = s_texel_cache_gen;
     e->rgba[0] = out[0]; e->rgba[1] = out[1]; e->rgba[2] = out[2]; e->rgba[3] = out[3];
@@ -975,12 +1059,9 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
     switch (fmt) {
     case TEXFMT_I4: case TEXFMT_I8: case TEXFMT_IA4: case TEXFMT_IA8:
     case TEXFMT_RGB565: case TEXFMT_RGB5A3: case TEXFMT_RGBA8: case TEXFMT_CMPR:
-        break;   /* supported */
+        break;   /* supported (direct) */
     case TEXFMT_C4: case TEXFMT_C8: case TEXFMT_C14X2:
-        TRAPF(paletted, "paletted texture format %u (C4/C8/C14X2 need a TLUT model "
-              "we haven't built) — texmap %u, %ux%u, TX_SETIMAGE0=0x%06X",
-              fmt, texmap, w1 + 1, h1 + 1, tc->image0_raw);
-        memset(out, 0, 4); return;
+        break;   /* supported (paletted — TLUT in modeled TMEM, see decode_texel) */
     default:
         TRAPF(unknowntexfmt, "unknown/unsupported texture format %u (texmap %u, %ux%u, "
               "TX_SETIMAGE0=0x%06X TX_SETIMAGE3=0x%06X src_addr=0x%08X)",
@@ -1011,10 +1092,10 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
          * pixels in a scanline and adjacent samples' own 4 taps repeat the
          * same (texmap,iS,iT) constantly, this is exactly what the cache
          * memoizes. */
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT,  w1, v00);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT,  w1, v10);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT1, w1, v01);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT1, w1, v11);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT,  w1, tc->tlut, tc->tlutfmt, v00);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT,  w1, tc->tlut, tc->tlutfmt, v10);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT1, w1, tc->tlut, tc->tlutfmt, v01);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT1, w1, tc->tlut, tc->tlutfmt, v11);
         for (int c = 0; c < 4; c++) {
             u32 acc = v00[c] * (u32)((128 - fS) * (128 - fT)) +
                       v10[c] * (u32)((fS)       * (128 - fT)) +
@@ -1025,7 +1106,7 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
     } else {
         int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
         int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS, iT, w1, out);
+        decode_texel_cached(wid, texmap, fmt, src, src_len, iS, iT, w1, tc->tlut, tc->tlutfmt, out);
     }
 }
 
@@ -2119,46 +2200,70 @@ static void scan_block_rows_serial(Tev* t, const TriScan* ts) {
  * back-to-back, often < 1ms apart), then WaitOnAddress so idle frames cost no
  * CPU.
  *
- * Row distribution is DYNAMIC: every participant (main included) grabs the
- * next unclaimed block row via fetch_add(s_mt_row_next) and bumps
- * s_mt_rows_done after finishing it; the join condition is rows_done ==
- * nrows, NOT "all workers checked in". This makes stragglers harmless: a
- * worker that wakes late (or whose pinned core is busy with background load)
- * simply grabs fewer rows — or none — and the fork completes without it.
- * (The first, static row0/stride split waited for every worker's check-in,
- * so one preempted or still-waking worker gated every fork — measured as
- * join-wait >> scan on a loaded desktop.) Which worker scans a row only
- * selects which private Tev/rb/texel-cache computes it; the bytes are
- * identical, so dynamic assignment does not affect exactness.
+ * Row distribution is DYNAMIC: every participant (main included) claims the
+ * next unclaimed block row and bumps s_mt_rows_done after finishing it; the
+ * join condition is rows_done == nrows, NOT "all workers checked in". This
+ * makes stragglers harmless: a worker that wakes late (or whose pinned core
+ * is busy with background load) simply claims fewer rows — or none — and
+ * the fork completes without it. (The first, static row0/stride split
+ * waited for every worker's check-in, so one preempted or still-waking
+ * worker gated every fork — measured as join-wait >> scan on a loaded
+ * desktop.) Which worker scans a row only selects which private
+ * Tev/rb/texel-cache computes it; the bytes are identical, so dynamic
+ * assignment does not affect exactness.
+ *
+ * The claim is a CAS on ONE 64-bit word packing (fork_id << 32 |
+ * nrows << 16 | next_row). Packing nrows and the row counter together is
+ * load-bearing, not an optimization: with a separate fetch_add counter and
+ * nrows variable, a worker suspended between the two could validate a STALE
+ * row index against the NEXT fork's row count, double-claiming a row the
+ * new fork's counter also hands out (double-scanned row + corrupted
+ * rows_done -> the join's `!=` spin never exits; hit in the wild on the
+ * card-select screen, gdb-confirmed). With the packed word, the bounds
+ * check reads nrows from the very value the CAS claims against, so a claim
+ * is valid-by-construction for the job the word currently describes:
+ *  - CAS succeeds -> row k < nrows of the CURRENT word's fork is owned
+ *    exclusively (the +1 only touches the row field; nrows <= 264 rows so
+ *    the field never carries). s_mt_job/main's join guarantee then keep the
+ *    job fields frozen until this row's rows_done increment lands — main
+ *    cannot pass the join, let alone republish, while an owned row is
+ *    unfinished.
+ *  - CAS fails (any interleaving: another claimer, or a republish changing
+ *    fork_id) -> reload and re-validate. A stale worker either helps the
+ *    new fork or sees row >= nrows and goes back to sleep.
  *
  * Publication protocol per forked triangle (main thread):
  *   1. copy the per-draw Tev template into every worker's s_tev_w[i]
- *   2. s_mt_job = triangle, s_mt_nrows = row count, rows_done = 0
- *   3. s_mt_row_next = 0 (RELEASE — after 1+2; a worker that grabs a row
- *      therefore sees the fully-written job it belongs to)
+ *   2. s_mt_job = triangle, rows_done = 0
+ *   3. s_mt_grab = (new fork_id, nrows, row 0) (RELEASE — after 1+2, so a
+ *      claim on the new word sees the fully-written job it belongs to)
  *   4. s_mt_epoch++ (RELEASE) + WakeByAddressAll
- *   5. grab rows itself, then spin until rows_done == nrows (ACQUIRE — every
- *      row's EFB writes are release-published by its rows_done increment)
- * A stale-epoch worker is safe by the same counter: between forks
- * fetch_add returns >= nrows (row space exhausted -> idle), and once step 3
- * lands it returns a valid row of the NEW job, never a torn one. */
+ *   5. claim rows itself, then spin until rows_done == nrows (ACQUIRE —
+ *      every row's EFB writes are release-published by its rows_done
+ *      increment; no increment can leak across forks, since a fork's join
+ *      only exits once every claimed row of THAT fork has finished) */
 static int s_mt_threads = -1;   /* resolved count incl. main thread; 1 = serial */
 static u32 s_mt_min_area = 2048; /* fork gate, px of post-scissor bbox
                                   * (GCN_GX_MT_MIN_AREA). Default from the
                                   * [gx-area-hist] measurement: >= 2^11 covers
                                   * ~92% of scan wall in ~5.9K forks/boot. */
 static TriScan s_mt_job;
-static s32 s_mt_nrows;               /* block rows in s_mt_job (pre-publish) */
+static u32 s_mt_fork_id;             /* main-only; distinguishes forks in s_mt_grab */
+static volatile s64 s_mt_grab;       /* fork_id<<32 | nrows<<16 | next_row */
 static volatile s32 s_mt_epoch;
-static volatile s32 s_mt_row_next;   /* next unclaimed block-row index */
 static volatile s32 s_mt_rows_done;  /* completed block rows this fork */
 
-/* Grab-and-scan loop shared by main and workers during a fork. */
-static void scan_rows_dynamic(Tev* t, const TriScan* ts) {
+/* Claim-and-scan loop shared by main and workers during a fork. */
+static void scan_rows_dynamic(Tev* t) {
     for (;;) {
-        s32 k = __atomic_fetch_add(&s_mt_row_next, 1, __ATOMIC_ACQUIRE);
-        if (k >= s_mt_nrows) return;
-        scan_one_block_row(t, ts, ts->block_miny + k * BLK);
+        s64 cur = __atomic_load_n(&s_mt_grab, __ATOMIC_ACQUIRE);
+        u32 k = (u32)((u64)cur & 0xFFFFu);
+        u32 nrows = (u32)(((u64)cur >> 16) & 0xFFFFu);
+        if (k >= nrows) return;
+        if (!__atomic_compare_exchange_n(&s_mt_grab, &cur, cur + 1, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;   /* lost the claim — revalidate from the fresh word */
+        scan_one_block_row(t, &s_mt_job, s_mt_job.block_miny + (s32)k * BLK);
         __atomic_add_fetch(&s_mt_rows_done, 1, __ATOMIC_RELEASE);
     }
 }
@@ -2189,7 +2294,7 @@ static DWORD WINAPI gx_mt_worker(LPVOID arg) {
             spins = 0;
         }
         seen = e;
-        scan_rows_dynamic(&s_tev_w[wid], &s_mt_job);
+        scan_rows_dynamic(&s_tev_w[wid]);
     }
     return 0;   /* unreachable — workers live for the whole process */
 }
@@ -2357,18 +2462,20 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
         }
         s32 nrows = (ts.maxy - ts.block_miny + BLK - 1) / BLK;
         s_mt_job = ts;
-        s_mt_nrows = nrows;
         __atomic_store_n(&s_mt_rows_done, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&s_mt_row_next, 0, __ATOMIC_RELEASE);  /* publishes job+nrows */
+        s_mt_fork_id++;
+        __atomic_store_n(&s_mt_grab,
+                         (s64)(((u64)s_mt_fork_id << 32) | ((u64)(u32)nrows << 16)),
+                         __ATOMIC_RELEASE);   /* publishes job + rows_done reset */
         __atomic_add_fetch(&s_mt_epoch, 1, __ATOMIC_RELEASE);
         WakeByAddressAll((PVOID)&s_mt_epoch);
         if (s_mt_stats != 1) {
-            scan_rows_dynamic(t, &ts);
+            scan_rows_dynamic(t);
             while (__atomic_load_n(&s_mt_rows_done, __ATOMIC_ACQUIRE) != nrows)
                 _mm_pause();
         } else {
             u64 t1 = __rdtsc();
-            scan_rows_dynamic(t, &ts);
+            scan_rows_dynamic(t);
             u64 t2 = __rdtsc();
             while (__atomic_load_n(&s_mt_rows_done, __ATOMIC_ACQUIRE) != nrows)
                 _mm_pause();
@@ -2546,6 +2653,100 @@ static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
         perspective_divide(s_verts[indices[i + 2]]);
         draw_triangle(t, s_verts[indices[i]], s_verts[indices[i + 1]], s_verts[indices[i + 2]]);
     }
+}
+
+/* ============================================================================
+ * Line processing (Clipper.cpp ProcessLine/ClipLine/CopyLineVertex). A line
+ * is clipped parametrically in clip space, perspective-divided, then expanded
+ * into a quad (two CCW triangles) offset ±line_half_width along the MINOR
+ * axis — GC's quirky vertical-or-horizontal line caps ("FIXME: what does
+ * real hardware do at 45°?" — Dolphin's words; we reproduce Dolphin, the
+ * oracle). linesize is in 1/6th-pixel units (LPSize, BP 0x22 bits 0-7), so
+ * half-width = linesize/12. The two -px/-py copies get the
+ * LINE_PT_TEX_OFFSETS[lineoff] texcoord bump on every texgen whose TexSize
+ * s.line_offset bit (BP 0x30+2c bit 18) is set, scaled like tf_texcoord's
+ * scale pass. Triangles go straight to draw_triangle — Dolphin calls
+ * DrawTriangleFrontFace directly, bypassing cull mode, and draw_triangle is
+ * exactly that stage (process_triangle's cull runs before it, not inside). */
+static const float s_line_pt_tex_offsets[8] = {
+    0, 1 / 16.f, 1 / 8.f, 1 / 4.f, 1 / 2.f, 1, 1, 1,
+};
+
+static void copy_line_vertex(OutVtx* dst, const OutVtx* src, int px, int py,
+                             int apply_line_offset) {
+    const float line_half_width = (float)bits(s_bp[0x22], 0, 8) / 12.0f;
+    *dst = *src;
+    dst->screenPosition[0] = src->screenPosition[0] + (float)px * line_half_width;
+    dst->screenPosition[1] = src->screenPosition[1] + (float)py * line_half_width;
+    const u32 lineoff = bits(s_bp[0x22], 16, 3);
+    if (apply_line_offset && s_line_pt_tex_offsets[lineoff] != 0) {
+        u32 numtexgens = s_xf[0x103f] & 0xf;   /* xfmem.numTexGen, as Clipper reads it */
+        for (u32 c = 0; c < numtexgens; c++) {
+            if (bits(s_bp[0x30 + c * 2], 18, 1)) {   /* TexSize s.line_offset */
+                dst->texCoords[c][0] += (float)(bits(s_bp[0x30 + c * 2], 0, 16) + 1)
+                                        * s_line_pt_tex_offsets[lineoff];
+            }
+        }
+    }
+}
+
+static void process_line(Tev* t, OutVtx* v0, OutVtx* v1) {
+    int m0 = calc_clip_mask(v0), m1 = calc_clip_mask(v1);
+    int mask = m0 | m1;
+
+    OutVtx interp0, interp1;
+    if (mask) {
+        /* ClipLine: accumulate the largest clip parameter per endpoint over
+         * every violated plane; reject when both endpoints are outside one
+         * plane. Plane table order matches the CLIP_POS_X..CLIP_NEG_Z bit
+         * order of calc_clip_mask. */
+        static const float planes[6][4] = {
+            { -1, 0, 0, 1 }, { 1, 0, 0, 1 },   /* POS_X, NEG_X */
+            { 0, -1, 0, 1 }, { 0, 1, 0, 1 },   /* POS_Y, NEG_Y */
+            { 0, 0, -1, 1 }, { 0, 0, 1, 1 },   /* POS_Z, NEG_Z */
+        };
+        float t0 = 0.0f, t1 = 0.0f;
+        for (int pl = 0; pl < 6; pl++) {
+            if (!(mask & (1 << pl))) continue;
+            const float* P = planes[pl];
+            float dp0 = v0->projectedPosition[0] * P[0] + v0->projectedPosition[1] * P[1] +
+                        v0->projectedPosition[2] * P[2] + v0->projectedPosition[3] * P[3];
+            float dp1 = v1->projectedPosition[0] * P[0] + v1->projectedPosition[1] * P[1] +
+                        v1->projectedPosition[2] * P[2] + v1->projectedPosition[3] * P[3];
+            if (dp0 < 0 && dp1 < 0) return;   /* fully clipped */
+            if (dp1 < 0) {
+                float tc = dp1 / (dp1 - dp0);
+                if (tc > t1) t1 = tc;
+            } else if (dp0 < 0) {
+                float tc = dp0 / (dp0 - dp1);
+                if (tc > t0) t0 = tc;
+            }
+        }
+        /* Both lerps read the ORIGINAL endpoints (Clipper's Vertices[0/1]
+         * stay the originals even when indices are remapped). */
+        if (m0) vtx_lerp(&interp0, t0, v0, v1);
+        if (m1) vtx_lerp(&interp1, t1, v1, v0);
+        if (m0) v0 = &interp0;
+        if (m1) v1 = &interp1;
+    }
+
+    perspective_divide(v0);
+    perspective_divide(v1);
+
+    const float dx = v1->screenPosition[0] - v0->screenPosition[0];
+    const float dy = v1->screenPosition[1] - v0->screenPosition[1];
+    int px = 0, py = 0;
+    /* px/py sign choice keeps the two triangles CCW (Clipper's note). */
+    if (fabsf(dx) > fabsf(dy)) py = (dx > 0) ? -1 : 1;
+    else                       px = (dy > 0) ? 1 : -1;
+
+    OutVtx tri[3];
+    copy_line_vertex(&tri[0], v0, px, py, 0);
+    copy_line_vertex(&tri[1], v1, px, py, 0);
+    copy_line_vertex(&tri[2], v1, -px, -py, 1);
+    draw_triangle(t, &tri[2], &tri[1], &tri[0]);   /* ccw winding */
+    copy_line_vertex(&tri[1], v0, -px, -py, 1);
+    draw_triangle(t, &tri[0], &tri[1], &tri[2]);
 }
 
 /* ============================================================================
@@ -2974,19 +3175,48 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
         out->position[2] = (n == 3) ? be_f32(p + 8) : 0.0f;
     }
 
-    /* normal (Index only; short, /2^14 per FracAdjust) */
+    /* normal (VertexLoader_Normal.cpp): Direct or Index8/16, every component
+     * format — FracAdjust is FIXED per width (byte: 6 fraction bits, short:
+     * 14; float raw), NOT the VAT frac field, unlike position/texcoord.
+     * NormalElements (VAT g0 bit 9) selects N (1 group of 3) vs NBT (3
+     * groups -> out->normal[0..2]); NormalIndex3 (VAT g0 bit 31) gives each
+     * NBT group its OWN index, with group i's data at byte offset i*3*elem
+     * from its indexed element (VertexLoader_Normal's ReadIndexedNormal
+     * offset) — the single-index NBT layout is the same 3 consecutive
+     * groups read from one element. */
     u32 normtype = (low >> 11) & 3;
     if (normtype != VCF_NONE) {
         u32 normfmt = (g0 >> 10) & 7, normelem = (g0 >> 9) & 1;
-        if (normtype == VCF_DIRECT) { TRAP(directnorm, "direct normal attribute"); return 0; }
-        if (normfmt != 3) { TRAP(normfmt, "normal format != short"); return 0; }
-        if (normelem != 0) { TRAP(normntb, "normal NTB (tangent/binormal)"); return 0; }
-        u32 idx = read_index(v, &off, normtype);
-        const u8* p = array_ptr(cp, 1, idx, 6);
-        if (!p) { TRAP(normoob, "normal array out of MEM1"); return 0; }
-        out->normal[0][0] = be_s16(p)     / (float)(1 << 14);
-        out->normal[0][1] = be_s16(p + 2) / (float)(1 << 14);
-        out->normal[0][2] = be_s16(p + 4) / (float)(1 << 14);
+        u32 nidx3 = (g0 >> 31) & 1;
+        u32 groups = normelem ? 3u : 1u;
+        u32 esize = (normfmt < 2u) ? 1u : (normfmt < 4u) ? 2u : 4u;
+        float scale = (normfmt < 2u) ? (1.0f / 64.0f)
+                    : (normfmt < 4u) ? (1.0f / 16384.0f) : 1.0f;
+        if (normtype == VCF_DIRECT) {
+            for (u32 gI = 0; gI < groups; gI++)
+                for (u32 c = 0; c < 3; c++)
+                    out->normal[gI][c] = read_direct_elem(v, &off, normfmt) * scale;
+        } else if (nidx3 && groups == 3u) {
+            for (u32 gI = 0; gI < 3u; gI++) {
+                u32 idx = read_index(v, &off, normtype);
+                const u8* p = array_ptr(cp, 1, idx, (gI + 1u) * 3u * esize);
+                if (!p) { TRAP(normoob, "normal array out of MEM1"); return 0; }
+                p += gI * 3u * esize;
+                for (u32 c = 0; c < 3; c++) {
+                    u32 o = c * esize;
+                    out->normal[gI][c] = read_direct_elem(p, &o, normfmt) * scale;
+                }
+            }
+        } else {
+            u32 idx = read_index(v, &off, normtype);
+            const u8* p = array_ptr(cp, 1, idx, groups * 3u * esize);
+            if (!p) { TRAP(normoob, "normal array out of MEM1"); return 0; }
+            for (u32 gI = 0; gI < groups; gI++)
+                for (u32 c = 0; c < 3; c++) {
+                    u32 o = (gI * 3u + c) * esize;
+                    out->normal[gI][c] = read_direct_elem(p, &o, normfmt) * scale;
+                }
+        }
     }
 
     /* color0/color1 (VertexLoader_Color.cpp): Direct or Index8/16, all 6 GX
@@ -3327,6 +3557,15 @@ static void build_draw_cfg(void) {
         tc->src     = tc->valid ? s_cpu->ram + tc->phys : NULL;
         tc->src_len = tc->valid ? s_cpu->ram_size - tc->phys : 0u;
 
+        /* TX_SETTLUT (BPMemory.h TexTLUT, regs 0x98+unit / 0xB8+(unit-4)):
+         * palette location inside modeled TMEM (tmem_offset<<9) + entry
+         * format. Read for every unit; only C4/C8/C14X2 decodes consume it.
+         * The pointer can never leave the 1MB TMEM array — max reachable
+         * byte is 0x3FF<<9 + 16383*2+1 < 1MB (Dolphin's own static bound). */
+        u32 tlut_reg = (unit < 4u) ? s_bp[0x98 + unit] : s_bp[0xB8 + (unit - 4u)];
+        tc->tlut    = gcn_gx_tmem() + ((tlut_reg & 0x3FFu) << 9);
+        tc->tlutfmt = bits(tlut_reg, 10, 2);
+
         u32 mode0 = tx_mode0(unit), mode1 = tx_mode1(unit);
         tc->wrap_s = bits(mode0, 0, 2);
         tc->wrap_t = bits(mode0, 2, 2);
@@ -3449,12 +3688,15 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
                     const u8* verts, u32 nverts, u32 vstride) {
     /* prim 0/1 = GX_DRAW_QUADS / GX_DRAW_QUADS_2 (SetupUnit.cpp:34-40 routes
      * both to SetupQuad — Dolphin itself treats QUADS_2 as a non-standard
-     * alias, not a distinct assembly). prim 4 = GX_DRAW_TRIANGLE_FAN. */
+     * alias, not a distinct assembly). prim 4 = GX_DRAW_TRIANGLE_FAN.
+     * prim 5 = GX_DRAW_LINES (SetupLine: every vertex pair -> ProcessLine).
+     * Triangles/strip/linestrip/points stay trapped until observed. */
     s_trap_cp = cp; s_trap_vat = vat; s_trap_prim = prim;
 
     int is_quad = (prim == 0 || prim == 1);
-    if (!is_quad && prim != 4) {
-        TRAPF(nonfan, "primitive != TRIANGLE_FAN/QUADS (prim %u opcode-class, vat %u, "
+    int is_line = (prim == 5);
+    if (!is_quad && prim != 4 && !is_line) {
+        TRAPF(nonfan, "primitive != TRIANGLE_FAN/QUADS/LINES (prim %u opcode-class, vat %u, "
               "%u verts) pc=0x%08X vcd_lo=0x%08X vcd_hi=0x%08X",
               prim, vat, nverts, s_cpu ? s_cpu->pc : 0u, cp->vtx_desc_lo, cp->vtx_desc_hi);
         return;
@@ -3473,7 +3715,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
                     cp->vtx_desc_hi, cp->vat_g0[vat], cp->vat_g1[vat], cp->vat_g2[vat]);
         }
     }
-    if (nverts < 3) return;
+    if (nverts < (is_line ? 2u : 3u)) return;
 
     recompute_scissor();
     tev_load_registers(&s_tev_w[0]);
@@ -3497,7 +3739,14 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
         tf_color(&in, writep);
         tf_texcoord(&in, writep);
 
-        if (is_quad) {
+        if (is_line) {
+            /* SetupLine (SetupUnit.cpp:132-145): every vertex PAIR becomes
+             * one line; the write pointer snaps back to slot 0 after each. */
+            if (counter < 1) { counter++; writep = pv[counter]; continue; }
+            process_line(&s_tev_w[0], pv[0], pv[1]);
+            counter = 0;
+            writep = pv[0];
+        } else if (is_quad) {
             /* SetupQuad (SetupUnit.cpp:62-79): triangle 1 = (v0,v1,v2), then
              * triangle 2 = (v0,v2,v3) — the VertPointer/counter/write-pointer
              * state returns to its initial layout every 4 vertices (traced by

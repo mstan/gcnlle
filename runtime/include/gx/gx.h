@@ -78,4 +78,9 @@ void gcn_gx_init(CPUState* cpu, GcnCp* cp, GcnPe* pe);
  * set and CPReadWriteDistance > 0. */
 void gcn_gx_tick(u32 cycles);
 
+/* Modeled TMEM (1MB). LOADTLUT1 BP writes copy palettes from guest RAM into
+ * it; gx_raster.c's paletted texture decode (C4/C8/C14X2) reads them back.
+ * Always valid (static storage), contents all-zero until the first TLUT load. */
+const u8* gcn_gx_tmem(void);
+
 #endif /* GCN_GX_GX_H */

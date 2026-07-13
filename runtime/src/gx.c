@@ -50,6 +50,8 @@
 #define GX_OP_PRIM_END         0xBFu
 
 /* BP registers with side effects (BPMemory.h:52-64). */
+#define GX_BP_LOADTLUT0        0x64u   /* TLUT source: guest addr >> 5 */
+#define GX_BP_LOADTLUT1        0x65u   /* TLUT dest: tmem_addr | line_count<<10 */
 #define GX_BP_SETDRAWDONE      0x45u
 #define GX_BP_PE_TOKEN_ID      0x47u
 #define GX_BP_PE_TOKEN_INT_ID  0x48u
@@ -327,6 +329,16 @@ static void gx_on_xf(GcnGx* gx, u16 address, u8 count, const u8* data) {
  * BP register load (BPStructs.cpp BPWritten:55-396). Store the value; run the
  * side effects for the registers that have them.
  * ==========================================================================*/
+/* Modeled TMEM (1MB, matching Dolphin's s_tex_mem/TMEM_SIZE). Only the TLUT
+ * path uses it so far: LOADTLUT1 writes snapshots of guest RAM here, and the
+ * rasterizer's paletted decode (C4/C8/C14X2) reads palette entries from it
+ * via gcn_gx_tmem(). Texture image preloads (BPMEM_PRELOAD_*) are not
+ * modeled — textures are sampled straight from MEM1, Dolphin's
+ * non-cache_manually_managed path (see gx_raster.c tex_sample scope note). */
+static u8 s_gx_tmem[0x100000];
+
+const u8* gcn_gx_tmem(void) { return s_gx_tmem; }
+
 static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     if (note_once(&gx->seen_bp[cmd]))
         fprintf(stderr, "gx: BP reg 0x%02X first written (val 0x%06X)\n", cmd, value);
@@ -349,6 +361,29 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     case GX_BP_PE_TOKEN_INT_ID:        /* BPStructs.cpp:218-233 (interrupt) */
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 1);
         break;
+    case GX_BP_LOADTLUT1: {            /* BPStructs.cpp BPMEM_LOADTLUT1 */
+        /* Copy a Texture Look-Up Table from guest RAM into modeled TMEM.
+         * The copy happens AT WRITE TIME (the guest may overwrite the RAM
+         * source afterwards — TMEM keeps the snapshot, exactly like HW).
+         * Source address comes from the last LOADTLUT0 write (<<5, upper
+         * bits ignored on GameCube: & 0x01FFFFFF); dest/count from this
+         * value: tmem_addr bits 0-9 (<<9 = byte address), tmem_line_count
+         * bits 10-20 (x32 bytes). Dolphin static_asserts the max transfer
+         * (0x3FF<<9 + 0x7FF*32) fits TMEM_SIZE, so an in-range guest source
+         * can never overflow the 1MB array; a source outside MEM1 is
+         * clamped and logged instead of read out of bounds. */
+        u32 tmem_addr = (value & 0x3FFu) << 9;
+        u32 count = ((value >> 10) & 0x7FFu) * 32u;
+        u32 src = (gx->bp[GX_BP_LOADTLUT0] << 5) & 0x01FFFFFFu;
+        CPUState* cpu = gx->cpu;
+        if (cpu && cpu->ram && (u64)src + count <= (u64)cpu->ram_size) {
+            memcpy(s_gx_tmem + tmem_addr, cpu->ram + src, count);
+        } else {
+            fprintf(stderr, "gx: LOADTLUT source out of MEM1 (src 0x%08X count %u) — skipped\n",
+                    src, count);
+        }
+        break;
+    }
     case GX_BP_TRIGGER_EFB_COPY:       /* BPStructs.cpp:240-395 */
         /* GCN_GX_STATS bucket 4 (EFB): timed only at this call site, not the
          * BP dispatch around it — the off path below is byte-identical work. */
