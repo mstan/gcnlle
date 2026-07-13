@@ -116,6 +116,21 @@ typedef void (*GcnViIrqFn)(void* user, int level);
  * GcnPiFifoResetFn / irq-trampoline pattern (boot.c wires the two together). */
 typedef void (*GcnViSiPollFn)(void* user, u32 half_line_count, int is_at_field_boundary);
 
+/* GCN_THROTTLE=1 field-boundary pacing hook (dispatch.c). Fired ONLY when
+ * vi_advance_halfline's is_at_field_boundary is true (unlike si_poll_hook
+ * above, which fires every halfline), carrying the period, in seconds, of
+ * the field that JUST STARTED — derived from this file's own timing chain
+ * (vi_ticks_per_halfline() * the starting field's own halfline count,
+ * divided by GCN_VI_CORE_CLOCK; see vi.c's call site for the exact odd/even
+ * selection). vi.c knows nothing about wall clocks or sleeping; it only
+ * reports "this many seconds of emulated field time just elapsed", so the
+ * pacing consumer can sleep to match real time without vi.c taking any
+ * dependency on it (same boot.c-wires-two-modules-together pattern as
+ * si_poll_hook / the PI_FIFO_RESET hook into gp.c). Computed from the live
+ * registers every time, so a mid-run VI retiming (PAL/NTSC, interlace
+ * changes) paces correctly too — nothing here hardcodes 59.94/50/60 Hz. */
+typedef void (*GcnViFieldFn)(void* user, double field_period_sec);
+
 typedef struct {
     u16 reg[GCN_VI_SIZE / 2];     /* 16-bit register backing (off >> 1)       */
     u32 half_line_count;          /* halflines into the current frame         */
@@ -129,12 +144,24 @@ typedef struct {
     void*      irq_user;
     GcnViSiPollFn si_poll_hook;    /* sink for the per-halfline SI poll schedule (boot.c -> si.c) */
     void*         si_poll_user;
+    GcnViFieldFn  field_hook;      /* sink for GCN_THROTTLE field-boundary pacing (boot.c -> dispatch.c) */
+    void*         field_hook_user;
 } GcnVi;
 
 void gcn_vi_init(GcnVi* vi);
 void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user);
 /* Register the per-halfline SI-poll scheduling hook fired from vi_advance_halfline. */
 void gcn_vi_set_si_poll_hook(GcnVi* vi, GcnViSiPollFn fn, void* user);
+/* Register the field-boundary pacing hook (GcnViFieldFn doc above). */
+void gcn_vi_set_field_hook(GcnVi* vi, GcnViFieldFn fn, void* user);
+/* Register the guest CPU (for its RAM pointer) so vi.c can hand the host
+ * window (GCN_WINDOW=1, host/host_window.h) the live XFB bytes at each field
+ * boundary — same CPUState* wiring gcn_gx_init already takes directly (no
+ * generic hook indirection needed: unlike si_poll_hook, which exists so
+ * vi.c stays free of a si.h dependency, host_window.h has no dependency on
+ * vi.h/si.h to avoid — it declares only plain (const u8*,u32,u32,u32)). No
+ * effect unless GCN_WINDOW=1 (gcn_host_window_enabled() gates the call). */
+void gcn_vi_set_cpu(GcnVi* vi, CPUState* cpu);
 /* Advance the beam to `core_cycles` — the monotonic device clock from the
  * dispatch loop (called per block). MUST be monotonic; never the guest TB. */
 void gcn_vi_tick(u64 core_cycles);

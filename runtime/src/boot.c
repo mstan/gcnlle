@@ -86,6 +86,7 @@
 #include "gx/gx.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
+#include "host/host_window.h"  /* GCN_WINDOW=1: opt-in native display window */
 #include "util/crc32.h"
 #include "descramble_core.h"   /* IPL_SCRAMBLE_END etc. — the M1 integrity check */
 
@@ -162,12 +163,22 @@ static void sram_persist_to_file(void* user) {
 
 /* ROADMAP M4: memory cards. Slot A (channel 0 dev0) and slot B (channel 1 dev0)
  * are backed by a Dolphin-compatible flat .raw image. GCN_MEMCARD_A/B name a
- * host file: loaded if it exists and validates, otherwise a blank 251-block
- * (16 Mbit) card is formatted and the file created. With no env set, slot A
- * still gets an in-memory formatted card so EXT reads 1 (matching the Dolphin
- * oracle's "card in slot A" config — this preserves the validated boot), and
- * slot B stays empty. Every guest write is flushed back to the file on chip
- * deselect (card_persist_to_file). */
+ * host file:
+ *   - exists + validates            -> loaded as-is.
+ *   - exists but invalid/corrupt    -> reformatted blank (Dolphin-style
+ *                                      header/directory/BAT) and overwritten.
+ *   - does not exist yet [auto-create] -> a FACTORY-BLANK image (all 0xFF,
+ *     no header — real erased-flash state) is created at that path and
+ *     mounted; the IPL's own card manager is left to notice it's unformatted
+ *     and offer to format it, same as a real blank card in a real console
+ *     (see setup_memcard's "!existed" branch). Sized from
+ *     GCN_MEMCARD_A_MBITS / GCN_MEMCARD_B_MBITS (4/8/16/32/64/128 real Mbit;
+ *     default 128 Mbit / 16 MiB, matching the pre-existing formatted-blank
+ *     default below).
+ * With no env set, slot A still gets an in-memory formatted card so EXT reads
+ * 1 (matching the Dolphin oracle's "card in slot A" config — this preserves
+ * the validated boot), and slot B stays empty. Every guest write is flushed
+ * back to the file on chip deselect (card_persist_to_file). */
 typedef struct { const char* path[2]; } GcnCardPersistCtx;
 static GcnCardPersistCtx s_card_persist_ctx;
 
@@ -223,6 +234,37 @@ static void set_card_flash_id(GcnExi* exi, u32 ch, const u8* header20) {
     exi->sram[0x3Au + ch] = (u8)(csum ^ 0xFFu);
 }
 
+/* ROADMAP M4 [auto-create]: GCN_MEMCARD_A_MBITS / GCN_MEMCARD_B_MBITS pick the
+ * size of a brand-new factory-blank card image (see setup_memcard's
+ * "!existed" branch). Values are real GameCube Mbit (4/8/16/32/64/128 — the
+ * six sizes GCMemcard::Open() accepts, memcard_image.h GCN_MC_MBIT_*).
+ * Unset or unrecognized falls back to 128 Mbit, the same size the
+ * pre-existing "path given, file missing/invalid" fallback below already
+ * defaults to — this knob only widens what's selectable, it never changes
+ * the default. Grepped first (PRINCIPLES "do not invent a second knob"): no
+ * earlier GCN_MEMCARD_*_MBITS-shaped env var existed in this tree. */
+static u32 memcard_mbits_bytes_from_env(const char* env_name) {
+    unsigned code = GCN_MC_MBIT_2043;   /* default: 128 Mbit, 16 MiB */
+    const char* e = getenv(env_name);
+    if (e && *e) {
+        unsigned long want = strtoul(e, NULL, 0);
+        switch (want) {
+        case 4:   code = GCN_MC_MBIT_59;   break;
+        case 8:   code = GCN_MC_MBIT_123;  break;
+        case 16:  code = GCN_MC_MBIT_251;  break;
+        case 32:  code = GCN_MC_MBIT_507;  break;
+        case 64:  code = GCN_MC_MBIT_1019; break;
+        case 128: code = GCN_MC_MBIT_2043; break;
+        default:
+            fprintf(stderr, "gcn boot: %s=%s is not one of the six real "
+                    "GameCube card sizes (4/8/16/32/64/128 Mbit) — using the "
+                    "default 128 Mbit\n", env_name, e);
+            break;
+        }
+    }
+    return gcn_mc_image_bytes_for_mbits(code);
+}
+
 /* Install a formatted/loaded memory card on `ch`. `path` (may be NULL) is the
  * .raw backing. Returns the malloc'd card image (owned by `card` after
  * gcn_memcard_init) or NULL on hard failure. */
@@ -235,19 +277,62 @@ static void setup_memcard(GcnExi* exi, u32 ch, GcnMemcard* card, const char* pat
     u8* img = NULL;
 
     if (path && *path) {
-        u8* file = NULL; u32 file_sz = 0;
-        if (gcn_seed_read_file(path, &file, &file_sz)) {
-            char err[128];
-            if (gcn_mc_image_valid_size(file_sz) &&
-                gcn_mc_image_check(file, file_sz, err, sizeof err)) {
-                img = file; sz = file_sz;
-                fprintf(stdout, "gcn boot: memory card %c loaded from '%s' (%u bytes)\n",
-                        (char)('A' + ch), path, file_sz);
-            } else {
-                fprintf(stdout, "gcn boot: memory card %c file '%s' invalid (%s) — "
-                        "reformatting\n", (char)('A' + ch), path,
-                        gcn_mc_image_valid_size(file_sz) ? err : "bad size");
-                free(file);
+        /* Existence probe BEFORE gcn_seed_read_file: a path that has never
+         * existed (auto-create a factory-blank card) and a path that exists
+         * but is short/corrupt/unreadable (reformat-in-place, pre-existing
+         * behavior below) are different real-hardware scenarios, and
+         * gcn_seed_read_file's plain bool return doesn't distinguish them. */
+        FILE* probe = fopen(path, "rb");
+        int existed = probe != NULL;
+        if (probe) fclose(probe);
+
+        if (existed) {
+            u8* file = NULL; u32 file_sz = 0;
+            if (gcn_seed_read_file(path, &file, &file_sz)) {
+                char err[128];
+                if (gcn_mc_image_valid_size(file_sz) &&
+                    gcn_mc_image_check(file, file_sz, err, sizeof err)) {
+                    img = file; sz = file_sz;
+                    fprintf(stdout, "gcn boot: memory card %c loaded from '%s' (%u bytes)\n",
+                            (char)('A' + ch), path, file_sz);
+                } else {
+                    fprintf(stdout, "gcn boot: memory card %c file '%s' invalid (%s) — "
+                            "reformatting\n", (char)('A' + ch), path,
+                            gcn_mc_image_valid_size(file_sz) ? err : "bad size");
+                    free(file);
+                }
+            }
+            /* else: gcn_seed_read_file itself failed (e.g. zero-length or
+             * unreadable) — img stays NULL and falls to the formatted-blank
+             * fallback below, same as before this feature existed. */
+        } else {
+            /* [auto-create] Path names a card that has never existed: mint a
+             * FACTORY-BLANK image — all 0xFF, the real erased-flash state,
+             * NO header/directory/BAT. Deliberately do NOT call
+             * gcn_mc_image_format() here: writing a valid header is the
+             * IPL's OWN card manager's job the first time it sees an
+             * unformatted card (LLE-first — PRINCIPLES.md "the firmware does
+             * it", not us). A real GameCube shows "this card is unformatted,
+             * format it?" for a brand-new card; so should this one. */
+            char env_name[24];
+            u32 blank_sz;
+            u8* blank;
+            snprintf(env_name, sizeof env_name, "GCN_MEMCARD_%c_MBITS", (char)('A' + ch));
+            blank_sz = memcard_mbits_bytes_from_env(env_name);
+            blank = (u8*)malloc(blank_sz);
+            if (blank) {
+                memset(blank, 0xFF, blank_sz);
+                if (gcn_mc_image_save_file(path, blank, blank_sz)) {
+                    img = blank; sz = blank_sz;
+                    fprintf(stdout,
+                        "gcn boot: created factory-blank memory card at '%s' (%u Mbit)\n",
+                        path, blank_sz / 131072u);   /* 131072 B/Mbit (GCN_MC_BLOCK_SIZE * GCN_MC_BLOCKS_PER_MBIT) */
+                } else {
+                    fprintf(stderr, "gcn boot: memory card %c: failed to write "
+                            "factory-blank image to '%s' — falling back to an "
+                            "in-memory pre-formatted card\n", (char)('A' + ch), path);
+                    free(blank);
+                }
             }
         }
     }
@@ -491,11 +576,22 @@ int main(int argc, char** argv) {
     static GcnVi vi;
     gcn_vi_init(&vi);
     gcn_vi_set_irq(&vi, vi_irq_to_pi, &pi);
+    /* GCN_WINDOW=1 (opt-in): lets vi.c hand the host window (host_window.c)
+     * the live XFB bytes at each field boundary via the guest RAM pointer.
+     * No effect unless GCN_WINDOW is set — see gcn_vi_set_cpu's doc comment. */
+    gcn_vi_set_cpu(&vi, &cpu);
     /* The SI poll is scheduled off the VI beam (VideoInterface.cpp:950-968);
      * wire vi's per-halfline hook straight to si.c's beam-poll entry point so
      * vi.c never takes a dependency on si.h (same pattern as PI_FIFO_RESET's
      * hook into gp.c). */
     gcn_vi_set_si_poll_hook(&vi, gcn_si_beam_poll, &si);
+    /* GCN_THROTTLE=1 (opt-in): pace emulated time to wall-clock time at each
+     * VI field boundary. Matches GcnViFieldFn's signature exactly (see
+     * dispatch.h), so no trampoline is needed here — same pattern as the
+     * irq_to_pi trampolines above, minus the trampoline. No effect unless
+     * GCN_THROTTLE is set (gcn_dispatch_throttle_on_field's own cached-getenv
+     * gate; see dispatch.c). */
+    gcn_vi_set_field_hook(&vi, gcn_dispatch_throttle_on_field, NULL);
     gcn_mmio_register(&bus, "VI", GCN_VI_BASE, GCN_VI_SIZE,
                       gcn_vi_read, gcn_vi_write, &vi);
 
@@ -562,10 +658,19 @@ int main(int argc, char** argv) {
     gcn_rings_init();
     GcnDebugCtx dbg = { &cpu };
     int dbg_port = gcn_debug_server_start(&dbg);
-    /* With the debug server on, run unbounded and park on stop, so the process
-     * (and its always-on rings) stay inspectable until a client sends "quit"
-     * rather than racing to the block budget. */
-    u32 run_blocks = (dbg_port > 0) ? 0u : max_blocks;
+
+    /* GCN_WINDOW=1 (opt-in): native Win32 display + keyboard-pad window,
+     * replacing tools/gcn_viewer.py's TCP/PPM/Tk loop for interactive use
+     * (host/host_window.h). Started here (mirrors the debug-server start
+     * just above) so it is up before the dispatch loop runs; a no-op when
+     * GCN_WINDOW is unset. */
+    gcn_host_window_start(&cpu);
+
+    /* With the debug server or the host window on, run unbounded and stop
+     * only on an explicit quit signal (TCP "quit" / window closed), so the
+     * process (and its always-on rings) stay inspectable/interactive rather
+     * than racing to the block budget. */
+    u32 run_blocks = (dbg_port > 0 || gcn_host_window_enabled()) ? 0u : max_blocks;
 
     /* M1: arm the handoff-instant snapshot the integrity check compares (see
      * dispatch.h — end-of-run memory is useless once BS2 has executed). */
@@ -583,13 +688,17 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     int still_live = gcn_dispatch_run(&cpu, run_blocks);
-    if (dbg_port > 0 && !gcn_debug_server_quit_requested())
+    /* Don't park waiting on a TCP "quit" that may never come if what actually
+     * ended the run was the host window closing (GCN_WINDOW=1, no debug
+     * client attached). */
+    if (dbg_port > 0 && !gcn_debug_server_quit_requested() && !gcn_host_window_quit_requested())
         gcn_debug_server_park();
     gcn_debug_server_stop();
     gcn_trace_close();
 
     const char* reason =
-        still_live ? "block budget reached (still live — likely busy-waiting on unmodeled HW)"
+        gcn_host_window_quit_requested() ? "host window closed"
+        : still_live ? "block budget reached (still live — likely busy-waiting on unmodeled HW)"
         : cpu.exception ? "PPC exception raised"
         : "PC has no recompiled function / host call (fell off the image)";
 

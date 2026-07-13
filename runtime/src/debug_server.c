@@ -14,6 +14,7 @@
 #include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
 #include "dsp/dsp.h"       /* gcn_dsp_flush: catch a batched core up before dsp_state peeks it */
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
+#include "vi/yuy2.h"       /* screenshot: YUY2->RGB (shared with host_window.c) */
 #include "si/si.h"         /* set_input: injected pad-report surface */
 
 #include <winsock2.h>
@@ -249,18 +250,10 @@ static void handle_line(Client* c, const char* line) {
                     const u8* row = cpu->ram + fb_addr + (u64)y * fb_stride;
                     for (u32 x = 0; x < fb_w; x++) {
                         const u8* px = row + (x / 2u) * 4u;
-                        double Y = (x & 1u) ? px[2] : px[0];
-                        double U = px[1], V = px[3];
-                        double yc = 1.164 * (Y - 16.0);
-                        double r = yc + 1.596 * (V - 128.0);
-                        double g = yc - 0.813 * (V - 128.0) - 0.391 * (U - 128.0);
-                        double b = yc + 2.018 * (U - 128.0);
                         u8 rgb[3];
-                        rgb[0] = (u8)(r < 0 ? 0 : r > 255 ? 255 : r);
-                        rgb[1] = (u8)(g < 0 ? 0 : g > 255 ? 255 : g);
-                        rgb[2] = (u8)(b < 0 ? 0 : b > 255 ? 255 : b);
+                        u8 Y = gcn_yuy2_to_rgb(px, (int)(x & 1u), &rgb[0], &rgb[1], &rgb[2]);
                         fwrite(rgb, 1, 3, f);
-                        luma_sum += (u8)Y;
+                        luma_sum += Y;
                     }
                 }
                 fclose(f);

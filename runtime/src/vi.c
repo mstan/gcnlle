@@ -7,12 +7,17 @@
  */
 #include "vi/vi.h"
 #include "debug/rings.h"
+#include "host/host_window.h"  /* GCN_WINDOW=1 field-boundary present hook, see below */
 
 #include <stdio.h>
 #include <string.h>
 
 /* The dispatch loop ticks one VI (like the one DSP core); registered at init. */
 static GcnVi* s_vi = NULL;
+/* Guest CPU, for its RAM pointer only — see gcn_vi_set_cpu's header doc.
+ * NULL (the pre-existing default) means the host-window present hook below
+ * simply never fires; every other VI behavior is unaffected. */
+static CPUState* s_vi_cpu = NULL;
 
 void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user) {
     vi->irq = fn;
@@ -22,6 +27,16 @@ void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user) {
 void gcn_vi_set_si_poll_hook(GcnVi* vi, GcnViSiPollFn fn, void* user) {
     vi->si_poll_hook = fn;
     vi->si_poll_user = user;
+}
+
+void gcn_vi_set_field_hook(GcnVi* vi, GcnViFieldFn fn, void* user) {
+    vi->field_hook = fn;
+    vi->field_hook_user = user;
+}
+
+void gcn_vi_set_cpu(GcnVi* vi, CPUState* cpu) {
+    (void)vi;   /* singleton, like s_vi above — one VI instance per process */
+    s_vi_cpu = cpu;
 }
 
 /* ---- derived timing (VideoInterface.cpp GetTicksPerSample /
@@ -100,6 +115,39 @@ static void vi_advance_halfline(GcnVi* vi) {
     int is_at_field_boundary = (old_hl == 0u) || (old_hl == even_field_begin);
     if (vi->si_poll_hook)
         vi->si_poll_hook(vi->si_poll_user, old_hl, is_at_field_boundary);
+
+    /* GCN_THROTTLE=1 (dispatch.c, opt-in): fire the field-pacing hook with the
+     * period of the field that's just starting. old_hl==0 means the ODD field
+     * just started, whose own halfline count is exactly even_field_begin
+     * (that's what "even field begins" means — the odd field's length); the
+     * even field's own length is the other vi_halflines_field() call. Zero
+     * cost when no hook is registered (GcnViFieldFn doc, vi.h). */
+    if (is_at_field_boundary && vi->field_hook) {
+        u32 field_hl = (old_hl == 0u)
+            ? even_field_begin
+            : vi_halflines_field(vi, GCN_VI_VTE_HI, GCN_VI_VTE_LO);
+        double field_period_sec = (double)(vi_ticks_per_halfline(vi) * (u64)field_hl) /
+                                   (double)GCN_VI_CORE_CLOCK;
+        vi->field_hook(vi->field_hook_user, field_period_sec);
+    }
+
+    /* GCN_WINDOW=1 (opt-in, host/host_window.h): hand the native window the
+     * live XFB at each field boundary — the same scanout-geometry query the
+     * debug server's "screenshot" command uses (gcn_vi_xfb_info), with the
+     * identical MEM1-bounds check debug_server.c's screenshot case applies.
+     * gcn_host_window_present copies the bytes out SYNCHRONOUSLY on this
+     * (the main emulation) thread before returning, because the guest may
+     * start overwriting the XFB the moment this call returns. Zero cost and
+     * zero behavior change when GCN_WINDOW is unset (gcn_host_window_enabled
+     * is a cached getenv check; gcn_vi_xfb_info's own outputs are unaffected
+     * either way). */
+    if (is_at_field_boundary && gcn_host_window_enabled() && s_vi_cpu && s_vi_cpu->ram) {
+        u32 fb_addr, fb_w, fb_h, fb_stride;
+        if (gcn_vi_xfb_info(&fb_addr, &fb_w, &fb_h, &fb_stride) &&
+            (u64)fb_addr + (u64)fb_stride * fb_h <= s_vi_cpu->ram_size) {
+            gcn_host_window_present(s_vi_cpu->ram + fb_addr, fb_w, fb_h, fb_stride);
+        }
+    }
 
     vi->half_line_count++;
     if (total == 0 || vi->half_line_count >= total)

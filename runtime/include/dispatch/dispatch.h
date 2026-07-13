@@ -36,4 +36,13 @@ u32 gcn_dispatch_entry(void);
 void      gcn_dispatch_arm_bs1_snapshot(u32 len);
 const u8* gcn_dispatch_bs1_snapshot(u32* len_out);
 
+/* GCN_THROTTLE=1: paces emulated time to wall-clock time. Matches vi.h's
+ * GcnViFieldFn signature exactly so boot.c can wire it straight into
+ * gcn_vi_set_field_hook with no trampoline (`user` is unused). Default OFF
+ * (unset/0 GCN_THROTTLE): the only work this function ever does is one
+ * cached getenv check — no QueryPerformanceCounter, no Sleep, nothing. See
+ * dispatch.c for the pacing math and its fixed-origin (never re-anchored)
+ * policy. */
+void gcn_dispatch_throttle_on_field(void* user, double field_period_sec);
+
 #endif /* GCN_DISPATCH_H */

@@ -16,11 +16,17 @@
 #include "pi/pi.h"            /* deliver pending external interrupts         */
 #include "debug/rings.h"      /* always-on block/PC ring */
 #include "debug/debug_server.h" /* pumped once per block (non-blocking) */
+#include "host/host_window.h" /* GCN_WINDOW=1: quit-requested poll, see below */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <x86intrin.h>   /* __rdtsc — GCN_DISPATCH_STATS attribution only */
+#include <x86intrin.h>   /* __rdtsc / _mm_pause — GCN_DISPATCH_STATS / GCN_THROTTLE */
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>     /* QueryPerformanceCounter/Sleep — GCN_THROTTLE pacing */
+#include <mmsystem.h>    /* timeBeginPeriod — Sleep() granularity, GCN_THROTTLE only
+                          * (winmm; see runtime/CMakeLists.txt gcn_boot link line) */
 
 /* Nominal PPC-cycle budget handed to the DSP per executed block (the DSP core
  * advances ~1/6th of it). A recompiled block is only ~5-10 PPC cycles, so this
@@ -45,6 +51,94 @@
  * VI 27 MHz pixel clock) keep running through a TB write. Deriving device time
  * from the writable TB made the beam jump backward when the IPL rebased it. */
 #define GCN_CORE_CYCLES_PER_BLOCK (GCN_TB_TICKS_PER_BLOCK * 12u)
+
+/* GCN_THROTTLE=1: pace EMULATED time to WALL-CLOCK time. Free-run today runs
+ * ~1.3x real-time (nothing paces the loop against a clock), which makes
+ * interactive sessions play too fast. Default OFF — unset/0 costs exactly
+ * one cached-sentinel int compare per call, no QueryPerformanceCounter, no
+ * Sleep, nothing else.
+ *
+ * Wired as vi.c's per-FIELD pacing hook (vi.h GcnViFieldFn; boot.c registers
+ * this function directly via gcn_vi_set_field_hook — matching signatures,
+ * no trampoline needed), NOT a periodic block-count gate: the hardware's own
+ * presentation boundary is the field, so that's what we pace against. vi.c
+ * computes field_period_sec itself from the VI's own timing-register chain
+ * (ticks-per-halfline * the field's own halfline count / GCN_VI_CORE_CLOCK,
+ * vi.c's call site) — nothing here hardcodes 59.94/50/60 Hz, and a mid-run
+ * VI retiming (PAL/NTSC, interlace change) re-derives correctly next field.
+ *
+ * Correctness over pragmatism: the wall-clock origin is captured ONCE, at
+ * the first field boundary after the throttle arms, and NEVER re-anchored
+ * for the rest of the session — no re-baseline, no sleep-skip-ahead, no
+ * dropped fields. Emulated field time only ever accumulates forward
+ * (target_sec += field_period_sec, every field, unconditionally) against
+ * that fixed origin. If the host stalls and emulation falls behind the fixed
+ * schedule, this simply stops sleeping until wall clock has naturally worked
+ * its way back under target_sec — it never fast-forwards to catch up. */
+static int    s_throttle = -1;              /* cached getenv sentinel: -1 unread, 0/1 */
+static int    s_throttle_armed = 0;         /* wall_start/qpc_freq captured */
+static double s_throttle_target_sec = 0.0;  /* fixed-origin accumulated emulated time */
+static LARGE_INTEGER s_throttle_wall_start;
+static LARGE_INTEGER s_throttle_qpc_freq;
+
+void gcn_dispatch_throttle_on_field(void* user, double field_period_sec) {
+    (void)user;
+    if (s_throttle < 0) {
+        const char* e = getenv("GCN_THROTTLE");
+        s_throttle = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (!s_throttle)
+        return;
+
+    if (!s_throttle_armed) {
+        /* Fixed origin for the WHOLE session — captured once, never touched
+         * again (see the doc comment above). timeBeginPeriod(1) drops
+         * Sleep()'s granularity from the ~15.6ms Windows default to ~1-2ms,
+         * which the sleep-then-spin split below relies on; called once,
+         * lives for the process (Windows reverts a process's timer-
+         * resolution request automatically at exit, so no matching
+         * timeEndPeriod is needed for this one-shot binary). */
+        timeBeginPeriod(1);
+        QueryPerformanceFrequency(&s_throttle_qpc_freq);
+        QueryPerformanceCounter(&s_throttle_wall_start);
+        s_throttle_armed = 1;
+        s_throttle_target_sec = 0.0;
+        return;   /* nothing to pace against on the very first field */
+    }
+
+    s_throttle_target_sec += field_period_sec;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double wall_elapsed = (double)(now.QuadPart - s_throttle_wall_start.QuadPart) /
+                          (double)s_throttle_qpc_freq.QuadPart;
+    double ahead = s_throttle_target_sec - wall_elapsed;   /* >0: emulation ahead of wall clock */
+
+    if (ahead > 0.002) {
+        /* Sleep the bulk of the gap — real Sleep() granularity is ~1.6ms even
+         * with timeBeginPeriod(1), so never sleep past the target — then spin
+         * the final <2ms with _mm_pause for tight, low-power precision. The
+         * sleep is invisible to emulated state by construction: it happens
+         * here, between vi.c firing this hook and vi.c returning to the
+         * dispatch loop, touching no timebase/device-tick state at all. */
+        double sleep_budget = ahead - 0.002;
+        if (sleep_budget > 0.0)
+            Sleep((DWORD)(sleep_budget * 1000.0));
+        for (;;) {
+            QueryPerformanceCounter(&now);
+            wall_elapsed = (double)(now.QuadPart - s_throttle_wall_start.QuadPart) /
+                           (double)s_throttle_qpc_freq.QuadPart;
+            if (s_throttle_target_sec - wall_elapsed <= 0.0)
+                break;
+            _mm_pause();
+        }
+    }
+    /* ahead <= 0.002: on pace, or behind the fixed schedule — never sleep,
+     * never speed up, never re-anchor. A stall (debug-server breakpoint, a
+     * slow device tick) simply stops costing sleeps until wall clock works
+     * its way back under target_sec on its own; the fixed schedule is never
+     * adjusted to compensate. */
+}
 
 /* M1 handoff snapshot (see dispatch.h): armed by boot.c, captured at the first
  * pc==0x81300000 block below. */
@@ -207,6 +301,13 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         if ((blocks & 0xFFu) == 0u) {
             gcn_debug_server_pump();
             if (gcn_debug_server_quit_requested())
+                return 1;
+            /* GCN_WINDOW=1: the host window (host_window.c) sets its quit
+             * flag from WM_CLOSE/WM_DESTROY on its own thread; poll it here,
+             * same cadence as the debug-server quit check above (zero cost
+             * when GCN_WINDOW is unset — gcn_host_window_quit_requested is a
+             * single atomic load of a static that never leaves 0). */
+            if (gcn_host_window_quit_requested())
                 return 1;
         }
         blocks++;

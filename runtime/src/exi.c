@@ -64,24 +64,35 @@ void gcn_exi_set_irq(GcnExi* exi, GcnExiIrqFn fn, void* user) {
  *      CEXIChannel::IsCausingInterrupt:251-267) ----
  * Per channel the line is (EXIINT & EXIINTMASK) || (TCINT & TCINTMASK) ||
  * (EXTINT & EXTINTMASK) from that channel's CSR; the PI line is the OR across
- * all channels. Dolphin also latches EXIINT from a device's IsInterruptSet()
- * (memcards / the ch0-dev4 -> ch2 mapping); no device asserts EXIINT in this
- * milestone (memcards are M4), so we OR only the modeled CSR bits — a real
- * memcard interrupt would surface here when that device lands. Pushed to PI on
+ * all channels. A device's own IsInterruptSet() (the memcards' command-done
+ * latch) is first REGISTERED into that channel's EXIINT CSR bit, exactly as
+ * Dolphin does — see the load-bearing comment inside the loop. Pushed to PI on
  * EVERY evaluation (PI INTSR is W1C, so a still-asserted level must re-appear). */
 static void exi_update_interrupts(GcnExi* exi) {
     int level = 0;
     for (u32 ch = 0; ch < GCN_EXI_CHANNELS; ch++) {
-        u32 csr = exi->channels[ch].csr;
-        int exiint = (csr & GCN_EXI_CSR_EXIINT) ? 1 : 0;
         /* M4: on channels 0/1 the memory card's own command-done interrupt
-         * (armed by SetInterrupt, latched by an erase/program) feeds EXIINT
-         * unconditionally — "Always check memcard slots" (EXI_Channel.cpp:253,
-         * IsCausingInterrupt). This is the interrupt the CARD flash driver waits
-         * on after a write/erase. */
+         * (armed by SetInterrupt, latched by an erase/program) is REGISTERED
+         * INTO THE CHANNEL'S EXIINT CSR BIT — EXI_Channel.cpp:253
+         * IsCausingInterrupt, literally "interrupt of device 0 is registered
+         * in EXIINT" — not merely ORed into the PI line. The distinction is
+         * load-bearing: the IPL's EXI interrupt dispatcher reads each
+         * channel's CSR to FIND the interrupt source and W1C-ack it there;
+         * feeding the line without latching the CSR bit asserts PI INTSR's
+         * EXI cause while every CSR reads clean, so the guest can neither
+         * locate nor ack the cause and spins in its dispatcher forever. Hit
+         * live by the card manager's copy flow: the erase-complete interrupt
+         * on the card-B channel hung the copy at PC 0x81336BC8 (INTSR=0x10
+         * pending, ch1 CSR EXIINT=0 — diagnosed from the always-on MMIO +
+         * card-traffic rings). A W1C ack while the DEVICE latch is still up
+         * re-registers on the next evaluation, exactly like Dolphin; the
+         * device latch itself drops on the SDK's CLEAR_STATUS (0x89)
+         * command (memcard.c). */
         if (ch < 2u && exi->card[ch] && gcn_memcard_interrupt_set(exi->card[ch]))
-            exiint = 1;
-        if ((exiint && (csr & GCN_EXI_CSR_EXIINTMASK)) ||
+            exi->channels[ch].csr |= GCN_EXI_CSR_EXIINT;
+
+        u32 csr = exi->channels[ch].csr;
+        if (((csr & GCN_EXI_CSR_EXIINT) && (csr & GCN_EXI_CSR_EXIINTMASK)) ||
             ((csr & GCN_EXI_CSR_TCINT)  && (csr & GCN_EXI_CSR_TCINTMASK))  ||
             ((csr & GCN_EXI_CSR_EXTINT) && (csr & GCN_EXI_CSR_EXTINTMASK)))
             level = 1;

@@ -126,6 +126,7 @@ if(GCN_WITH_GENERATED)
     src/gx_raster.c
     src/rings.c
     src/debug_server.c
+    src/host_window.c
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )
@@ -137,6 +138,10 @@ if(GCN_WITH_GENERATED)
   # ws2_32: Winsock for the TCP debug server (debug_server.c).
   # synchronization: WaitOnAddress/WakeByAddressAll for the GX-MT worker
   # pool's hybrid spin/sleep wait (gx_raster.c).
+  # winmm: timeBeginPeriod for GCN_THROTTLE's Sleep() granularity (dispatch.c).
+  # user32/gdi32: window class/message pump + StretchDIBits for the opt-in
+  # GCN_WINDOW=1 native display window (host_window.c).
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
-                         ipl_descramble_core ws2_32 synchronization)
+                         ipl_descramble_core ws2_32 synchronization winmm
+                         user32 gdi32)
 endif()
