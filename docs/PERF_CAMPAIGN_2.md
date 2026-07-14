@@ -204,3 +204,32 @@ fused table; 36.8% versus the original interpreter**). Whole-boot interleaved
 A/B for DSP-only LTO was 3.533 s to 3.401 s by average (3.7%) and 3.552 s to
 3.385 s by median (4.7%). The pinned 24M derived framebuffer remained
 `bea0d67fb1dbba07be06c815c5c4d451`; no firmware work is skipped.
+
+## Static fused GX row scanners rejected (2026-07-13)
+
+The next measured GX experiment removed the remaining per-pixel indirect call
+through `s_cfg.fused`. Six statically-bound A--F row scanners were selected once
+per triangle; object-code audit confirmed direct calls to the matching fused
+shader and zero indirect calls inside those pixel loops. The complete generic
+path remained available in the same binary behind `GCN_GX_STATIC_FUSED=0`.
+
+An adversarial thread audit caught and prevented a stale-worker design error
+before benchmarking: a worker must claim a row from the packed, versioned fork
+word before reading the job's scanner, because a late worker may help a newer
+fork. The corrected experiment observed that publication rule and passed exact
+same-binary gates:
+
+- uniform 5M, feature off and on: `fee16a8b6143e82698169b9bfba77801`;
+- derived 24M, feature on twice: `bea0d67fb1dbba07be06c815c5c4d451`.
+
+The performance result was negative. Twelve normal-priority 12M-derived boots
+used an `off,on,on,off` pattern repeated three times (six samples per mode):
+
+- off: min 3.364487 s, median 3.480585 s, average 3.519462 s;
+- on: min 3.434695 s, median 3.668312 s, average 3.649723 s;
+- enabled was 3.701% slower by average and 5.394% slower by median; off won
+  4/6 adjacent comparisons and 2/3 ABBA blocks.
+
+The cloned scanner hot text/i-cache cost outweighed removal of the indirect
+pixel call. The entire experiment and knob were removed; no dormant branch,
+row indirection, or specialized scanner remains in the runtime.
