@@ -11,6 +11,11 @@ DSPStacks, DSPAnalyzer, DSPCaptureLogger, and `Interpreter/` (Int{Arithmetic,
 Multiplier,ExtOps,Branch,LoadStore,Tables,CCUtil}). Excluded: `Jit/` (we use the
 interpreter — deterministic), Assembler/Disassembler (not needed to execute).
 
+The release/dev build uses GCC LTO on this small C++ library only
+(`GCN_DSP_LTO=ON`, disable-able). It lets the compiler inline between the
+interpreter's opcode-family translation units; it is not a DSP JIT and does
+not skip or replace firmware instructions.
+
 Integration (net-new, ours):
 - `host.cpp` implements the `DSP::Host::*` callbacks against the runtime's MEM1
   (ReadHostMemory/WriteHostMemory/DMAToDSP/DMAFromDSP) and PI (InterruptRequest).

@@ -8,6 +8,7 @@
 #include "Core/DSP/DSPCore.h"
 #include "Core/DSP/DSPTables.h"
 #include "Core/DSP/Interpreter/DSPInterpreter.h"
+#include "Core/DSP/Interpreter/DSPIntTables.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -55,6 +56,10 @@ void dsp_lle_init(const uint8_t* irom_be, const uint8_t* coef_be,
   // ExecuteInstruction(). (The interpreter's own function-pointer tables are a
   // separate array initialized by the Interpreter ctor.)
   InitInstructionTable();
+  // Fuse the template's extension bit with the interpreter's main/extension
+  // handlers. ExecuteInstruction then needs one opcode-indexed lookup instead
+  // of three independent tables on every real DSP instruction.
+  Interpreter::FinalizeInstructionTables();
   g_core->SetState(State::Running);
 }
 

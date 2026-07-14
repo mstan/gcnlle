@@ -10,6 +10,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # the default runtime build catches breakage; linked into gcn_boot.
 add_subdirectory(dsp_lle)
 
+# The DSP interpreter is split across the opcode-family translation units in
+# dsp_lle/Core/DSP/Interpreter. GCC otherwise cannot inline through those TU
+# boundaries, leaving a member-function call for every real firmware
+# instruction. LTO only this small C++ library (NOT the 100+ giant generated
+# PPC C chunks), then enable the linker plugin on gcn_boot below. This remains
+# genuine LLE: every DSP instruction and cycle is still executed. On the IPL
+# derived workload it reduced the interpreter's measured ns/instruction by
+# roughly 27% on top of the fused dispatch table. Disable for compiler/debug
+# troubleshooting with -DGCN_DSP_LTO=OFF.
+option(GCN_DSP_LTO "Use GCC LTO for the vendored DSP-LLE interpreter only" ON)
+if(GCN_DSP_LTO AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(gcn_dsp_lle PRIVATE -flto=auto)
+endif()
+
 # M1: the vendored segher IPL descrambler (tools/ipl_descramble/descramble_core.c)
 # as its OWN existing CMake target (ipl_descramble_core) — reused verbatim by
 # gcn_boot's EXI model (exi.c gcn_exi_set_rom_scrambled) rather than recompiled
@@ -173,6 +187,9 @@ if(GCN_WITH_GENERATED)
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm
                          user32 gdi32 opengl32)
+  if(GCN_DSP_LTO AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(gcn_boot PRIVATE -flto=auto)
+  endif()
 
   # E2 (perf campaign 2): profile-guided optimization. The boot is fully
   # deterministic, which makes it an ideal PGO training input, and the

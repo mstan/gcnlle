@@ -11,7 +11,15 @@ class Interpreter;
 
 using InterpreterFunction = void (Interpreter::*)(UDSPInstruction);
 
+struct DecodedInterpreterOp
+{
+  InterpreterFunction main;
+  InterpreterFunction extension;
+};
+
 InterpreterFunction GetOp(UDSPInstruction inst);
 InterpreterFunction GetExtOp(UDSPInstruction inst);
+const DecodedInterpreterOp& GetDecodedOp(UDSPInstruction inst);
 void InitInstructionTables();
+void FinalizeInstructionTables();
 }  // namespace DSP::Interpreter

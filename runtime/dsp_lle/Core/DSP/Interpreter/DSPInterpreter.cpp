@@ -50,16 +50,16 @@ Interpreter::~Interpreter() = default;
 
 void Interpreter::ExecuteInstruction(const UDSPInstruction inst)
 {
-  const DSPOPCTemplate* opcode_template = GetOpTemplate(inst);
+  const DecodedInterpreterOp& decoded = GetDecodedOp(inst);
 
-  if (opcode_template->extended)
+  if (decoded.extension)
   {
-    (this->*GetExtOp(inst))(inst);
+    (this->*decoded.extension)(inst);
   }
 
-  (this->*GetOp(inst))(inst);
+  (this->*decoded.main)(inst);
 
-  if (opcode_template->extended)
+  if (decoded.extension)
   {
     ApplyWriteBackLog();
   }

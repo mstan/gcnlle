@@ -239,7 +239,9 @@ namespace
 {
 std::array<InterpreterFunction, 65536> s_op_table;
 std::array<InterpreterFunction, 256> s_ext_op_table;
+std::array<DecodedInterpreterOp, 65536> s_decoded_op_table;
 bool s_tables_initialized = false;
+bool s_decoded_table_initialized = false;
 }  // Anonymous namespace
 
 InterpreterFunction GetOp(UDSPInstruction inst)
@@ -255,6 +257,11 @@ InterpreterFunction GetExtOp(UDSPInstruction inst)
     return s_ext_op_table[inst & 0x7F];
 
   return s_ext_op_table[inst & 0xFF];
+}
+
+const DecodedInterpreterOp& GetDecodedOp(UDSPInstruction inst)
+{
+  return s_decoded_op_table[inst];
 }
 
 void InitInstructionTables()
@@ -287,5 +294,21 @@ void InitInstructionTables()
   }
 
   s_tables_initialized = true;
+}
+
+void FinalizeInstructionTables()
+{
+  if (s_decoded_table_initialized)
+    return;
+
+  for (size_t i = 0; i < s_decoded_op_table.size(); ++i)
+  {
+    const auto inst = static_cast<UDSPInstruction>(i);
+    const bool extended = GetOpTemplate(inst)->extended;
+    s_decoded_op_table[i] = {
+        s_op_table[i], extended ? GetExtOp(inst) : InterpreterFunction{}};
+  }
+
+  s_decoded_table_initialized = true;
 }
 }  // namespace DSP::Interpreter
