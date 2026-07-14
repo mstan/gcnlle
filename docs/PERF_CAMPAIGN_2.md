@@ -290,9 +290,21 @@ Normal-priority interleaved ABBA testing at 12M derived blocks measured:
 
 This is a real, exact win and is the accepted release build configuration.
 It does not close the strict derived-timing target: that mode remains roughly
-0.50--0.55x real time on this host. Default uniform timing remains faster than
-real time and can sustain the throttled 60 FPS IPL UI. The next value-compatible
-architectural candidate is event-deadline device servicing: execute every guest
-instruction, but service devices at their earliest real observable event rather
-than every fixed 96-cycle return. Idle skipping and result skipping remain
-forbidden.
+0.50--0.55x real time by the earlier block-budget estimate. That estimate is
+not a frame-rate measurement and must not be used to claim a real-time UI.
+
+A subsequent current-PGO windowed acceptance measured 5,787 firmware
+`GXSetDrawDone` completions over 605.769 wall seconds: **9.55 FPS** in default
+uniform mode. A separate 60.008-second unthrottled, headless derived-mode run
+measured 1,219 completions: **20.31 FPS**. The throttle does not sleep when the
+runtime is behind, so neither result is a pacing artifact. Calendar time in the
+uniform run advanced only 9 displayed seconds across 60 wall seconds, an
+independent visible confirmation of the shortfall.
+
+Current uniform attribution at 12M blocks is GX 55.2%, DSP 19.4%, recompiled
+CPU 15.1%, VI 4.4%, AI 3.0%, and DI 2.9%. Therefore the 60 FPS goal is **not
+met**, and GX cadence/software raster work is the first performance priority.
+An event-deadline feasibility audit found that active GX, DI, DSP/AID,
+timebase, and in-call MMIO are fixed fences today; only measurement counters
+are justified before any deadline change. Idle skipping and result skipping
+remain forbidden.
