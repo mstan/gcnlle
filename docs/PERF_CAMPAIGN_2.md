@@ -233,3 +233,32 @@ used an `off,on,on,off` pattern repeated three times (six samples per mode):
 The cloned scanner hot text/i-cache cost outweighed removal of the indirect
 pixel call. The entire experiment and knob were removed; no dormant branch,
 row indirection, or specialized scanner remains in the runtime.
+
+## DSP PC-indexed decoded-op cache rejected (2026-07-14)
+
+A compact PC-indexed DSP dispatch cache was measured and rejected. The
+existing fused decoded-op table occupies 2 MiB because each decoded opcode
+contains two 16-byte C++ member-function pointers. The experiment copied all
+4,096 IRAM and 4,096 IROM entries into a 256 KiB per-core table, rebuilt it on
+initialization and every existing `CodeLoaded` invalidation, and selected it
+behind `GCN_DSP_PC_DECODE=1`. Every firmware instruction, operand fetch, cycle,
+memory access, and interrupt remained present.
+
+Adversarial review caught a re-entrant invalidation hazard before gating: a DSP
+handler can synchronously start IDMA through an IFX write, rebuilding the cache
+while the current instruction is executing. The gated prototype first
+snapshotted both handlers by value, and object-code review also forced the helper
+back inline so the A/B did not add a host call to every DSP instruction.
+
+Same-binary exactness held: uniform 5M OFF and ON both produced
+`fee16a8b6143e82698169b9bfba77801`; derived 24M ON repeated produced
+`bea0d67fb1dbba07be06c815c5c4d451`. Twelve normal-priority 12M-derived boots
+used OFF,ON,ON,OFF repeated three times:
+
+- OFF: min 3.904915 s, median 4.032773 s, average 4.013476 s;
+- ON: min 3.933949 s, median 4.503864 s, average 4.394414 s;
+- enabled was 9.491% slower by average and 11.682% slower by median;
+- OFF won 5/6 adjacent comparisons and all three ABBA blocks.
+
+The smaller table did not offset its larger hot dispatch path and extra cache
+footprint. The implementation and environment knob were removed completely.
