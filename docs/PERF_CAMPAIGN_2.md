@@ -463,6 +463,40 @@ entire dispatcher; its expected whole-runtime ceiling is below 1%, so it is not
 worth a regen/prototype before higher-ceiling work. All temporary counters were
 removed after the measurement.
 
+## Generated RAM fast-path layout experiments (2026-07-14)
+
+A second temporary dispatcher counter identified the exact generated entry
+responsible for most derived-mode invocations. At 11,534,336 invocations,
+guest PC `0x813388DC` accounted for 9,491,685 (82.29%). It is the three-cycle
+IPL polling loop `lwz r0,-31112(r13); cmplwi r0,0; beq 0x813388DC`, reading
+cached MEM1 address `0x8145D998` until the scheduler deadline. This is real
+guest work and cannot be collapsed or replaced by a result-skipping poll.
+
+The accepted generated object placed the cached RAM-hit body roughly 270 KiB
+from that loop through GCC tail sharing. Compiler-layout probes did not solve
+it: `-fno-reorder-blocks-and-partition` was a no-op,
+`-fno-tree-tail-merge` retained a distant shared body, and
+`-fno-crossjumping` enlarged the hot object by 7.6% and was dramatically slower
+in a loaded ABBA probe. All three flags were removed.
+
+An emitter prototype then normalized the exactly equivalent physical/cached/
+uncached MEM1 windows to one low-30-bit offset predicate while rejecting only
+tag `01`. A boundary test covered widths 1/2/4/8, every top-bit segment, and
+the last valid/out-of-range offsets; all 12 recompiler tests passed. After the
+required three-stage uniform-pinned regeneration, the candidate shrank the
+hot object from 2,561,428 to 2,526,802 bytes and the executable from
+274,011,963 to 263,397,691 bytes. The uniform 5M XFB still matched
+`fee16a8b6143e82698169b9bfba77801`.
+
+The intended local layout did not materialize: disassembly still branched from
+the hot loop at host offset `0x229e` to a shared RAM-hit body at `0x35c48`.
+More importantly, a clean high-priority derived 12M ABBA comparison measured
+accepted baseline `3.724596 / 3.863204` seconds versus candidate
+`4.226861 / 4.076709` seconds. Min-of-pair regressed 9.45%. The normalization
+and its test were therefore removed despite the code-size reduction and first
+golden pass. No generated source was hand-edited, and no optimization from this
+experiment is retained.
+
 ## DSP dynamic block-shape profile (2026-07-14)
 
 The guarded DSP basic-block candidate first received a profiling-only pass in
