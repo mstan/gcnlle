@@ -345,3 +345,38 @@ growth were removed before the baseline rebuild; no dormant branch remains.
 Future raster work must reduce arithmetic across multiple pixels (compact SIMD)
 or amortize existing fork/join work without cloning scanners, not add another
 scalar memo layer.
+
+## Per-pixel bilinear RGBA SIMD accepted opt-in (2026-07-14)
+
+The next candidate stayed inside one texture sample: after the original four
+cache/decode calls complete in their original order, SSE2 performs the four
+independent RGBA bilinear sums together. Each texel byte is 0--255, each weight
+is 0--16384, and the weights sum to 16384, so `pmaddwd` produces the same
+non-negative result with a maximum accumulator of 4,177,920. A logical shift by
+14 and non-saturating-in-range packs reproduce the scalar bytes exactly. No
+texture read, pixel, TEV, blend, dither, or EFB-write ordering changes.
+
+`GCN_GX_TEX_SIMD=1` opts in; unset and an explicit `=0` retain the scalar path.
+The value is resolved once in `gx_raster_init`, before GX pipeline or GX-MT
+workers exist. An adversarial review caught and corrected an initial presence-
+only environment check which would have treated `=0` as enabled. Disassembly
+then confirmed the value check and the intended two-`pmaddwd` kernel.
+
+A same-binary derived 12M `OFF,ON,ON,OFF` sequence repeated three times found:
+
+- OFF: min 4.213724 s, median 4.595375 s, average 4.590374 s;
+- ON: min 4.245877 s, median 4.373285 s, average 4.401089 s;
+- ON was 4.833% faster by median and 4.124% faster by average;
+- ON won 5/6 adjacent comparisons and all three ABBA block means.
+
+All twelve runs were high priority, RC 0, and exception-free. The full pinned
+XFB matrix then passed: uniform 5M/8M, derived 24M/56M with both derived cases
+repeated, plus derived 24M controls for one worker, eight workers, synchronous
+GX, and the general non-fused TEV path. Explicit `=0` and `=1` uniform checks
+also matched. Oracle value/order results remained uniform `19355/3` and derived
+`19354/4`, with only the established terminal PI reorder.
+
+The implementation remains opt-in at this checkpoint. Because same-binary OFF
+still executes one predictable hot-path test, the default-on decision requires
+an interleaved comparison against a genuinely pre-change build rather than
+treating the same-binary delta as the final campaign score.
