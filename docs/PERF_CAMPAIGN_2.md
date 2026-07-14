@@ -462,3 +462,40 @@ switch could remove only a table lookup and indirect call while retaining the
 entire dispatcher; its expected whole-runtime ceiling is below 1%, so it is not
 worth a regen/prototype before higher-ceiling work. All temporary counters were
 removed after the measurement.
+
+## DSP dynamic block-shape profile (2026-07-14)
+
+The guarded DSP basic-block candidate first received a profiling-only pass in
+the unchanged interpreter `Step()` path. It counted dynamic block lengths,
+instruction coverage, control-flow outcomes, memory region, and hot entries;
+it did not cache, substitute, skip, or reorder any DSP instruction. A corrected
+second run classified indirect branches by opcode family rather than Dolphin's
+broader `reads_pc` metadata flag.
+
+At the last complete report (14,680,064 executed DSP instructions), 2,993,279
+blocks had completed. Block counts for lengths 1 / 2 / 3 / 4 / 5--8 / 9--16 /
+17+ were:
+
+`712,946 / 33,980 / 200,465 / 618,720 / 985,419 / 419,582 / 22,167`.
+
+The corresponding executed-instruction counts were:
+
+`712,946 / 67,960 / 601,395 / 2,474,880 / 5,478,377 / 4,853,645 / 490,856`.
+
+Thus length-4+ blocks covered 90.58% of completed dynamic instructions;
+length-4--8 blocks alone covered 54.18%, length-9--16 covered 33.06%, and
+length-17+ only 3.34%. Execution was almost entirely downloaded IRAM:
+14,679,882 IRAM instructions versus 182 IROM instructions. Observed control
+flow included 520,489/130,090 taken/not-taken direct conditionals, 316,631
+direct unconditional branches, 248,302 indirect/call-return branches, and
+1,777,871 hardware-loop edges; there were no exception entries during the
+measured window and one halt transition. The hottest block entries were
+`0031`, `034b`, `01c1`, `0124`, `015e`, `0191`, `0334`, and `036e`.
+
+The coverage justifies auditing a true native block compiler, but not the
+initial descriptor-cache sketch. A descriptor would still indirect-call the
+same fused handlers and repeat the extra per-PC cache footprint whose earlier
+prototype regressed average runtime by 9.491%. The complete Dolphin x64 DSP JIT
+already present in the local oracle source is the relevant LLE reference; it
+must pass a separate dependency and exactness audit before any import. The
+temporary profiler was removed completely after these measurements.
