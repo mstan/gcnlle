@@ -499,3 +499,44 @@ prototype regressed average runtime by 9.491%. The complete Dolphin x64 DSP JIT
 already present in the local oracle source is the relevant LLE reference; it
 must pass a separate dependency and exactness audit before any import. The
 temporary profiler was removed completely after these measurements.
+
+## Dolphin x64 DSP JIT rejected as an import (2026-07-14)
+
+The complete x64 DSP JIT in the local Dolphin oracle tree was audited after the
+block-shape profile. Licensing and the LLE floor are not the problem: it compiles
+the real DSP ISA/ucode, shares the same hardware-interface methods, and falls
+back to interpreter handlers for unsupported main and extension operations.
+Its execution contract is nevertheless not equivalent to the interpreter
+contract this project validates.
+
+Decisive value/order blockers in the unmodified JIT are:
+
+- a compiled basic block retires before its size is subtracted from the cycle
+  budget, so a grant ending inside a block over-executes register, memory,
+  mailbox, DMA, and interrupt-visible effects;
+- `RunCycles` narrows the budget to 16 bits;
+- analyzer idle blocks substitute a 0x1000-cycle charge instead of executing
+  all granted instructions;
+- an IFX-triggered IDMA can invalidate IRAM re-entrantly while the currently
+  executing host block continues through stale instructions;
+- native HALT leaves a different PC/call-stack result than the interpreter;
+- exception checks and SR updates rely on static analyzer placement rather
+  than preserving the interpreter's per-instruction state/check sequence;
+- JIT execution does not advance the DSP instruction step counter;
+- an unsupported-host factory path can create a null emitter which consumes
+  no DSP work if the x64 build macro is wrong.
+
+The dependency closure itself is tractable but not small: roughly 6,639 lines
+of DSP JIT sources plus 4,825 lines of x64 emitter/common support, executable
+memory handling, CPU-feature plumbing, CMake integration, and an environment-
+gated core selection. That does not address the semantic blockers.
+
+Making this acceptable would require exact mid-block budget tails, full-width
+budget handling, immediate IRAM-generation exits, interpreter-identical HALT,
+per-instruction exceptions/SR/step counting, no idle substitution or block
+linking initially, and a new one-cycle interpreter/JIT differential harness
+covering all opcodes, budget partitions, IDMA self-modification, loops, mailbox/
+IFX order, and interrupts. Against the measured ~10.8% perfect whole-runtime
+ceiling for the interpreter loop, that is a high-risk recompiler project rather
+than a cost-effective optimization. The JIT is therefore rejected as an import;
+no source or build changes were made.
