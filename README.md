@@ -9,14 +9,20 @@ disc-load screen. Exactly what PSXRecomp does for the PlayStation BIOS.
 
 ## Status
 
-Early scaffold.
+IPL milestones M0–M5 are complete: the recompiled boot ROM reaches and runs
+the native menu, including the rolling-cube animation, calendar, memory-card
+manager, options, and disc-detection screen.
 
-- `recompiler/` — **builds green (10/10 tests)**. Fork of
+- `recompiler/` — **builds green (12/12 tests)**. Fork of
   [ExpansionPak/DolRecomp](https://github.com/ExpansionPak/DolRecomp), a
-  PowerPC (Gekko/Broadway) → C static recompiler, being retargeted from game
-  DOLs to the IPL. See `recompiler/UPSTREAM.md`.
-- `runtime/` — LLE host skeleton (compiles a placeholder). Device models to
-  come: MEM1, EXI (RTC/SRAM/memory cards), VI, GX, DSP/AI, DI, SI.
+  PowerPC (Gekko/Broadway) → C static recompiler retargeted to the IPL. See
+  `recompiler/UPSTREAM.md`.
+- `runtime/` — LLE models for MEM1, EXI/RTC/SRAM/memory cards, VI, GX,
+  DSP/AI, DI, and SI, validated against byte-exact frame-buffer goldens and
+  Dolphin MMIO traces.
+- Uniform-cycle interactive boots run in real time. Derived-cycle performance
+  work remains active; statically recompiled commercial-game execution is
+  intentionally out of the current scope.
 - `bios/` — you supply your own `ipl.bin` dump (not distributed).
 - `oracle/` — Dolphin as the independent differential oracle.
 - `tools/` — decomp-toolkit (`dtk`) for binary/disc wrangling.

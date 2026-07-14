@@ -44,6 +44,9 @@
  *                      retain the pinned XFB/oracle results; live VI capture,
  *                      debug RAM access, FIFO reset, and shutdown join before
  *                      observing or releasing worker-produced state.
+ *   GCN_DSP_THREAD     experimental DSP-core worker. Default is the exact,
+ *                      synchronous LLE path; "1" opts into overlap whose DSP
+ *                      interrupt publication can depend on host scheduling.
  *
  *   GCN_BOOT_BS1       [M1] "1" switches to the REAL BS1 boot: argv[1] is now
  *                      the RAW SCRAMBLED bios/ipl.bin (not a pre-descrambled

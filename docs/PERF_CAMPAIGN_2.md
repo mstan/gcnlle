@@ -135,3 +135,72 @@ next campaign phase; G2 tile tuning is the smaller follow-up.
 - -O3 / -fno-jump-tables / crossjumping flags: measured honest negatives in
   Phase D.
 - Whole-program `restrict ctx`: soundness (above).
+
+## G3 finalized + G2 result (2026-07-13, `70e2b80` follow-up)
+
+Final-source G3 A/B on the plain RelWithDebInfo build, 12M derived blocks,
+HIGH-priority interleaved 8-run sequence:
+
+- synchronous: min 4.116 s, median 4.457 s, average 4.540 s;
+- pipeline: min 3.723 s, median 3.854 s, average 3.839 s;
+- average whole-boot improvement: **15.5%** (every pipeline sample beat every
+  synchronous sample).
+
+The host was under variable background load, so this establishes direction and
+default-worthiness rather than a clean final scoreboard. G3 is now default on;
+`GCN_GX_PIPELINE=0` retains the synchronous diagnostic path. Before the flip,
+the default path held all four pinned XFB hashes (derived 24M/56M repeated),
+both oracle counts, 10 repeated clean shutdowns, and interactive window/debug
+capture. An adversarial thread audit found and fixed the publication gaps that
+the initial opt-in gates did not cover: live VI field capture and debug RAM
+access now drain, shutdown drains/quits/joins before RAM teardown, worker
+failure cannot become an infinite wait, and the idle worker uses a changed
+wake epoch so `WakeByAddressAll` cannot be lost.
+
+G2 was measured and rejected rather than landed. All 8x8, 16x16, 32x8 and
+32x16 tile shapes produced the exact 5M golden, but none beat the existing
+dynamic full-width 2-pixel-row scheduler; 32-wide tiles were clearly worse.
+Grouped row claims of 2/4/8 also lost to one-row claims as load imbalance grew.
+Raster participant counts 4/6/7/8 did not justify reserving a core; 8 remained
+best on average. The experimental tile/claim code was removed completely.
+
+The next honest scoreboard is the current-source PGO retrain stacked with
+default G3. Remaining class-level candidates, in measurement order, are:
+profile-fed PPC hot-region/direct-exit emission, a guarded DSP basic-block
+compiler with interpreter fallback, and integer-only SIMD within fully covered
+fused raster spans. None is authorized to skip LLE work or alter publication
+timing; each needs an env-gated micro A/B before a full gate campaign.
+
+## Determinism correction + DSP interpreter work (2026-07-13)
+
+A longer adversarial stress matrix found two rare framebuffer/CPU-state
+outliers with the asynchronous DSP worker. The worker published a DSP-to-CPU
+interrupt whenever the host worker happened to reach it, so architectural
+visibility could move with host scheduling even though ordinary golden runs
+usually passed. A deterministic publication experiment changed the pinned
+24M derived framebuffer and was rejected rather than re-pinned. The result is
+deliberate: synchronous DSP-LLE is again the default, and
+`GCN_DSP_THREAD=1` is an explicitly experimental diagnostic/performance path.
+
+The last complete current-source PGO cycle before the DSP source changed gave
+the following noisy but fully interleaved 12M derived result:
+
+- plain: min 3.643 s, median 4.272 s, average 4.236 s;
+- PGO: min 3.295 s, median 3.771 s, average 3.720 s;
+- average improvement: **12.2%**, with every paired PGO run winning.
+
+PGO attribution was block-exec 51.2%, DSP 21.0%, GX 19.6%, and other devices
+8.2%. That PGO executable is now stale and is evidence only; the final release
+must be retrained after the current source and regenerated PPC output settle.
+
+Two exact DSP interpreter optimizations followed. First, the main handler,
+extension handler, and extension-presence flag were fused into one decoded
+opcode-table lookup. Across three identical 12M derived runs, the interpreter
+executed exactly 15,141,752 instructions each time while its cumulative core
+time fell from about 580 ms to 503 ms (**13.2% inside DSP**). Second, GCC LTO
+was scoped only to the small vendored DSP C++ library, never the giant generated
+PPC chunks. The same instruction count then took 366.6 ms (**27.2% beyond the
+fused table; 36.8% versus the original interpreter**). Whole-boot interleaved
+A/B for DSP-only LTO was 3.533 s to 3.401 s by average (3.7%) and 3.552 s to
+3.385 s by median (4.7%). The pinned 24M derived framebuffer remained
+`bea0d67fb1dbba07be06c815c5c4d451`; no firmware work is skipped.
