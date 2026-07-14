@@ -308,3 +308,40 @@ An event-deadline feasibility audit found that active GX, DI, DSP/AID,
 timebase, and in-call MMIO are fixed fences today; only measurement counters
 are justified before any deadline change. Idle skipping and result skipping
 remain forbidden.
+
+## GX characterization and bilinear reuse rejected (2026-07-14)
+
+Fresh current-binary profiling resolved the measured UI bottleneck. At a
+matched 10,485,760 synchronous GX ticks, uniform and derived modes respectively
+spent 94.1% and 93.7% of GX time drawing; FIFO plus decode was only 0.8% and
+1.0%, and EFB copy/clear was 5.1% and 5.4%. Triangle scan/pixel work was
+93.3--94.2% of draw time, with the largest `2^14` bounding-box bucket alone
+accounting for roughly 74% of triangle time. At least 99.2% of enabled GX ticks
+drained no FIFO chunk, but empty-call removal cannot solve the derived-mode
+raster ceiling and changing cadence would alter current CP/PE timing.
+
+The first exact raster candidate added an opt-in, per-worker memo of the
+immediately previous bilinear 2x2 texel footprint. It retained draw generation,
+texmap, all four wrapped coordinates, and exact RGBA bytes; identical footprints
+avoided four probes into the existing per-draw texel cache, and a one-texel
+right shift reused the old right column while obtaining the new column through
+the original cache path. Pixel, TEV, blend, EFB-write, command, and first-use
+decode order stayed unchanged.
+
+The overlap was real: a derived 12M diagnostic observed 14,656,205 bilinear
+samples, with 36.350% identical-footprint reuse and 27.751% right-shift reuse.
+It avoided 29,444,406 of 58,624,820 logical large-cache probes (50.225%). The
+wall result was nevertheless negative. A same-binary `OFF,ON,ON,OFF` sequence
+repeated three times measured:
+
+- OFF: min 4.035304 s, median 4.314476 s, average 4.298559 s;
+- ON: min 4.286930 s, median 4.477838 s, average 4.471011 s;
+- ON was 3.786% slower by median and 4.012% slower by average;
+- OFF won 4/6 adjacent comparisons and all three ABBA blocks.
+
+The extra hot-path comparisons and footprint copies cost more than the avoided
+cache probes. The entire implementation, knob, counters, ABI fields, and object
+growth were removed before the baseline rebuild; no dormant branch remains.
+Future raster work must reduce arithmetic across multiple pixels (compact SIMD)
+or amortize existing fork/join work without cloning scanners, not add another
+scalar memo layer.
