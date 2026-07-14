@@ -147,7 +147,7 @@ static int note_once(u8* flag) {
 }
 
 /* ============================================================================
- * G3: CPU/GX pipeline (GCN_GX_PIPELINE=1, perf campaign 2 — see
+ * G3: CPU/GX pipeline (default on; GCN_GX_PIPELINE=0 disables — see
  * docs/PERF_CAMPAIGN_2.md and the recon notes therein).
  *
  * The split that keeps this exact: the CP FIFO STATE MACHINE is pure
@@ -178,10 +178,10 @@ static int note_once(u8* flag) {
  * POISONS the pipeline: drain fully, hand the staging leftover back to the
  * CPU (scanner carry == worker leftover by construction: both are "bytes
  * past the last whole top-level command"), and run synchronously from then
- * on, loudly. The IPL never emits top-level primitives (all 994 observed
- * draws live inside display lists — docs/GX_INVENTORY.md), so the boot
- * never poisons; a future game that does gets bit-exact sync behavior and
- * a log line instead of silent risk.
+ * on, loudly. The IPL also emits one top-level 4-vertex quad per frame, so
+ * this is a recoverable sync-mode handoff: drain, execute that stretch on
+ * the CPU, re-seed the scanner from the leftover, then resume pipelining.
+ * A future unsizable command gets the same exact fallback, never a guess.
  *
  * Deliberate, gate-arbitrated residual (same class the DSP thread ships
  * with, and the same model Dolphin's dual-core uses): CALL_DL bytes,
@@ -191,10 +191,9 @@ static int note_once(u8* flag) {
  * synchronous consumption — the four golden XFB hashes (repeat-run
  * deterministic) + the oracle value+order diff are the arbiters, exactly
  * as they were for GCN_DSP_THREAD. EFB->XFB copies also land in guest RAM
- * from the worker: the end-of-run drain (boot.c, before GCN_MEM_DUMP), the
- * debug-server screenshot drain, and the fifo-reset drain keep every
- * gate-visible reader exact; the mid-run host-window present may see a
- * field one frame stale, which is a visual non-event.
+ * from the worker: live VI field capture, end-of-run/shutdown, debug RAM and
+ * screenshot access, and fifo reset all drain first so they never race or
+ * observe a partially-written field.
  * ==========================================================================*/
 static u32 rd32(const u8* p);                                    /* defined below */
 static u32 gx_run(GcnGx* gx, const u8* data, u32 available);     /* defined below */
@@ -210,9 +209,11 @@ static volatile s64 s_pipe_done_upto = 0;  /* worker: produced-offset it has ful
                                             * wait on THIS, not on retired. */
 static volatile s32 s_pipe_parked   = 0;   /* worker inside WaitOnAddress            */
 static volatile s32 s_pipe_waiting  = 0;   /* CPU inside WaitOnAddress               */
+static volatile s32 s_pipe_epoch    = 0;   /* changed before every worker wake        */
 static volatile s32 s_pipe_quit     = 0;
+static volatile s32 s_pipe_failed   = 0;   /* worker cannot preserve command stream  */
 static HANDLE       s_pipe_h        = NULL;
-static int          s_pipe_on       = -1;  /* GCN_GX_PIPELINE=1 enables; -1 unresolved */
+static int          s_pipe_on       = -1;  /* default on; GCN_GX_PIPELINE=0 disables */
 static int          s_pipe_poisoned = 0;   /* scanner overflow (bug guard): permanent sync */
 static int          s_pipe_syncmode = 0;   /* unsizable top-level cmd (e.g. a top-level
                                             * PRIM — the IPL draws one 4-vertex quad
@@ -231,15 +232,35 @@ static s64 s_scan_pos = 0;        /* cumulative stream offset of carry[0] */
 
 static DWORD WINAPI gx_pipe_worker(LPVOID param);
 
+/* A worker failure cannot safely fall back to synchronous decode: CP already
+ * consumed the queued bytes, and some may remain only in the worker staging
+ * buffer. Make the invariant breach loud instead of losing commands or
+ * waiting forever on an offset the exited worker can never publish. */
+static void gx_pipe_abort_if_failed(void) {
+    if (__atomic_load_n(&s_pipe_failed, __ATOMIC_ACQUIRE)) {
+        fprintf(stderr, "gx-pipe: fatal worker failure; command stream cannot continue\n");
+        fflush(stderr);
+        abort();
+    }
+}
+
 static int gx_pipe_on(void) {
     if (s_pipe_on < 0) {
+        /* Default ON after the finalized implementation held all four golden
+         * XFB hashes, both oracle counts, repeated-run determinism, and showed
+         * a 15.5% average whole-boot win in an interleaved derived A/B. Keep a
+         * synchronous escape hatch for diagnostics and future FIFO shapes. */
         const char* e = getenv("GCN_GX_PIPELINE");
-        s_pipe_on = (e && e[0] == '1') ? 1 : 0;
+        s_pipe_on = (e && e[0] == '0') ? 0 : 1;
         if (s_pipe_on) {
             s_pipe_h = CreateThread(NULL, 0, gx_pipe_worker, NULL, 0, NULL);
-            if (!s_pipe_h) s_pipe_on = 0;
+            if (!s_pipe_h) {
+                fprintf(stderr, "gx-pipe: CreateThread failed; using synchronous GX\n");
+                s_pipe_on = 0;
+            }
         }
     }
+    gx_pipe_abort_if_failed();
     return s_pipe_on && !s_pipe_poisoned && !s_pipe_syncmode;
 }
 
@@ -247,12 +268,16 @@ static int gx_pipe_on(void) {
 static void gx_pipe_wait_retired(s64 target) {
     int spins = 0;
     for (;;) {
+        gx_pipe_abort_if_failed();
         s64 r = __atomic_load_n(&s_pipe_retired, __ATOMIC_ACQUIRE);
         if (r >= target) return;
         if (++spins < 16384) { _mm_pause(); continue; }
         s64 expect = r;
         __atomic_store_n(&s_pipe_waiting, 1, __ATOMIC_SEQ_CST);
-        WaitOnAddress((volatile VOID*)&s_pipe_retired, &expect, sizeof expect, INFINITE);
+        /* A worker-failure wake does not change s_pipe_retired, so it can race
+         * between the failure check and this wait. Bound the sleep and recheck
+         * s_pipe_failed rather than relying on an unlatched wake alone. */
+        WaitOnAddress((volatile VOID*)&s_pipe_retired, &expect, sizeof expect, 100u);
         __atomic_store_n(&s_pipe_waiting, 0, __ATOMIC_SEQ_CST);
     }
 }
@@ -270,17 +295,33 @@ void gcn_gx_pipeline_drain(void) {
     s64 target = __atomic_load_n(&s_pipe_produced, __ATOMIC_RELAXED);
     int spins = 0;
     for (;;) {
+        gx_pipe_abort_if_failed();
         s64 d = __atomic_load_n(&s_pipe_done_upto, __ATOMIC_ACQUIRE);
         if (d >= target) return;
         if (++spins < 16384) { _mm_pause(); continue; }
         s64 expect = d;
         __atomic_store_n(&s_pipe_waiting, 1, __ATOMIC_SEQ_CST);
-        WaitOnAddress((volatile VOID*)&s_pipe_done_upto, &expect, sizeof expect, INFINITE);
+        WaitOnAddress((volatile VOID*)&s_pipe_done_upto, &expect, sizeof expect, 100u);
         __atomic_store_n(&s_pipe_waiting, 0, __ATOMIC_SEQ_CST);
     }
 }
 
+void gcn_gx_pipeline_shutdown(void) {
+    if (s_pipe_on != 1) return;
+    gcn_gx_pipeline_drain();
+    __atomic_store_n(&s_pipe_quit, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&s_pipe_epoch, 1, __ATOMIC_RELEASE);
+    WakeByAddressAll((PVOID)&s_pipe_epoch);
+    if (s_pipe_h) {
+        WaitForSingleObject(s_pipe_h, INFINITE);
+        CloseHandle(s_pipe_h);
+        s_pipe_h = NULL;
+    }
+    s_pipe_on = 0;
+}
+
 static void gx_pipe_push_chunk(const u8* src) {
+    gx_pipe_abort_if_failed();
     /* Ring-full backpressure (worker a full MiB behind): wait for space.
      * retired <= pulled, so gating space on retired is conservative. */
     s64 produced = s_pipe_produced;
@@ -288,8 +329,9 @@ static void gx_pipe_push_chunk(const u8* src) {
     memcpy(s_pipe_ring + (produced & (GX_PIPE_CAP - 1)), src, GCN_CP_GATHER_PIPE_SIZE);
     __atomic_store_n(&s_pipe_produced, produced + GCN_CP_GATHER_PIPE_SIZE,
                      __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&s_pipe_epoch, 1, __ATOMIC_RELEASE);
     if (__atomic_load_n(&s_pipe_parked, __ATOMIC_SEQ_CST))
-        WakeByAddressAll((PVOID)&s_pipe_produced);
+        WakeByAddressAll((PVOID)&s_pipe_epoch);
 }
 
 /* Size one top-level command at data[0..len). Returns the command size, 0 if
@@ -400,17 +442,19 @@ static DWORD WINAPI gx_pipe_worker(LPVOID param) {
         s64 produced = __atomic_load_n(&s_pipe_produced, __ATOMIC_ACQUIRE);
         if (produced == pulled) {
             if (__atomic_load_n(&s_pipe_quit, __ATOMIC_ACQUIRE)) return 0;
+            s32 epoch = __atomic_load_n(&s_pipe_epoch, __ATOMIC_ACQUIRE);
             int spins = 0;
             for (;;) {
                 produced = __atomic_load_n(&s_pipe_produced, __ATOMIC_ACQUIRE);
                 if (produced != pulled ||
                     __atomic_load_n(&s_pipe_quit, __ATOMIC_ACQUIRE)) break;
                 if (++spins < 16384) { _mm_pause(); continue; }
-                s64 expect = produced;
+                s32 expect = epoch;
                 __atomic_store_n(&s_pipe_parked, 1, __ATOMIC_SEQ_CST);
-                WaitOnAddress((volatile VOID*)&s_pipe_produced, &expect,
+                WaitOnAddress((volatile VOID*)&s_pipe_epoch, &expect,
                               sizeof expect, INFINITE);
                 __atomic_store_n(&s_pipe_parked, 0, __ATOMIC_SEQ_CST);
+                epoch = __atomic_load_n(&s_pipe_epoch, __ATOMIC_ACQUIRE);
             }
             continue;
         }
@@ -431,6 +475,12 @@ static DWORD WINAPI gx_pipe_worker(LPVOID param) {
                                 "— worker halted\n", (unsigned)GX_BUF_CAP);
                 warned = 1;
             }
+            fflush(stderr);
+            __atomic_store_n(&s_pipe_failed, 1, __ATOMIC_RELEASE);
+            /* Published offsets intentionally do not advance. Wake every CPU
+             * wait site so it observes s_pipe_failed and aborts loudly. */
+            WakeByAddressAll((PVOID)&s_pipe_retired);
+            WakeByAddressAll((PVOID)&s_pipe_done_upto);
             return 0;
         }
         memcpy(gx->buf + gx->buf_len, s_pipe_ring + (pulled & (GX_PIPE_CAP - 1)), take);

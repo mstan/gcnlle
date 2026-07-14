@@ -68,16 +68,13 @@ static u32 s_batch_ppc = 4096;  /* GCN_DSP_BATCH_PPC: flush cap (PPC cycles)  */
  *     paths). The consumed release/acquire pair is the fence that also
  *     covers the ucode's host DMA writes into MEM1/ARAM.
  *
- * Known, deliberate divergence risk (why this is opt-in until gates prove
- * it): a DSP->CPU interrupt raised INSIDE an async window latches when the
- * worker actually sets g_dsp_int_pending (a few µs into the window) instead
- * of at the cap tick — never EARLIER than synchronous, at most ~one batch
- * window (4096 PPC cycles) LATER, and only for interrupt-driven flows (mail
- * handshakes always ride drained read/write paths and stay exact). The
- * arbiter is the standing gate set: all four golden XFB hashes + oracle
- * value+order counts, run with the thread on. NOT an idle-skip and NOT a
- * park: every granted cycle executes on the real core, in order, exactly
- * once — only the wall-clock location of that execution moves. */
+ * Known divergence risk: a DSP->CPU interrupt raised INSIDE an async window
+ * latches when the worker actually sets g_dsp_int_pending instead of at a
+ * deterministic emulated-cycle boundary. The four standard gates usually
+ * hold, but rare schedule-sensitive XFB/CPU-state outliers were observed under
+ * sustained A/B work on 2026-07-13. Keep this path explicit opt-in; the exact
+ * synchronous LLE path is the default. NOT an idle-skip and NOT a park: every
+ * granted cycle executes on the real core, in order, exactly once. */
 static volatile s64 s_thr_granted  = 0;  /* cumulative whole-of-6 PPC cycles granted  */
 static volatile s64 s_thr_consumed = 0;  /* cumulative cycles the worker has executed */
 static volatile s32 s_thr_quit     = 0;
@@ -124,12 +121,11 @@ static DWORD WINAPI dsp_thread_main(LPVOID param) {
 
 static int dsp_thread_on(void) {
     if (s_thr_on < 0) {
-        /* Default ON (GCN_DSP_THREAD=0 forces the synchronous path) — same
-         * policy as GX-MT: a bit-exactness-gated perf feature, validated on
-         * all four golden hashes (deterministic across repeat runs) + oracle
-         * value+order counts in both cycle modes, thread on AND off. */
+        /* Explicit opt-in: worker completion can move mailbox-interrupt
+         * publication according to host scheduling. The synchronous LLE path
+         * is the deterministic default; GCN_DSP_THREAD=1 is experimental. */
         const char* e = getenv("GCN_DSP_THREAD");
-        s_thr_on = (e && e[0] == '0') ? 0 : 1;
+        s_thr_on = (e && e[0] == '1') ? 1 : 0;
         if (s_thr_on) {
             s_thr_h = CreateThread(NULL, 0, dsp_thread_main, NULL, 0, NULL);
             if (!s_thr_h) s_thr_on = 0;   /* creation failure = stay synchronous */

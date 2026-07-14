@@ -151,6 +151,9 @@ static void handle_line(Client* c, const char* line) {
         u32 addr = 0, len = 0;
         json_uint(line, "addr", &addr); json_uint(line, "len", &len);
         if (len > 65536) len = 65536;
+        /* Preserve the synchronous debug-snapshot contract: a pending GX
+         * copy may write MEM1, including the XFB, on its worker. */
+        gcn_gx_pipeline_drain();
         u32 avail = 0; u8* p = ram_ptr(addr, &avail);
         if (!p) { n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":false,\"error\":\"addr out of range\"}\n"); }
         else {
@@ -169,6 +172,9 @@ static void handle_line(Client* c, const char* line) {
         u32 addr = 0; char hex[8192] = {0};
         json_uint(line, "addr", &addr);
         json_str(line, "hex", hex, sizeof hex);
+        /* The GX worker may still be reading display-list, vertex, texture,
+         * or TLUT bytes from MEM1. Join before a debugger mutates them. */
+        gcn_gx_pipeline_drain();
         u32 avail = 0; u8* p = ram_ptr(addr, &avail);
         int nbytes = (int)strlen(hex) / 2;
         if (!p) { n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":false,\"error\":\"addr out of range\"}\n"); }

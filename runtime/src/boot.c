@@ -39,6 +39,11 @@
  *                      nature — never set it for oracle-diff runs. Wins over
  *                      a GCN_SRAM_FILE-persisted counter (SRAM settings from
  *                      the file still apply).
+ *   GCN_GX_PIPELINE    default-on CPU/GX execution overlap. "0" selects the
+ *                      fully synchronous fallback for diagnostics. Both paths
+ *                      retain the pinned XFB/oracle results; live VI capture,
+ *                      debug RAM access, FIFO reset, and shutdown join before
+ *                      observing or releasing worker-produced state.
  *
  *   GCN_BOOT_BS1       [M1] "1" switches to the REAL BS1 boot: argv[1] is now
  *                      the RAW SCRAMBLED bios/ipl.bin (not a pre-descrambled
@@ -731,10 +736,10 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     int still_live = gcn_dispatch_run(&cpu, run_blocks);
-    /* G3: retire any pipelined GX work before anything below (trace close,
-     * GCN_MEM_DUMP, XFB hashes) reads GX-produced RAM. No-op when the
-     * pipeline is off. */
-    gcn_gx_pipeline_drain();
+    /* G3: retire and join the GX worker before anything below (debug park,
+     * trace close, GCN_MEM_DUMP, XFB hashes, RAM teardown) can observe or
+     * release its state. No-op when the synchronous path is selected. */
+    gcn_gx_pipeline_shutdown();
     /* Don't park waiting on a TCP "quit" that may never come if what actually
      * ended the run was the host window closing (GCN_WINDOW=1, no debug
      * client attached). */

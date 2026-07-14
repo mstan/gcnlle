@@ -7,6 +7,7 @@
  */
 #include "vi/vi.h"
 #include "debug/rings.h"
+#include "gx/gx.h"          /* default-on GX worker: join before live XFB capture */
 #include "host/host_window.h"  /* GCN_WINDOW=1 field-boundary present hook, see below */
 
 #include <stdio.h>
@@ -145,6 +146,11 @@ static void vi_advance_halfline(GcnVi* vi) {
         u32 fb_addr, fb_w, fb_h, fb_stride;
         if (gcn_vi_xfb_info(&fb_addr, &fb_w, &fb_h, &fb_stride) &&
             (u64)fb_addr + (u64)fb_stride * fb_h <= s_vi_cpu->ram_size) {
+            /* G3 executes EFB->XFB copies on a worker. Join at the hardware
+             * publication boundary so the host never observes a half-written
+             * field (or races the worker's non-atomic guest-RAM stores). The
+             * worker still overlaps the CPU for the rest of the field. */
+            gcn_gx_pipeline_drain();
             gcn_host_window_present(s_vi_cpu->ram + fb_addr, fb_w, fb_h, fb_stride);
         }
     }
