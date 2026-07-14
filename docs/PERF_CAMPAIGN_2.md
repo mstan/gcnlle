@@ -425,3 +425,40 @@ the measured dispatch shares. Removing the much larger join slice requires the
 already-rejected guest-read reordering. The wake-only design is therefore below
 the materiality threshold. All temporary counters and hot-path branches were
 removed after the measurement; no runtime implementation remains.
+
+## Cross-chunk PPC direct exits rejected (2026-07-14)
+
+The profile-fed PPC audit next considered chaining a generated chunk directly
+into another generated chunk. This is not an exact transformation at the
+current architectural boundary. Every return to `gcn_dispatch_run` performs,
+in order, external-PI delivery, block-ring publication, pending-exception
+handling, deadline arming, derived cycle charging, DSP/AI/VI/DI/GX progress,
+and debug/window service. A direct C call would skip those observations. Merely
+checking the cycle deadline or publishing a block-ring entry inside generated
+code does not reproduce their value/order relationship.
+
+There is also little unexploited local work. Each 16-KiB guest chunk is one C
+function/TU. Static forward edges inside it are already direct `goto`s, backward
+conditional loops use deadline-gated `goto`s, and eligible local `bl`/`blr`
+pairs use the bounded shadow stack. The remaining returns are deadline yields,
+cross-chunk edges, dynamic control flow, exceptions, or deliberately unsupported
+local cases.
+
+Temporary opt-in dispatcher counters measured a representative derived 12M
+run. At the last complete 2^20-block report (11,534,336 invocations):
+
+- 10,679,725 returns (92.55%) remained in the same generated chunk;
+- 853,407 (7.40%) crossed chunks and 1,204 returned off-image;
+- average retired work was 89.93 PPC cycles per generated invocation;
+- 10,577,924 invocations (91.71%) retired at least the full 96-cycle scheduler
+  quantum;
+- profiler attribution at that point was 50.5% generated block execution,
+  19.3% DSP, and 21.7% GX (instrumented shares, not an absolute benchmark).
+
+The dominant same-chunk/full-quantum result confirms that dispatch is already
+amortized across real guest work and returns primarily to honor the scheduler
+boundary. Strict cross-chunk chaining is rejected. A boundary-preserving hot-PC
+switch could remove only a table lookup and indirect call while retaining the
+entire dispatcher; its expected whole-runtime ceiling is below 1%, so it is not
+worth a regen/prototype before higher-ceiling work. All temporary counters were
+removed after the measurement.
