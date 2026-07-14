@@ -151,11 +151,16 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "\nstatic inline int dolrecomp_call(CPUState* ctx, u32 address) {\n");
     fprintf(out, "    u32 alias;\n");
     fprintf(out, "    ctx->pc = address;\n");
-    fprintf(out, "    if (ppc_host_call(ctx, address)) return 1;\n");
+    /* Most static-recompiler deployments (including the IPL runtime) install
+     * no HLE host-call replacement. Test the callback field inline so that
+     * common case does not pay a non-inlinable ppc_host_call() round trip at
+     * every returned guest block. The callback ABI and priority are unchanged
+     * when a replacement is installed. */
+    fprintf(out, "    if (ctx->host_call && ctx->host_call(ctx, address)) return 1;\n");
     fprintf(out, "    if (dolrecomp_call_original(ctx, address)) return 1;\n");
     fprintf(out, "    if (dolrecomp_physical_pc_alias(ctx, address, &alias)) {\n");
     fprintf(out, "        ctx->pc = alias;\n");
-    fprintf(out, "        if (ppc_host_call(ctx, alias)) return 1;\n");
+    fprintf(out, "        if (ctx->host_call && ctx->host_call(ctx, alias)) return 1;\n");
     fprintf(out, "        if (dolrecomp_call_original(ctx, alias)) return 1;\n");
     fprintf(out, "    }\n");
     fprintf(out, "    return 0;\n");

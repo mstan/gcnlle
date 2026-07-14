@@ -252,7 +252,7 @@ device/oracle logic.
   - `#define DOLRECOMP_ENTRY_POINT 0xXXXXXXXXu`
   - `typedef void (*DolRecompFunction)(CPUState*);`
   - `dolrecomp_find_original(u32) -> DolRecompFunction` (range table)
-  - `dolrecomp_call(CPUState*, u32)` — tries `ppc_host_call`, then
+  - `dolrecomp_call(CPUState*, u32)` — tests `ctx->host_call` inline, then
     `find_original`, then the physical-address alias (`addr | GC_RAM_BASE`).
   - `dolrecomp_run_blocks(CPUState*, u32 max)` — loop: `dolrecomp_call(ctx,
     ctx->pc)`, stop on `ctx->exception`.
@@ -278,9 +278,11 @@ M0 build carries no generated dependency.
 2. **`func_*` vs. address aliases.** `dolrecomp_call` tries the physical alias
    `addr | GC_RAM_BASE` when a call misses. The IPL runs cached at
    `0x81300000`, so aliasing should not fire, but confirm once execution starts.
-3. **Host-call table.** `ppc_host_call`/`ctx->host_call` is the host-intercept
-   hook. At M0 we install none (pure LLE). Whether the IPL boot needs any host
-   intercept is TBD — expected **none** for the LLE baseline.
+3. **Host-call table.** `ctx->host_call` is the host-intercept hook. The
+   generated dispatcher checks the nullable field directly to avoid an
+   out-of-line helper call on every returned block. At M0 we install none
+   (pure LLE). Whether the IPL boot needs any host intercept is TBD — expected
+   **none** for the LLE baseline.
 4. **`instruction_fallback`.** For opcodes the emitter cannot lower it calls
    `ppc_fallback_instruction` -> `ctx->instruction_fallback`. Not installed at
    M0; a hit would raise an illegal-instruction program exception (loud), which
