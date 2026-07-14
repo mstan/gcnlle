@@ -346,7 +346,7 @@ Future raster work must reduce arithmetic across multiple pixels (compact SIMD)
 or amortize existing fork/join work without cloning scanners, not add another
 scalar memo layer.
 
-## Per-pixel bilinear RGBA SIMD accepted opt-in (2026-07-14)
+## Per-pixel bilinear RGBA SIMD rejected (2026-07-14)
 
 The next candidate stayed inside one texture sample: after the original four
 cache/decode calls complete in their original order, SSE2 performs the four
@@ -356,11 +356,11 @@ non-negative result with a maximum accumulator of 4,177,920. A logical shift by
 14 and non-saturating-in-range packs reproduce the scalar bytes exactly. No
 texture read, pixel, TEV, blend, dither, or EFB-write ordering changes.
 
-`GCN_GX_TEX_SIMD=1` opts in; unset and an explicit `=0` retain the scalar path.
-The value is resolved once in `gx_raster_init`, before GX pipeline or GX-MT
-workers exist. An adversarial review caught and corrected an initial presence-
-only environment check which would have treated `=0` as enabled. Disassembly
-then confirmed the value check and the intended two-`pmaddwd` kernel.
+The prototype used `GCN_GX_TEX_SIMD=1`; unset and an explicit `=0` retained the
+scalar path. The value was resolved once in `gx_raster_init`, before GX pipeline
+or GX-MT workers existed. An adversarial review caught and corrected an initial
+presence-only environment check which would have treated `=0` as enabled.
+Disassembly then confirmed the value check and intended two-`pmaddwd` kernel.
 
 A same-binary derived 12M `OFF,ON,ON,OFF` sequence repeated three times found:
 
@@ -376,7 +376,18 @@ GX, and the general non-fused TEV path. Explicit `=0` and `=1` uniform checks
 also matched. Oracle value/order results remained uniform `19355/3` and derived
 `19354/4`, with only the established terminal PI reorder.
 
-The implementation remains opt-in at this checkpoint. Because same-binary OFF
-still executes one predictable hot-path test, the default-on decision requires
-an interleaved comparison against a genuinely pre-change build rather than
-treating the same-binary delta as the final campaign score.
+That same-binary result did not survive the required comparison against a
+genuinely pre-change executable. A direct baseline link substituted only the
+pre-SIMD `gx_raster.c` object into the otherwise identical accepted object set;
+its 274,011,963-byte size matched the recorded baseline exactly. A high-priority
+cross-binary `BASE,SIMD,SIMD,BASE` sequence repeated three times measured:
+
+- BASE: min 3.362318 s, median 3.606897 s, average 3.649306 s;
+- SIMD: min 3.306006 s, median 3.748113 s, average 3.664668 s;
+- SIMD was 3.915% slower by median and 0.421% slower by average;
+- SIMD won 4/6 adjacent comparisons and only 2/3 ABBA block means.
+
+All twelve runs were high priority, RC 0, exception-free, and used hash-checked
+standalone executables. Exact arithmetic was not sufficient: the candidate did
+not beat the real baseline. The implementation, environment knob, hot branch,
+and object growth were therefore removed; only this negative evidence remains.

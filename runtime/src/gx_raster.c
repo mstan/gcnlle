@@ -53,12 +53,6 @@
  * SIMD-on and GCN_GX_NO_SIMD=1 must produce the identical golden XFB hash. */
 static int s_no_simd = -1;
 
-/* GCN_GX_TEX_SIMD=1: opt in to the SSE2 implementation of the four-channel
- * bilinear filter arithmetic in tex_sample. The four cache/decode calls and
- * their order are unchanged; SIMD begins only after all four RGBA taps exist.
- * Resolve this once during init, before GX-MT workers can read it. */
-static int s_tex_simd;
-
 /* GCN_GX_NO_AVX2=1: force the AVX2 8-wide widenings below (efb_clear_rect's
  * color/depth clear passes; gx_raster_efb_copy's vertical-filter+YUV-encode,
  * chroma-smooth, and YUYV-pack passes) to fall back to the existing SSE2
@@ -1118,42 +1112,6 @@ static inline void decode_texel_cached(int wid, u32 texmap, u32 fmt, const u8* s
     if (s_pixel_stats) s_ps_texel_cache_misses++;
 }
 
-/* Exact four-channel form of the scalar loop below. The non-negative weights
- * sum to 16384, so every signed-16 input fits and each signed-32 result is at
- * most 255*16384 = 4,177,920. The shift and packs therefore cannot saturate
- * or change a byte. Tap acquisition and its observable order stay outside. */
-static inline void bilinear_rgba_sse2(const u8 v00[4], const u8 v10[4],
-                                      const u8 v01[4], const u8 v11[4],
-                                      int fS, int fT, u8 out[4]) {
-    u32 p00, p10, p01, p11;
-    memcpy(&p00, v00, sizeof p00);
-    memcpy(&p10, v10, sizeof p10);
-    memcpy(&p01, v01, sizeof p01);
-    memcpy(&p11, v11, sizeof p11);
-
-    const __m128i zero = _mm_setzero_si128();
-    const __m128i c00 = _mm_unpacklo_epi8(_mm_cvtsi32_si128((int)p00), zero);
-    const __m128i c10 = _mm_unpacklo_epi8(_mm_cvtsi32_si128((int)p10), zero);
-    const __m128i c01 = _mm_unpacklo_epi8(_mm_cvtsi32_si128((int)p01), zero);
-    const __m128i c11 = _mm_unpacklo_epi8(_mm_cvtsi32_si128((int)p11), zero);
-    const __m128i row0 = _mm_unpacklo_epi16(c00, c10);
-    const __m128i row1 = _mm_unpacklo_epi16(c01, c11);
-
-    const int w00 = (128 - fS) * (128 - fT);
-    const int w10 = fS * (128 - fT);
-    const int w01 = (128 - fS) * fT;
-    const int w11 = fS * fT;
-    const __m128i weights0 = _mm_set1_epi32((w10 << 16) | w00);
-    const __m128i weights1 = _mm_set1_epi32((w11 << 16) | w01);
-    __m128i acc = _mm_add_epi32(_mm_madd_epi16(row0, weights0),
-                                _mm_madd_epi16(row1, weights1));
-    acc = _mm_srli_epi32(acc, 14);
-    const __m128i rgba16 = _mm_packs_epi32(acc, zero);
-    const __m128i rgba8 = _mm_packus_epi16(rgba16, zero);
-    const u32 packed = (u32)_mm_cvtsi128_si32(rgba8);
-    memcpy(out, &packed, sizeof packed);
-}
-
 static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
     /* tx_mode0/mode1/image0/image3 field extraction is per-draw-constant (BP
      * loads never interleave with a draw's vertex payload) — decoded once by
@@ -1204,10 +1162,6 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
         decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT,  w1, tc->tlut, tc->tlutfmt, v10);
         decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT1, w1, tc->tlut, tc->tlutfmt, v01);
         decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT1, w1, tc->tlut, tc->tlutfmt, v11);
-        if (s_tex_simd) {
-            bilinear_rgba_sse2(v00, v10, v01, v11, fS, fT, out);
-            return;
-        }
         for (int c = 0; c < 4; c++) {
             u32 acc = v00[c] * (u32)((128 - fS) * (128 - fT)) +
                       v10[c] * (u32)((fS)       * (128 - fT)) +
@@ -5312,8 +5266,6 @@ void gx_raster_efb_copy(const GxCpState* cp) {
  * ==========================================================================*/
 void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
     s_cpu = cpu; s_bp = bp; s_xf = xf;
-    const char* tex_simd = getenv("GCN_GX_TEX_SIMD");
-    s_tex_simd = (tex_simd && tex_simd[0] == '1') ? 1 : 0;
     memset(s_efb_color, 0, sizeof s_efb_color);
     memset(s_efb_depth, 0, sizeof s_efb_depth);
     memset(s_tev_w, 0, sizeof s_tev_w);
