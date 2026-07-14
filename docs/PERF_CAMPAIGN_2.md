@@ -391,3 +391,37 @@ All twelve runs were high priority, RC 0, exception-free, and used hash-checked
 standalone executables. Exact arithmetic was not sufficient: the candidate did
 not beat the real baseline. The implementation, environment knob, hot branch,
 and object growth were therefore removed; only this negative evidence remains.
+
+## Triangle batching and wake coalescing rejected (2026-07-14)
+
+The next draw-level audit considered processing two fork-eligible triangles
+under one GX-MT grant. A union-row scheme can preserve EFB read/modify/write
+order by assigning each block row to one worker and running that row's
+triangles in submission order. It cannot preserve the broader observable order:
+later indexed-vertex and guest-RAM texture reads would occur before all rows of
+the earlier triangle finish. The current per-triangle join forbids that. A
+one-final-join batch was therefore rejected under the strict LLE value/order
+contract, independent of its possible framebuffer result.
+
+Temporary `GCN_GX_MT_STATS` counters measured the remaining exact alternative:
+retain the per-triangle barrier but coalesce worker wakes within a draw. The
+derived 12M run used synchronous GX (`GCN_GX_PIPELINE=0`) so the CPU-side stats
+printer could not race the GX execution thread. Its final snapshot reported:
+
+- 6,178 forked and 33,139 serial nonempty triangles;
+- per-fork TSC 159,695 scan, 38,488 join, and 3,650 publication;
+- 79.122% scan, 19.069% join, and only 1.808% publication;
+- emitted-triangle draw histogram 64,798 / 37,872 / 39,250 / 170 for 0/1/2/3+;
+- eligible-triangle draw histogram 138,865 / 272 / 2,953 / 0 for 0/1/2/3+;
+- workers observed 41,082 epoch changes without first calling `WaitOnAddress`
+  and 1,360 after calling it at least once (1,367 total wait calls).
+
+The wait counters describe observed worker transitions, not proof that a thread
+blocked: changed-address returns and skipped epochs are possible. The eligible
+histogram is also marginal, not an adjacency proof. Neither limitation affects
+the ceiling decision. An exact wake/publication-only session can remove at most
+the 1.808% publication slice, approximately 0.39% whole-runtime speedup under
+the measured dispatch shares. Removing the much larger join slice requires the
+already-rejected guest-read reordering. The wake-only design is therefore below
+the materiality threshold. All temporary counters and hot-path branches were
+removed after the measurement; no runtime implementation remains.
