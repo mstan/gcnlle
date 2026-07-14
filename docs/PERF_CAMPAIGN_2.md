@@ -262,3 +262,37 @@ used OFF,ON,ON,OFF repeated three times:
 
 The smaller table did not offset its larger hot dispatch path and extra cache
 footprint. The implementation and environment knob were removed completely.
+
+## Current-source PGO acceptance (2026-07-14)
+
+PGO was retrained after the final emitter, GX-pipeline, and DSP-LLE source
+changes. The GEN build was trained on uniform 8M plus derived 24M/56M and a
+derived 12M synchronous-DSP run, producing 201 non-empty profiles. The USE
+build consumed 203 profile-guided translation units without missing-profile or
+coverage-mismatch warnings.
+
+The retrained binary passed the complete acceptance matrix without re-pinning:
+
+- uniform 5M: `fee16a8b6143e82698169b9bfba77801`;
+- uniform 8M: `a94db4e05555e87a03704c79def96005`;
+- derived 24M twice: `bea0d67fb1dbba07be06c815c5c4d451`;
+- derived 56M twice: `5227ee9c3f4ddd0f7486c2ad508b3e7a`;
+- uniform oracle: 19,355 matches / 3 resyncs;
+- derived oracle: 19,354 matches / 4 resyncs, with only the standing terminal
+  PI-order divergence.
+
+Normal-priority interleaved ABBA testing at 12M derived blocks measured:
+
+- plain: min 3.179626 s, median 3.234967 s, average 3.246550 s;
+- PGO: min 2.757948 s, median 2.844289 s, average 2.960318 s;
+- PGO improved the median by **12.077%** and the average by **8.816%**;
+- PGO won 5/6 adjacent comparisons and all three ABBA blocks.
+
+This is a real, exact win and is the accepted release build configuration.
+It does not close the strict derived-timing target: that mode remains roughly
+0.50--0.55x real time on this host. Default uniform timing remains faster than
+real time and can sustain the throttled 60 FPS IPL UI. The next value-compatible
+architectural candidate is event-deadline device servicing: execute every guest
+instruction, but service devices at their earliest real observable event rather
+than every fixed 96-cycle return. Idle skipping and result skipping remain
+forbidden.

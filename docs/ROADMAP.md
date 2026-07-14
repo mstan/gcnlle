@@ -71,6 +71,19 @@ DI poll (pc 0x8133ACBC, DICVR reads 0x2) with the same-fixture dummy disc
 (tools/make_dummy_disc.py, oracle-symmetric). Discless goldens bit-exact
 throughout (no-disc remains the default).
 
+The fixture was corrected on 2026-07-14 from a region-inconsistent `GDUMMY`
+(PAL ID byte with an NTSC-J BI2 value) to `GDUE00` with BI2 region 1, so both
+the IPL and Dolphin now receive a coherent NTSC-U disc. A fresh 200M-instruction
+Dolphin capture and the runtime share the same 14-event DI prefix through the
+terminal `DICVR == 2` poll at `0x8133ACBC`. Dolphin's capture horizon ends in
+that poll, so it is evidence for the hardware-visible prefix, not for the later
+DMA payload. Separately, a runtime hot-insert traversed the real IPL UI from
+"Please insert" to the firmware-drawn "Reading disc..." state, issued the
+`A8000040` DiscID DMA, placed `GDUE00` and the disc magic at `0x80000000`, then
+performed the apploader header reads and reached the fixture's deliberate null
+apploader boundary. No title detection, boot shortcut, or game-specific path is
+involved.
+
 ## Observability (cross-cutting — must be in place before M2)
 
 This is **not a phase you finish**; it is always-on infrastructure every
