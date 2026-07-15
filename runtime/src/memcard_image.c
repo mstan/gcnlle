@@ -8,7 +8,7 @@
  *   oracle/dolphin/Source/Core/Core/HW/GCMemcard/GCMemcard.h
  *   oracle/dolphin/Source/Core/Core/HW/GCMemcard/GCMemcardUtils.cpp
  * — see memcard_image.h's top-of-file comment for the exact line citations,
- * and F:/Projects/gcnrecomp/_work/M4_SPEC_FORMAT.md for the derived spec.
+ * with the project's derived format notes used during implementation.
  *
  * This module reads/writes all multi-byte card fields as explicit big-endian
  * bytes directly (never via host-native struct layout), so it is correct on
@@ -88,6 +88,20 @@
 static unsigned rd_be16(const unsigned char* p)
 {
     return ((unsigned)p[0] << 8) | (unsigned)p[1];
+}
+
+/* The IPL journals Directory and BAT metadata by alternating between two
+ * blocks. Their update counters are signed 16-bit values, and the BIOS picks
+ * the numerically greater counter (ties select copy 0). Oracle:
+ * GCMemcard.cpp:249-263. */
+static int newer_copy(const unsigned char* copy0, const unsigned char* copy1,
+                      unsigned counter_offset)
+{
+    int counter0 = (int)rd_be16(copy0 + counter_offset);
+    int counter1 = (int)rd_be16(copy1 + counter_offset);
+    if (counter0 & 0x8000) counter0 -= 0x10000;
+    if (counter1 & 0x8000) counter1 -= 0x10000;
+    return counter0 >= counter1 ? 0 : 1;
 }
 
 static void wr_be16(unsigned char* p, unsigned v)
@@ -421,11 +435,26 @@ int gcn_mc_image_check(const unsigned char* buf, unsigned size_bytes, char* err,
         return 0;
     }
 
-    /* Pick the non-corrupted copy of each pair as "active" (GCMemcard.cpp:255-263
-     * picks by update counter; since our own writer always keeps both mirrors
-     * identical, any tie-break is equivalent — we just avoid a corrupted one). */
-    active_dir = dir_bad_checksum[0] ? 1 : 0;
-    active_bat = (bat_bad_checksum[0] || bat_bad_free[0]) ? 1 : 0;
+    /* A single corrupt copy is recoverable from its peer; otherwise select
+     * the real active journal halves by signed update counter. Real IPL writes
+     * intentionally leave the other valid copy stale. */
+    if (dir_bad_checksum[0])
+        active_dir = 1;
+    else if (dir_bad_checksum[1])
+        active_dir = 0;
+    else
+        active_dir = newer_copy(buf + (size_t)GCN_MC_BLOCK_SIZE * 1u,
+                                buf + (size_t)GCN_MC_BLOCK_SIZE * 2u,
+                                D_UPDATE_COUNTER);
+
+    if (bat_bad_checksum[0] || bat_bad_free[0])
+        active_bat = 1;
+    else if (bat_bad_checksum[1] || bat_bad_free[1])
+        active_bat = 0;
+    else
+        active_bat = newer_copy(buf + (size_t)GCN_MC_BLOCK_SIZE * 3u,
+                                buf + (size_t)GCN_MC_BLOCK_SIZE * 4u,
+                                B_UPDATE_COUNTER);
 
     if (dir_bad_checksum[active_dir]) {
         set_err(err, errcap, "directory: invalid checksum");
@@ -459,10 +488,10 @@ int gcn_mc_image_check(const unsigned char* buf, unsigned size_bytes, char* err,
  * save's own flattened data. Returns the number of bytes actually copied
  * (0 on a hard failure / out-of-range chain). */
 static unsigned read_save_bytes(const unsigned char* buf, unsigned size_bytes,
+                                 const unsigned char* bat,
                                  unsigned first_block, unsigned block_count,
                                  unsigned offset, unsigned length, unsigned char* out)
 {
-    const unsigned char* bat = buf + (size_t)GCN_MC_BLOCK_SIZE * 3;
     unsigned total_blocks = size_bytes / GCN_MC_BLOCK_SIZE;
     unsigned long file_size, bytes_to_copy, copied;
     unsigned current, off_in_block;
@@ -528,13 +557,23 @@ int gcn_mc_image_list(const unsigned char* buf, unsigned size_bytes,
                       gcn_mc_dirent_t* out, int out_cap)
 {
     const unsigned char* dir;
+    const unsigned char* bat;
+    const unsigned char* dir0;
+    const unsigned char* dir1;
+    const unsigned char* bat0;
+    const unsigned char* bat1;
     unsigned i;
     int count = 0;
 
     if (!buf || !gcn_mc_image_valid_size(size_bytes))
         return 0;
 
-    dir = buf + (size_t)GCN_MC_BLOCK_SIZE * 1;
+    dir0 = buf + (size_t)GCN_MC_BLOCK_SIZE * 1u;
+    dir1 = buf + (size_t)GCN_MC_BLOCK_SIZE * 2u;
+    bat0 = buf + (size_t)GCN_MC_BLOCK_SIZE * 3u;
+    bat1 = buf + (size_t)GCN_MC_BLOCK_SIZE * 4u;
+    dir = newer_copy(dir0, dir1, D_UPDATE_COUNTER) ? dir1 : dir0;
+    bat = newer_copy(bat0, bat1, B_UPDATE_COUNTER) ? bat1 : bat0;
 
     for (i = 0; i < GCN_MC_DIRLEN; ++i) {
         const unsigned char* e = dir + D_ENTRIES + i * GCN_MC_DENTRY_SIZE;
@@ -561,7 +600,7 @@ int gcn_mc_image_list(const unsigned char* buf, unsigned size_bytes,
         entry.comment2[0] = '\0';
         if (comments_addr != 0xFFFFFFFFu) {
             unsigned char raw[GCN_MC_DENTRY_STRLEN * 2];
-            unsigned got = read_save_bytes(buf, size_bytes, first_block, block_count,
+            unsigned got = read_save_bytes(buf, size_bytes, bat, first_block, block_count,
                                            comments_addr, (unsigned)sizeof raw, raw);
             if (got == sizeof raw) {
                 copy_field(entry.comment1, sizeof entry.comment1, raw, GCN_MC_DENTRY_STRLEN);
@@ -769,8 +808,14 @@ int gcn_mc_image_import_save(unsigned char* buf, unsigned size_bytes,
     if (!detect_and_parse_save(save, save_len, dentry, &blockdata, &block_count, err, errcap))
         return 0;
 
-    dir = buf + (size_t)GCN_MC_BLOCK_SIZE * 1;
-    bat = buf + (size_t)GCN_MC_BLOCK_SIZE * 3;
+    {
+        unsigned char* dir0 = buf + (size_t)GCN_MC_BLOCK_SIZE * 1u;
+        unsigned char* dir1 = buf + (size_t)GCN_MC_BLOCK_SIZE * 2u;
+        unsigned char* bat0 = buf + (size_t)GCN_MC_BLOCK_SIZE * 3u;
+        unsigned char* bat1 = buf + (size_t)GCN_MC_BLOCK_SIZE * 4u;
+        dir = newer_copy(dir0, dir1, D_UPDATE_COUNTER) ? dir1 : dir0;
+        bat = newer_copy(bat0, bat1, B_UPDATE_COUNTER) ? bat1 : bat0;
+    }
 
     /* GCMemcard::ImportFile (GCMemcard.cpp:713-731): dir-full / out-of-blocks /
      * title-present checks, in that order. */
@@ -869,8 +914,16 @@ int gcn_mc_image_import_save(unsigned char* buf, unsigned size_bytes,
      * module instead keeps both copies always identical, per this module's
      * brief — simpler and always self-consistent for a single offline import,
      * at the cost of not modeling Dolphin's power-loss journaling. */
-    memcpy(buf + (size_t)GCN_MC_BLOCK_SIZE * 2, dir, GCN_MC_BLOCK_SIZE);
-    memcpy(buf + (size_t)GCN_MC_BLOCK_SIZE * 4, bat, GCN_MC_BLOCK_SIZE);
+    /* Normalize the offline result into both mirrors regardless of which
+     * journal half was active on input. */
+    if (dir != buf + (size_t)GCN_MC_BLOCK_SIZE * 1)
+        memcpy(buf + (size_t)GCN_MC_BLOCK_SIZE * 1, dir, GCN_MC_BLOCK_SIZE);
+    memcpy(buf + (size_t)GCN_MC_BLOCK_SIZE * 2,
+           buf + (size_t)GCN_MC_BLOCK_SIZE * 1, GCN_MC_BLOCK_SIZE);
+    if (bat != buf + (size_t)GCN_MC_BLOCK_SIZE * 3)
+        memcpy(buf + (size_t)GCN_MC_BLOCK_SIZE * 3, bat, GCN_MC_BLOCK_SIZE);
+    memcpy(buf + (size_t)GCN_MC_BLOCK_SIZE * 4,
+           buf + (size_t)GCN_MC_BLOCK_SIZE * 3, GCN_MC_BLOCK_SIZE);
 
     return 1;
 }

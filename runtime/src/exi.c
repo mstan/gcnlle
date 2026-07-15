@@ -15,7 +15,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>   /* [ENHANCEMENT] host-clock RTC mode */
 
 /* ---- helpers ---------------------------------------------------------------*/
 
@@ -141,30 +140,17 @@ void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]) {
 }
 
 void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter) {
-    exi->rtc_counter = rtc_counter;
+    gcn_rtc_set_fixed(&exi->rtc, rtc_counter);
 }
 
-/* [ENHANCEMENT] Host-clock RTC (see exi.h). GC epoch = 2000-01-01 00:00:00
- * = Unix 0x386D4380 (Dolphin EXI_DeviceIPL.h:27 GC_EPOCH). The counter is fed
- * LOCAL time, not UTC: on real hardware the user sets the clock to their wall
- * time (SRAM counterBias is a game-facing correction, 0 in our fixture), and
- * Dolphin feeds the IPL GetLocalTimeSinceJan1970 (unix + tz/DST offset) for
- * the same reason — so the calendar screen shows the host's actual clock. */
-#define GCN_EXI_GC_EPOCH_UNIX 0x386D4380u
-
-static u32 exi_rtc_host_now(const GcnExi* exi) {
-    time_t now = time(NULL);
-    struct tm* lt = localtime(&now);
-    /* _mkgmtime(localtime(t)) - t = the host's UTC offset incl. DST (mingw/
-     * MSVC CRT; the POSIX spelling is timegm). */
-    time_t tz_off = lt ? (_mkgmtime(lt) - now) : 0;
-    return (u32)((u64)(now + tz_off) - GCN_EXI_GC_EPOCH_UNIX)
-           + (u32)exi->rtc_host_offset;
+u32 gcn_exi_sync_rtc_from_host(GcnExi* exi, u64 core_cycles) {
+    u32 sampled = gcn_rtc_sample_host_local();
+    gcn_rtc_start(&exi->rtc, sampled, core_cycles);
+    return sampled;
 }
 
-void gcn_exi_set_rtc_host_mode(GcnExi* exi, int on) {
-    exi->rtc_host_mode = on;
-    exi->rtc_host_offset = 0;
+u32 gcn_exi_rtc_latch(GcnExi* exi, u64 core_cycles) {
+    return gcn_rtc_read(&exi->rtc, core_cycles);
 }
 
 void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user) {
@@ -313,11 +299,9 @@ static void ipl_dev_read(GcnExi* exi, CPUState* cpu, u32 ch, bool dma, u32 len) 
         ipl_rom_read(exi, cpu, ch, dma, len);
         break;
     case GCN_EXI_OP_RTC_READ:
-        /* Immediate 4-byte read returns the seconds-since-2000 counter —
-         * the deterministic fixture, or live host time in the opt-in
-         * GCN_RTC_HOST enhancement mode (see exi.h). */
-        c->data = exi->rtc_host_mode ? exi_rtc_host_now(exi)
-                                     : exi->rtc_counter;
+        /* Host time, when requested, was sampled once at boot. Reads advance
+         * the device solely from monotonic emulated Gekko cycles. */
+        c->data = gcn_rtc_read(&exi->rtc, cpu ? cpu->cycles : 0u);
         break;
     case GCN_EXI_OP_SRAM_READ:
         if (dma) {
@@ -367,14 +351,7 @@ static void ipl_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma, u
             }
         } else {                /* subsequent write = data payload */
             if (exi->op[ch] == GCN_EXI_OP_RTC_WRITE) {
-                if (exi->rtc_host_mode) {
-                    /* [ENHANCEMENT] host mode: the guest "sets the clock" by
-                     * adjusting our offset from host time; the host clock
-                     * itself is never touched. */
-                    exi->rtc_host_offset += (s32)(c->data - exi_rtc_host_now(exi));
-                } else {
-                    exi->rtc_counter = c->data;
-                }
+                gcn_rtc_write(&exi->rtc, c->data, cpu ? cpu->cycles : 0u);
                 if (exi->persist) exi->persist(exi->persist_user);
             } else if (exi->op[ch] == GCN_EXI_OP_SRAM_WRITE) {
                 for (u32 i = 0; i < len && i < 4u; i++) {

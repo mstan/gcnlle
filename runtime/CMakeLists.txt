@@ -6,6 +6,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(GCN_VULKAN "Build the opt-in headless Vulkan GX shadow capability path" ON)
+if(GCN_VULKAN)
+  find_package(Vulkan QUIET)
+endif()
+
 # DSP LLE core (C++ static lib running the real DSP firmware). Built always so
 # the default runtime build catches breakage; linked into gcn_boot.
 add_subdirectory(dsp_lle)
@@ -105,6 +110,13 @@ add_executable(test_memcard_image tests/test_memcard_image.c src/memcard_image.c
 target_include_directories(test_memcard_image PRIVATE include)
 add_test(NAME memcard_image COMMAND $<TARGET_FILE:test_memcard_image>)
 
+add_executable(test_rtc tests/test_rtc.c src/rtc.c)
+target_include_directories(test_rtc PRIVATE include)
+add_test(NAME rtc_boot_sync COMMAND $<TARGET_FILE:test_rtc>)
+
+add_executable(gcn_memcard_inspect tools/memcard_inspect.c src/memcard_image.c)
+target_include_directories(gcn_memcard_inspect PRIVATE include)
+
 # ---------------------------------------------------------------------------
 # M0 execution target: link Track A's recompiled BS2 and run it.
 #
@@ -151,6 +163,7 @@ if(GCN_WITH_GENERATED)
     src/dispatch.c
     src/mmio.c
     src/exi.c
+    src/rtc.c
     src/memcard.c
     src/memcard_image.c
     src/si.c
@@ -164,7 +177,9 @@ if(GCN_WITH_GENERATED)
     src/cp.c
     src/gp.c
     src/gx.c
+    src/gx_render.c
     src/gx_raster.c
+    src/gx_vulkan.c
     src/rings.c
     src/debug_server.c
     src/host_window.c
@@ -187,6 +202,58 @@ if(GCN_WITH_GENERATED)
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm
                          user32 gdi32 opengl32)
+  if(Vulkan_FOUND)
+    set(GX_CLEAR_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_clear.comp.inc)
+    set(GX_XFB_COPY_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_xfb_copy.comp.inc)
+    set(GX_XFB_SUBGROUP_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_xfb_subgroup.comp.inc)
+    set(GX_DRAW_F_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_draw_f.comp.inc)
+    add_custom_command(
+      OUTPUT ${GX_CLEAR_SPV_INC}
+      COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.1 -O
+              -mfmt=c -o ${GX_CLEAR_SPV_INC}
+              ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_clear.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_clear.comp
+      VERBATIM
+      COMMENT "Compiling exact GX EFB clear compute shader"
+    )
+    add_custom_command(
+      OUTPUT ${GX_XFB_COPY_SPV_INC}
+      COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.1 -O
+              -mfmt=c -o ${GX_XFB_COPY_SPV_INC}
+              ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_xfb_copy.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_xfb_copy.comp
+      VERBATIM
+      COMMENT "Compiling exact GX EFB-to-XFB compute shader"
+    )
+    add_custom_command(
+      OUTPUT ${GX_XFB_SUBGROUP_SPV_INC}
+      COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.1 -O
+              -DGCN_XFB_SUBGROUP=1 -mfmt=c -o ${GX_XFB_SUBGROUP_SPV_INC}
+              ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_xfb_copy.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_xfb_copy.comp
+      VERBATIM
+      COMMENT "Compiling exact subgroup GX EFB-to-XFB compute shader"
+    )
+    add_custom_command(
+      OUTPUT ${GX_DRAW_F_SPV_INC}
+      COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.1 -O
+              -mfmt=c -o ${GX_DRAW_F_SPV_INC}
+              ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_draw_f.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_draw_f.comp
+      VERBATIM
+      COMMENT "Compiling exact GX fused-program A--K compute shader"
+    )
+    add_custom_target(gcn_gx_shaders DEPENDS ${GX_CLEAR_SPV_INC}
+                                              ${GX_XFB_COPY_SPV_INC}
+                                              ${GX_XFB_SUBGROUP_SPV_INC}
+                                              ${GX_DRAW_F_SPV_INC})
+    add_dependencies(gcn_boot gcn_gx_shaders)
+    set_source_files_properties(src/gx_vulkan.c PROPERTIES
+      OBJECT_DEPENDS "${GX_CLEAR_SPV_INC};${GX_XFB_COPY_SPV_INC};${GX_XFB_SUBGROUP_SPV_INC};${GX_DRAW_F_SPV_INC}")
+    target_include_directories(gcn_boot PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_compile_definitions(gcn_boot PRIVATE GCN_HAVE_VULKAN=1)
+    target_link_libraries(gcn_boot PRIVATE Vulkan::Vulkan)
+  endif()
   if(GCN_DSP_LTO AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_options(gcn_boot PRIVATE -flto=auto)
   endif()

@@ -223,7 +223,7 @@ static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
  * `pixels` were shaded via a fused_pixel_A/B/C specialization instead of the
  * general tev_draw() — the coverage number the task's VERIFY step asks for,
  * gated on this same knob so it costs nothing when census is off. */
-#define GX_CENSUS_MAX 16
+#define GX_CENSUS_MAX 32
 typedef struct { int used; u32 hash; u64 draws, pixels, fused_pixels; } GxCensusEntry;
 static int s_tev_census = -1;
 static GxCensusEntry s_census[GX_CENSUS_MAX];
@@ -284,6 +284,29 @@ static const u32* s_xf;    /* u32[0x1058] XF memory (rd32 host-order words)  */
  * ==========================================================================*/
 static u32 s_efb_color[EFB_WIDTH * EFB_HEIGHT];
 static u32 s_efb_depth[EFB_WIDTH * EFB_HEIGHT];
+static GxRasterTriangleSink s_triangle_sink;
+static void* s_triangle_sink_user;
+
+void gx_raster_efb_data(const u32** color, const u32** depth,
+                        u32* width, u32* height) {
+    if (color) *color = s_efb_color;
+    if (depth) *depth = s_efb_depth;
+    if (width) *width = EFB_WIDTH;
+    if (height) *height = EFB_HEIGHT;
+}
+
+void gx_raster_efb_data_mutable(u32** color, u32** depth,
+                                u32* width, u32* height) {
+    if (color) *color = s_efb_color;
+    if (depth) *depth = s_efb_depth;
+    if (width) *width = EFB_WIDTH;
+    if (height) *height = EFB_HEIGHT;
+}
+
+void gx_raster_set_triangle_sink(GxRasterTriangleSink sink, void* user) {
+    s_triangle_sink = sink;
+    s_triangle_sink_user = sink ? user : NULL;
+}
 
 /* Tev / EfbInterface component ordering (Tev.h:225-231, matches EfbInterface). */
 enum { ALP_C = 0, BLU_C = 1, GRN_C = 2, RED_C = 3 };
@@ -1753,7 +1776,7 @@ static inline void fused_blend_stage(Tev* t, u8* output) {
  * — see the derivation table's "swaptab[0]==identity" note. */
 static int fused_blend_common_match(void) {
     return s_cfg.numcolchans == 1 &&
-           s_cfg.zt_enable == 0 && s_cfg.zt_early == 0 &&
+           s_cfg.zt_enable == 0 &&
            s_cfg.da_enable == 0 &&
            s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
            s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
@@ -1785,6 +1808,23 @@ static inline int fused_stage_match(u32 stage_idx, u32 exp_cc, u32 exp_ac,
     const TevStageCfg* sc = &s_cfg.stage[stage_idx];
     return sc->cc == exp_cc && sc->ac == exp_ac &&
            sc->enable == exp_enable && sc->colorchan == exp_colorchan;
+}
+
+/* GPU-only depth program K. Software deliberately stays on the general path
+ * so its ordinary z slope/test/update remains the differential authority. */
+static int gpu_depth_K_match(void) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == 1 &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 1 && s_cfg.zt_early == 1 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 1 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 1 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x00F8CFu, 0x00F770u, 1, 0);
 }
 
 /* ---- config A: stages=1, texgens=1, st0 cc=0x00F8CF ac=0x00F670 ----------
@@ -1846,6 +1886,78 @@ static void fused_pixel_A(Tev* t) {
      * reads alpha or ref), so c0||c1 is always true regardless of the shaded
      * alpha value — proven structurally from the word's bit fields, not
      * sampled/assumed. No alpha_test() call needed. */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* Config H: config A followed by B's already-derived stage-1 alpha fold. */
+static void fused_pixel_H(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 texel[4], output[4];
+    tev_sample_stat(t->wid, s_cfg.stage[0].texmap, t->UvS[0], t->UvT[0],
+                    t->TextureLinear[0], texel);
+    output[RED_C] = texel[0];
+    output[GRN_C] = texel[1];
+    output[BLU_C] = texel[2];
+    {
+        s32 x = texel[3];
+        s32 cc = x + (x >> 7);
+        s32 temp = (s32)t->Color[0][3] * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp1024((s16)temp);
+    }
+    {
+        s32 p = output[ALP_C];
+        s32 cc = p + (p >> 7);
+        s32 temp = s_cfg.stage[1].stage_konst.a * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp255((s16)temp);
+    }
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* Config I: texture-replace RGB, RasAlpha/KonstAlpha stage 0, then the
+ * standard disabled-texture stage-1 alpha fold. Intermediate alpha stays
+ * signed-11-bit exactly like Reg[Prev], rather than being narrowed to u8. */
+static void fused_pixel_I(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 texel[4], output[4];
+    tev_sample_stat(t->wid, s_cfg.stage[0].texmap, t->UvS[0], t->UvT[0],
+                    t->TextureLinear[0], texel);
+    output[RED_C] = texel[0];
+    output[GRN_C] = texel[1];
+    output[BLU_C] = texel[2];
+    s32 k0 = s_cfg.stage[0].stage_konst.a;
+    u32 cc0 = (u32)k0 + ((u32)k0 >> 7);
+    s32 temp0 = (s32)t->Color[0][3] * (s32)cc0;
+    temp0 += 128;
+    temp0 >>= 8;
+    s32 p = clamp1024((s16)temp0);
+    u32 cc1 = (u32)p + ((u32)p >> 7);
+    s32 temp1 = s_cfg.stage[1].stage_konst.a * (s32)cc1;
+    temp1 += 128;
+    temp1 >>= 8;
+    output[ALP_C] = (u8)clamp255((s16)temp1);
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* Config J: no-texture RasColor passthrough followed by stage-1 alpha. */
+static void fused_pixel_J(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 output[4];
+    output[RED_C] = t->Color[0][0];
+    output[GRN_C] = t->Color[0][1];
+    output[BLU_C] = t->Color[0][2];
+    s32 p = t->Color[0][3];
+    s32 cc = p + (p >> 7);
+    s32 temp = s_cfg.stage[1].stage_konst.a * cc;
+    temp += 128;
+    temp >>= 8;
+    output[ALP_C] = (u8)clamp255((s16)temp);
     tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
 }
 
@@ -2111,10 +2223,7 @@ static void fused_pixel_D(Tev* t) {
  * algebraic rewrite needed.) Verified bit-exact over the full domain: Y in
  * [0,255] x K in the full signed range [-1024,1023] (524,288 cases, 0
  * mismatches). */
-static void fused_pixel_E(Tev* t) {
-    tev_stats_enter(1);
-    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
-
+static inline void fused_core_E(Tev* t, u8 output[4]) {
     u32 texmap = s_cfg.stage[0].texmap;
     u8 texel[4];
     tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
@@ -2124,7 +2233,6 @@ static void fused_pixel_E(Tev* t) {
     const TColor* reg1 = &t->Reg[1];   /* "Color0" TEV const register, per-draw */
     s32 konst_a = s_cfg.stage[0].stage_konst.a;
 
-    u8 output[4];
     {
         s32 c = texel[0] + (texel[0] >> 7);
         s32 temp = ((s32)reg2->r << 8) + c * ((s32)reg1->r - (s32)reg2->r);
@@ -2151,8 +2259,34 @@ static void fused_pixel_E(Tev* t) {
         output[ALP_C] = (u8)clamp255((s16)temp);
     }
 
-    /* alpha test always passes -- see fused_pixel_A's identical derivation
-     * (same 0x7F0000 word, checked as part of fused_blend_common_match). */
+}
+
+static void fused_pixel_E(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 output[4];
+    fused_core_E(t, output);
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
+}
+
+/* ---- config G: config E followed by B's exact stage-1 alpha fold ---------
+ * st0 is byte-for-byte config E. st1 is the same disabled-texture
+ * 08FC0F/08F870 stage already derived for config B: RGB is an identity and
+ * alpha modulates the stage-0 result by stage_konst[1].a. */
+static void fused_pixel_G(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 output[4];
+    fused_core_E(t, output);
+    {
+        s32 konst_a = s_cfg.stage[1].stage_konst.a;
+        s32 p = output[ALP_C];
+        s32 cc = p + (p >> 7);
+        s32 temp = konst_a * cc;
+        temp += 128;
+        temp >>= 8;
+        output[ALP_C] = (u8)clamp255((s16)temp);
+    }
     tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage);
 }
 
@@ -2226,7 +2360,7 @@ typedef struct {
     float texCoords[8][3];
 } OutVtx;
 
-typedef struct { float f0, dfdx, dfdy; s32 x0, y0; float xOff, yOff; } Slope;
+typedef GxRasterSlope Slope;
 
 /* One Tev per GX-MT worker. s_tev_w[0] is the ONLY instance the serial path
  * ever touches (it is the old single s_tev, renamed); workers 1..n-1 receive
@@ -2522,12 +2656,7 @@ static void update_zslope(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2,
  * With nthreads==1 / row0==0 / rowstride==1 the loop below IS the old serial
  * loop, same iteration sequence, same arithmetic.
  * ==========================================================================*/
-typedef struct {   /* everything the scan loop needs that is per-triangle */
-    s32 block_minx, block_miny, minx, maxx, miny, maxy;
-    s32 C1, C2, C3;
-    s32 DX12, DX23, DX31, DY12, DY23, DY31;
-    s32 FDX12, FDX23, FDX31, FDY12, FDY23, FDY31;
-} TriScan;
+typedef GxRasterTriScan TriScan;
 
 static void scan_one_block_row(Tev* t, const TriScan* ts, s32 y) {
     /* Fused-path pixel-fn selection, hoisted out of the pixel loops:
@@ -2750,6 +2879,21 @@ static void gx_mt_resolve(void) {
     s_mt_threads = n;
 }
 
+static u32 fused_program_id(void) {
+    if (s_cfg.fused == fused_pixel_A) return 1;
+    if (s_cfg.fused == fused_pixel_B) return 2;
+    if (s_cfg.fused == fused_pixel_C) return 3;
+    if (s_cfg.fused == fused_pixel_D) return 4;
+    if (s_cfg.fused == fused_pixel_E) return 5;
+    if (s_cfg.fused == fused_pixel_F) return 6;
+    if (s_cfg.fused == fused_pixel_G) return 7;
+    if (s_cfg.fused == fused_pixel_H) return 8;
+    if (s_cfg.fused == fused_pixel_I) return 9;
+    if (s_cfg.fused == fused_pixel_J) return 10;
+    if (!s_cfg.fused && gpu_depth_K_match()) return 11;
+    return 0;
+}
+
 static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
     /* Setup only — edge equations, bbox/scissor clamp, slopes. The pixel
      * loops (and the fused-path pixel-fn selection, hoisted per triangle)
@@ -2846,6 +2990,82 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     ts.DY12 = DY12; ts.DY23 = DY23; ts.DY31 = DY31;
     ts.FDX12 = FDX12; ts.FDX23 = FDX23; ts.FDX31 = FDX31;
     ts.FDY12 = FDY12; ts.FDY23 = FDY23; ts.FDY31 = FDY31;
+
+    if (s_triangle_sink) {
+        GxRasterTriangleJob job;
+        memset(&job, 0, sizeof job);
+        job.scan = ts;
+        if (!s_cfg.fused) job.z = s_ZSlope;
+        job.w = s_WSlope;
+        job.num_color_chans = s_cfg.numcolchans;
+        job.num_texgens = s_cfg.numtexgens;
+        job.pixel_format = s_pf;
+        job.fused_program = fused_program_id();
+        for (u32 reg = 0; reg < 4; ++reg) {
+            job.tev_reg[reg][0] = s_tev_w[0].Reg[reg].r;
+            job.tev_reg[reg][1] = s_tev_w[0].Reg[reg].g;
+            job.tev_reg[reg][2] = s_tev_w[0].Reg[reg].b;
+            job.tev_reg[reg][3] = s_tev_w[0].Reg[reg].a;
+        }
+        for (u32 stage = 0; stage < 2; ++stage) {
+            job.stage_konst[stage][0] = s_cfg.stage[stage].stage_konst.r;
+            job.stage_konst[stage][1] = s_cfg.stage[stage].stage_konst.g;
+            job.stage_konst[stage][2] = s_cfg.stage[stage].stage_konst.b;
+            job.stage_konst[stage][3] = s_cfg.stage[stage].stage_konst.a;
+        }
+        for (u32 i = 0; i < s_cfg.numcolchans; ++i) {
+            int first = (s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ? 3 : 0;
+            for (int comp = first; comp < 4; ++comp)
+                job.color[i][comp] = s_ColorSlopes[i][comp];
+        }
+        for (u32 i = 0; i < s_cfg.numtexgens; ++i)
+            for (u32 comp = 0; comp < 3; ++comp)
+                job.tex[i][comp] = s_TexSlopes[i][comp];
+        if (s_triangle_sink(s_triangle_sink_user, &job, 0))
+            return;
+
+        /* Keep the packet alive across the authoritative scan so a
+         * differential sink can compare the GPU result after software. */
+        if (s_mt_threads > 1 && s_cfg.parallel_ok &&
+            (u32)((maxx - minx) * (maxy - miny)) >= s_mt_min_area) {
+            u64 t0 = s_mt_stats == 1 ? __rdtsc() : 0;
+            for (int i = 1; i < s_mt_threads; i++) {
+                s_tev_w[i] = s_tev_w[0];
+                s_tev_w[i].wid = i;
+            }
+            s32 nrows = (ts.maxy - ts.block_miny + BLK - 1) / BLK;
+            s_mt_job = ts;
+            __atomic_store_n(&s_mt_rows_done, 0, __ATOMIC_RELAXED);
+            s_mt_fork_id++;
+            __atomic_store_n(&s_mt_grab,
+                             (s64)(((u64)s_mt_fork_id << 32) |
+                                   ((u64)(u32)nrows << 16)),
+                             __ATOMIC_RELEASE);
+            __atomic_add_fetch(&s_mt_epoch, 1, __ATOMIC_RELEASE);
+            WakeByAddressAll((PVOID)&s_mt_epoch);
+            if (s_mt_stats != 1) {
+                scan_rows_dynamic(t);
+                while (__atomic_load_n(&s_mt_rows_done, __ATOMIC_ACQUIRE) != nrows)
+                    _mm_pause();
+            } else {
+                u64 t1 = __rdtsc();
+                scan_rows_dynamic(t);
+                u64 t2 = __rdtsc();
+                while (__atomic_load_n(&s_mt_rows_done, __ATOMIC_ACQUIRE) != nrows)
+                    _mm_pause();
+                u64 t3 = __rdtsc();
+                s_mt_forks++;
+                s_mt_scan_tsc += t2 - t1;
+                s_mt_join_tsc += t3 - t2;
+                s_mt_fork_tsc += t3 - t0;
+            }
+        } else {
+            if (s_mt_stats == 1) s_mt_serial_tris++;
+            scan_block_rows_serial(t, &ts);
+        }
+        (void)s_triangle_sink(s_triangle_sink_user, &job, 1);
+        return;
+    }
 
     /* GX-MT fork gate: enough pixels to amortize a fork/join (measured via
      * [gx-area-hist], see s_mt_min_area), and a draw whose pixel program is
@@ -4041,12 +4261,29 @@ static void build_draw_cfg(void) {
         } else if (s_cfg.numtevstages == 0 &&
                    fused_stage_match(0, 0x18428Fu, 0x08F770u, 1, 0)) {
             s_cfg.fused = fused_pixel_E;   /* D1 residuals-sweep config, see its derivation */
+        } else if (s_cfg.numtevstages == 1 &&
+                   fused_stage_match(0, 0x18428Fu, 0x08F770u, 1, 0) &&
+                   fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0)) {
+            s_cfg.fused = fused_pixel_G;
+        } else if (s_cfg.numtevstages == 1 &&
+                   fused_stage_match(0, 0x00F8CFu, 0x00F670u, 1, 0) &&
+                   fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0)) {
+            s_cfg.fused = fused_pixel_H;
+        } else if (s_cfg.numtevstages == 1 &&
+                   fused_stage_match(0, 0x00F8CFu, 0x00F770u, 1, 0) &&
+                   fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0)) {
+            s_cfg.fused = fused_pixel_I;
         }
     } else if (!s_no_fused && fused_common_match_notex()) {
         if (s_cfg.numtevstages == 0 &&
             fused_stage_match(0, 0x00AFFFu, 0x00BFF0u, 1, 0)) {
             s_cfg.fused = fused_pixel_F;   /* D1 residuals-sweep config, see its derivation */
             s_cfg.fused_needs_ras_rgb = 1; /* reads RasColor.rgb -- see the field's comment */
+        } else if (s_cfg.numtevstages == 1 &&
+                   fused_stage_match(0, 0x00AFFFu, 0x00BFF0u, 1, 0) &&
+                   fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0)) {
+            s_cfg.fused = fused_pixel_J;
+            s_cfg.fused_needs_ras_rgb = 1;
         }
     }
 

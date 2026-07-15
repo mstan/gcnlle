@@ -8,6 +8,7 @@
  */
 #include "gx/gx.h"
 #include "gx/gx_raster.h"
+#include "gx/gx_render.h"
 #include "debug/rings.h"
 
 #include <stdio.h>
@@ -290,7 +291,7 @@ static void gx_pipe_wait_retired(s64 target) {
  * gate-visible read of GX-produced state that is not already fenced:
  * end-of-run (boot.c pre-GCN_MEM_DUMP), debug-server screenshots, the PI
  * fifo-reset hook (gp.c), and the poison transition below. */
-void gcn_gx_pipeline_drain(void) {
+static void gx_pipe_drain_worker(void) {
     if (s_pipe_on != 1) return;
     s64 target = __atomic_load_n(&s_pipe_produced, __ATOMIC_RELAXED);
     int spins = 0;
@@ -306,18 +307,39 @@ void gcn_gx_pipeline_drain(void) {
     }
 }
 
+void gcn_gx_pipeline_drain(void) {
+    gx_pipe_drain_worker();
+    gx_render_flush();
+}
+
 void gcn_gx_pipeline_shutdown(void) {
-    if (s_pipe_on != 1) return;
-    gcn_gx_pipeline_drain();
-    __atomic_store_n(&s_pipe_quit, 1, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&s_pipe_epoch, 1, __ATOMIC_RELEASE);
-    WakeByAddressAll((PVOID)&s_pipe_epoch);
-    if (s_pipe_h) {
-        WaitForSingleObject(s_pipe_h, INFINITE);
-        CloseHandle(s_pipe_h);
-        s_pipe_h = NULL;
+    if (s_pipe_on == 1) {
+        gcn_gx_pipeline_drain();
+        __atomic_store_n(&s_pipe_quit, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&s_pipe_epoch, 1, __ATOMIC_RELEASE);
+        WakeByAddressAll((PVOID)&s_pipe_epoch);
+        if (s_pipe_h) {
+            WaitForSingleObject(s_pipe_h, INFINITE);
+            CloseHandle(s_pipe_h);
+            s_pipe_h = NULL;
+        }
+        s_pipe_on = 0;
     }
-    s_pipe_on = 0;
+    if (s_gxstats == 1) {
+        u64 total = s_gx_tsc[GX_STAT_FIFO] + s_gx_tsc[GX_STAT_DECODE] +
+                    s_gx_tsc[GX_STAT_DRAW] + s_gx_tsc[GX_STAT_EFB];
+        if (total)
+            fprintf(stderr,
+                    "[gx-final-stats] fifo=%.1f%% decode=%.1f%% draw=%.1f%% "
+                    "efb=%.1f%% draws=%llu efbcopy=%llu\n",
+                    100.0 * (double)s_gx_tsc[GX_STAT_FIFO] / (double)total,
+                    100.0 * (double)s_gx_tsc[GX_STAT_DECODE] / (double)total,
+                    100.0 * (double)s_gx_tsc[GX_STAT_DRAW] / (double)total,
+                    100.0 * (double)s_gx_tsc[GX_STAT_EFB] / (double)total,
+                    (unsigned long long)s_gx_draws,
+                    (unsigned long long)s_gx_efbcopies);
+    }
+    gx_render_shutdown();
 }
 
 static void gx_pipe_push_chunk(const u8* src) {
@@ -522,7 +544,7 @@ static void gx_pipe_enter_syncmode(void) {
                         "once)\n");
         announced = 1;
     }
-    gcn_gx_pipeline_drain();
+    gx_pipe_drain_worker();
     s_pipe_syncmode = 1;
 }
 
@@ -749,6 +771,7 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     switch (cmd) {
     case GX_BP_SETDRAWDONE:            /* BPStructs.cpp:180-201 */
         if ((value & 0xFFu) == 0x02u) {
+            gx_render_flush();
             gcn_pe_set_finish(gx->pe);
             fprintf(stderr, "gx: GXSetDrawDone -> PE finish (val 0x%04X)\n",
                     value & 0xFFFFu);
@@ -757,9 +780,11 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
         }
         break;
     case GX_BP_PE_TOKEN_ID:            /* BPStructs.cpp:202-217 (no interrupt) */
+        gx_render_flush();
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 0);
         break;
     case GX_BP_PE_TOKEN_INT_ID:        /* BPStructs.cpp:218-233 (interrupt) */
+        gx_render_flush();
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 1);
         break;
     case GX_BP_LOADTLUT1: {            /* BPStructs.cpp BPMEM_LOADTLUT1 */
@@ -790,11 +815,11 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
          * BP dispatch around it — the off path below is byte-identical work. */
         if (s_gxstats) {
             u64 t0 = __rdtsc();
-            gx_raster_efb_copy(&gx->cpst);
+            gx_render_efb_copy(&gx->cpst);
             s_gx_tsc[GX_STAT_EFB] += __rdtsc() - t0;
             s_gx_efbcopies++;
         } else {
-            gx_raster_efb_copy(&gx->cpst);
+            gx_render_efb_copy(&gx->cpst);
         }
         break;
     default:
@@ -968,12 +993,12 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
              * off path below is byte-identical work. */
             if (s_gxstats) {
                 u64 t0 = __rdtsc();
-                gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
+                gx_render_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
                 s_gx_tsc[GX_STAT_DRAW] += __rdtsc() - t0;
                 s_gx_draws++;
                 s_gx_verts += nverts;
             } else {
-                gx_raster_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
+                gx_render_draw(&gx->cpst, prim, vat, &data[3], nverts, vsize);
             }
             return total;
         }
@@ -1022,7 +1047,7 @@ void gcn_gx_init(CPUState* cpu, GcnCp* cp, GcnPe* pe) {
     s_gx.pe  = pe;
     /* Bind the persistent BP/XF register files + guest CPU into the rasterizer
      * (they never move) and clear the EFB model. */
-    gx_raster_init(cpu, s_gx.bp, s_gx.xf);
+    gx_render_init(cpu, s_gx.bp, s_gx.xf);
 }
 
 void gcn_gx_tick(u32 cycles) {

@@ -33,12 +33,10 @@
  *                      runs at clean shutdown. Unset (the default): nothing
  *                      is read or written — fixtures only, byte-identical to
  *                      before this option existed.
- *   GCN_RTC_HOST       [ENHANCEMENT] "1" makes RTC reads track the live host
- *                      wall clock (GC-epoch converted, exi.h) so the menu
- *                      shows the real current date/time. Nondeterministic by
- *                      nature — never set it for oracle-diff runs. Wins over
- *                      a GCN_SRAM_FILE-persisted counter (SRAM settings from
- *                      the file still apply).
+ *   GCN_RTC_HOST       [ENHANCEMENT] "1" samples host local time ONCE at boot,
+ *                      seeds the EXI RTC, then advances it only from emulated
+ *                      Gekko cycles. Never set it for oracle-diff runs. It
+ *                      wins over a persisted counter; SRAM settings still load.
  *   GCN_GX_PIPELINE    default-on CPU/GX execution overlap. "0" selects the
  *                      fully synchronous fallback for diagnostics. Both paths
  *                      retain the pinned XFB/oracle results; live VI capture,
@@ -164,7 +162,7 @@ static GcnSramPersistCtx s_sram_persist_ctx;
 
 static void sram_persist_to_file(void* user) {
     GcnSramPersistCtx* ctx = (GcnSramPersistCtx*)user;
-    if (!gcn_exi_persist_save(ctx->path, ctx->exi->rtc_counter, ctx->exi->sram))
+    if (!gcn_exi_persist_save(ctx->path, ctx->exi->rtc.counter, ctx->exi->sram))
         fprintf(stderr, "gcn boot: WARNING — failed to write GCN_SRAM_FILE '%s'\n",
                 ctx->path);
 }
@@ -526,16 +524,15 @@ int main(int argc, char** argv) {
         gcn_exi_set_persist(&exi, sram_persist_to_file, &s_sram_persist_ctx);
     }
 
-    /* [ENHANCEMENT, opt-in] GCN_RTC_HOST=1: RTC reads track the live host
-     * wall clock (GC-epoch converted; see exi.h). Applied AFTER the
-     * GCN_SRAM_FILE load so host time wins over any persisted counter (the
-     * SRAM settings from the file still apply). Default off: the
-     * deterministic fixture serves every oracle-diff run. */
+    /* [ENHANCEMENT, opt-in] GCN_RTC_HOST=1: sample host local time exactly
+     * once. The EXI RTC then advances from emulated cycles, never by reading
+     * the host clock again. Applied after persistence load so the boot sync
+     * wins while SRAM settings remain intact. */
     const char* rtc_host = getenv("GCN_RTC_HOST");
     if (rtc_host && *rtc_host && *rtc_host != '0') {
-        gcn_exi_set_rtc_host_mode(&exi, 1);
-        fprintf(stdout, "gcn boot: GCN_RTC_HOST — RTC tracks the host clock "
-                "(enhancement mode; nondeterministic, not for oracle diffs)\n");
+        u32 sampled_rtc = gcn_exi_sync_rtc_from_host(&exi, cpu.cycles);
+        fprintf(stdout, "gcn boot: GCN_RTC_HOST — sampled host local time once "
+                "at boot (RTC=%u); subsequent time is emulated\n", sampled_rtc);
     }
 
     /* ROADMAP M4: memory cards. Slot A defaults to a formatted card (EXT=1,
@@ -873,6 +870,7 @@ int main(int argc, char** argv) {
      * no-op in the common case — it only matters if gcn_exi_set_persist was
      * never wired to a per-write flush for some future caller, or as cheap
      * insurance against this function's own flush having failed earlier. */
+    gcn_exi_rtc_latch(&exi, cpu.cycles);
     if (sram_path && *sram_path)
         sram_persist_to_file(&s_sram_persist_ctx);
 

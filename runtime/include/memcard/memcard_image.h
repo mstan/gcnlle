@@ -8,8 +8,8 @@
  * provision a `.raw` file that the runtime's memcard device can then mount.
  *
  * Every offset, field width, endianness and checksum below is transcribed from
- * the Dolphin oracle (GPL-2.0-or-later), cross-checked against the citation-backed
- * spec at F:/Projects/gcnrecomp/_work/M4_SPEC_FORMAT.md:
+ * the Dolphin oracle (GPL-2.0-or-later), cross-checked against the project's
+ * derived memory-card format notes:
  *   - Sizes/blocks/header/directory/BAT layout & the checksum algorithm:
  *     oracle/dolphin/Source/Core/Core/HW/GCMemcard/GCMemcard.h, GCMemcard.cpp
  *     (CalculateMemcardChecksums:326-348, Format:1017-1053,
@@ -98,8 +98,9 @@ int gcn_mc_image_format(unsigned char* buf, unsigned size_bytes,
  * Returns 1 if valid, 0 otherwise. */
 int gcn_mc_image_check(const unsigned char* buf, unsigned size_bytes, char* err, int errcap);
 
-/* Fills out[0..min(out_cap, n)) with the card's directory entries (in
- * directory-slot order, skipping unused/0xFF entries) and returns the total
+/* Fills out[0..min(out_cap, n)) from the active signed-update-counter
+ * Directory/BAT journal pair (in directory-slot order, skipping unused/0xFF
+ * entries) and returns the total
  * number of occupied entries n (which may exceed out_cap; the caller can
  * pass out_cap == 0 / out == NULL to just get the count). */
 int gcn_mc_image_list(const unsigned char* buf, unsigned size_bytes,

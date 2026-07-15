@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+#ifdef GCN_XFB_SUBGROUP
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D efb_color;
+layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D efb_depth;
+layout(set = 0, binding = 2, std430) buffer XfbOutput {
+    uint words[];
+} xfb;
+
+layout(push_constant) uniform CopyPush {
+    uvec4 rect;          // left, top, right, bottom; right/bottom exclusive
+    uvec4 dimensions;    // source width, destination height, yscale register, invert
+    uvec4 mode;          // clamp top, clamp bottom, pixel format, copy enabled
+    uvec4 weights0;      // copy-filter coefficients 0..3
+    uvec4 weights1;      // copy-filter coefficients 4..6, output words/row
+    uvec4 output_cfg;    // output word base, reserved
+} p;
+
+int clampi(int value, int low, int high) {
+    return min(max(value, low), high);
+}
+
+uint expand6(uint value) {
+    return (value << 2) | (value >> 4);
+}
+
+ivec3 efb_rgb(int x, int y) {
+    x = clampi(x, 0, 639);
+    y = clampi(y, 0, 527);
+    uint packed = imageLoad(efb_color, ivec2(x, y)).r;
+    if (p.mode.z == 1u) {
+        return ivec3(expand6((packed >> 18) & 0x3fu),
+                     expand6((packed >> 12) & 0x3fu),
+                     expand6((packed >> 6) & 0x3fu));
+    }
+    // RGB8_Z24, RGB565_Z16 and Z24 use SWEfbInterface's same direct
+    // extraction in the authoritative software renderer.
+    return ivec3((packed >> 16) & 0xffu,
+                 (packed >> 8) & 0xffu,
+                 packed & 0xffu);
+}
+
+ivec3 filtered_yuv(int x, int yprev, int sy, int ynext) {
+    ivec3 c0 = efb_rgb(x, yprev);
+    ivec3 c1 = efb_rgb(x, sy);
+    ivec3 c2 = efb_rgb(x, ynext);
+    int wab = int(p.weights0.x + p.weights0.y);
+    int wcde = int(p.weights0.z + p.weights0.w + p.weights1.x);
+    int wfg = int(p.weights1.y + p.weights1.z);
+    ivec3 rgb = min((c0 * wab + c1 * wcde + c2 * wfg) >> 6,
+                    ivec3(255));
+
+    int y = 66 * rgb.r + 129 * rgb.g + 25 * rgb.b;
+    int u = -38 * rgb.r - 74 * rgb.g + 112 * rgb.b;
+    int v = 112 * rgb.r - 94 * rgb.g - 18 * rgb.b;
+    return ivec3((y >> 8) + ((y >> 7) & 1),
+                 (u >> 8) + ((u >> 7) & 1),
+                 (v >> 8) + ((v >> 7) & 1));
+}
+
+uint byte_clamp(int value) {
+    return uint(clampi(value, 0, 255));
+}
+
+void main() {
+    uint pair_x = gl_GlobalInvocationID.x;
+    uint dy = gl_GlobalInvocationID.y;
+    if (p.mode.w == 0u || dy >= p.dimensions.y ||
+        pair_x * 2u >= p.dimensions.x)
+        return;
+
+    int sy;
+    if (p.dimensions.z == 256u) {
+        // Both scale directions are exactly 1.0 at register value 256.
+        sy = int(p.rect.y + dy);
+    } else {
+        float yscale = p.dimensions.w != 0u
+            ? (p.dimensions.z != 0u ? 256.0 / float(p.dimensions.z) : 1.0)
+            : float(p.dimensions.z) / 256.0;
+        sy = int(p.rect.y) + int(float(dy) /
+            (yscale == 0.0 ? 1.0 : yscale) + 0.5);
+    }
+    sy = min(sy, int(p.rect.w) - 1);
+    int yprev = max(p.mode.x != 0u ? int(p.rect.y) : 0, sy - 1);
+    int ynext = min((p.mode.y != 0u ? int(p.rect.w) : 528) - 1, sy + 1);
+
+    int first = int(p.rect.x + pair_x * 2u);
+    int last = int(p.rect.z) - 1;
+    int xm1 = max(first - 1, int(p.rect.x));
+    int x1 = min(first + 1, last);
+
+    ivec3 y0 = filtered_yuv(first, yprev, sy, ynext);
+    ivec3 y1 = filtered_yuv(x1, yprev, sy, ynext);
+#ifdef GCN_XFB_SUBGROUP
+    ivec3 prior_y1 = ivec3(subgroupShuffleUp(y1.x, 1u),
+                           subgroupShuffleUp(y1.y, 1u),
+                           subgroupShuffleUp(y1.z, 1u));
+    bool subgroup_boundary = gl_SubgroupInvocationID == 0u ||
+                             gl_LocalInvocationID.x == 0u;
+    ivec3 ym1 = subgroup_boundary
+        ? filtered_yuv(xm1, yprev, sy, ynext)
+        : prior_y1;
+#else
+    ivec3 ym1 = filtered_yuv(xm1, yprev, sy, ynext);
+#endif
+
+    uint out_y0 = byte_clamp(y0.x + 16);
+    uint out_u = byte_clamp(128 + ((ym1.y + (y0.y << 1) + y1.y) >> 2));
+    uint out_y1 = byte_clamp(y1.x + 16);
+    uint out_v = byte_clamp(128 + ((ym1.z + (y0.z << 1) + y1.z) >> 2));
+    xfb.words[p.output_cfg.x + dy * p.weights1.w + pair_x] =
+        out_y0 | (out_u << 8) | (out_y1 << 16) | (out_v << 24);
+}

@@ -29,8 +29,7 @@ static int g_failures = 0;
     } while (0)
 
 /* ---- Independent re-implementation of CalculateMemcardChecksums, written
- * straight from the spec (F:/Projects/gcnrecomp/_work/M4_SPEC_FORMAT.md §5 /
- * GCMemcard.cpp:326-348), deliberately NOT sharing code with
+ * straight from Dolphin's GCMemcard.cpp:326-348, deliberately NOT sharing code with
  * runtime/src/memcard_image.c's calc_checksums() — this is a cross-check,
  * not a re-test of the same function. */
 static unsigned test_rd_be16(const unsigned char* p)
@@ -104,6 +103,8 @@ int main(void)
     gcn_mc_dirent_t entries[GCN_MC_DIRLEN];
     int count, i;
     int found_melee;
+    unsigned char old_dir[GCN_MC_BLOCK_SIZE];
+    unsigned char old_bat[GCN_MC_BLOCK_SIZE];
 
     /* --- sizing helpers --- */
     CHECK(gcn_mc_image_valid_size(0x200000u), "0x200000 must be a valid card size");
@@ -171,19 +172,22 @@ int main(void)
                 GCN_MC_BLOCK_SIZE) == 0,
          "BAT blocks 3 and 4 must be identical after format");
 
+    /* Preserve counter-0 metadata so the import test can reproduce the IPL's
+     * normal ping-pong journal: stale valid copy 0, newer valid copy 1. */
+    memcpy(old_dir, card + (size_t)GCN_MC_BLOCK_SIZE * 1, GCN_MC_BLOCK_SIZE);
+    memcpy(old_bat, card + (size_t)GCN_MC_BLOCK_SIZE * 3, GCN_MC_BLOCK_SIZE);
+
     /* --- list should be empty on a blank card --- */
     count = gcn_mc_image_list(card, size_bytes, entries, (int)(sizeof entries / sizeof entries[0]));
     CHECK(count == 0, "blank card must list zero directory entries");
 
-    /* --- import the real Melee save (skipped if the local asset is absent, so
-     * this test stays portable — the format/check/checksum coverage above is
-     * self-contained and hard-asserted regardless). The GCN_MELEE_GCS env var
-     * overrides the default path. --- */
+    /* --- Optional real-save import. The user supplies the fixture explicitly;
+     * no save data or machine-local path is part of this repository. The
+     * format/check/checksum coverage above is always self-contained. --- */
     {
         const char* gcs_path = getenv("GCN_MELEE_GCS");
-        if (!gcs_path || !gcs_path[0])
-            gcs_path = "E:/Downloads/super-smash-bros-melee.11108.gcs";
-        save = read_whole_file(gcs_path, &save_size);
+        save = (gcs_path && gcs_path[0])
+            ? read_whole_file(gcs_path, &save_size) : NULL;
     }
     if (!save) {
         printf("SKIP: Melee GCS save not found — import sub-test skipped "
@@ -224,6 +228,26 @@ int main(void)
              "card must still check valid after import (dir+BAT consistent)");
         if (err[0])
             fprintf(stderr, "  (post-import check reported: %s)\n", err);
+
+        /* CARD writes only the inactive journal half. Leave imported
+         * counter-1 metadata in copies 1 and restore counter-0 blank metadata
+         * to copies 0. Forcing pair 0 would be DIR_BAT_INCONSISTENT. */
+        memcpy(card + (size_t)GCN_MC_BLOCK_SIZE * 1, old_dir, GCN_MC_BLOCK_SIZE);
+        memcpy(card + (size_t)GCN_MC_BLOCK_SIZE * 3, old_bat, GCN_MC_BLOCK_SIZE);
+        err[0] = '\0';
+        CHECK(gcn_mc_image_check(card, size_bytes, err, (int)sizeof err) == 1,
+             "IPL-style ping-pong metadata must select newer update counters");
+        if (err[0])
+            fprintf(stderr, "  (ping-pong check reported: %s)\n", err);
+
+        memset(entries, 0, sizeof entries);
+        count = gcn_mc_image_list(card, size_bytes, entries,
+                                  (int)(sizeof entries / sizeof entries[0]));
+        CHECK(count == 1 && strncmp(entries[0].gamecode, "GALE", 4) == 0,
+             "list must read the newer directory and BAT journal copies");
+        CHECK(strstr(entries[0].comment1, "Smash") != NULL ||
+              strstr(entries[0].comment2, "Smash") != NULL,
+             "list comments must follow the newer BAT chain");
     }
 
     free(card);

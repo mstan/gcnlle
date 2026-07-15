@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+// Exact compute differential for the eleven fused IPL pixel programs A--K.
+// currently accept only direct I8 textures; the host rejects every other
+// format before dispatch.  Program F has no texture dependency.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform uimage2D efb_color;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D efb_depth;
+layout(set = 0, binding = 3, std430) readonly buffer DrawJob {
+    uint words[];
+} job;
+layout(set = 0, binding = 4, std430) readonly buffer TextureData {
+    uint words[];
+} texture_data;
+layout(push_constant) uniform DrawPush {
+    uint word_base;
+    uint batch_mode;
+    uint tile_header_base;
+    uint tile_index_base;
+} draw_push;
+
+uint current_word_base;
+uint jw(uint index) { return job.words[current_word_base + index]; }
+int si(uint index) { return int(jw(index)); }
+float sf(uint index) { return uintBitsToFloat(jw(index)); }
+
+float slope_value(uint base, int x, int y) {
+    precise float dx = sf(base + 5u) + float(x - si(base + 3u));
+    precise float dy = sf(base + 6u) + float(y - si(base + 4u));
+    precise float xterm = sf(base + 1u) * dx;
+    precise float value = sf(base) + xterm;
+    precise float yterm = sf(base + 2u) * dy;
+    value = value + yterm;
+    return value;
+}
+
+uint color_byte(uint slope_base, int x, int y) {
+    float value = slope_value(slope_base, x, y);
+    return uint(int(value < 0.0 ? 0.0 : value > 255.0 ? 255.0 : value));
+}
+
+precise vec2 texture_uv(int x, int y) {
+    precise float inv_w = 1.0 / slope_value(51u, x, y);
+    precise float q = slope_value(72u, x, y) * inv_w;
+    precise float projection = inv_w;
+    if (q != 0.0)
+        projection = inv_w / q;
+    precise float u = slope_value(58u, x, y) * projection;
+    precise float v = slope_value(65u, x, y) * projection;
+    return vec2(u, v);
+}
+
+int fixed_log2(float value) {
+    uint bits = floatBitsToUint(value);
+    return int((bits & 0x7f800000u) >> 19) - 2032 +
+           int((bits & 0x007fffffu) >> 19);
+}
+
+bool texture_linear(int bx, int by) {
+    precise vec2 uv00 = texture_uv(bx, by);
+    precise vec2 uv10 = texture_uv(bx + 1, by);
+    precise vec2 uv01 = texture_uv(bx, by + 1);
+    precise float dudx = abs(uv00.x - uv10.x);
+    precise float dvdx = abs(uv00.y - uv10.y);
+    precise float dudy = abs(uv00.x - uv01.x);
+    precise float dvdy = abs(uv00.y - uv01.y);
+    precise float s_delta;
+    precise float t_delta;
+    if (jw(86u) != 0u) {
+        s_delta = dudx + dudy;
+        t_delta = dvdx + dvdy;
+    } else {
+        s_delta = max(dudx, dudy);
+        t_delta = max(dvdx, dvdy);
+    }
+    int lod = fixed_log2(max(s_delta, t_delta));
+    lod += si(87u);
+    return (lod > 0 && jw(85u) == 1u) ||
+           (lod <= 0 && jw(84u) == 1u);
+}
+
+int wrap_coord(int coord, uint mode, int size) {
+    if (mode == 0u)
+        return clamp(coord, 0, size - 1);
+    if (mode == 1u)
+        return coord & (size - 1);
+    if ((coord & size) != 0)
+        coord = ~coord;
+    return coord & (size - 1);
+}
+
+uint load_texture_u8(uint offset) {
+    if (offset >= jw(90u))
+        return 0u;
+    uint packed = texture_data.words[(jw(99u) + offset) >> 2];
+    return (packed >> ((offset & 3u) * 8u)) & 0xffu;
+}
+
+uvec4 decode_texture(int s, int t) {
+    uint ss = uint(s), tt = uint(t);
+    uint format = jw(79u);
+    if (format == 0u) {
+        uint width_blocks = (jw(80u) + 7u) >> 3;
+        uint base = ((tt >> 3) * width_blocks + (ss >> 3)) << 5;
+        uint packed = load_texture_u8(base + ((tt & 7u) << 2) + ((ss & 7u) >> 1));
+        uint i = ((ss & 1u) == 0u ? packed >> 4 : packed) & 0xfu;
+        i = (i << 4) | i;
+        return uvec4(i);
+    }
+    if (format == 6u) {
+        uint width_blocks = (jw(80u) + 3u) >> 2;
+        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 6;
+        uint index = ((tt & 3u) << 2) + (ss & 3u);
+        uint a = load_texture_u8(base + index * 2u);
+        uint r = load_texture_u8(base + index * 2u + 1u);
+        uint g = load_texture_u8(base + 32u + index * 2u);
+        uint b = load_texture_u8(base + 32u + index * 2u + 1u);
+        return uvec4(r, g, b, a);
+    }
+    uint width_blocks = (jw(80u) + 7u) >> 3;
+    uint base = ((tt >> 2) * width_blocks + (ss >> 3)) << 5;
+    uint i = load_texture_u8(base + ((tt & 3u) << 3) + (ss & 7u));
+    return uvec4(i);
+}
+
+uvec4 sample_texture(int s, int t, bool linear) {
+    int width = int(jw(80u));
+    int height = int(jw(81u));
+    if (!linear) {
+        int is = wrap_coord(s >> 7, jw(82u), width);
+        int it = wrap_coord(t >> 7, jw(83u), height);
+        return decode_texture(is, it);
+    }
+
+    s -= 64;
+    t -= 64;
+    int is = s >> 7;
+    int it = t >> 7;
+    int is1 = is + 1;
+    int it1 = it + 1;
+    int fs = s & 0x7f;
+    int ft = t & 0x7f;
+    is = wrap_coord(is, jw(82u), width);
+    it = wrap_coord(it, jw(83u), height);
+    is1 = wrap_coord(is1, jw(82u), width);
+    it1 = wrap_coord(it1, jw(83u), height);
+    uvec4 v00 = decode_texture(is, it);
+    uvec4 v10 = decode_texture(is1, it);
+    uvec4 v01 = decode_texture(is, it1);
+    uvec4 v11 = decode_texture(is1, it1);
+    uvec4 acc = v00 * uint((128 - fs) * (128 - ft)) +
+                v10 * uint(fs * (128 - ft)) +
+                v01 * uint((128 - fs) * ft) +
+                v11 * uint(fs * ft);
+    return acc >> 14;
+}
+
+int signed16(int value) {
+    uint low = uint(value) & 0xffffu;
+    return low >= 0x8000u ? int(low) - 0x10000 : int(low);
+}
+
+uint clamp255_s16(int value) {
+    return uint(clamp(signed16(value), 0, 255));
+}
+
+int clamp1024_s16(int value) {
+    int narrowed = int(value << 16) >> 16;
+    return clamp(narrowed, -1024, 1023);
+}
+
+uint modulate(uint value, uint factor) {
+    uint cc = factor + (factor >> 7);
+    return clamp255_s16(int(value * cc + 128u) >> 8);
+}
+
+uint core_c_channel(uint texel, int reg_value) {
+    int c = int(texel + (texel >> 7));
+    int value = (reg_value * c) << 1;
+    value = (value + 128) >> 8;
+    return clamp255_s16(value);
+}
+
+uint program_e_channel(uint texel, int reg1, int reg2) {
+    int c = int(texel + (texel >> 7));
+    int value = (reg2 << 8) + c * (reg1 - reg2);
+    value = ((value << 1) + 128) >> 8;
+    return clamp255_s16(value);
+}
+
+uint expand6(uint value) { return (value << 2) | (value >> 4); }
+
+uvec4 get_abgr(uint packed, uint pixel_format) {
+    if (pixel_format == 1u) {
+        return uvec4(expand6(packed & 0x3fu),
+                     expand6((packed >> 6) & 0x3fu),
+                     expand6((packed >> 12) & 0x3fu),
+                     expand6((packed >> 18) & 0x3fu));
+    }
+    return uvec4(255u, packed & 0xffu, (packed >> 8) & 0xffu,
+                 (packed >> 16) & 0xffu);
+}
+
+void shade_pixel(int x, int y) {
+    if (x >= si(3u) || y >= si(5u))
+        return;
+
+    int x16 = x << 4;
+    int y16 = y << 4;
+    if (si(6u) + si(9u) * y16 - si(12u) * x16 <= 0 ||
+        si(7u) + si(10u) * y16 - si(13u) * x16 <= 0 ||
+        si(8u) + si(11u) * y16 - si(14u) * x16 <= 0)
+        return;
+
+    uint program = jw(50u);
+    if (program == 11u) {
+        int z = int(slope_value(100u, x, y));
+        z = clamp(z, 0, 16777215);
+        uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
+        if (uint(z) > old_depth)
+            return;
+        imageStore(efb_depth, ivec2(x, y), uvec4(uint(z)));
+    }
+    uint ras_r = color_byte(22u, x, y);
+    uint ras_g = color_byte(29u, x, y);
+    uint ras_b = color_byte(36u, x, y);
+    uint ras_a = color_byte(43u, x, y);
+    uint out_r = ras_r, out_g = ras_g, out_b = ras_b, out_a = ras_a;
+
+    if (program != 6u && program != 10u) {
+        int bx = x & ~1;
+        int by = y & ~1;
+        precise vec2 uv = texture_uv(x, y);
+        precise float sfixed = uv.x * 128.0;
+        precise float tfixed = uv.y * 128.0;
+        uvec4 texel = sample_texture(int(sfixed), int(tfixed),
+                                    texture_linear(bx, by));
+        if (program == 1u || program == 8u) {
+            out_r = texel.r; out_g = texel.g; out_b = texel.b;
+            out_a = modulate(ras_a, texel.a);
+            if (program == 8u) {
+                int p = int(out_a);
+                int cc = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+            }
+        } else if (program == 2u || program == 3u) {
+            out_r = core_c_channel(texel.r, si(91u));
+            out_g = core_c_channel(texel.g, si(92u));
+            out_b = core_c_channel(texel.b, si(93u));
+            out_a = modulate(ras_a, texel.a);
+            if (program == 2u) {
+                int p = int(out_a);
+                int cc = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+            }
+        } else if (program == 4u) {
+            out_a = modulate(texel.a, ras_a);
+        } else if (program == 5u || program == 7u) {
+            out_r = program_e_channel(texel.r, si(91u), si(94u));
+            out_g = program_e_channel(texel.g, si(92u), si(95u));
+            out_b = program_e_channel(texel.b, si(93u), si(96u));
+            uint cc = uint(si(97u)) + (uint(si(97u)) >> 7);
+            int alpha = int(uint(ras_a) * cc + 128u) >> 8;
+            out_a = clamp255_s16(alpha);
+            if (program == 7u) {
+                int p = int(out_a);
+                int stage1_cc = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * stage1_cc + 128) >> 8);
+            }
+        } else if (program == 9u || program == 11u) {
+            out_r = texel.r; out_g = texel.g; out_b = texel.b;
+            uint cc0 = uint(si(97u)) + (uint(si(97u)) >> 7);
+            int p = clamp1024_s16((int(ras_a) * int(cc0) + 128) >> 8);
+            if (program == 11u) {
+                out_a = uint(p) & 0xffu;
+            } else {
+                uint cc1 = uint(p) + (uint(p) >> 7);
+                out_a = clamp255_s16((si(98u) * int(cc1) + 128) >> 8);
+            }
+        }
+    }
+    if (program == 10u) {
+        int p = int(ras_a);
+        int cc = p + (p >> 7);
+        out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+    }
+
+    uvec4 src = uvec4(out_a, out_b, out_g, out_r);
+    uint pf = jw(21u);
+    uint old = imageLoad(efb_color, ivec2(x, y)).r;
+    uvec4 dst = get_abgr(old, pf);
+    uint src_alpha = src.x;
+    uint sa = src_alpha + (src_alpha >> 7);
+    uint inverse = 255u - src_alpha;
+    uint da = inverse + (inverse >> 7);
+    uvec4 blended = min((src * sa + dst * da) >> 8, uvec4(255u));
+
+    if (pf == 1u) {
+        const uint matrix[4] = uint[4](0u, 2u, 3u, 1u);
+        uint dither = matrix[((uint(y) & 1u) << 1) | (uint(x) & 1u)];
+        blended.y = ((blended.y - (blended.y >> 6)) + dither) & 0xfcu;
+        blended.z = ((blended.z - (blended.z >> 6)) + dither) & 0xfcu;
+        blended.w = ((blended.w - (blended.w >> 6)) + dither) & 0xfcu;
+        uint value = (old & 0xff000000u) |
+                ((blended.x >> 2) & 0x3fu) |
+                ((blended.y << 4) & 0x00000fc0u) |
+                ((blended.z << 10) & 0x0003f000u) |
+                ((blended.w << 16) & 0x00fc0000u);
+        imageStore(efb_color, ivec2(x, y), uvec4(value));
+    } else {
+        uint value = (old & 0xff000000u) | blended.y |
+                     (blended.z << 8) | (blended.w << 16);
+        imageStore(efb_color, ivec2(x, y), uvec4(value));
+    }
+}
+
+void main() {
+    if (draw_push.batch_mode == 0u) {
+        current_word_base = draw_push.word_base;
+        int x = si(2u) + int(gl_GlobalInvocationID.x);
+        int y = si(4u) + int(gl_GlobalInvocationID.y);
+        shade_pixel(x, y);
+        return;
+    }
+
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= 640 || y >= 528)
+        return;
+    uint tile = gl_WorkGroupID.y * 40u + gl_WorkGroupID.x;
+    uint first = job.words[draw_push.tile_header_base + tile * 2u];
+    uint count = job.words[draw_push.tile_header_base + tile * 2u + 1u];
+    for (uint i = 0u; i < count; ++i) {
+        uint packet = job.words[draw_push.tile_index_base + first + i];
+        current_word_base = draw_push.word_base + packet * 128u;
+        shade_pixel(x, y);
+    }
+}

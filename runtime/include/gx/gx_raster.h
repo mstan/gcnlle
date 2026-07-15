@@ -70,6 +70,52 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
  * preserving Dolphin's copy-then-clear order. */
 void gx_raster_efb_copy(const GxCpState* cp);
 
+/* Read-only packed EFB planes for the opt-in GPU differential shadow. The
+ * pointers remain valid for the process lifetime; callers must synchronize at
+ * the ordered draw/copy boundary and must never mutate them. */
+void gx_raster_efb_data(const u32** color, const u32** depth,
+                        u32* width, u32* height);
+void gx_raster_efb_data_mutable(u32** color, u32** depth,
+                                u32* width, u32* height);
+
+/* Exact post-clip triangle work packet for the GPU shadow. Geometry remains
+ * owned by the LLE software vertex loader/transform/clipper; this is the
+ * already-decoded edge state and interpolation data consumed by the measured-
+ * hot scan/pixel stage. A NULL sink is the normal software path. */
+typedef struct {
+    float f0, dfdx, dfdy;
+    s32 x0, y0;
+    float xOff, yOff;
+} GxRasterSlope;
+
+typedef struct {
+    s32 block_minx, block_miny, minx, maxx, miny, maxy;
+    s32 C1, C2, C3;
+    s32 DX12, DX23, DX31, DY12, DY23, DY31;
+    s32 FDX12, FDX23, FDX31, FDY12, FDY23, FDY31;
+} GxRasterTriScan;
+
+typedef struct {
+    GxRasterTriScan scan;
+    GxRasterSlope z, w;
+    GxRasterSlope color[2][4];
+    GxRasterSlope tex[8][3];
+    u32 num_color_chans;
+    u32 num_texgens;
+    u32 pixel_format;
+    u32 fused_program; /* 0=general, 1..11=the exact A..K programs */
+    s32 tev_reg[4][4];       /* [Prev/Color0/Color1/Color2][R,G,B,A] */
+    s32 stage_konst[2][4];   /* first two stages are sufficient for A..F */
+} GxRasterTriangleJob;
+
+/* Return nonzero from the pre-software callback only when the sink has taken
+ * authoritative ownership of this exact triangle.  The rasterizer then skips
+ * its scan.  The post-software callback's return value is ignored. */
+typedef int (*GxRasterTriangleSink)(void* user,
+                                    const GxRasterTriangleJob* job,
+                                    int after_software);
+void gx_raster_set_triangle_sink(GxRasterTriangleSink sink, void* user);
+
 /* GCN_GX_STATS=1 (same knob gx.c reads): gx_raster_draw's own internal time
  * split between vertex load+transform+clip and triangle scan/pixel, plus a
  * pixels_shaded counter (tev_draw invocations). gx.c calls this at the same
@@ -116,7 +162,8 @@ void gx_raster_get_pixel_stats(GxPixelStats* out);
 
 /* GCN_GX_TEV_CENSUS=1: print the distinct-shading-config census (draws +
  * shaded pixels per config) — decides fused-path specialization targets.
- * No-op unless the knob is on. Called from gx.c's shared stats cadence. */
+ * No-op unless the knob is on. Called from gx.c's shared stats cadence and
+ * once at renderer shutdown so short late-state captures still report. */
 void gx_raster_print_census(void);
 
 /* GCN_GX_STATS: print the per-triangle post-scissor-bbox-area histogram

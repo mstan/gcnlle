@@ -31,6 +31,7 @@
 
 #include "cpu/cpu.h"
 #include "memcard/memcard.h"   /* M4: EXI memory-card devices (slot A/B) */
+#include "exi/rtc.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,7 +93,7 @@ enum {
 typedef void (*GcnExiIrqFn)(void* user, int level);
 
 /* Fired synchronously whenever a guest RTC_WRITE or SRAM_WRITE transaction
- * mutates exi->rtc_counter / exi->sram (ROADMAP M3 persistence). The runtime
+ * mutates exi->rtc.counter / exi->sram (ROADMAP M3 persistence). The runtime
  * host (boot.c) hooks this to flush the combined RTC+SRAM blob to the
  * GCN_SRAM_FILE path, mirroring the "write straight through" semantics real
  * SRAM/RTC hardware has (no host-side batching invented here). NULL by
@@ -118,23 +119,7 @@ typedef struct GcnExi {
                              paths (gcn_exi_set_rom), which are unowned as
                              before this field existed. */
     u8        sram[GCN_SRAM_SIZE_BYTES];
-    u32       rtc_counter;
-
-    /* [ENHANCEMENT, opt-in] Host-clock RTC (GCN_RTC_HOST=1): RTC reads return
-     * the live host wall clock converted to the GC epoch — LOCAL seconds
-     * since 2000-01-01 00:00:00 (unix_time + tz/DST offset - 0x386D4380;
-     * Dolphin EXI_DeviceIPL.h:27 GC_EPOCH, fed local time via
-     * GetLocalTimeSinceJan1970 for the same IPL-shows-wall-clock reason)
-     * — plus rtc_host_offset, which an RTC_WRITE adjusts so the
-     * guest can still "set the clock" relative to host time (we never touch
-     * the host clock). DEFAULT OFF: reads serve the deterministic fixture
-     * counter, byte-identical to before — host mode is a per-run convenience
-     * on top of the validated baseline (PRINCIPLES: enhancements never
-     * replace it) and NOT usable for oracle-diff runs (host time is
-     * inherently nondeterministic). In host mode the persisted blob's rtc
-     * field is written on flush but IGNORED on load (host time wins). */
-    int       rtc_host_mode;
-    s32       rtc_host_offset;
+    GcnRtc    rtc;
 
     /* Per-channel transaction state (reset when a device is (re)selected). */
     int       op[GCN_EXI_CHANNELS];
@@ -208,11 +193,15 @@ void gcn_exi_free(GcnExi* exi);
 void gcn_exi_set_sram(GcnExi* exi, const u8 sram[GCN_SRAM_SIZE_BYTES]);
 void gcn_exi_set_rtc(GcnExi* exi, u32 rtc_counter);
 
-/* [ENHANCEMENT] Enable host-clock RTC mode (see the struct field doc). */
-void gcn_exi_set_rtc_host_mode(GcnExi* exi, int on);
+/* [ENHANCEMENT] Sample host local time once, seed the device at
+ * `core_cycles`, then advance solely from emulated cycles. */
+u32 gcn_exi_sync_rtc_from_host(GcnExi* exi, u64 core_cycles);
+
+/* Advance/latch the running counter for persistence or explicit observation. */
+u32 gcn_exi_rtc_latch(GcnExi* exi, u64 core_cycles);
 
 /* Register the write-back hook (ROADMAP M3): called synchronously right after
- * a guest RTC_WRITE or SRAM_WRITE lands in exi->rtc_counter / exi->sram. NULL
+ * a guest RTC_WRITE or SRAM_WRITE lands in exi->rtc.counter / exi->sram. NULL
  * (the gcn_exi_init default) means no persistence — every write path stays
  * exactly as it is today. */
 void gcn_exi_set_persist(GcnExi* exi, GcnExiPersistFn fn, void* user);

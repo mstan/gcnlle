@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform uimage2D efb_color;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D efb_depth;
+
+layout(push_constant) uniform ClearPush {
+    uvec4 rect;          // left, top, right, bottom (inclusive)
+    uint clear_enable;
+    uint pixel_format;
+    uint color_update;
+    uint alpha_update;
+    uint depth_update;
+    uint clear_color;
+    uint clear_depth;
+} p;
+
+void main() {
+    uvec2 xy = p.rect.xy + gl_GlobalInvocationID.xy;
+    if (xy.x >= 640u || xy.y >= 528u || p.clear_enable == 0u ||
+        xy.x > p.rect.z || xy.y > p.rect.w)
+        return;
+
+    if (p.color_update != 0u || p.alpha_update != 0u) {
+        uint old = imageLoad(efb_color, ivec2(xy)).r;
+        uint value = old;
+        bool direct = p.pixel_format == 0u || p.pixel_format == 2u ||
+                      p.pixel_format == 3u;
+        if (direct) {
+            // Direct formats have no writable alpha plane. Both software
+            // color setters reduce to this exact expression.
+            if (p.color_update != 0u)
+                value = (old & 0xff000000u) | (p.clear_color >> 8);
+        } else if (p.pixel_format == 1u) {
+            if (p.color_update != 0u && p.alpha_update != 0u) {
+                value = (old & 0xff000000u) |
+                        ((p.clear_color >> 2) & 0x0000003fu) |
+                        ((p.clear_color >> 4) & 0x00000fc0u) |
+                        ((p.clear_color >> 6) & 0x0003f000u) |
+                        ((p.clear_color >> 8) & 0x00fc0000u);
+            } else if (p.color_update != 0u) {
+                value = (old & 0xff00003fu) |
+                        ((p.clear_color >> 4) & 0x00000fc0u) |
+                        ((p.clear_color >> 6) & 0x0003f000u) |
+                        ((p.clear_color >> 8) & 0x00fc0000u);
+            } else if (p.alpha_update != 0u) {
+                value = (old & 0xffffffc0u) |
+                        ((p.clear_color >> 2) & 0x3fu);
+            }
+        }
+        imageStore(efb_color, ivec2(xy), uvec4(value, 0u, 0u, 0u));
+    }
+
+    if (p.depth_update != 0u)
+        imageStore(efb_depth, ivec2(xy),
+                   uvec4(p.clear_depth & 0x00ffffffu, 0u, 0u, 0u));
+}
