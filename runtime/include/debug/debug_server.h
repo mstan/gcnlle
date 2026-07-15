@@ -23,6 +23,7 @@
 #include "cpu/cpu.h"
 #include "di/di.h"   /* ROADMAP M5: insert_disc/eject_disc reach into the DI device */
 #include "exi/exi.h" /* rtc_state: live one-shot-synchronized RTC state */
+#include "dsp/dsp.h" /* audio_state: current AID DMA registers */
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,7 @@ typedef struct {
     CPUState* cpu;   /* regs + RAM (get_registers, read_ram, write_ram)        */
     GcnDi*    di;     /* disc interface (insert_disc, eject_disc)              */
     GcnExi*   exi;    /* EXI RTC state (rtc_state)                             */
+    GcnDsp*   dsp;    /* DSP AID DMA state (audio_state)                       */
 } GcnDebugCtx;
 
 /* Start listening if GCN_DEBUG_PORT is set (else a no-op returning 0). Returns

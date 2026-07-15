@@ -58,6 +58,10 @@ typedef struct {
  * EFB model. */
 void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf);
 
+/* Conservatively invalidate BP-derived draw configuration after any BP load.
+ * Consecutive draws without a BP write reuse the exact decoded state. */
+void gx_raster_notify_bp_write(void);
+
 /* Execute one primitive draw (OpcodeDecoder RunCommand -> SWVertexLoader ->
  * TransformUnit -> Clipper -> Rasterizer -> Tev). `prim` is the GX primitive
  * index ((opcode>>3)&7; 4 = TRIANGLE_FAN), `vat` the VAT index (opcode&7).
@@ -103,7 +107,7 @@ typedef struct {
     u32 num_color_chans;
     u32 num_texgens;
     u32 pixel_format;
-    u32 fused_program; /* 0=general, 1..11=the exact A..K programs */
+    u32 fused_program; /* 0=general, 1..19=the exact A..S programs */
     s32 tev_reg[4][4];       /* [Prev/Color0/Color1/Color2][R,G,B,A] */
     s32 stage_konst[2][4];   /* first two stages are sufficient for A..F */
 } GxRasterTriangleJob;
@@ -125,6 +129,8 @@ void gx_raster_set_triangle_sink(GxRasterTriangleSink sink, void* user);
  * *draw_calls == 0 means the stat gate was never turned on. Any output
  * pointer may be NULL. */
 void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u64* draw_calls);
+void gx_raster_get_config_cache_stats(u64* hits, u64* misses);
+void gx_raster_print_draw_shape_stats(void);
 
 /* GCN_GX_STATS=1 (same knob): further split of gx.c's own GX_STAT_EFB bucket
  * (gx_raster_efb_copy's whole call, copy-encode + clear) into the clear-only

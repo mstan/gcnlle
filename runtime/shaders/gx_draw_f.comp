@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 
-// Exact compute differential for the eleven fused IPL pixel programs A--K.
+// Exact compute differential for the nineteen fused IPL pixel programs A--S.
 // currently accept only direct I8 textures; the host rejects every other
 // format before dispatch.  Program F has no texture dependency.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -175,6 +175,11 @@ uint modulate(uint value, uint factor) {
     return clamp255_s16(int(value * cc + 128u) >> 8);
 }
 
+uint modulate2(uint value, uint factor) {
+    uint cc = factor + (factor >> 7);
+    return clamp255_s16(int(value * cc * 2u + 128u) >> 8);
+}
+
 uint core_c_channel(uint texel, int reg_value) {
     int c = int(texel + (texel >> 7));
     int value = (reg_value * c) << 1;
@@ -214,7 +219,7 @@ void shade_pixel(int x, int y) {
         return;
 
     uint program = jw(50u);
-    if (program == 11u) {
+    if (program == 11u || program == 12u) {
         int z = int(slope_value(100u, x, y));
         z = clamp(z, 0, 16777215);
         uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
@@ -228,7 +233,8 @@ void shade_pixel(int x, int y) {
     uint ras_a = color_byte(43u, x, y);
     uint out_r = ras_r, out_g = ras_g, out_b = ras_b, out_a = ras_a;
 
-    if (program != 6u && program != 10u) {
+    if (program != 6u && program != 10u && program != 13u &&
+        program != 16u) {
         int bx = x & ~1;
         int by = y & ~1;
         precise vec2 uv = texture_uv(x, y);
@@ -236,7 +242,7 @@ void shade_pixel(int x, int y) {
         precise float tfixed = uv.y * 128.0;
         uvec4 texel = sample_texture(int(sfixed), int(tfixed),
                                     texture_linear(bx, by));
-        if (program == 1u || program == 8u) {
+        if (program == 1u || program == 8u || program == 17u) {
             out_r = texel.r; out_g = texel.g; out_b = texel.b;
             out_a = modulate(ras_a, texel.a);
             if (program == 8u) {
@@ -256,7 +262,7 @@ void shade_pixel(int x, int y) {
             }
         } else if (program == 4u) {
             out_a = modulate(texel.a, ras_a);
-        } else if (program == 5u || program == 7u) {
+        } else if (program == 5u || program == 7u || program == 12u) {
             out_r = program_e_channel(texel.r, si(91u), si(94u));
             out_g = program_e_channel(texel.g, si(92u), si(95u));
             out_b = program_e_channel(texel.b, si(93u), si(96u));
@@ -278,6 +284,27 @@ void shade_pixel(int x, int y) {
                 uint cc1 = uint(p) + (uint(p) >> 7);
                 out_a = clamp255_s16((si(98u) * int(cc1) + 128) >> 8);
             }
+        } else if (program == 14u) {
+            out_r = core_c_channel(texel.r, si(91u));
+            out_g = core_c_channel(texel.g, si(92u));
+            out_b = core_c_channel(texel.b, si(93u));
+            uint p = modulate2(ras_a, texel.a);
+            out_a = modulate(uint(si(98u)), p);
+        } else if (program == 15u || program == 18u) {
+            out_r = clamp255_s16(si(91u) + int(modulate(ras_r, texel.r)));
+            out_g = clamp255_s16(si(92u) + int(modulate(ras_g, texel.g)));
+            out_b = clamp255_s16(si(93u) + int(modulate(ras_b, texel.b)));
+            int cc = int(texel.a + (texel.a >> 7));
+            int p = (int(ras_a) * cc) >> 8;
+            uint stage0_a = clamp255_s16((si(107u) + p) >> 1);
+            out_a = program == 15u ? modulate(uint(si(98u)), stage0_a) :
+                                     stage0_a;
+        } else if (program == 19u) {
+            out_r = clamp255_s16(si(91u) * 2 + int(texel.r + (texel.r >> 7)));
+            out_g = clamp255_s16(si(92u) * 2 + int(texel.g + (texel.g >> 7)));
+            out_b = clamp255_s16(si(93u) * 2 + int(texel.b + (texel.b >> 7)));
+            uint p = modulate(ras_a, uint(si(97u)));
+            out_a = modulate(uint(si(98u)), p);
         }
     }
     if (program == 10u) {
@@ -294,7 +321,8 @@ void shade_pixel(int x, int y) {
     uint sa = src_alpha + (src_alpha >> 7);
     uint inverse = 255u - src_alpha;
     uint da = inverse + (inverse >> 7);
-    uvec4 blended = min((src * sa + dst * da) >> 8, uvec4(255u));
+    uvec4 blended = (program == 16u || program == 17u) ? src :
+                    min((src * sa + dst * da) >> 8, uvec4(255u));
 
     if (pf == 1u) {
         const uint matrix[4] = uint[4](0u, 2u, 3u, 1u);

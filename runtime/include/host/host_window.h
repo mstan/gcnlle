@@ -4,7 +4,8 @@
  * XFB at full frame rate, replacing tools/gcn_viewer.py's TCP/PPM/Tk poll
  * loop for interactive use. See src/host_window.c for the implementation —
  * the window-thread/message-pump design, the double-buffer/publish scheme,
- * and the keyboard->SI pad mapping (kept identical to gcn_viewer.py).
+ * the aspect-locked resize/presentation path, and the keyboard->SI pad mapping
+ * (kept identical to gcn_viewer.py).
  *
  * Default OFF: with GCN_WINDOW unset, every entry point below is a cheap
  * no-op (one cached getenv check) — no other behavior changes, so the

@@ -6,6 +6,7 @@
  * results back, and compares them after the authoritative software copy/clear.
  */
 #include "gx/gx_vulkan.h"
+#include "gx/gx.h"       /* XFB RAM publication guard shared with VI */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #define READBACK_BYTES (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
 #define DRAW_JOB_OFFSET (XFB_SHADOW_OFFSET + XFB_SHADOW_TOTAL)
 #define DRAW_PACKET_BYTES 512u
+#define GX_VK_DRAW_PROGRAM_COUNT 19u
 #define DRAW_JOB_BYTES  (8u * 1024u * 1024u)
 #define DRAW_PACKET_ARENA_BYTES (6u * 1024u * 1024u)
 #define EFB_TILE_WIDTH 40u
@@ -154,14 +156,15 @@ typedef struct {
     int draw_active;
     u64 draws;
     u64 triangles;
-    u64 fused_triangles[12];
-    u32 draw_validate_remaining[12];
-    u32 draw_validate_program; /* 0=all A--K, otherwise exact program id */
+    u64 fused_triangles[GX_VK_DRAW_PROGRAM_COUNT + 1u];
+    u32 draw_validate_remaining[GX_VK_DRAW_PROGRAM_COUNT + 1u];
+    u32 draw_validate_program; /* 0=all A--S, otherwise exact program id */
     u32 draw_validation_program;
     int draw_validation_pending;
-    u64 draw_validations[12];
-    u8 texture_reject_logged[12];
+    u64 draw_validations[GX_VK_DRAW_PROGRAM_COUNT + 1u];
+    u8 texture_reject_logged[GX_VK_DRAW_PROGRAM_COUNT + 1u];
     GxVkTextureEntry texture_cache[GX_VK_TEXTURE_CACHE_ENTRIES];
+    GxVkTextureEntry* last_texture_binding;
     u64 texture_stamp;
     u64 texture_hits;
     u64 texture_misses;
@@ -555,7 +558,8 @@ void gx_vulkan_shadow_shutdown(void) {
         fprintf(stderr,
                 "gx_vulkan: captured %llu draws / %llu post-clip triangles "
                 "(A=%llu B=%llu C=%llu D=%llu E=%llu F=%llu G=%llu "
-                "H=%llu I=%llu J=%llu K=%llu general=%llu)\n",
+                "H=%llu I=%llu J=%llu K=%llu L=%llu M=%llu N=%llu "
+                "O=%llu P=%llu Q=%llu R=%llu S=%llu general=%llu)\n",
                 (unsigned long long)s_vk.draws,
                 (unsigned long long)s_vk.triangles,
                 (unsigned long long)s_vk.fused_triangles[1],
@@ -569,9 +573,17 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.fused_triangles[9],
                 (unsigned long long)s_vk.fused_triangles[10],
                 (unsigned long long)s_vk.fused_triangles[11],
+                (unsigned long long)s_vk.fused_triangles[12],
+                (unsigned long long)s_vk.fused_triangles[13],
+                (unsigned long long)s_vk.fused_triangles[14],
+                (unsigned long long)s_vk.fused_triangles[15],
+                (unsigned long long)s_vk.fused_triangles[16],
+                (unsigned long long)s_vk.fused_triangles[17],
+                (unsigned long long)s_vk.fused_triangles[18],
+                (unsigned long long)s_vk.fused_triangles[19],
                 (unsigned long long)s_vk.fused_triangles[0]);
     }
-    for (u32 program = 1; program <= 11u; ++program) {
+    for (u32 program = 1; program <= GX_VK_DRAW_PROGRAM_COUNT; ++program) {
         if (s_vk.draw_validations[program])
             fprintf(stderr,
                     "gx_vulkan: %llu fused-program-%c GPU triangle comparisons passed\n",
@@ -795,7 +807,7 @@ int gx_vulkan_shadow_init(void) {
       if (e && *e) draw_validate_count = (u32)strtoul(e, NULL, 0); }
     s_vk.draw_validate_program = 6u;
     { const char* e = getenv("GCN_GX_VK_DRAW_PROGRAM");
-      if (e && e[0] && !e[1] && e[0] >= 'A' && e[0] <= 'K')
+      if (e && e[0] && !e[1] && e[0] >= 'A' && e[0] <= 'S')
           s_vk.draw_validate_program = (u32)(e[0] - 'A') + 1u;
       else if (e && strcmp(e, "ALL") == 0)
           s_vk.draw_validate_program = 0u;
@@ -807,7 +819,7 @@ int gx_vulkan_shadow_init(void) {
         s_vk.draw_validate_remaining[s_vk.draw_validate_program] =
             draw_validate_count;
     } else {
-        for (u32 program = 1; program <= 11u; ++program)
+        for (u32 program = 1; program <= GX_VK_DRAW_PROGRAM_COUNT; ++program)
             s_vk.draw_validate_remaining[program] = draw_validate_count;
     }
     return 1;
@@ -824,7 +836,7 @@ int gx_vulkan_resident_init(void) {
     memset(s_vk.draw_validate_remaining, 0,
            sizeof s_vk.draw_validate_remaining);
     fprintf(stderr,
-            "gx_vulkan: resident exact A--K compute path enabled; unsupported "
+            "gx_vulkan: resident exact A--S compute path enabled; unsupported "
             "state synchronizes to software\n");
     return 1;
 }
@@ -856,41 +868,31 @@ static GxVkTextureEntry* find_texture_binding(const u32* bp, u32 unit) {
     u32 format = (image0 >> 20) & 0xfu;
     u32 address = ((image3 & 0x00ffffffu) << 5) & 0x1fffffffu;
     u32 length = texture_encoded_size(format, width, height);
+    GxVkTextureEntry* last = s_vk.last_texture_binding;
+    if (last && last->used && last->address == address &&
+        last->format == format && last->width == width &&
+        last->height == height && last->length == length)
+        return last;
     for (u32 i = 0; i < GX_VK_TEXTURE_CACHE_ENTRIES; ++i) {
         GxVkTextureEntry* entry = &s_vk.texture_cache[i];
         if (entry->used && entry->address == address &&
             entry->format == format && entry->width == width &&
-            entry->height == height && entry->length == length)
+            entry->height == height && entry->length == length) {
+            s_vk.last_texture_binding = entry;
             return entry;
+        }
     }
     return NULL;
 }
 
-static int snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
-                               GxVkTextureEntry** texture_out) {
-    _Static_assert(sizeof(GxRasterTriScan) == 21u * sizeof(u32),
-                   "GPU triangle scan packet layout changed");
-    _Static_assert(sizeof(GxRasterSlope) == 7u * sizeof(u32),
-                   "GPU triangle slope packet layout changed");
-    if (texture_out)
-        *texture_out = NULL;
-    memset(words, 0, DRAW_PACKET_BYTES);
-    memcpy(words, &job->scan, sizeof job->scan);
-    words[21] = job->pixel_format;
-    for (u32 comp = 0; comp < 4u; ++comp)
-        memcpy(words + 22u + comp * 7u, &job->color[0][comp],
-               sizeof(GxRasterSlope));
-    words[50] = job->fused_program;
-    memcpy(words + 51u, &job->w, sizeof job->w);
-    for (u32 comp = 0; comp < 3u; ++comp)
-        memcpy(words + 58u + comp * 7u, &job->tex[0][comp],
-               sizeof(GxRasterSlope));
-
-    if (job->fused_program != 6u && job->fused_program != 10u) {
+static int resolve_fused_texture(const GxRasterTriangleJob* job,
+                                 GxVkTextureEntry** texture_out) {
+    *texture_out = NULL;
+    if (job->fused_program != 6u && job->fused_program != 10u &&
+        job->fused_program != 13u && job->fused_program != 16u) {
         u32 order = s_vk.draw_bp[0x28];
         u32 unit = order & 7u;
         u32 mode0 = s_vk.draw_bp[0x80 + unit];
-        u32 mode1 = s_vk.draw_bp[0x84 + unit];
         GxVkTextureEntry* texture = find_texture_binding(s_vk.draw_bp, unit);
         if (!(order & (1u << 6)) || !texture ||
             (texture->format != 0u && texture->format != 1u &&
@@ -912,6 +914,33 @@ static int snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
             }
             return 0;
         }
+        *texture_out = texture;
+    }
+    return 1;
+}
+
+static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
+                                const GxVkTextureEntry* texture) {
+    _Static_assert(sizeof(GxRasterTriScan) == 21u * sizeof(u32),
+                   "GPU triangle scan packet layout changed");
+    _Static_assert(sizeof(GxRasterSlope) == 7u * sizeof(u32),
+                   "GPU triangle slope packet layout changed");
+    memcpy(words, &job->scan, sizeof job->scan);
+    words[21] = job->pixel_format;
+    for (u32 comp = 0; comp < 4u; ++comp)
+        memcpy(words + 22u + comp * 7u, &job->color[0][comp],
+               sizeof(GxRasterSlope));
+    words[50] = job->fused_program;
+    memcpy(words + 51u, &job->w, sizeof job->w);
+    for (u32 comp = 0; comp < 3u; ++comp)
+        memcpy(words + 58u + comp * 7u, &job->tex[0][comp],
+               sizeof(GxRasterSlope));
+
+    if (texture) {
+        u32 order = s_vk.draw_bp[0x28];
+        u32 unit = order & 7u;
+        u32 mode0 = s_vk.draw_bp[0x80 + unit];
+        u32 mode1 = s_vk.draw_bp[0x84 + unit];
         words[79] = texture->format;
         words[80] = texture->width;
         words[81] = texture->height;
@@ -924,8 +953,8 @@ static int snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
         words[88] = mode1 & 0xffu;
         words[89] = (mode1 >> 8) & 0xffu;
         words[90] = texture->length;
-        if (texture_out)
-            *texture_out = texture;
+    } else {
+        memset(words + 79u, 0, 12u * sizeof(*words));
     }
     for (u32 comp = 0; comp < 3u; ++comp) {
         words[91u + comp] = (u32)job->tev_reg[1][comp];
@@ -933,8 +962,12 @@ static int snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
     }
     words[97] = (u32)job->stage_konst[0][3];
     words[98] = (u32)job->stage_konst[1][3];
+    words[99] = 0u;
     memcpy(words + 100u, &job->z, sizeof job->z);
-    return 1;
+    words[107] = (u32)job->tev_reg[1][3];
+    /* Words 108..127 are alignment-only stride padding.  The shader never
+     * indexes them, and resident packets are written directly into their
+     * mapped final slot, so touching that padding is pure bandwidth. */
 }
 
 static int flush_staging(void) {
@@ -963,6 +996,7 @@ static int resident_materialize_pending(void) {
     if (!invalidate_readback())
         return 0;
     u64 t0 = __rdtsc();
+    gcn_gx_xfb_write_begin();
     for (u32 i = 0; i < s_vk.resident_pending_count; ++i) {
         const GxVkPendingXfb* p = &s_vk.resident_pending[i];
         const u8* gpu = s_vk.readback_map + READBACK_XFB_OFFSET + p->slot_offset;
@@ -970,6 +1004,7 @@ static int resident_materialize_pending(void) {
             memcpy(p->ram + p->address + (u64)y * p->stride,
                    gpu + (u64)y * p->gpu_stride, (size_t)p->width * 2u);
     }
+    gcn_gx_xfb_write_end();
     s_vk.resident_copy_memcpy_tsc += __rdtsc() - t0;
     s_vk.resident_pending_count = 0;
     return 1;
@@ -1242,7 +1277,8 @@ static int ensure_resident_texture(GxVkTextureEntry* texture) {
 }
 
 static int resident_record_draw(const GxRasterTriangleJob* job) {
-    if (job->fused_program < 1u || job->fused_program > 11u)
+    if (job->fused_program < 1u ||
+        job->fused_program > GX_VK_DRAW_PROGRAM_COUNT)
         return 0;
     if (job->scan.minx < 0 || job->scan.miny < 0 ||
         job->scan.maxx <= job->scan.minx ||
@@ -1250,13 +1286,10 @@ static int resident_record_draw(const GxRasterTriangleJob* job) {
         job->scan.maxx > (int)EFB_WIDTH ||
         job->scan.maxy > (int)EFB_HEIGHT)
         return 0;
-    u32 packet[DRAW_PACKET_BYTES / sizeof(u32)];
     GxVkTextureEntry* texture = NULL;
-    if (!snapshot_fused_draw(job, packet, &texture) ||
+    if (!resolve_fused_texture(job, &texture) ||
         !ensure_resident_texture(texture))
         return 0;
-    if (texture)
-        packet[99] = texture->gpu_offset;
 
     u32 tx0 = (u32)job->scan.minx / 16u;
     u32 ty0 = (u32)job->scan.miny / 16u;
@@ -1285,10 +1318,14 @@ static int resident_record_draw(const GxRasterTriangleJob* job) {
     if (!resident_begin_commands())
         return 0;
 
-    u32 packet_index = s_vk.resident_job_count++;
-    memcpy(s_vk.staging_map + DRAW_JOB_OFFSET + s_vk.resident_draw_arena_used +
-               (u64)packet_index * DRAW_PACKET_BYTES,
-           packet, DRAW_PACKET_BYTES);
+    u32 packet_index = s_vk.resident_job_count;
+    u32* packet = (u32*)(s_vk.staging_map + DRAW_JOB_OFFSET +
+                         s_vk.resident_draw_arena_used +
+                         (u64)packet_index * DRAW_PACKET_BYTES);
+    snapshot_fused_draw(job, packet, texture);
+    if (texture)
+        packet[99] = texture->gpu_offset;
+    ++s_vk.resident_job_count;
     for (u32 ty = ty0; ty <= ty1; ++ty) {
         for (u32 tx = tx0; tx <= tx1; ++tx) {
             u32 tile = ty * EFB_TILE_WIDTH + tx;
@@ -1314,8 +1351,9 @@ static int submit_fused_draw(const GxRasterTriangleJob* job) {
            (size_t)EFB_PLANE_BYTES);
     u32* words = (u32*)(s_vk.staging_map + DRAW_JOB_OFFSET);
     GxVkTextureEntry* texture = NULL;
-    if (!snapshot_fused_draw(job, words, &texture))
+    if (!resolve_fused_texture(job, &texture))
         return 0;
+    snapshot_fused_draw(job, words, texture);
     if (texture) {
         memcpy(s_vk.staging_map + TEXTURE_SHADOW_OFFSET,
                texture->bytes, texture->length);
@@ -1537,7 +1575,8 @@ int gx_vulkan_shadow_begin_draw(const u32* bp, const u8* ram, u32 ram_size) {
 
 int gx_vulkan_shadow_triangle(const GxRasterTriangleJob* job,
                               int after_software) {
-    if (!s_vk.draw_active || !job || job->fused_program > 11u)
+    if (!s_vk.draw_active || !job ||
+        job->fused_program > GX_VK_DRAW_PROGRAM_COUNT)
         return 0;
     if (after_software) {
         if (!s_vk.draw_validation_pending)
@@ -1552,10 +1591,12 @@ int gx_vulkan_shadow_triangle(const GxRasterTriangleJob* job,
         label[5] = (char)('A' + program - 1u);
         if (!compare_plane(label, color, gpu))
             return 0;
-        if (program == 11u) {
+        if (program == 11u || program == 12u) {
             const u32* gpu_depth = (const u32*)(s_vk.readback_map +
                                                 READBACK_DEPTH_OFFSET);
-            if (!compare_plane("draw-K depth", depth, gpu_depth))
+            char depth_label[] = "draw-K depth";
+            depth_label[5] = (char)('A' + program - 1u);
+            if (!compare_plane(depth_label, depth, gpu_depth))
                 return 0;
         }
         s_vk.draw_validate_remaining[program]--;
@@ -1664,10 +1705,11 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
     if (job->pixel_format != (s_vk.draw_bp[0x43] & 7u))
         return -1;
     s_vk.triangles++;
-    if (job->fused_program <= 11u)
+    if (job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT)
         s_vk.fused_triangles[job->fused_program]++;
 
-    int supported = job->fused_program >= 1u && job->fused_program <= 11u;
+    int supported = job->fused_program >= 1u &&
+                    job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT;
     if (supported && job->num_texgens && !s_vk.draw_textures_validated) {
         supported = validate_draw_textures(s_vk.draw_bp, s_vk.draw_ram,
                                            s_vk.draw_ram_size);
@@ -1832,6 +1874,34 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
                       (clear_push.bottom - clear_push.top + 16u) / 16u, 1);
     gpu_time_end(clear_query);
 
+    /* The resident path may keep recording after this EFB copy until the
+     * frame fence.  Make the clear visible to those following draw dispatches
+     * inside the same command buffer.  The old submit-after-every-copy path
+     * got this dependency from resident_begin_commands() in the next command
+     * buffer; frame batching needs it here explicitly. */
+    if (clear_push.clear_enable) {
+        VkImageMemoryBarrier clear_to_draw[2] = {0};
+        for (u32 i = 0; i < 2u; ++i) {
+            clear_to_draw[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            clear_to_draw[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            clear_to_draw[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                             VK_ACCESS_SHADER_WRITE_BIT;
+            clear_to_draw[i].oldLayout = clear_to_draw[i].newLayout =
+                VK_IMAGE_LAYOUT_GENERAL;
+            clear_to_draw[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            clear_to_draw[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            clear_to_draw[i].image = s_vk.image[i];
+            clear_to_draw[i].subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            clear_to_draw[i].subresourceRange.levelCount = 1;
+            clear_to_draw[i].subresourceRange.layerCount = 1;
+        }
+        vkCmdPipelineBarrier(s_vk.command_buffer,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                             0, NULL, 0, NULL, 2, clear_to_draw);
+    }
+
     VkBufferMemoryBarrier xfb_to_transfer = {0};
     xfb_to_transfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     xfb_to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1873,9 +1943,15 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     if (s_vk.gpu_stats) {
         if (!resident_submit_batch())
             return -1;
-    } else if (!resident_submit_async()) {
-        return -1;
     }
+    /* Keep the copy and all following draws in this command buffer until the
+     * frame fence (GXSetDrawDone -> gx_vulkan_resident_flush).  The resident
+     * path has one host-mapped staging arena: submitting here and immediately
+     * recording the next frame let the CPU overwrite draw packets while the
+     * GPU was still reading them, producing intermittent stretched geometry
+     * and whole-object flicker.  A full XFB ring still forces an earlier
+     * submit above, and texture updates explicitly submit before reusing
+     * their arena bytes. */
     s_vk.resident_copy_total_tsc += __rdtsc() - copy_t0;
     return 1;
 }

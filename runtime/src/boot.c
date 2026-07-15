@@ -16,6 +16,16 @@
  *                      device (else the BS2 payload window is reused).
  *   GCN_DSP_ROM        DSP-LLE IROM dump (default bios/dsp_rom.bin).
  *   GCN_DSP_COEF       DSP-LLE coefficient dump (default bios/dsp_coef.bin).
+ *   GCN_AUDIO          host playback for the real AID DMA stream. Defaults
+ *                      ON with GCN_WINDOW=1 and OFF for headless runs; "1"
+ *                      or "0" explicitly overrides that policy.
+ *   GCN_GX_BACKEND     "software", "vulkan", or "vulkan-shadow". Interactive
+ *                      GCN_WINDOW=1 runs default to the exact resident Vulkan
+ *                      path; headless/oracle runs default to software.
+ *   GCN_GL             host presenter policy for GCN_WINDOW=1. Default/unset
+ *                      uses double-buffered WGL; "0" selects the GDI fallback.
+ *   GCN_GL_VSYNC       WGL swap interval policy. Default/unset enables vsync;
+ *                      "0" disables it for diagnostics.
  *   GCN_DEBUG_PORT     enable the TCP debug server on this port (see
  *                      docs/TCP_COMMANDS.md); with it set, gcn_boot runs
  *                      unbounded and parks on stop instead of exiting.
@@ -39,9 +49,10 @@
  *                      wins over a persisted counter; SRAM settings still load.
  *   GCN_GX_PIPELINE    default-on CPU/GX execution overlap. "0" selects the
  *                      fully synchronous fallback for diagnostics. Both paths
- *                      retain the pinned XFB/oracle results; live VI capture,
- *                      debug RAM access, FIFO reset, and shutdown join before
- *                      observing or releasing worker-produced state.
+ *                      retain the pinned XFB/oracle results. GXSetDrawDone
+ *                      materializes completed XFBs before VI can flip to them;
+ *                      debug RAM access, FIFO reset, and shutdown explicitly
+ *                      join before observing or releasing produced state.
  *   GCN_DSP_THREAD     experimental DSP-core worker. Default is the exact,
  *                      synchronous LLE path; "1" opts into overlap whose DSP
  *                      interrupt publication can depend on host scheduling.
@@ -92,6 +103,7 @@
 #include "gx/gx.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
+#include "host/host_audio.h"   /* real AID DMA -> interactive WASAPI output */
 #include "host/host_window.h"  /* GCN_WINDOW=1: opt-in native display window */
 #include "util/crc32.h"
 #include "descramble_core.h"   /* IPL_SCRAMBLE_END etc. — the M1 integrity check */
@@ -584,6 +596,8 @@ int main(int argc, char** argv) {
     }
     gcn_dsp_init(&dsp, dsp_rom, dsp_coef, cpu.ram, cpu.ram_size);
     gcn_dsp_set_irq(&dsp, dsp_irq_to_pi, &pi);
+    if (gcn_host_audio_start(32000u))
+        gcn_dsp_set_audio_sink(&dsp, gcn_host_audio_submit_be_s16, NULL);
     gcn_mmio_register(&bus, "DSP", GCN_DSP_BASE, GCN_DSP_SIZE,
                       gcn_dsp_read, gcn_dsp_write, &dsp);
 
@@ -704,7 +718,7 @@ int main(int argc, char** argv) {
     /* Observability: bring up the always-on ring buffers and (if GCN_DEBUG_PORT
      * is set) the TCP debug query surface over them + live CPU/RAM state. */
     gcn_rings_init();
-    GcnDebugCtx dbg = { .cpu = &cpu, .di = &di, .exi = &exi };
+    GcnDebugCtx dbg = { .cpu = &cpu, .di = &di, .exi = &exi, .dsp = &dsp };
     int dbg_port = gcn_debug_server_start(&dbg);
 
     /* GCN_WINDOW=1 (opt-in): native Win32 display + keyboard-pad window,
@@ -882,6 +896,7 @@ int main(int argc, char** argv) {
     gcn_memcard_free(&card_a);
     gcn_memcard_free(&card_b);
 
+    gcn_host_audio_stop();
     gcn_dsp_free(&dsp);
     gcn_exi_free(&exi);   /* no-op unless GCN_BOOT_BS1 owned a descrambled buffer */
     gcn_di_free(&di);     /* no-op unless GCN_DISC mounted an image */

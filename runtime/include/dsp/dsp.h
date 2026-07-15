@@ -63,6 +63,7 @@
  * insensitive to the exact rate; what matters is that AID interrupts PACE the
  * guest's audio frame loop. */
 #define GCN_DSP_AID_TICKS_PER_BLOCK 1266u
+#define GCN_DSP_AID_CORE_CYCLES_PER_BLOCK (GCN_DSP_AID_TICKS_PER_BLOCK * 96u)
 
 /* DSP CSR bits (Dolphin UDSPControl). */
 #define GCN_DSP_CSR_RES      0x0001u  /* reset DSP (write-1, auto-clears) */
@@ -98,15 +99,20 @@ typedef struct {
     bool  dma_active;                 /* ARAM DMA in flight               */
     u32   dma_polls_left;             /* CSR polls until it "completes"    */
 
-    /* Audio DMA engine (Dolphin DSP.cpp AudioDMA / UpdateAudioDMA). The data
-     * sink (host audio out) is deferred; this models the addressing and the
-     * AID interrupt pacing the guest's audio frame loop is clocked by. */
+    /* Audio DMA engine (Dolphin DSP.cpp AudioDMA / UpdateAudioDMA). */
     u32   aid_source;                 /* programmed source address         */
     u16   aid_ctrl;                   /* enable + block count              */
     u32   aid_cur_addr;               /* current block address             */
     u16   aid_blocks_left;            /* remaining 32-byte blocks          */
     u8    aid_int_pending;            /* fifo-start AID int, fires next tick */
     u32   aid_accum;                  /* tick accumulator (block pacing)   */
+    u8*   mem1;                       /* source backing for AID DMA         */
+    u32   mem1_size;
+
+    /* One callback per consumed 32-byte AID block. The payload is guest
+     * big-endian interleaved signed-16 stereo PCM (eight frames). */
+    void (*audio_sink)(void* user, const u8* samples, u32 bytes);
+    void* audio_user;
 
     int   irq_level;                  /* last DSP->PI line level (edge detect for the ring) */
     GcnDspIrqFn irq;                  /* sink for the DSP interrupt line (boot.c -> PI) */
@@ -117,8 +123,11 @@ typedef struct {
  * mem1 is the guest MEM1 backing the DSP DMAs against. */
 void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size);
 void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user);
+void gcn_dsp_set_audio_sink(GcnDsp* dsp,
+                            void (*sink)(void* user, const u8* samples, u32 bytes),
+                            void* user);
 void gcn_dsp_free(GcnDsp* dsp);
-void gcn_dsp_tick(u32 ppc_cycles);   /* advance the DSP core (called per block) */
+void gcn_dsp_tick(u32 ppc_cycles, u32 aid_core_cycles);
 /* Run all owed DSP cycles now. Called before any CPU observation of DSP state
  * (DSP MMIO, PI INTSR/INTMR, debug queries). No-op when batching is off or
  * nothing is owed. Preserves the /6 remainder as still-owed. See dsp.c. */

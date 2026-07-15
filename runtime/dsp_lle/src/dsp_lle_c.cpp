@@ -171,7 +171,8 @@ void dsp_lle_update(int ppc_cycles) {
         fprintf(stderr,
                 "[dsp-stats] calls=%llu budget=%llu (avg %.1f cyc/call) "
                 "steps=%llu wall_ms=%.1f ns/step=%.1f ns/call=%.0f "
-                "stop@idle=%llu stop@other=%llu last_pc=%04x cr=%04x\n",
+                "stop@idle=%llu stop@other=%llu last_pc=%04x cr=%04x "
+                "imem=%04x,%04x,%04x,%04x,%04x,%04x,%04x\n",
                 (unsigned long long)calls, (unsigned long long)budget,
                 (double)budget / (double)calls,
                 (unsigned long long)steps,
@@ -179,7 +180,13 @@ void dsp_lle_update(int ppc_cycles) {
                 steps ? (double)wall_ns / (double)steps : 0.0,
                 (double)wall_ns / (double)calls,
                 (unsigned long long)stop_idle, (unsigned long long)stop_other,
-                st.pc, st.control_reg);
+                st.pc, st.control_reg,
+                st.ReadIMEM(st.pc), st.ReadIMEM(static_cast<uint16_t>(st.pc + 1u)),
+                st.ReadIMEM(static_cast<uint16_t>(st.pc + 2u)),
+                st.ReadIMEM(static_cast<uint16_t>(st.pc + 3u)),
+                st.ReadIMEM(static_cast<uint16_t>(st.pc + 4u)),
+                st.ReadIMEM(static_cast<uint16_t>(st.pc + 5u)),
+                st.ReadIMEM(static_cast<uint16_t>(st.pc + 6u)));
         fflush(stderr);
       }
       return;

@@ -161,6 +161,13 @@ void gcn_dsp_set_irq(GcnDsp* dsp, GcnDspIrqFn fn, void* user) {
     dsp->irq_user = user;
 }
 
+void gcn_dsp_set_audio_sink(GcnDsp* dsp,
+                            void (*sink)(void* user, const u8* samples, u32 bytes),
+                            void* user) {
+    dsp->audio_sink = sink;
+    dsp->audio_user = user;
+}
+
 /* ---- interrupt line (DSP.cpp UpdateInterrupts:372-382) ----
  * Dolphin computes ((Hex>>1) & Hex & (INT_DSP|INT_ARAM|INT_AID)) != 0 over the
  * control register — i.e. the line is high when any interrupt status bit is set
@@ -195,6 +202,8 @@ static void dsp_latch_mailbox_int(GcnDsp* dsp) {
 
 void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size) {
     memset(dsp, 0, sizeof *dsp);
+    dsp->mem1 = mem1;
+    dsp->mem1_size = mem1_size;
     dsp_lle_init(irom, coef, mem1, mem1_size);   /* brings up the core + ARAM */
     s_dsp = dsp;
 }
@@ -218,16 +227,25 @@ void gcn_dsp_free(GcnDsp* dsp) {
  * the programmed source/length and raise the AID interrupt. The one-block
  * "fifo start" interrupt latched at enable time (aid_int_pending — Dolphin
  * schedules it 200 cycles after the CONTROL_LEN write) also lands here. */
-static void dsp_aid_tick(GcnDsp* dsp) {
+static void dsp_aid_tick(GcnDsp* dsp, u32 core_cycles) {
     if (dsp->aid_int_pending) {
         dsp->aid_int_pending = 0;
         dsp->csr |= GCN_DSP_CSR_AIDINT;
     }
-    if (++dsp->aid_accum < GCN_DSP_AID_TICKS_PER_BLOCK)
+    dsp->aid_accum += core_cycles;
+    if (dsp->aid_accum < GCN_DSP_AID_CORE_CYCLES_PER_BLOCK)
         return;
-    dsp->aid_accum = 0;
+    dsp->aid_accum -= GCN_DSP_AID_CORE_CYCLES_PER_BLOCK;
     if (!(dsp->aid_ctrl & GCN_DSP_AID_ENABLE))
         return;
+    /* Dolphin sends the current 32-byte block to the external audio FIFO
+     * before updating the zero-based countdown/address. Keep that exact
+     * ordering: the interrupt handler may already have programmed the next
+     * autoload buffer while this one is still playing. */
+    if (dsp->audio_sink && dsp->mem1 &&
+        (u64)dsp->aid_cur_addr + 32u <= dsp->mem1_size) {
+        dsp->audio_sink(dsp->audio_user, dsp->mem1 + dsp->aid_cur_addr, 32u);
+    }
     if (dsp->aid_blocks_left != 0) {
         dsp->aid_blocks_left--;
         dsp->aid_cur_addr += 32;
@@ -330,7 +348,7 @@ void gcn_dsp_flush_lazy_pi(void) {
     gcn_dsp_flush();
 }
 
-void gcn_dsp_tick(u32 ppc_cycles) {
+void gcn_dsp_tick(u32 ppc_cycles, u32 aid_core_cycles) {
     /* bisect guard, read once (getenv per block was a measurable hot-path cost). */
     static int s_notick = -1;
     if (s_notick < 0) s_notick = getenv("GCN_DSP_NOTICK") ? 1 : 0;
@@ -392,7 +410,7 @@ void gcn_dsp_tick(u32 ppc_cycles) {
      * expensive DSP core step above is deferred. */
     if (s_dsp) {
         dsp_latch_mailbox_int(s_dsp);
-        dsp_aid_tick(s_dsp);
+        dsp_aid_tick(s_dsp, aid_core_cycles);
         dsp_update_interrupts(s_dsp);
     }
 }

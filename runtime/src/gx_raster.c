@@ -478,6 +478,11 @@ typedef struct {
      * the dead-work elision. Meaningless when `fused` is NULL. */
     int fused_needs_ras_rgb;
 
+    /* Exact A--S renderer program selected from this same BP-derived config.
+     * Cached with the config so thousands of unchanged tiny menu draws do not
+     * re-walk every program signature. */
+    u32 program_id;
+
     /* GX-MT: 1 iff this draw's pixel program is provably free of pixel-to-
      * pixel Tev-state carry, i.e. its pixels may be partitioned across
      * workers in any order with byte-identical results. Computed once per
@@ -487,6 +492,18 @@ typedef struct {
 } DrawCfg;
 
 static DrawCfg s_cfg;
+static u64 s_bp_generation = 1;
+static u64 s_cfg_bp_generation = 0;
+static u64 s_cfg_cache_hits;
+static u64 s_cfg_cache_misses;
+static u64 s_draw_shapes[8][17]; /* nverts 0..15, 16=16+ */
+
+void gx_raster_notify_bp_write(void) {
+    if (++s_bp_generation == 0) {
+        s_bp_generation = 1;
+        s_cfg_bp_generation = 0;
+    }
+}
 
 /* Shared with gx_raster_efb_copy (which rebuilds this same subset for its own
  * call via build_efb_cfg() — see below): PEControl.pixel_format and
@@ -1827,6 +1844,76 @@ static int gpu_depth_K_match(void) {
            fused_stage_match(0, 0x00F8CFu, 0x00F770u, 1, 0);
 }
 
+/* GPU-only programs L--Q cover the remaining exact IPL states observed with
+ * persistent SRAM/cards.  Software intentionally remains on tev_draw() so it
+ * is the independent differential authority for every new program. */
+static int gpu_depth_L_match(void) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == 1 &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 1 && s_cfg.zt_early == 1 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 1 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 1 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x00428Fu, 0x00F770u, 1, 0);
+}
+
+static int gpu_program_M_match(void) {
+    return fused_common_match_notex() && s_cfg.numtevstages == 0 &&
+           fused_stage_match(0, 0x08FFFAu, 0x08FFD0u, 0, 0);
+}
+
+static int gpu_program_N_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 1 &&
+           fused_stage_match(0, 0x18F28Fu, 0x18F670u, 1, 0) &&
+           fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0);
+}
+
+static int gpu_program_O_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 1 &&
+           fused_stage_match(0, 0x08FA82u, 0x38F610u, 1, 0) &&
+           fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0);
+}
+
+static int gpu_replace_common_match(u32 numtexgens) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == numtexgens &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 0 && s_cfg.zt_early == 0 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 0 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 0 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 1 && s_bp[0xF3] == 0x3F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3;
+}
+
+static int gpu_program_P_match(void) {
+    return gpu_replace_common_match(0) &&
+           fused_stage_match(0, 0x00AFFFu, 0x00BFF0u, 1, 0);
+}
+
+static int gpu_program_Q_match(void) {
+    return gpu_replace_common_match(1) &&
+           fused_stage_match(0, 0x00F8CFu, 0x00F670u, 1, 0);
+}
+
+static int gpu_program_R_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 0 &&
+           fused_stage_match(0, 0x08FA82u, 0x38F610u, 1, 0);
+}
+
+static int gpu_program_S_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 1 &&
+           fused_stage_match(0, 0x18FD82u, 0x08F770u, 1, 0) &&
+           fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0);
+}
+
 /* ---- config A: stages=1, texgens=1, st0 cc=0x00F8CF ac=0x00F670 ----------
  *
  * cc=0x00F8CF bit-field decode (bits() same as build_draw_cfg):
@@ -2824,9 +2911,21 @@ static void gx_mt_resolve(void) {
     const char* e = getenv("GCN_GX_THREADS");
     int n = e ? atoi(e) : 0;
     if (n <= 0) {
-        n = ncpu / 2;   /* one worker per physical core (SMT/2) */
-        if (n > 8) n = 8;
-        if (n < 1) n = 1;
+        const char* backend = getenv("GCN_GX_BACKEND");
+        const char* window = getenv("GCN_WINDOW");
+        int resident_vulkan =
+            (backend && strcmp(backend, "vulkan") == 0) ||
+            ((!backend || !*backend) && window && *window && *window != '0');
+        if (!e && resident_vulkan) {
+            /* Exact resident draws return from the Vulkan triangle sink
+             * before the CPU pixel scanner runs. Spawning GX scan workers in
+             * that mode only creates idle-spin/scheduler contention. */
+            n = 1;
+        } else {
+            n = ncpu / 2;   /* one worker per physical core (SMT/2) */
+            if (n > 8) n = 8;
+            if (n < 1) n = 1;
+        }
     }
     if (n > GX_MT_MAX) n = GX_MT_MAX;
     /* The per-pixel stats/census knobs accumulate into SHARED counters from
@@ -2879,7 +2978,7 @@ static void gx_mt_resolve(void) {
     s_mt_threads = n;
 }
 
-static u32 fused_program_id(void) {
+static u32 compute_program_id(void) {
     if (s_cfg.fused == fused_pixel_A) return 1;
     if (s_cfg.fused == fused_pixel_B) return 2;
     if (s_cfg.fused == fused_pixel_C) return 3;
@@ -2891,8 +2990,18 @@ static u32 fused_program_id(void) {
     if (s_cfg.fused == fused_pixel_I) return 9;
     if (s_cfg.fused == fused_pixel_J) return 10;
     if (!s_cfg.fused && gpu_depth_K_match()) return 11;
+    if (!s_cfg.fused && gpu_depth_L_match()) return 12;
+    if (!s_cfg.fused && gpu_program_M_match()) return 13;
+    if (!s_cfg.fused && gpu_program_N_match()) return 14;
+    if (!s_cfg.fused && gpu_program_O_match()) return 15;
+    if (!s_cfg.fused && gpu_program_P_match()) return 16;
+    if (!s_cfg.fused && gpu_program_Q_match()) return 17;
+    if (!s_cfg.fused && gpu_program_R_match()) return 18;
+    if (!s_cfg.fused && gpu_program_S_match()) return 19;
     return 0;
 }
+
+static u32 fused_program_id(void) { return s_cfg.program_id; }
 
 static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
     /* Setup only — edge equations, bbox/scissor clamp, slopes. The pixel
@@ -2902,6 +3011,8 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     if (s_draw_stats) s_last_tri_area = 0;   /* bucket 0 unless the bbox clamp below survives */
 
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
+    u32 triangle_program = fused_program_id();
+    int rs_gpu_program = triangle_program == 18u || triangle_program == 19u;
     /* Dead-slope-setup skip (perf task, follow-up to ff6b617): update_zslope
      * populates s_ZSlope, whose one and only reader is raster_pixel_prep's
      * `s32 z = (s32)slope_value(&s_ZSlope, ...)` — reached exclusively via
@@ -2915,7 +3026,8 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
      * unconditionally on every triangle (this `if` compiles away to nothing
      * for it), so it keeps rebuilding s_ZSlope before raster_pixel_prep reads
      * it, same as before this change. */
-    if (!s_cfg.fused) update_zslope(v0, v1, v2, x_off, y_off);
+    if (!s_cfg.fused && !rs_gpu_program)
+        update_zslope(v0, v1, v2, x_off, y_off);
 
     s32 Y1 = iround(16.0f * (v0->screenPosition[1] - y_off)) - 9;
     s32 Y2 = iround(16.0f * (v1->screenPosition[1] - y_off)) - 9;
@@ -2965,8 +3077,11 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
      * comp 3 (alpha) is unaffected and still evaluated either way. General
      * path: s_cfg.fused is NULL, so comp starts at 0 exactly as before —
      * byte-identical. */
+    int first_color_comp =
+        ((s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ||
+         triangle_program == 19u) ? 3 : 0;
     for (u32 i = 0; i < s_cfg.numcolchans; i++)
-        for (int comp = ((s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ? 3 : 0); comp < 4; comp++)
+        for (int comp = first_color_comp; comp < 4; comp++)
             s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
                                                 v2->color[i][comp], &ctx);
     for (u32 i = 0; i < s_cfg.numtexgens; i++) {
@@ -2993,14 +3108,18 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
 
     if (s_triangle_sink) {
         GxRasterTriangleJob job;
-        memset(&job, 0, sizeof job);
         job.scan = ts;
-        if (!s_cfg.fused) job.z = s_ZSlope;
+        /* The sink packet exposes the full software fallback shape, but the
+         * active program consumes only color/tex channels named by the draw
+         * config.  Clearing the whole ~1 KiB struct for every resident GPU
+         * triangle was several GiB of dead stores per IPL menu run. */
+        memset(&job.z, 0, sizeof job.z);
+        if (!s_cfg.fused && !rs_gpu_program) job.z = s_ZSlope;
         job.w = s_WSlope;
         job.num_color_chans = s_cfg.numcolchans;
         job.num_texgens = s_cfg.numtexgens;
         job.pixel_format = s_pf;
-        job.fused_program = fused_program_id();
+        job.fused_program = triangle_program;
         for (u32 reg = 0; reg < 4; ++reg) {
             job.tev_reg[reg][0] = s_tev_w[0].Reg[reg].r;
             job.tev_reg[reg][1] = s_tev_w[0].Reg[reg].g;
@@ -3013,11 +3132,13 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
             job.stage_konst[stage][2] = s_cfg.stage[stage].stage_konst.b;
             job.stage_konst[stage][3] = s_cfg.stage[stage].stage_konst.a;
         }
+        memset(job.color[0], 0, sizeof job.color[0]);
         for (u32 i = 0; i < s_cfg.numcolchans; ++i) {
-            int first = (s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ? 3 : 0;
+            int first = first_color_comp;
             for (int comp = first; comp < 4; ++comp)
                 job.color[i][comp] = s_ColorSlopes[i][comp];
         }
+        memset(job.tex[0], 0, sizeof job.tex[0]);
         for (u32 i = 0; i < s_cfg.numtexgens; ++i)
             for (u32 comp = 0; comp < 3; ++comp)
                 job.tex[i][comp] = s_TexSlopes[i][comp];
@@ -3438,14 +3559,31 @@ static float gx_aspect_persp_xscale(void) {
     return s_scale;
 }
 
-static void tf_position(const InVtx* in, OutVtx* out) {
-    float m[12]; get_posmat(in->posMtx, m);
-    mul_vec3_mat34(in->position, m, out->mvPosition);
-    u32 ptype = s_xf[0x1026];      /* ProjectionType (0 persp, 1 ortho) */
-    float p[6]; for (int i = 0; i < 6; i++) p[i] = xf_f(0x1020 + i);
-    if (ptype == 0) {              /* Perspective (MultipleVec3Perspective) */
+typedef struct {
+    float m[12];
+    float p[6];
+    u32 ptype;
+} PositionTransform;
+
+static void prepare_position_transform(u8 pos_mtx, PositionTransform* tf) {
+    get_posmat(pos_mtx, tf->m);
+    tf->ptype = s_xf[0x1026];      /* ProjectionType (0 persp, 1 ortho) */
+    for (int i = 0; i < 6; i++) tf->p[i] = xf_f(0x1020 + i);
+    if (tf->ptype == 0) {
         float aspect_k = gx_aspect_persp_xscale();
-        if (aspect_k > 0.0f) { p[0] *= aspect_k; p[1] *= aspect_k; }
+        if (aspect_k > 0.0f) {
+            tf->p[0] *= aspect_k;
+            tf->p[1] *= aspect_k;
+        }
+    }
+}
+
+static void tf_position_prepared(const InVtx* in, OutVtx* out,
+                                 const PositionTransform* tf) {
+    const float* m = tf->m;
+    const float* p = tf->p;
+    mul_vec3_mat34(in->position, m, out->mvPosition);
+    if (tf->ptype == 0) {          /* Perspective (MultipleVec3Perspective) */
         out->projectedPosition[0] = p[0]*out->mvPosition[0] + p[1]*out->mvPosition[2];
         out->projectedPosition[1] = p[2]*out->mvPosition[1] + p[3]*out->mvPosition[2];
         out->projectedPosition[2] = (p[4]*out->mvPosition[2] + p[5]) * (1.0f - 1e-7f);
@@ -3456,6 +3594,12 @@ static void tf_position(const InVtx* in, OutVtx* out) {
         out->projectedPosition[2] = p[4]*out->mvPosition[2] + p[5];
         out->projectedPosition[3] = 1.0f;
     }
+}
+
+static void tf_position(const InVtx* in, OutVtx* out) {
+    PositionTransform tf;
+    prepare_position_transform(in->posMtx, &tf);
+    tf_position_prepared(in, out, &tf);
 }
 static void tf_normal(const InVtx* in, OutVtx* out) {
     float m[9]; get_normmat(in->posMtx, m);
@@ -3550,9 +3694,8 @@ static void light_alpha(const float* pos, const float* normal, int lnum, u32 dif
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
-static void tf_color(const InVtx* in, OutVtx* out) {
-    u32 numchan = gm_numcolchans();
-    for (u32 chan = 0; chan < 2; chan++) {
+static void tf_color_n(const InVtx* in, OutVtx* out, u32 channels) {
+    for (u32 chan = 0; chan < channels; chan++) {
         u32 colorreg = s_xf[0x100e + chan];   /* LitChannel color */
         u32 alphareg = s_xf[0x1010 + chan];   /* LitChannel alpha */
         /* matcolor as [R,G,B,A]-ish; the SW backend treats matcolor as
@@ -3624,8 +3767,11 @@ static void tf_color(const InVtx* in, OutVtx* out) {
         out->color[chan][1] = chancolor[2];   /* G */
         out->color[chan][2] = chancolor[1];   /* B */
         out->color[chan][3] = chancolor[0];   /* A */
-        (void)numchan;
     }
+}
+
+static void tf_color(const InVtx* in, OutVtx* out) {
+    tf_color_n(in, out, 2u);
 }
 
 static void tf_texcoord(const InVtx* in, OutVtx* out) {
@@ -3701,6 +3847,44 @@ static const u8* array_ptr(const GxCpState* cp, u32 arr, u32 index, u32 need) {
     u64 addr = (u64)base + (u64)index * stride;
     if (!s_cpu || !s_cpu->ram || addr + need > (u64)s_cpu->ram_size) return NULL;
     return s_cpu->ram + addr;
+}
+
+/* Position-only loader for the late IPL menu's tiny R/S fans.  Those streams
+ * have no per-vertex matrix indices and use indexed float positions as their
+ * first attribute.  Keep the checks explicit: if the stream ever changes,
+ * gx_raster_draw_impl falls back to the complete vertex loader below. */
+static int load_indexed_float_position_only(const GxCpState* cp, u32 vat,
+                                             const u8* v, u32 vstride,
+                                             InVtx* out) {
+    u32 low = cp->vtx_desc_lo;
+    u32 g0 = cp->vat_g0[vat];
+    u32 postype = (low >> 9) & 3u;
+    u32 posfmt = (g0 >> 1) & 7u;
+    u32 poselem = g0 & 1u;
+    u32 index_bytes;
+
+    if ((low & 0x1ffu) != 0u || posfmt != 4u)
+        return 0;
+    if (postype == VCF_INDEX8)
+        index_bytes = 1u;
+    else if (postype == VCF_INDEX16)
+        index_bytes = 2u;
+    else
+        return 0;
+    if (vstride < index_bytes)
+        return 0;
+
+    u32 idx = postype == VCF_INDEX8 ? (u32)v[0] : (u32)be_u16(v);
+    u32 n = poselem ? 3u : 2u;
+    const u8* p = array_ptr(cp, 0, idx, n * 4u);
+    if (!p)
+        return 0;
+
+    out->posMtx = (u8)bits(cp->matrix_index_a, 0, 6);
+    out->position[0] = be_f32(p);
+    out->position[1] = be_f32(p + 4);
+    out->position[2] = n == 3u ? be_f32(p + 8) : 0.0f;
+    return 1;
 }
 
 /* Direct-attribute component read (VertexLoader_{Position,TextCoord}.cpp
@@ -3934,6 +4118,42 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
     return 1;
 }
 
+/* Complete the position-only R/S vertex without re-running the general VCD /
+ * VAT parser.  Both exact programs use VAT0=50F76C09: one indexed XYZ float
+ * position, one indexed signed-short normal, and one indexed signed-short ST
+ * coordinate (8 fractional bits), with no vertex matrix or color fields.
+ * Return zero on any layout change so the caller uses load_vertex instead. */
+static int load_rs_vertex_rest(const GxCpState* cp, u32 vat, const u8* v,
+                               u32 vstride, InVtx* out) {
+    u32 low = cp->vtx_desc_lo;
+    u32 pos_bytes;
+    if (vat != 0u || cp->vtx_desc_hi != 0x00000002u ||
+        cp->vat_g0[vat] != 0x50F76C09u)
+        return 0;
+    if (low == 0x00001600u && vstride == 4u)
+        pos_bytes = 2u;
+    else if (low == 0x00001400u && vstride == 3u)
+        pos_bytes = 1u;
+    else
+        return 0;
+
+    float position[3] = {
+        out->position[0], out->position[1], out->position[2]
+    };
+    u8 pos_mtx = out->posMtx;
+    memset(out, 0, sizeof *out);
+    out->posMtx = pos_mtx;
+    memcpy(out->position, position, sizeof position);
+    const u8* normal = array_ptr(cp, 1, v[pos_bytes], 6u);
+    if (!normal)
+        return 0;
+    out->normal[0][0] = be_s16(normal) * (1.0f / 16384.0f);
+    out->normal[0][1] = be_s16(normal + 2) * (1.0f / 16384.0f);
+    out->normal[0][2] = be_s16(normal + 4) * (1.0f / 16384.0f);
+    memset(out->color, 0xFF, sizeof out->color);
+    return 1;
+}
+
 /* ============================================================================
  * Setup unit (triangle fan) + public draw.
  * ==========================================================================*/
@@ -4091,7 +4311,7 @@ static int draw_parallel_ok(void) {
     return 1;
 }
 
-static void build_draw_cfg(void) {
+static void advance_texel_cache_generation(void) {
     /* Bump the per-draw texel cache's generation (see the big "Per-draw texel
      * cache" comment above tex_sample) — this is the ENTIRE invalidation cost
      * for a new draw: one integer increment, no memset. Skip stored-gen 0 (it
@@ -4103,6 +4323,9 @@ static void build_draw_cfg(void) {
         memset(s_texel_cache_w, 0, sizeof s_texel_cache_w);
         s_texel_cache_gen = 1;
     }
+}
+
+static void build_draw_cfg(void) {
 
     s_pf     = pixel_format();
     s_zt_upd = zm_update_enable();
@@ -4286,6 +4509,7 @@ static void build_draw_cfg(void) {
             s_cfg.fused_needs_ras_rgb = 1;
         }
     }
+    s_cfg.program_id = compute_program_id();
 
     /* GCN_GX_TEV_CENSUS (see the block comment above this function). */
     if (s_tev_census < 0) s_tev_census = getenv("GCN_GX_TEV_CENSUS") ? 1 : 0;
@@ -4354,8 +4578,82 @@ static void build_efb_cfg(void) {
  * top of the file) has a single measurement point regardless of which of this
  * function's several early-return paths (bad primitive, vat<3 verts,
  * load_vertex failure, normal completion) is taken. */
+static int position_triangle_survives(const OutVtx* v0, const OutVtx* v1,
+                                      const OutVtx* v2) {
+    if ((calc_clip_mask(v0) & calc_clip_mask(v1) & calc_clip_mask(v2)) != 0)
+        return 0;
+    int backface = is_backface(v0, v1, v2);
+    u32 cull = s_cfg.cullmode;
+    return backface ? (cull != 2 && cull != 3) :
+                      (cull != 1 && cull != 3);
+}
+
+static void transform_vertex_rest(const InVtx* in, OutVtx* out) {
+    tf_normal(in, out);
+    tf_color(in, out);
+    tf_texcoord(in, out);
+}
+
+/* Exact late-menu XF state. Both R/S texgens source transformed normal, so
+ * their submitted texcoord index is dead. S is unlit register color; R uses
+ * one lit color channel. Guard every word that makes those reductions true. */
+static int rs_exact_xf(u32 program) {
+    u32 expected_color = program == 18u ? 0x00000506u : 0x00000500u;
+    return (program == 18u || program == 19u) &&
+           gm_numcolchans() == 1u && (s_xf[0x103f] & 0xfu) == 1u &&
+           s_xf[0x1012] == 0x00000001u &&
+           s_xf[0x1040] == 0x00000084u && s_xf[0x1050] == 0x0000003Du &&
+           s_xf[0x100e] == expected_color && s_xf[0x1010] == 0x00000500u;
+}
+
+typedef struct {
+    float normal[9];
+    float tex[12];
+    float post[12];
+    float s_scale, t_scale;
+} RsTransform;
+
+static void prepare_rs_transform(const GxCpState* cp, u8 pos_mtx,
+                                 RsTransform* tf) {
+    get_normmat(pos_mtx, tf->normal);
+    get_texmat((u8)bits(cp->matrix_index_a, 6, 6), tf->tex);
+    get_postmat(61u, tf->post);   /* exact post0 word 0x3D, normalize=0 */
+    tf->s_scale = (float)(bits(s_bp[0x30], 0, 16) + 1u);
+    tf->t_scale = (float)(bits(s_bp[0x31], 0, 16) + 1u);
+}
+
+static void transform_rs_vertex_rest(const InVtx* in, OutVtx* out,
+                                     u32 program, const RsTransform* tf) {
+    mul_vec3_mat33(in->normal[0], tf->normal, out->normal[0]);
+    normalize3(out->normal[0]);
+    if (program == 19u) {
+        u32 matc = s_xf[0x100c];
+        out->color[0][0] = (u8)(matc >> 24);
+        out->color[0][1] = (u8)(matc >> 16);
+        out->color[0][2] = (u8)(matc >> 8);
+        out->color[0][3] = (u8)matc;
+    } else {
+        tf_color_n(in, out, 1u);
+    }
+    /* Exact tg0=0x84: Regular, source=normal, ABC1, ST projection. Exact
+     * dual/post0=0x3D: post matrix 61, no normalization. */
+    float tmp[3];
+    mul_vec3_mat24(out->normal[0], tf->tex, tmp);
+    mul_vec3_mat34(tmp, tf->post, out->texCoords[0]);
+    if (out->texCoords[0][2] == 0.0f) {
+        float x = out->texCoords[0][0] / 2.0f;
+        float y = out->texCoords[0][1] / 2.0f;
+        out->texCoords[0][0] = x < -1 ? -1 : x > 1 ? 1 : x;
+        out->texCoords[0][1] = y < -1 ? -1 : y > 1 ? 1 : y;
+    }
+    out->texCoords[0][0] *= tf->s_scale;
+    out->texCoords[0][1] *= tf->t_scale;
+}
+
 static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
                     const u8* verts, u32 nverts, u32 vstride) {
+    if (s_draw_stats && prim < 8u)
+        s_draw_shapes[prim][nverts < 16u ? nverts : 16u]++;
     /* prim 0/1 = GX_DRAW_QUADS / GX_DRAW_QUADS_2 (SetupUnit.cpp:34-40 routes
      * both to SetupQuad — Dolphin itself treats QUADS_2 as a non-standard
      * alias, not a distinct assembly). prim 4 = GX_DRAW_TRIANGLE_FAN.
@@ -4387,9 +4685,79 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
     }
     if (nverts < (is_line ? 2u : 3u)) return;
 
-    recompute_scissor();
+    /* BP register loads are separate FIFO commands, so no BP-derived state
+     * can change between two draws unless gx_on_bp() advanced the generation.
+     * The late IPL menus issue thousands of tiny draws under one unchanged
+     * state; decoding all stages, textures, swaps, scissor and carry analysis
+     * for each was pure repetition. TEV census mode deliberately rebuilds so
+     * its per-config draw counters retain their diagnostic meaning. */
+    advance_texel_cache_generation();
     tev_load_registers(&s_tev_w[0]);
-    build_draw_cfg();
+    if (s_cfg_bp_generation != s_bp_generation || s_tev_census == 1) {
+        ++s_cfg_cache_misses;
+        recompute_scissor();
+        build_draw_cfg();
+        s_cfg_bp_generation = s_bp_generation;
+    } else {
+        ++s_cfg_cache_hits;
+    }
+
+    /* Late-menu programs R/S submit millions of 3/4-vertex fans, most wholly
+     * clipped or culled. Position/cull depends only on tf_position output, so
+     * defer normal/lighting/color/texcoord work until a triangle is known to
+     * survive. Surviving triangles still use the unchanged clipping path. */
+    u32 gpu_program = fused_program_id();
+    if (prim == 4u && (nverts == 3u || nverts == 4u) &&
+        (gpu_program == 18u || gpu_program == 19u)) {
+        InVtx in[4];
+        OutVtx out[4];
+        PositionTransform position_tf;
+        int positions_ok = 1;
+        for (u32 i = 0; i < nverts; ++i) {
+            if (!load_indexed_float_position_only(
+                    cp, vat, verts + (u64)i * vstride, vstride, &in[i])) {
+                positions_ok = 0;
+                break;
+            }
+            if (i == 0u)
+                prepare_position_transform(in[i].posMtx, &position_tf);
+            else if (in[i].posMtx != in[0].posMtx) {
+                positions_ok = 0;
+                break;
+            }
+            memset(&out[i], 0, sizeof out[i]);
+            tf_position_prepared(&in[i], &out[i], &position_tf);
+        }
+        if (positions_ok) {
+            int keep0 = position_triangle_survives(&out[0], &out[1], &out[2]);
+            int keep1 = nverts == 4u &&
+                        position_triangle_survives(&out[0], &out[2], &out[3]);
+            u32 needed = (keep0 ? 0x7u : 0u) | (keep1 ? 0xDu : 0u);
+            int exact_xf = rs_exact_xf(gpu_program);
+            RsTransform rs_tf;
+            if (exact_xf && needed != 0u)
+                prepare_rs_transform(cp, in[0].posMtx, &rs_tf);
+            for (u32 i = 0; i < nverts; ++i) {
+                if (needed & (1u << i)) {
+                    const u8* vertex = verts + (u64)i * vstride;
+                    if (exact_xf && load_rs_vertex_rest(
+                            cp, vat, vertex, vstride, &in[i])) {
+                        transform_rs_vertex_rest(&in[i], &out[i], gpu_program,
+                                                 &rs_tf);
+                    } else {
+                        if (!load_vertex(cp, vat, vertex, vstride, &in[i]))
+                            return;
+                        transform_vertex_rest(&in[i], &out[i]);
+                    }
+                }
+            }
+            if (keep0)
+                process_triangle(&s_tev_w[0], &out[0], &out[1], &out[2]);
+            if (keep1)
+                process_triangle(&s_tev_w[0], &out[0], &out[2], &out[3]);
+            return;
+        }
+    }
 
     /* SetupUnit vertex assembly (SetupUnit.cpp:12-130): v0 stays in store[0]
      * for the whole call (its slot is never reassigned by either path); only
@@ -4487,6 +4855,23 @@ void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u6
     if (tsc_tri) *tsc_tri = s_tsc_tri;
     if (pixels_shaded) *pixels_shaded = s_pixels_shaded;
     if (draw_calls) *draw_calls = s_draw_calls_stat;
+}
+
+void gx_raster_get_config_cache_stats(u64* hits, u64* misses) {
+    if (hits) *hits = s_cfg_cache_hits;
+    if (misses) *misses = s_cfg_cache_misses;
+}
+
+void gx_raster_print_draw_shape_stats(void) {
+    if (!s_draw_stats) return;
+    fprintf(stderr, "[gx-draw-shapes]");
+    for (u32 prim = 0; prim < 8u; ++prim)
+        for (u32 nv = 0; nv <= 16u; ++nv)
+            if (s_draw_shapes[prim][nv])
+                fprintf(stderr, " p%u/n%u%s=%llu", prim,
+                        nv, nv == 16u ? "+" : "",
+                        (unsigned long long)s_draw_shapes[prim][nv]);
+    fprintf(stderr, "\n");
 }
 
 /* Sibling getter for the EFB-bucket copy-vs-clear split (see s_tsc_efb_clear's
@@ -5372,6 +5757,10 @@ void gx_raster_efb_copy(const GxCpState* cp) {
              * simd_ok/copy_getpx above), not re-checked per scanline. */
             int use_avx2 = simd_ok && gx_avx2_available();
 
+            /* VI may snapshot this same guest address from the CPU thread.
+             * Hold the XFB writer guard across every destination row so the
+             * host observes either the previous field or this complete one. */
+            gcn_gx_xfb_write_begin();
             for (int dy = 0; dy < dst_h; dy++) {
                 int sy = top + (int)(dy / (yscale == 0 ? 1.0f : yscale) + 0.5f);
                 if (sy >= bottom) sy = bottom - 1;
@@ -5481,6 +5870,7 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                         efb_copy_pack(row, x, i, scanY, scanU, scanV);
                 }
             }
+            gcn_gx_xfb_write_end();
         }
     } else {
         TRAP(efbtex, "EFB->texture copy (copy_to_xfb=0)");
@@ -5503,6 +5893,11 @@ void gx_raster_efb_copy(const GxCpState* cp) {
  * ==========================================================================*/
 void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
     s_cpu = cpu; s_bp = bp; s_xf = xf;
+    s_bp_generation = 1;
+    s_cfg_bp_generation = 0;
+    s_cfg_cache_hits = 0;
+    s_cfg_cache_misses = 0;
+    memset(s_draw_shapes, 0, sizeof s_draw_shapes);
     memset(s_efb_color, 0, sizeof s_efb_color);
     memset(s_efb_depth, 0, sizeof s_efb_depth);
     memset(s_tev_w, 0, sizeof s_tev_w);

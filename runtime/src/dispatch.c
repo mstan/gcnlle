@@ -443,7 +443,8 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                                                &dsp_remainder, &device_cycles,
                                                dsp_cycles_per_block, s_cycles_uniform,
                                                &dsp_cycles, &ai_cycles);
-            gcn_dsp_tick(dsp_cycles);
+            gcn_dsp_tick(dsp_cycles,
+                         derived ? ai_cycles : GCN_CORE_CYCLES_PER_BLOCK);
             u64 t2 = __rdtsc(); s_tsc[1] += t2 - t1;
             if (derived) gcn_ai_tick(ai_cycles); else gcn_ai_tick_legacy();
             u64 t3 = __rdtsc(); s_tsc[2] += t3 - t2;
@@ -480,7 +481,8 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         /* Accrues DSP-cycle debt and flushes it at CPU observation points or
          * the K-cycle cap (default 4096 PPC cycles, GCN_DSP_BATCH_PPC) —
          * no longer runs the DSP core every block; see gcn_dsp_flush (dsp.c). */
-        gcn_dsp_tick(dsp_cycles);
+        gcn_dsp_tick(dsp_cycles,
+                     derived ? ai_cycles : GCN_CORE_CYCLES_PER_BLOCK);
         if (derived) gcn_ai_tick(ai_cycles);      /* pace AISCNT / AIINT while PSTAT=1 */
         else         gcn_ai_tick_legacy();
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
@@ -489,11 +491,11 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         }
         /* Service the debug server between blocks: non-blocking, so it stays
          * responsive even while the guest busy-waits on unmodeled hardware. A
-         * client "quit" ends the run cleanly. Pumped every 256 blocks rather than
+         * client "quit" ends the run cleanly. Pumped every 262144 blocks rather than
          * every block — the accept()/recv() syscalls were a per-block hot-path
-         * cost, and 256 blocks is well under a millisecond of guest time, so the
-         * TCP surface (screenshot/set_input/quit) stays responsive. */
-        if ((blocks & 0xFFu) == 0u) {
+         * cost, and 262144 blocks is about 60 ms at the rendered IPL's steady-state
+         * rate, so the TCP surface (screenshot/set_input/quit) stays responsive. */
+        if ((blocks & 0x3FFFFu) == 0u) {
             gcn_debug_server_pump();
             if (gcn_debug_server_quit_requested())
                 return 1;

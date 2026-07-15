@@ -44,6 +44,13 @@ void gx_render_init(CPUState* cpu, const u32* bp, const u32* xf) {
     s_initialized = 1;
 
     const char* requested = getenv("GCN_GX_BACKEND");
+    /* Interactive use should select the already-validated resident renderer
+     * without requiring a second, easy-to-miss environment variable.  Keep
+     * headless/oracle runs on the byte-exact software baseline, and retain an
+     * explicit `software` override for debugging and differential work. */
+    const char* window = getenv("GCN_WINDOW");
+    if ((!requested || !*requested) && window && *window && *window != '0')
+        requested = "vulkan";
     if (!requested || !*requested || strcmp(requested, "software") == 0)
         return;
 
@@ -65,7 +72,7 @@ void gx_render_init(CPUState* cpu, const u32* bp, const u32* xf) {
             s_mode = GX_RENDER_VULKAN_RESIDENT;
             gx_raster_set_triangle_sink(vulkan_triangle_sink, NULL);
             fprintf(stderr,
-                "gx_render: exact Vulkan A--K renderer active with synchronized "
+                "gx_render: exact Vulkan A--S renderer active with synchronized "
                 "software fallback\n");
         } else {
             fprintf(stderr,

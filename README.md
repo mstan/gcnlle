@@ -19,9 +19,12 @@ and disc-detection screen.
 - Memory-card image validation and the IPL's copy and erase paths have been
   exercised end-to-end on Dolphin-compatible raw images, including persisted
   journal verification after each operation.
-- The software renderer is the correctness baseline. An opt-in Vulkan
-  differential/resident backend is active performance work and remains
-  experimental.
+- The software renderer remains the correctness baseline for headless/oracle
+  runs. Interactive Windows launches use the exact resident Vulkan backend by
+  default, with synchronized software fallback for unsupported state, and a
+  vsynced double-buffered WGL presenter so DWM never observes a partial frame.
+  Set `GCN_GX_BACKEND=software` to force the reference renderer or `GCN_GL=0`
+  to select the diagnostic GDI presenter.
 - Commercial-game recompilation and execution are outside the present scope.
 
 The detailed milestone history is in [docs/ROADMAP.md](docs/ROADMAP.md), and
@@ -44,9 +47,12 @@ See [PRINCIPLES.md](PRINCIPLES.md) for the validation discipline and
 
 ## Build and test without firmware
 
-The tested host setup is 64-bit Windows with MSYS2 MinGW64 GCC, CMake, and
-Ninja. The recompiler is C11; the runtime also builds a C++20 DSP component.
-Vulkan is optional and is detected automatically.
+The tested host setup is 64-bit Windows on an AVX2-capable CPU, with MSYS2
+MinGW64 GCC, CMake, and Ninja. The rendered runtime defaults to the fixed
+`x86-64-v3` baseline; use `-DGCN_X86_64_V3=OFF` for an older CPU (the portable
+build is correct but may not sustain real-time IPL rendering). The recompiler
+is C11; the runtime also builds a C++20 DSP component. Vulkan is optional and
+is detected automatically.
 
 From an MSYS2 shell:
 

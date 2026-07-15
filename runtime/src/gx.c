@@ -139,6 +139,8 @@ static u64 s_gx_draws;      /* GX_OP_PRIM_* commands rasterized */
 static u64 s_gx_verts;      /* total vertices across those draws */
 static u64 s_gx_dlcalls;    /* CALL_DL commands actually executed (non-recursive) */
 static u64 s_gx_efbcopies;  /* GX_BP_TRIGGER_EFB_COPY writes */
+static u64 s_gx_frames;     /* accepted GXSetDrawDone writes (one per IPL frame) */
+static u64 s_xfb_generation; /* completed frame publication sequence */
 
 /* Log a first-occurrence once; returns 1 the first time a flag is raised. */
 static int note_once(u8* flag) {
@@ -192,9 +194,9 @@ static int note_once(u8* flag) {
  * synchronous consumption — the four golden XFB hashes (repeat-run
  * deterministic) + the oracle value+order diff are the arbiters, exactly
  * as they were for GCN_DSP_THREAD. EFB->XFB copies also land in guest RAM
- * from the worker: live VI field capture, end-of-run/shutdown, debug RAM and
- * screenshot access, and fifo reset all drain first so they never race or
- * observe a partially-written field.
+ * from the worker: GXSetDrawDone's producer fence materializes a completed
+ * XFB before the guest can flip VI to it; end-of-run/shutdown, debug RAM and
+ * screenshot access, and fifo reset explicitly drain before observing state.
  * ==========================================================================*/
 static u32 rd32(const u8* p);                                    /* defined below */
 static u32 gx_run(GcnGx* gx, const u8* data, u32 available);     /* defined below */
@@ -230,6 +232,20 @@ static int          s_pipe_syncmode = 0;   /* unsizable top-level cmd (e.g. a to
 static u8  s_scan_carry[128];
 static u32 s_scan_carry_len = 0;
 static s64 s_scan_pos = 0;        /* cumulative stream offset of carry[0] */
+
+/* The IPL normally renders successive fields into the same guest XFB. The GX
+ * worker materializes that buffer row-by-row while VI runs on the CPU thread;
+ * protect only those RAM accesses so scanout cannot publish a hybrid frame.
+ * This is deliberately narrower than a pipeline drain. */
+static SRWLOCK s_xfb_lock = SRWLOCK_INIT;
+
+void gcn_gx_xfb_read_begin(void)  { AcquireSRWLockShared(&s_xfb_lock); }
+void gcn_gx_xfb_read_end(void)    { ReleaseSRWLockShared(&s_xfb_lock); }
+void gcn_gx_xfb_write_begin(void) { AcquireSRWLockExclusive(&s_xfb_lock); }
+void gcn_gx_xfb_write_end(void)   { ReleaseSRWLockExclusive(&s_xfb_lock); }
+u64 gcn_gx_xfb_generation(void) {
+    return __atomic_load_n(&s_xfb_generation, __ATOMIC_ACQUIRE);
+}
 
 static DWORD WINAPI gx_pipe_worker(LPVOID param);
 
@@ -338,7 +354,27 @@ void gcn_gx_pipeline_shutdown(void) {
                     100.0 * (double)s_gx_tsc[GX_STAT_EFB] / (double)total,
                     (unsigned long long)s_gx_draws,
                     (unsigned long long)s_gx_efbcopies);
+        u64 vtx = 0, tri = 0, pixels = 0, draw_calls = 0;
+        gx_raster_get_draw_stats(&vtx, &tri, &pixels, &draw_calls);
+        if (vtx + tri)
+            fprintf(stderr,
+                    "[gx-final-draw-stats] draws=%llu vtx=%.1f%% tri=%.1f%% "
+                    "pixels=%llu\n",
+                    (unsigned long long)draw_calls,
+                    100.0 * (double)vtx / (double)(vtx + tri),
+                    100.0 * (double)tri / (double)(vtx + tri),
+                    (unsigned long long)pixels);
+        u64 cfg_hits = 0, cfg_misses = 0;
+        gx_raster_get_config_cache_stats(&cfg_hits, &cfg_misses);
+        fprintf(stderr, "[gx-config-cache] hit=%llu miss=%llu (%.1f%%)\n",
+                (unsigned long long)cfg_hits,
+                (unsigned long long)cfg_misses,
+                cfg_hits + cfg_misses ?
+                    100.0 * (double)cfg_hits / (double)(cfg_hits + cfg_misses) : 0.0);
+        gx_raster_print_draw_shape_stats();
     }
+    fprintf(stderr, "gx: completed %llu IPL frames (GXSetDrawDone)\n",
+            (unsigned long long)s_gx_frames);
     gx_render_shutdown();
 }
 
@@ -458,6 +494,10 @@ static s64 gx_scan_chunk(const u8* chunk, s64 chunk_start_off, int* poison) {
 
 static DWORD WINAPI gx_pipe_worker(LPVOID param) {
     (void)param;
+    /* This producer shares the rendered path's real-time audio deadline with
+     * the emulation thread. Keep both above ordinary desktop/capture work;
+     * the window consumer remains below-normal and coalesces frames. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     GcnGx* gx = &s_gx;
     s64 pulled = 0;
     for (;;) {
@@ -766,15 +806,20 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     if (note_once(&gx->seen_bp[cmd]))
         fprintf(stderr, "gx: BP reg 0x%02X first written (val 0x%06X)\n", cmd, value);
 
+    if (gx->bp[cmd] != value)
+        gx_raster_notify_bp_write();
     gx->bp[cmd] = value;
 
     switch (cmd) {
     case GX_BP_SETDRAWDONE:            /* BPStructs.cpp:180-201 */
         if ((value & 0xFFu) == 0x02u) {
             gx_render_flush();
+            /* All preceding EFB copies are now materialized in MEM1. Publish
+             * this generation before PE finish lets VI present only complete
+             * guest frames, never an intermediate copy from the same frame. */
+            __atomic_add_fetch(&s_xfb_generation, 1u, __ATOMIC_RELEASE);
             gcn_pe_set_finish(gx->pe);
-            fprintf(stderr, "gx: GXSetDrawDone -> PE finish (val 0x%04X)\n",
-                    value & 0xFFFFu);
+            ++s_gx_frames;
         } else {
             fprintf(stderr, "gx: GXSetDrawDone ??? (val 0x%04X)\n", value & 0xFFFFu);
         }
@@ -1042,6 +1087,8 @@ static u32 gx_run(GcnGx* gx, const u8* data, u32 available) {
  * ==========================================================================*/
 void gcn_gx_init(CPUState* cpu, GcnCp* cp, GcnPe* pe) {
     memset(&s_gx, 0, sizeof s_gx);
+    s_gx_frames = 0;
+    __atomic_store_n(&s_xfb_generation, 0u, __ATOMIC_RELAXED);
     s_gx.cpu = cpu;
     s_gx.cp  = cp;
     s_gx.pe  = pe;

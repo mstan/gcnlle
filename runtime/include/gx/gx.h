@@ -90,6 +90,24 @@ const u8* gcn_gx_tmem(void);
  * screenshots, the PI fifo-reset hook. */
 void gcn_gx_pipeline_drain(void);
 
+/* Host scanout snapshots and EFB->XFB materialization share guest MEM1. The
+ * guest commonly reuses one XFB address, so a VI field can otherwise copy
+ * the buffer while the GX worker is replacing its rows. These guards make
+ * each host snapshot observe one complete old or new XFB without draining
+ * unrelated queued GX work. Writers are the software and resident-Vulkan
+ * EFB-copy paths; VI holds the shared side only for its synchronous mailbox
+ * copy. */
+void gcn_gx_xfb_read_begin(void);
+void gcn_gx_xfb_read_end(void);
+void gcn_gx_xfb_write_begin(void);
+void gcn_gx_xfb_write_end(void);
+
+/* Monotonic producer publication point. It advances only after
+ * GXSetDrawDone has flushed/materialized every preceding EFB->XFB copy, so
+ * VI can distinguish a finished guest frame from intermediate copies made
+ * while constructing it. */
+u64 gcn_gx_xfb_generation(void);
+
 /* Drain, stop, and join the default-on GX worker before guest RAM/device
  * teardown. No-op when the synchronous fallback is selected. */
 void gcn_gx_pipeline_shutdown(void);

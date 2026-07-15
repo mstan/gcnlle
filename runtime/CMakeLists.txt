@@ -114,6 +114,13 @@ add_executable(test_rtc tests/test_rtc.c src/rtc.c)
 target_include_directories(test_rtc PRIVATE include)
 add_test(NAME rtc_boot_sync COMMAND $<TARGET_FILE:test_rtc>)
 
+add_executable(test_host_audio tests/test_host_audio.c src/host_audio.c)
+target_include_directories(test_host_audio PRIVATE include)
+if(WIN32)
+  target_link_libraries(test_host_audio PRIVATE ole32 uuid avrt)
+endif()
+add_test(NAME host_audio_pcm COMMAND $<TARGET_FILE:test_host_audio>)
+
 add_executable(gcn_memcard_inspect tools/memcard_inspect.c src/memcard_image.c)
 target_include_directories(gcn_memcard_inspect PRIVATE include)
 
@@ -182,10 +189,28 @@ if(GCN_WITH_GENERATED)
     src/gx_vulkan.c
     src/rings.c
     src/debug_server.c
+    src/host_audio.c
     src/host_window.c
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )
+  # The late IPL menus spend most of their time in the exact R/S raster setup
+  # paths.  Optimize that translation unit independently of stale whole-boot
+  # PGO weights.  FP contraction must stay off: fused multiply-add changed
+  # clip-boundary classification in the exact triangle-count gate.
+  option(GCN_X86_64_V3
+         "Use the AVX2-class x86-64-v3 baseline for the rendered IPL path" ON)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set(GCN_GX_RASTER_OPTIONS -O3 -ffp-contract=off)
+    if(GCN_X86_64_V3 AND CMAKE_SYSTEM_PROCESSOR MATCHES
+       "^(AMD64|amd64|x86_64)$")
+      # A fixed ISA/tuning pair keeps release artifacts reproducible while
+      # retaining the scheduling win measured on the rendered R/S path.
+      list(APPEND GCN_GX_RASTER_OPTIONS -march=x86-64-v3 -mtune=skylake)
+    endif()
+    set_property(SOURCE src/gx_raster.c APPEND PROPERTY
+                 COMPILE_OPTIONS ${GCN_GX_RASTER_OPTIONS})
+  endif()
   # generated/ for "generated.h"; include/ for cpu|memory|seed|dispatch headers.
   # descramble_core.h comes in transitively via ipl_descramble_core's PUBLIC
   # include dir (M1: exi.c/boot.c call the vendored segher descrambler
@@ -195,12 +220,14 @@ if(GCN_WITH_GENERATED)
   # synchronization: WaitOnAddress/WakeByAddressAll for the GX-MT worker
   # pool's hybrid spin/sleep wait (gx_raster.c).
   # winmm: timeBeginPeriod for GCN_THROTTLE's Sleep() granularity (dispatch.c).
+  # ole32/uuid/avrt: event-driven WASAPI host audio + MMCSS worker priority
+  # (host_audio.c).
   # user32/gdi32: window class/message pump + StretchDIBits for the opt-in
   # GCN_WINDOW=1 native display window (host_window.c).
-  # opengl32: WGL context + fixed-function GL 1.1 present path (GCN_GL,
-  # default ON) alongside the GDI one, same file.
+  # opengl32: opt-in WGL/fixed-function GL 1.1 present path (GCN_GL=1)
+  # alongside the default GDI one, same file.
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
-                         ipl_descramble_core ws2_32 synchronization winmm
+                         ipl_descramble_core ws2_32 synchronization winmm ole32 uuid avrt
                          user32 gdi32 opengl32)
   if(Vulkan_FOUND)
     set(GX_CLEAR_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_clear.comp.inc)
@@ -241,7 +268,7 @@ if(GCN_WITH_GENERATED)
               ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_draw_f.comp
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_draw_f.comp
       VERBATIM
-      COMMENT "Compiling exact GX fused-program A--K compute shader"
+      COMMENT "Compiling exact GX fused-program A--S compute shader"
     )
     add_custom_target(gcn_gx_shaders DEPENDS ${GX_CLEAR_SPV_INC}
                                               ${GX_XFB_COPY_SPV_INC}

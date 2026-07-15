@@ -7,7 +7,7 @@
  */
 #include "vi/vi.h"
 #include "debug/rings.h"
-#include "gx/gx.h"          /* default-on GX worker: join before live XFB capture */
+#include "gx/gx.h"          /* atomic host snapshot vs worker XFB writes */
 #include "host/host_window.h"  /* GCN_WINDOW=1 field-boundary present hook, see below */
 
 #include <stdio.h>
@@ -19,6 +19,10 @@ static GcnVi* s_vi = NULL;
  * NULL (the pre-existing default) means the host-window present hook below
  * simply never fires; every other VI behavior is unaffected. */
 static CPUState* s_vi_cpu = NULL;
+/* Last GXSetDrawDone generation copied into the host mailbox. Repeated VI
+ * fields retain the last complete texture instead of republishing an XFB
+ * while the guest is still building its successor. */
+static u64 s_presented_xfb_generation = 0;
 
 void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user) {
     vi->irq = fn;
@@ -146,12 +150,17 @@ static void vi_advance_halfline(GcnVi* vi) {
         u32 fb_addr, fb_w, fb_h, fb_stride;
         if (gcn_vi_xfb_info(&fb_addr, &fb_w, &fb_h, &fb_stride) &&
             (u64)fb_addr + (u64)fb_stride * fb_h <= s_vi_cpu->ram_size) {
-            /* G3 executes EFB->XFB copies on a worker. Join at the hardware
-             * publication boundary so the host never observes a half-written
-             * field (or races the worker's non-atomic guest-RAM stores). The
-             * worker still overlaps the CPU for the rest of the field. */
-            gcn_gx_pipeline_drain();
-            gcn_host_window_present(s_vi_cpu->ram + fb_addr, fb_w, fb_h, fb_stride);
+            /* The guest reuses an XFB address, so GX may already be replacing
+             * its rows for the next field. Lock only the synchronous mailbox
+             * copy; unlike a pipeline drain this still permits all unrelated
+             * GX decode/render work to overlap the CPU. */
+            gcn_gx_xfb_read_begin();
+            u64 generation = gcn_gx_xfb_generation();
+            if (generation != s_presented_xfb_generation) {
+                gcn_host_window_present(s_vi_cpu->ram + fb_addr, fb_w, fb_h, fb_stride);
+                s_presented_xfb_generation = generation;
+            }
+            gcn_gx_xfb_read_end();
         }
     }
 

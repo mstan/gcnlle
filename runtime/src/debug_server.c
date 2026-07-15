@@ -18,6 +18,7 @@
 #include "vi/yuy2.h"       /* screenshot: YUY2->RGB (shared with host_window.c) */
 #include "si/si.h"         /* set_input: injected pad-report surface */
 #include "di/di.h"         /* insert_disc/eject_disc: runtime disc mount lifecycle */
+#include "host/host_audio.h" /* audio_state: WASAPI queue/signal acceptance */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -244,6 +245,31 @@ static void handle_line(Client* c, const char* line) {
                 (unsigned long long)s_ctx.exi->rtc.anchor_cycles,
                 (unsigned long long)cpu->cycles);
         }
+    }
+    else if (!strcmp(cmd, "audio_state")) {
+        GcnHostAudioStats a;
+        gcn_host_audio_get_stats(&a);
+        u32 aid_source = s_ctx.dsp ? s_ctx.dsp->aid_source : 0u;
+        u32 aid_cur_addr = s_ctx.dsp ? s_ctx.dsp->aid_cur_addr : 0u;
+        u32 aid_blocks_left = s_ctx.dsp ? s_ctx.dsp->aid_blocks_left : 0u;
+        u32 aid_ctrl = s_ctx.dsp ? s_ctx.dsp->aid_ctrl : 0u;
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"enabled\":%s,\"device_open\":%s,"
+            "\"sample_rate\":%u,\"peak\":%u,\"buffered_frames\":%u,"
+            "\"frames_received\":%llu,\"audible_frames\":%llu,"
+            "\"buffers_submitted\":%llu,\"underruns\":%llu,"
+            "\"wait_milliseconds\":%llu,\"dropped_frames\":%llu,"
+            "\"aid_source\":%u,\"aid_cur_addr\":%u,"
+            "\"aid_blocks_left\":%u,\"aid_ctrl\":%u}\n",
+            a.enabled ? "true" : "false", a.device_open ? "true" : "false",
+            a.sample_rate, a.peak, a.buffered_frames,
+            (unsigned long long)a.frames_received,
+            (unsigned long long)a.audible_frames,
+            (unsigned long long)a.buffers_submitted,
+            (unsigned long long)a.underruns,
+            (unsigned long long)a.wait_milliseconds,
+            (unsigned long long)a.dropped_frames,
+            aid_source, aid_cur_addr, aid_blocks_left, aid_ctrl);
     }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
         /* Decode the XFB the VI is scanning out into a PPM on disk. Geometry

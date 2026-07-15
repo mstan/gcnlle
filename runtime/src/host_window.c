@@ -34,12 +34,12 @@
  * left/right-cancel model, deliberately matching the Python client so the
  * two input surfaces feel identical to a player switching between them.
  *
- * Presentation backend (GCN_GL, default ON): the same converted s_rgb
- * (0x00RRGGBB) buffer is either StretchDIBits'd (GDI) or uploaded to a GL
- * texture and drawn as a textured quad + SwapBuffers (WGL, fixed-function GL
- * 1.1). GCN_GL=0, or any WGL setup step failing, falls back to the GDI path
- * with byte-identical behavior to before the GL path existed. See gl_init(),
- * gl_upload_texture(), gl_draw_quad() below do_present().
+ * Presentation backend: the converted s_rgb (0x00RRGGBB) buffer is uploaded
+ * to a GL texture and committed with a true double-buffered SwapBuffers (WGL,
+ * fixed-function GL 1.1). This is the default because redirected GDI window
+ * surfaces can be sampled by DWM halfway through a blit, producing visible
+ * half/quarter-surface tears. GCN_GL=0 or any WGL setup failure selects the
+ * retained GDI fallback. See gl_init(), gl_upload_texture(), gl_draw_quad().
  */
 #include "host/host_window.h"
 #include "si/si.h"
@@ -53,7 +53,7 @@
 #include <windows.h>     /* CreateThread, window class/message pump, SRWLock,
                           * StretchDIBits — same include style as gx_raster.c's
                           * GX-MT worker pool. */
-#include <GL/gl.h>       /* Optional GL present path (GCN_GL, default ON) —
+#include <GL/gl.h>       /* Default WGL present path (GCN_GL != 0) —
                           * fixed-function GL 1.1 only: no extension loader,
                           * no core profile. wgl* entry points come from
                           * wingdi.h (pulled in by windows.h regardless of
@@ -100,6 +100,7 @@ static u32  s_shared_w     = 0;
 static u32  s_shared_h     = 0;
 static u32  s_shared_stride= 0;
 static int  s_shared_valid = 0;
+static volatile LONG s_present_posted = 0; /* latest-frame mailbox wake bit */
 
 /* ---- window-thread-owned state ---- */
 static HWND     s_hwnd = NULL;
@@ -113,6 +114,12 @@ static u32  s_rgb_cap     = 0;          /* pixels allocated                     
 static u32  s_rgb_w = 0, s_rgb_h = 0;
 static int  s_have_frame  = 0;
 static u32  s_last_w = 0, s_last_h = 0; /* geometry the window was last sized for      */
+static u32  s_display_aspect_num = 4, s_display_aspect_den = 3;
+static HDC      s_gdi_mem_dc = NULL;    /* persistent off-screen GDI front buffer       */
+static HBITMAP  s_gdi_bitmap = NULL;
+static HGDIOBJ  s_gdi_old_bitmap = NULL;
+static void*    s_gdi_bits = NULL;
+static u32      s_gdi_w = 0, s_gdi_h = 0;
 
 /* ---- injected pad state (mirrors gcn_viewer.py's Viewer.buttons/stick/cstick) ---- */
 static u16 s_buttons  = 0;
@@ -200,7 +207,7 @@ static void handle_key(WPARAM wp, LPARAM lp, int down) {
     apply_key(vk, down);
 }
 
-/* ---- OpenGL presentation path (GCN_GL=1, default ON) ----
+/* ---- OpenGL presentation path (default; GCN_GL=0 opts out) ----
  * Alternate present path alongside the GDI/StretchDIBits one above: fixed-
  * function GL 1.1 (no extension loader, no core profile) textured-quad blit
  * of the same s_rgb buffer produced below, then SwapBuffers. Falls back to
@@ -222,13 +229,14 @@ static u32    s_gl_tex_src_w = 0, s_gl_tex_src_h = 0; /* source dims last upload
 static float  s_gl_tex_u = 1.0f, s_gl_tex_v = 1.0f;   /* UV scale: src / pow2 (pow2 texture
                                                         * storage has unused padding)         */
 
-/* GCN_GL=1 default-on cached check (same lazy-static pattern as
- * gcn_host_window_enabled above): only an explicit leading '0' disables it. */
+/* Default-on cached check (same lazy-static pattern as
+ * gcn_host_window_enabled above). GCN_GL=0 retains the diagnostic GDI
+ * fallback; any other value, including unset, uses atomic WGL swaps. */
 static int gcn_gl_enabled(void) {
     static int s_enabled = -1;
     if (s_enabled < 0) {
         const char* e = getenv("GCN_GL");
-        s_enabled = (e && e[0] == '0') ? 0 : 1;
+        s_enabled = (!e || !*e || *e != '0') ? 1 : 0;
     }
     return s_enabled;
 }
@@ -244,13 +252,13 @@ static GLint gcn_gl_filter(void) {
     return s_filter;
 }
 
-/* GCN_GL_VSYNC=1 requests wglSwapIntervalEXT(1); default interval 0. Vsync
+/* Vsync defaults on; GCN_GL_VSYNC=0 requests wglSwapIntervalEXT(0). Vsync
  * (if the driver exposes it — see gl_init()) only ever blocks THIS window
  * thread's SwapBuffers call, never the emu thread: GCN_THROTTLE's own
  * Sleep-based pacing (dispatch.c) is what paces the emu thread. */
 static int gcn_gl_vsync_wanted(void) {
     const char* e = getenv("GCN_GL_VSYNC");
-    return (e && *e && *e != '0') ? 1 : 0;
+    return (!e || !*e || *e != '0') ? 1 : 0;
 }
 
 static u32 next_pow2_u32(u32 v) {
@@ -317,19 +325,76 @@ static void gl_init(HWND hwnd) {
      * GL path to work. */
     gcn_wglSwapIntervalEXT_t swap_interval =
         (gcn_wglSwapIntervalEXT_t)wglGetProcAddress("wglSwapIntervalEXT");
-    if (swap_interval)
-        swap_interval(gcn_gl_vsync_wanted() ? 1 : 0);
+    int vsync = gcn_gl_vsync_wanted();
+    int swap_interval_set = swap_interval ? swap_interval(vsync ? 1 : 0) : 0;
+
+    fprintf(stderr,
+            "host_window: WGL presenter active (double-buffered, vsync=%s%s)\n",
+            vsync ? "on" : "off",
+            swap_interval ? (swap_interval_set ? "" : ", driver rejected interval")
+                          : ", swap-control unavailable");
 
     glEnable(GL_TEXTURE_2D);
 }
 
-/* Single seam for destination-rect placement: today it always fills the
- * whole client rect, matching the GDI path's StretchDIBits call exactly.
- * Aspect-correct letterboxing (a later task) only needs to change this one
- * function. */
+/* Center the image without changing the display aspect selected when the
+ * current XFB geometry arrived. WM_SIZING normally keeps the client at this
+ * ratio; the letterbox/pillarbox fallback also covers maximize and programmatic
+ * resizes, which do not pass through WM_SIZING. */
 static void compute_dest_rect(int client_w, int client_h, u32 src_w, u32 src_h, RECT* out) {
-    (void)src_w; (void)src_h;
-    out->left = 0; out->top = 0; out->right = client_w; out->bottom = client_h;
+    u32 an = s_display_aspect_num ? s_display_aspect_num : src_w;
+    u32 ad = s_display_aspect_den ? s_display_aspect_den : src_h;
+    int dw = client_w, dh = client_h;
+    if (an && ad && (u64)client_w * ad > (u64)client_h * an)
+        dw = (int)((u64)client_h * an / ad);
+    else if (an && ad)
+        dh = (int)((u64)client_w * ad / an);
+    out->left = (client_w - dw) / 2;
+    out->top = (client_h - dh) / 2;
+    out->right = out->left + dw;
+    out->bottom = out->top + dh;
+}
+
+/* Maintain the current display aspect while the user drags any window edge.
+ * The proposed WM_SIZING rectangle is an OUTER window rectangle, so account
+ * for caption/borders before applying the client-area ratio. */
+static void constrain_sizing_rect(HWND hwnd, WPARAM edge, RECT* r) {
+    u32 an = s_display_aspect_num, ad = s_display_aspect_den;
+    if (!an || !ad || !r) return;
+
+    DWORD style = (DWORD)GetWindowLongPtrA(hwnd, GWL_STYLE);
+    DWORD exstyle = (DWORD)GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
+    RECT frame = { 0, 0, 0, 0 };
+    AdjustWindowRectEx(&frame, style, FALSE, exstyle);
+    LONG frame_w = frame.right - frame.left;
+    LONG frame_h = frame.bottom - frame.top;
+    LONG cw = (r->right - r->left) - frame_w;
+    LONG ch = (r->bottom - r->top) - frame_h;
+    if (cw < 1 || ch < 1) return;
+
+    LONG h_from_w = (LONG)((u64)cw * ad / an);
+    LONG w_from_h = (LONG)((u64)ch * an / ad);
+    int adjust_width;
+    if (edge == WMSZ_LEFT || edge == WMSZ_RIGHT)
+        adjust_width = 0;
+    else if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM)
+        adjust_width = 1;
+    else
+        adjust_width = labs(w_from_h - cw) <= labs(h_from_w - ch);
+
+    if (adjust_width) {
+        LONG outer_w = w_from_h + frame_w;
+        if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT)
+            r->left = r->right - outer_w;
+        else
+            r->right = r->left + outer_w;
+    } else {
+        LONG outer_h = h_from_w + frame_h;
+        if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT)
+            r->top = r->bottom - outer_h;
+        else
+            r->bottom = r->top + outer_h;
+    }
 }
 
 /* Upload s_rgb (0x00RRGGBB per pixel — the same buffer StretchDIBits reads)
@@ -374,6 +439,8 @@ static void gl_draw_quad(HWND hwnd, u32 src_w, u32 src_h) {
     if (cw <= 0 || ch <= 0) return;
 
     glViewport(0, 0, cw, ch);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0.0, (double)cw, (double)ch, 0.0, -1.0, 1.0);
@@ -391,6 +458,12 @@ static void gl_draw_quad(HWND hwnd, u32 src_w, u32 src_h) {
         glTexCoord2f(0.0f,       s_gl_tex_v); glVertex2i(dst.left,  dst.bottom);
     glEnd();
 
+    /* Some desktop-capture/DWM paths can sample the newly swapped surface
+     * before an asynchronously queued texture upload + quad has finished.
+     * That exposes a one-frame clear/partial quad even though the context is
+     * double-buffered.  Complete this tiny presentation workload before the
+     * atomic swap; this blocks only the coalescing window thread. */
+    glFinish();
     SwapBuffers(s_gl_hdc);
 }
 
@@ -402,12 +475,13 @@ static void gl_draw_black(HWND hwnd) {
     glViewport(0, 0, (int)(rc.right - rc.left), (int)(rc.bottom - rc.top));
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
     SwapBuffers(s_gl_hdc);
 }
 
 /* Copy the shared frame out under the lock, resize the window if its
- * geometry changed, convert YUY2->RGB, and invalidate for WM_PAINT to blit.
- * Runs on the window thread only. */
+ * geometry changed, convert YUY2->RGB, and present it. Runs on the window
+ * thread only. */
 static void do_present(HWND hwnd) {
     u32 w, h, stride;
 
@@ -425,11 +499,11 @@ static void do_present(HWND hwnd) {
 
     if (w == 0 || h == 0) return;
 
-    /* Resize-on-geometry-change: client area is 2x the XFB size, except a
-     * half-height VI field (e.g. 592x224, height*2 <= width) gets its
-     * vertical zoom doubled again (4x) to look proportionally correct —
-     * exactly gcn_viewer.py's poll_frame `ydouble = 2 if h*2<=w else 1`
-     * rule, applied to window client size instead of a Tk image zoom.
+    /* Resize-on-geometry-change: GDI defaults to a native-width client. A
+     * half-height VI field (e.g. 592x224) is expanded to 592x448 by row
+     * duplication below, allowing a 1:1 DIB copy instead of a per-frame GPU
+     * stretch that can serialize with Vulkan. The GL path keeps its
+     * 2x/4x client because its texture path owns scaling.
      *
      * [ENHANCEMENT, opt-in] GCN_ASPECT=16:9 / 21:9 additionally widens the
      * client by target/(4:3) — 4/3 or 7/4 — pairing with gx_raster.c's
@@ -438,8 +512,13 @@ static void do_present(HWND hwnd) {
      * take the classic Dolphin-widescreen stretch. Unset = exact old rule. */
     if (w != s_last_w || h != s_last_h) {
         u32 cw, ch;
-        if (h * 2u <= w) { cw = w * 2u; ch = h * 4u; }
-        else             { cw = w * 2u; ch = h * 2u; }
+        if (s_gl_active) {
+            if (h * 2u <= w) { cw = w * 2u; ch = h * 4u; }
+            else             { cw = w * 2u; ch = h * 2u; }
+        } else {
+            cw = w;
+            ch = h * ((h * 2u <= w) ? 2u : 1u);
+        }
         {
             static int s_aspect = -1;   /* -1 unresolved, 0 off, 1 = 16:9, 2 = 21:9 */
             if (s_aspect < 0) {
@@ -450,6 +529,8 @@ static void do_present(HWND hwnd) {
             if (s_aspect == 1)      cw = cw * 4u / 3u;
             else if (s_aspect == 2) cw = cw * 7u / 4u;
         }
+        s_display_aspect_num = cw;
+        s_display_aspect_den = ch;
         RECT rc = { 0, 0, (LONG)cw, (LONG)ch };
         DWORD style   = (DWORD)GetWindowLongPtrA(hwnd, GWL_STYLE);
         DWORD exstyle = (DWORD)GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
@@ -459,7 +540,9 @@ static void do_present(HWND hwnd) {
         s_last_w = w; s_last_h = h;
     }
 
-    u64 npx = (u64)w * (u64)h;
+    u32 row_repeat = (!s_gl_active && h * 2u <= w) ? 2u : 1u;
+    u32 rgb_h = h * row_repeat;
+    u64 npx = (u64)w * (u64)rgb_h;
     if (npx > s_rgb_cap) {
         u32* n = (u32*)realloc(s_rgb, (size_t)npx * sizeof(u32));
         if (!n) return;
@@ -472,15 +555,24 @@ static void do_present(HWND hwnd) {
      * is 0x00RRGGBB — so packing (R<<16)|(G<<8)|B here is correct. */
     for (u32 y = 0; y < h; y++) {
         const u8* row = s_scratch + (size_t)y * stride;
-        u32* out = s_rgb + (size_t)y * w;
-        for (u32 x = 0; x < w; x++) {
-            const u8* px = row + (x / 2u) * 4u;
-            u8 r, g, b;
-            gcn_yuy2_to_rgb(px, (int)(x & 1u), &r, &g, &b);
-            out[x] = ((u32)r << 16) | ((u32)g << 8) | (u32)b;
+        u32* out = s_rgb + (size_t)y * row_repeat * w;
+        u32 x = 0;
+        for (; x + 1u < w; x += 2u) {
+            u8 rgb0[3], rgb1[3];
+            gcn_yuy2_pair_to_rgb(row + (size_t)x * 2u, rgb0, rgb1);
+            out[x] = ((u32)rgb0[0] << 16) | ((u32)rgb0[1] << 8) | rgb0[2];
+            out[x + 1u] = ((u32)rgb1[0] << 16) |
+                          ((u32)rgb1[1] << 8) | rgb1[2];
         }
+        if (x < w) {
+            u8 r, g, b;
+            gcn_yuy2_to_rgb(row + (size_t)(x / 2u) * 4u, 0, &r, &g, &b);
+            out[x] = ((u32)r << 16) | ((u32)g << 8) | b;
+        }
+        if (row_repeat == 2u)
+            memcpy(out + w, out, (size_t)w * sizeof *out);
     }
-    s_rgb_w = w; s_rgb_h = h; s_have_frame = 1;
+    s_rgb_w = w; s_rgb_h = rgb_h; s_have_frame = 1;
 
     if (s_gl_active) {
         /* Draw immediately rather than InvalidateRect->WM_PAINT: every field
@@ -494,12 +586,98 @@ static void do_present(HWND hwnd) {
     }
 }
 
+typedef HRESULT (WINAPI *gcn_DwmFlush_t)(void);
+
+/* GDI has no swapchain. Wait until DWM has consumed the previous surface,
+ * then paint the complete off-screen DIB immediately after that boundary;
+ * the next compositor sample therefore cannot land in the middle of our
+ * blit. This wait is confined to the coalescing window thread. */
+static void gdi_wait_for_compositor(void) {
+    static int resolved = 0;
+    static gcn_DwmFlush_t flush = NULL;
+    if (!resolved) {
+        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        if (dwm)
+            flush = (gcn_DwmFlush_t)GetProcAddress(dwm, "DwmFlush");
+        resolved = 1;
+    }
+    if (flush)
+        flush();
+}
+
+/* Commit a complete RGB frame through an off-screen DIBSection. Direct
+ * StretchDIBits writes the top-level window surface progressively; DWM can
+ * sample that surface in the middle of the copy, which shows up as layer
+ * flicker/tearing. StretchBlt/BitBlt from a fully-populated memory DC makes
+ * the visible update one GDI operation and is also the accelerated resize
+ * path on current Windows drivers. Runs only on the window thread. */
+static void gdi_blit_frame(HDC hdc, const RECT* client) {
+    if (!s_rgb || !s_rgb_w || !s_rgb_h) return;
+    if (!s_gdi_mem_dc)
+        s_gdi_mem_dc = CreateCompatibleDC(hdc);
+    if (!s_gdi_mem_dc) return;
+
+    if (!s_gdi_bitmap || s_gdi_w != s_rgb_w || s_gdi_h != s_rgb_h) {
+        BITMAPINFO bmi;
+        memset(&bmi, 0, sizeof bmi);
+        bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+        bmi.bmiHeader.biWidth = (LONG)s_rgb_w;
+        bmi.bmiHeader.biHeight = -(LONG)s_rgb_h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HBITMAP bitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS,
+                                          &bits, NULL, 0);
+        if (!bitmap || !bits) {
+            if (bitmap) DeleteObject(bitmap);
+            return;
+        }
+        HGDIOBJ previous = SelectObject(s_gdi_mem_dc, bitmap);
+        if (!s_gdi_old_bitmap)
+            s_gdi_old_bitmap = previous;
+        if (s_gdi_bitmap)
+            DeleteObject(s_gdi_bitmap);
+        s_gdi_bitmap = bitmap;
+        s_gdi_bits = bits;
+        s_gdi_w = s_rgb_w;
+        s_gdi_h = s_rgb_h;
+    }
+
+    memcpy(s_gdi_bits, s_rgb,
+           (size_t)s_rgb_w * (size_t)s_rgb_h * sizeof *s_rgb);
+    RECT dst;
+    compute_dest_rect((int)(client->right - client->left),
+                      (int)(client->bottom - client->top),
+                      s_rgb_w, s_rgb_h, &dst);
+    if (dst.left || dst.top || dst.right != client->right ||
+        dst.bottom != client->bottom)
+        FillRect(hdc, client, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    if ((u32)(dst.right - dst.left) == s_rgb_w &&
+        (u32)(dst.bottom - dst.top) == s_rgb_h) {
+        BitBlt(hdc, dst.left, dst.top, (int)s_rgb_w, (int)s_rgb_h,
+               s_gdi_mem_dc, 0, 0, SRCCOPY);
+    } else {
+        SetStretchBltMode(hdc, COLORONCOLOR);
+        StretchBlt(hdc, dst.left, dst.top, dst.right - dst.left,
+                   dst.bottom - dst.top, s_gdi_mem_dc, 0, 0,
+                   (int)s_rgb_w, (int)s_rgb_h, SRCCOPY);
+    }
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_GCN_PRESENT:
+        /* Clear before consuming the latest shared frame. If the emulation
+         * thread publishes while conversion/upload is in progress it can
+         * post exactly one successor wake; otherwise repeated VI fields are
+         * coalesced instead of growing an unbounded stale-message backlog. */
+        InterlockedExchange(&s_present_posted, 0);
         do_present(hwnd);
         return 0;
     case WM_PAINT: {
+        if (!s_gl_active && s_have_frame)
+            gdi_wait_for_compositor();
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         if (s_gl_active) {
@@ -513,17 +691,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             RECT rc; GetClientRect(hwnd, &rc);
             if (s_have_frame && s_rgb && s_rgb_w && s_rgb_h) {
-                BITMAPINFO bmi;
-                memset(&bmi, 0, sizeof bmi);
-                bmi.bmiHeader.biSize        = sizeof bmi.bmiHeader;
-                bmi.bmiHeader.biWidth       = (LONG)s_rgb_w;
-                bmi.bmiHeader.biHeight      = -(LONG)s_rgb_h;   /* top-down DIB */
-                bmi.bmiHeader.biPlanes      = 1;
-                bmi.bmiHeader.biBitCount    = 32;
-                bmi.bmiHeader.biCompression = BI_RGB;
-                StretchDIBits(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
-                              0, 0, (int)s_rgb_w, (int)s_rgb_h,
-                              s_rgb, &bmi, DIB_RGB_COLORS, SRCCOPY);
+                gdi_blit_frame(hdc, &rc);
             } else {
                 FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
             }
@@ -533,6 +701,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ERASEBKGND:
         return 1;   /* WM_PAINT always repaints the whole client rect */
+    case WM_SIZING:
+        constrain_sizing_rect(hwnd, wp, (RECT*)lp);
+        return TRUE;
     case WM_KEYDOWN:
         handle_key(wp, lp, 1);
         return 0;
@@ -543,6 +714,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        if (s_gdi_mem_dc) {
+            if (s_gdi_old_bitmap)
+                SelectObject(s_gdi_mem_dc, s_gdi_old_bitmap);
+            if (s_gdi_bitmap)
+                DeleteObject(s_gdi_bitmap);
+            DeleteDC(s_gdi_mem_dc);
+            s_gdi_mem_dc = NULL;
+            s_gdi_bitmap = NULL;
+            s_gdi_old_bitmap = NULL;
+            s_gdi_bits = NULL;
+        }
         if (s_gl_active) {
             wglMakeCurrent(NULL, NULL);
             wglDeleteContext(s_gl_rc);
@@ -565,11 +747,18 @@ typedef struct {
 static DWORD WINAPI window_thread_proc(LPVOID param) {
     WindowStartCtx* ctx = (WindowStartCtx*)param;
     s_cpu = ctx->cpu;
+    /* Painting may be intercepted by desktop capture/overlay software and
+     * become unexpectedly CPU-heavy.  The mailbox always keeps the newest
+     * complete field, so letting this consumer yield to emulation is both
+     * lower-latency and safer than starving the audio/GX producer. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
     WNDCLASSEXA wc;
     memset(&wc, 0, sizeof wc);
     wc.cbSize        = sizeof wc;
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    /* WGL keeps the HDC for the context lifetime. CS_OWNDC makes that a
+     * private, stable window DC instead of retaining a transient common DC. */
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
     wc.lpfnWndProc   = wnd_proc;
     wc.hInstance     = GetModuleHandleA(NULL);
     wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
@@ -620,6 +809,12 @@ void gcn_host_window_start(CPUState* cpu) {
     if (s_started) return;
     s_started = 1;
 
+    /* Interactive emulation has a real-time audio deadline.  One
+     * above-normal producer thread prevents GDI capture and ordinary desktop
+     * work from turning otherwise-sufficient rendered throughput into A/V
+     * starvation; the WASAPI callback has its own MMCSS priority. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     static WindowStartCtx ctx;
     ctx.cpu = cpu;
     ctx.ready_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -666,7 +861,9 @@ void gcn_host_window_present(const u8* xfb, u32 width, u32 height, u32 stride) {
     s_shared_valid = 1;
     ReleaseSRWLockExclusive(&s_lock);
 
-    PostMessageA(s_hwnd, WM_GCN_PRESENT, 0, 0);
+    if (InterlockedExchange(&s_present_posted, 1) == 0 &&
+        !PostMessageA(s_hwnd, WM_GCN_PRESENT, 0, 0))
+        InterlockedExchange(&s_present_posted, 0);
 }
 
 int gcn_host_window_quit_requested(void) {
