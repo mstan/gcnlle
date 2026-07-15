@@ -1,11 +1,17 @@
-# Vendored upstream: ExpansionPak/DolRecomp
+# Vendored DolRecomp fork provenance
 
-- Source: https://github.com/ExpansionPak/DolRecomp
-- Vendored commit: f3a129d50a28b4586c559a002e2f7bfc15ecf953
-- Vendored on: 2026-07-09
-- License: GPL-3.0 (see LICENSE)
+- Canonical project: https://github.com/ExpansionPak/DolRecomp
+- Integration fork: https://github.com/mstan/DolRecomp
+- Fork branch: `gcnrecomp`
+- Upstream base: `f3a129d50a28b4586c559a002e2f7bfc15ecf953`
+- Vendored fork commit: `e1015cf7ee5d0f9b8f2cacb463417dc9115ff0f9`
+- Initial vendoring date: 2026-07-09
+- Fork pin updated: 2026-07-14
+- License: GPL-3.0 (see `LICENSE`)
 
-This directory is a **fork** of DolRecomp, the PowerPC (Gekko/Broadway)
-static recompiler engine. gcnrecomp retargets it from game DOLs to the
-GameCube **IPL** for an LLE-first BIOS/menu boot. Local modifications
-diverge from upstream; to pull upstream fixes, diff against commit f3a129d50a28b4586c559a002e2f7bfc15ecf953.
+This directory is a source snapshot of the exact integration-fork commit above.
+The public fork preserves the gcnrecomp-specific change series so individual
+recompiler improvements can be reviewed or proposed upstream without requiring
+the rest of the runtime.
+
+General DolRecomp users should use the canonical ExpansionPak repository.

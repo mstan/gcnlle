@@ -355,6 +355,94 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
     return target >= func_start && target < func_end && ((target - func_start) & 3u) == 0;
 }
 
+/* Exact tight-poll-loop class optimization.
+ *
+ * Recognize the common three-instruction hardware/firmware wait shape:
+ *
+ *   lwz     rD, disp(rA)
+ *   cmplwi  crF, rD, imm
+ *   beq     crF, loop
+ *
+ * The ordinary emitter already keeps a taken backward conditional inside the
+ * generated chunk until dr_deadline, but its generic RAM helper must classify
+ * the effective address on every iteration.  Large chunk TUs can also cause
+ * GCC to tail-share that RAM-hit body far away from the loop.  This predicate
+ * lets emit_function add a compact path at the load label which computes the
+ * loop-invariant EA and RAM pointer once, then performs every guest load in a
+ * small native loop.  It is a class transform -- no PC or firmware identity is
+ * involved -- and deliberately accepts only the simplest fully-auditable
+ * shape.  The normal instruction bodies/labels remain emitted as the exact
+ * fallback for uniform mode, non-RAM/unaligned addresses, and dispatch entry at
+ * either of the two interior instructions. */
+static bool is_lwz_cmpli_beq_poll(const PPCInst* insts, u32 count, u32 i) {
+    if (i + 3u >= count)
+        return false; /* needs a real fallthrough label after the branch */
+
+    const PPCInst* load = &insts[i];
+    const PPCInst* cmp = &insts[i + 1u];
+    const PPCInst* branch = &insts[i + 2u];
+
+    return load->op == PPC_OP_LWZ && !load->embedded_data &&
+           cmp->op == PPC_OP_CMPLI && !cmp->embedded_data && cmp->l == 0u &&
+           cmp->rA == load->rD &&
+           branch->op == PPC_OP_BC && !branch->embedded_data && !branch->lk &&
+           branch->bo == 12u && branch->bi == (u8)(cmp->crfD * 4u + 2u) &&
+           branch->branch_target == load->address &&
+           load->address + 4u == cmp->address &&
+           cmp->address + 4u == branch->address &&
+           /* The base must remain invariant across the load itself. */
+           (load->rA == 0u || load->rD != load->rA);
+}
+
+static void emit_lwz_cmpli_beq_poll(FILE* out, const PPCInst* load,
+                                    const PPCInst* cmp, const PPCInst* branch,
+                                    u32 cycle_charge, u32 fallthrough) {
+    const u32 cr_shift = 28u - (u32)cmp->crfD * 4u;
+    const u32 cr_mask = 0xFu << cr_shift;
+
+    fprintf(out, "    /* Exact lwz/cmplwi/beq poll fast path (class peephole). */\n");
+    fprintf(out, "    if (dr_cycles < dr_deadline) {\n");
+    fprintf(out, "        u32 dr_poll_ea = ");
+    emit_dform_ea(out, load->rA, load->simm, false);
+    fprintf(out, ";\n");
+    fprintf(out, "        u8* dr_poll_ptr = NULL;\n");
+    fprintf(out, "        if ((dr_poll_ea & 3u) == 0u) {\n");
+    fprintf(out, "            if (dr_poll_ea >= GC_RAM_BASE && dr_poll_ea <= GC_RAM_BASE + (GC_MAIN_RAM_SIZE - 4u))\n");
+    fprintf(out, "                dr_poll_ptr = dr_ram + (dr_poll_ea - GC_RAM_BASE);\n");
+    fprintf(out, "            else if (dr_poll_ea >= GC_RAM_UNCACHED && dr_poll_ea <= GC_RAM_UNCACHED + (GC_MAIN_RAM_SIZE - 4u))\n");
+    fprintf(out, "                dr_poll_ptr = dr_ram + (dr_poll_ea - GC_RAM_UNCACHED);\n");
+    fprintf(out, "            else if (dr_poll_ea <= GC_MAIN_RAM_SIZE - 4u)\n");
+    fprintf(out, "                dr_poll_ptr = dr_ram + dr_poll_ea;\n");
+    fprintf(out, "        }\n");
+    fprintf(out, "        if (dr_poll_ptr) {\n");
+    fprintf(out, "            u32 dr_poll_value;\n");
+    fprintf(out, "            for (;;) {\n");
+    /* Aligned atomic load makes every guest lwz an actual host load even if a
+     * device worker can change the polled word concurrently; it compiles to a
+     * plain aligned load on x86 and avoids introducing a C data-race/hoist. */
+    fprintf(out, "                dr_poll_value = bswap32(__atomic_load_n((const u32*)dr_poll_ptr, __ATOMIC_RELAXED));\n");
+    fprintf(out, "                dr_cycles += %uu;\n", cycle_charge);
+    fprintf(out, "                if (dr_poll_value != 0x%04Xu) break;\n", cmp->uimm);
+    fprintf(out, "                if (dr_cycles >= dr_deadline) {\n");
+    fprintf(out, "                    ctx->gpr[%u] = dr_poll_value;\n", load->rD);
+    fprintf(out, "                    ctx->cr = (ctx->cr & ~0x%08Xu) | ((0x2u | ((ctx->xer >> 31) & 1u)) << %uu);\n",
+            cr_mask, cr_shift);
+    fprintf(out, "                    ctx->pc = 0x%08Xu;\n", branch->branch_target);
+    fprintf(out, "                    DR_RET();\n");
+    fprintf(out, "                }\n");
+    fprintf(out, "            }\n");
+    fprintf(out, "            ctx->gpr[%u] = dr_poll_value;\n", load->rD);
+    fprintf(out, "            {\n");
+    fprintf(out, "                u32 dr_poll_cr = dr_poll_value < 0x%04Xu ? 0x8u : 0x4u;\n", cmp->uimm);
+    fprintf(out, "                dr_poll_cr |= (ctx->xer >> 31) & 1u;\n");
+    fprintf(out, "                ctx->cr = (ctx->cr & ~0x%08Xu) | (dr_poll_cr << %uu);\n",
+            cr_mask, cr_shift);
+    fprintf(out, "            }\n");
+    fprintf(out, "            goto label_%08X;\n", fallthrough);
+    fprintf(out, "        }\n");
+    fprintf(out, "    }\n");
+}
+
 static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target,
                                bool conditional, u32 cycle_charge,
                                u32 func_start, u32 func_end) {
@@ -2606,6 +2694,15 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
          * actually leave this chunk or call into the host. */
         if (!insts[i].embedded_data && !ppc_op_is_pc_pure(insts[i].op)) {
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        }
+        /* The fast path is emitted only at the load label.  Interior switch
+         * entries still land on their ordinary cmplwi/bc labels below, and
+         * uniform mode (deadline==0) cannot enter it, preserving the pinned
+         * uniform control-flow shape exactly. */
+        if (is_lwz_cmpli_beq_poll(insts, count, i)) {
+            emit_lwz_cmpli_beq_poll(out, &insts[i], &insts[i + 1u],
+                                    &insts[i + 2u], cum[i + 2u],
+                                    insts[i + 3u].address);
         }
         /* Cycle cost is coalesced per basic block, charged at each exit
          * (return/goto emitted inside the instruction body, e.g. a taken

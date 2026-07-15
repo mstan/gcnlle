@@ -13,10 +13,12 @@ IPL milestones M0–M5 are complete: the recompiled boot ROM reaches and runs
 the native menu, including the rolling-cube animation, calendar, memory-card
 manager, options, and disc-detection screen.
 
-- `recompiler/` — **builds green (12/12 tests)**. Fork of
-  [ExpansionPak/DolRecomp](https://github.com/ExpansionPak/DolRecomp), a
-  PowerPC (Gekko/Broadway) → C static recompiler retargeted to the IPL. See
-  `recompiler/UPSTREAM.md`.
+- `recompiler/` — **builds green (13/13 tests)**. Vendored from the public
+  [gcnrecomp DolRecomp integration fork](https://github.com/mstan/DolRecomp),
+  based on the canonical
+  [ExpansionPak/DolRecomp](https://github.com/ExpansionPak/DolRecomp). Its
+  reviewable fork history separates IPL/runtime-specific work from changes
+  that may be useful upstream. See `recompiler/UPSTREAM.md`.
 - `runtime/` — LLE models for MEM1, EXI/RTC/SRAM/memory cards, VI, GX,
   DSP/AI, DI, and SI, validated against byte-exact frame-buffer goldens and
   Dolphin MMIO traces.
@@ -42,5 +44,6 @@ recompiler is portable C11; the runtime will target Windows first.
 
 ## License
 
-**GPL-3.0** — this project forks GPL-3.0 code (DolRecomp) and harvests
-GPL-3.0 device models, so the whole is GPL-3.0. See `LICENSE`.
+**GPL-3.0** — the combined project includes GPL-3.0 DolRecomp code and
+GPL-2.0-or-later Dolphin-derived components distributed under GPLv3-compatible
+terms. See `LICENSE` and the component provenance notes.

@@ -183,3 +183,21 @@ add_test(NAME bl_shadow_exactness
         -DHOST_BUILD_CONFIG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/bl_shadow_run.cmake
 )
+
+# Campaign 3: execute the general lwz/cmplwi/backward-beq poll-loop peephole
+# through both its compact derived path and its untouched uniform fallback.
+add_executable(test_poll_loop_gen tests/test_poll_loop_gen.c)
+target_link_libraries(test_poll_loop_gen PRIVATE dr_backend)
+add_test(NAME poll_loop_exactness
+    COMMAND ${CMAKE_COMMAND}
+        -DGENERATOR_EXE=$<TARGET_FILE:test_poll_loop_gen>
+        -DOUTPUT_C=${CMAKE_CURRENT_BINARY_DIR}/poll_loop_check.c
+        -DHARNESS_SRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/test_poll_loop_harness.c
+        -DREPO_SRC=${CMAKE_CURRENT_SOURCE_DIR}/src
+        -DHOST_GENERATOR=${CMAKE_GENERATOR}
+        -DHOST_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM}
+        -DHOST_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
+        -DHOST_C_COMPILER=${CMAKE_C_COMPILER}
+        -DHOST_BUILD_CONFIG=$<CONFIG>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/poll_loop_run.cmake
+)
