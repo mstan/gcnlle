@@ -49,13 +49,19 @@ packets the IPL emits, then implement only that subset (harvest reshine's
 GX-FIFO→GL path). Deliverable: **screenshot of the GameCube logo**
 (screenshot-before-asserting, per PRINCIPLES).
 
-**M3 — EXI: RTC + SRAM → date/time & settings.** Model the EXI RTC (real-time
-clock) and SRAM (persisted settings). Deliverable: the menu shows/sets **date
-& time** and sound/screen/language options, persisted across runs.
+**M3 — EXI: RTC + SRAM → date/time & settings. ✅ DONE (2026-07-14).**
+The menu shows and persists date/time and settings. Optional host-local RTC
+sync samples exactly once at boot; direct live-state acceptance proved the
+counter remains unchanged while fewer than 486,000,000 additional emulated
+Gekko cycles elapse, then increments exactly as the cycle anchor advances. It
+never continuously substitutes host time.
 
-**M4 — Memory-card manager.** Model EXI memory-card devices; back them with
-host `.raw`/`.gci` files (Dolphin-compatible). Deliverable: **navigate,
-view, copy, delete** save blocks in the IPL's card manager.
+**M4 — Memory-card manager. ✅ DONE (2026-07-14).** EXI memory-card devices
+use Dolphin-compatible raw images. The real IPL navigated and viewed a GALE
+save, copied its 11-block chain from Slot A to Slot B, and erased the copied
+save from Slot B. Independent post-operation checks selected the active signed
+Directory/BAT journal copies: after erase Slot A remained valid with one
+11-block entry while Slot B remained valid with zero entries.
 
 **M5 — Disc-load screen (stub). ✅ DONE (2026-07-13).** Model DI enough to
 reach the "insert disc" screen. No game loading yet — that's a later phase.

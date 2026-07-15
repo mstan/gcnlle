@@ -76,6 +76,17 @@ GCN_MEM_DUMP="0x81200000:0x270000:$TMP/postdma.bin;0x80000000:0x3000:$TMP/lowmem
   "$BOOT" "$TMP/bs2.bin" 5000000 > "$TMP/phase1.log" 2>&1 || true
 [ -f "$TMP/postdma.bin" ] || { echo "error: no postdma.bin (see $TMP/phase1.log)"; cat "$TMP/phase1.log"; exit 1; }
 [ -f "$TMP/lowmem.bin" ]  || { echo "error: no lowmem.bin (see $TMP/phase1.log)";  cat "$TMP/phase1.log"; exit 1; }
+python3 - "$TMP/lowmem.bin" <<'PYEOF'
+import sys
+
+data = open(sys.argv[1], "rb").read()
+vector = data[0xC00:0xD00]
+if len(data) != 0x3000 or not vector or vector in (bytes(len(vector)), b"\xff" * len(vector)):
+    raise SystemExit("error: low-memory syscall vector is empty/invalid")
+if bytes.fromhex("4c000064") not in vector:  # rfi
+    raise SystemExit("error: low-memory syscall vector contains no rfi")
+print("low-memory syscall vector: PASS")
+PYEOF
 tail -5 "$TMP/phase1.log"
 
 echo "=================================================================="
@@ -137,6 +148,10 @@ echo "=================================================================="
   --segment "0xFFF00100:$TMP/bs1_rom.bin" -j8
 GEN_FINAL="$(dirname "$(find "$TMP/out" -name generated.h | head -1)")"
 [ -n "$GEN_FINAL" ] || { echo "error: final recompile produced no generated.h"; exit 1; }
+grep -Rqs '80000C00: mfhid0' "$GEN_FINAL/chunks" || {
+  echo "error: generated low-memory chunk did not decode the syscall vector"
+  exit 1
+}
 rm -rf "$ROOT/runtime/generated"
 cp -r "$GEN_FINAL" "$ROOT/runtime/generated"
 echo "done -> runtime/generated ($(find "$ROOT/runtime/generated/chunks" -name '*.c' | wc -l) chunks, BS1-at-RAM + BS1-at-ROM + BS2 + lowmem)"

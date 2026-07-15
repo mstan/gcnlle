@@ -228,6 +228,23 @@ static void handle_line(Client* c, const char* line) {
             (unsigned)dsp_lle_pc(), (unsigned)dsp_lle_read_control(),
             (unsigned)dsp_lle_peek_mbox_dsp(), (unsigned)dsp_lle_peek_mbox_cpu());
     }
+    else if (!strcmp(cmd, "rtc_state")) {
+        /* Query the same latch the IPL reads. This advances only from current
+         * emulated CPU cycles; it never samples the host clock. Exposing both
+         * anchors makes the one-shot boot-sync contract directly auditable. */
+        if (!cpu || !s_ctx.exi) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"RTC unavailable\"}\n");
+        } else {
+            u32 counter = gcn_exi_rtc_latch(s_ctx.exi, cpu->cycles);
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"counter\":%u,\"running\":%s,"
+                "\"anchor_cycles\":%llu,\"cpu_cycles\":%llu}\n",
+                counter, s_ctx.exi->rtc.running ? "true" : "false",
+                (unsigned long long)s_ctx.exi->rtc.anchor_cycles,
+                (unsigned long long)cpu->cycles);
+        }
+    }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
         /* Decode the XFB the VI is scanning out into a PPM on disk. Geometry
          * comes from the guest-programmed VI registers (gcn_vi_xfb_info); the

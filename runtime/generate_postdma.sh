@@ -43,6 +43,22 @@ GCN_MEM_DUMP="0x81200000:0x270000:$TMP/postdma.bin;0x80000000:0x3000:$TMP/lowmem
 [ -f "$TMP/postdma.bin" ] || { echo "error: no post-DMA dump produced"; exit 1; }
 [ -f "$TMP/lowmem.bin" ]  || { echo "error: no low-mem dump produced"; exit 1; }
 
+# The first syscall below enters physical 0x00000C00, dispatched through the
+# cached 0x80000C00 alias. A stale/early dump can be the right size yet contain
+# zeroes here, producing generated `.long 0` fallthrough all the way to
+# 0x80003000. Reject that tree before it can replace runtime/generated/.
+python3 - "$TMP/lowmem.bin" <<'PYEOF'
+import sys
+
+data = open(sys.argv[1], "rb").read()
+vector = data[0xC00:0xD00]
+if len(data) != 0x3000 or not vector or vector in (bytes(len(vector)), b"\xff" * len(vector)):
+    raise SystemExit("error: low-memory syscall vector is empty/invalid")
+if bytes.fromhex("4c000064") not in vector:  # rfi
+    raise SystemExit("error: low-memory syscall vector contains no rfi")
+print("low-memory syscall vector: PASS")
+PYEOF
+
 echo "[3/4] recompile the post-DMA image + low-mem handlers into one table"
 # Primary image = stage-1/2 (base 0x81200000). Extra segment = low-memory
 # exception handlers at 0x80000000; the 0xC00 syscall vector routes there via
@@ -52,6 +68,11 @@ echo "[3/4] recompile the post-DMA image + low-mem handlers into one table"
 
 echo "[4/4] install into runtime/generated/"
 GEN="$(dirname "$(find "$TMP/out" -name generated.h | head -1)")"
+[ -n "$GEN" ] || { echo "error: recompiler produced no generated.h"; exit 1; }
+grep -Rqs '80000C00: mfhid0' "$GEN/chunks" || {
+  echo "error: generated low-memory chunk did not decode the syscall vector"
+  exit 1
+}
 rm -rf "$ROOT/runtime/generated"; cp -r "$GEN" "$ROOT/runtime/generated"
 echo "done -> runtime/generated ($(find "$ROOT/runtime/generated/chunks" -name '*.c' | wc -l) chunks, stage-1 + stage-2)"
 echo "now rebuild gcn_boot: cmake --build runtime/build-boot --target gcn_boot"

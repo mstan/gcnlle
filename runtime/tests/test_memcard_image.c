@@ -37,6 +37,20 @@ static unsigned test_rd_be16(const unsigned char* p)
     return ((unsigned)p[0] << 8) | (unsigned)p[1];
 }
 
+static void test_wr_be16(unsigned char* p, unsigned value)
+{
+    p[0] = (unsigned char)(value >> 8);
+    p[1] = (unsigned char)value;
+}
+
+static void test_wr_be32(unsigned char* p, unsigned value)
+{
+    p[0] = (unsigned char)(value >> 24);
+    p[1] = (unsigned char)(value >> 16);
+    p[2] = (unsigned char)(value >> 8);
+    p[3] = (unsigned char)value;
+}
+
 static void test_calc_checksums(const unsigned char* data, size_t size,
                                 unsigned* csum_out, unsigned* icsum_out)
 {
@@ -105,6 +119,7 @@ int main(void)
     int found_melee;
     unsigned char old_dir[GCN_MC_BLOCK_SIZE];
     unsigned char old_bat[GCN_MC_BLOCK_SIZE];
+    unsigned char synthetic_gci[GCN_MC_DENTRY_SIZE + GCN_MC_BLOCK_SIZE];
 
     /* --- sizing helpers --- */
     CHECK(gcn_mc_image_valid_size(0x200000u), "0x200000 must be a valid card size");
@@ -181,6 +196,54 @@ int main(void)
     count = gcn_mc_image_list(card, size_bytes, entries, (int)(sizeof entries / sizeof entries[0]));
     CHECK(count == 0, "blank card must list zero directory entries");
 
+    /* --- ROM-free import + journal-selection regression. Build a minimal,
+     * self-authored one-block GCI in memory so the active-copy behavior is
+     * always covered in CI and never depends on a copyrighted save fixture. */
+    memset(synthetic_gci, 0, sizeof synthetic_gci);
+    memcpy(synthetic_gci + 0x00u, "GTST", 4);
+    memcpy(synthetic_gci + 0x04u, "00", 2);
+    memcpy(synthetic_gci + 0x08u, "gcnrecomp-journal-test", 22);
+    test_wr_be16(synthetic_gci + 0x36u, 0xFFFFu); /* replaced during import */
+    test_wr_be16(synthetic_gci + 0x38u, 1u);
+    test_wr_be32(synthetic_gci + 0x3Cu, 0xFFFFFFFFu); /* no comments */
+    for (i = GCN_MC_DENTRY_SIZE; i < (int)sizeof synthetic_gci; ++i)
+        synthetic_gci[i] = (unsigned char)(i * 37u + 11u);
+
+    err[0] = '\0';
+    CHECK(gcn_mc_image_import_save(card, size_bytes, synthetic_gci,
+                                   (unsigned)sizeof synthetic_gci,
+                                   err, (int)sizeof err) == 1,
+          "self-authored GCI import must succeed");
+    if (err[0])
+        fprintf(stderr, "  (synthetic import reported: %s)\n", err);
+    CHECK(gcn_mc_image_check(card, size_bytes, err, (int)sizeof err) == 1,
+          "card must remain valid after self-authored import");
+
+    /* CARD writes only the inactive journal half. Leave imported counter-1
+     * metadata in copies 1 and restore counter-0 blank metadata to copies 0.
+     * A checker that blindly forces pair 0 reports DIR_BAT_INCONSISTENT. */
+    memcpy(card + (size_t)GCN_MC_BLOCK_SIZE * 1, old_dir, GCN_MC_BLOCK_SIZE);
+    memcpy(card + (size_t)GCN_MC_BLOCK_SIZE * 3, old_bat, GCN_MC_BLOCK_SIZE);
+    err[0] = '\0';
+    CHECK(gcn_mc_image_check(card, size_bytes, err, (int)sizeof err) == 1,
+          "IPL-style ping-pong metadata must select newer update counters");
+    if (err[0])
+        fprintf(stderr, "  (ping-pong check reported: %s)\n", err);
+
+    memset(entries, 0, sizeof entries);
+    count = gcn_mc_image_list(card, size_bytes, entries,
+                              (int)(sizeof entries / sizeof entries[0]));
+    CHECK(count == 1 && strncmp(entries[0].gamecode, "GTST", 4) == 0,
+          "list must read the newer directory and BAT journal copies");
+    CHECK(entries[0].block_count == 1,
+          "newer BAT journal must resolve the synthetic one-block chain");
+
+    /* Reset to a blank card before the optional external-container check. */
+    CHECK(gcn_mc_image_format(card, size_bytes, flash_id, 0u, 0u, 0ULL) == 1,
+          "reformat after synthetic import must succeed");
+    memcpy(old_dir, card + (size_t)GCN_MC_BLOCK_SIZE * 1, GCN_MC_BLOCK_SIZE);
+    memcpy(old_bat, card + (size_t)GCN_MC_BLOCK_SIZE * 3, GCN_MC_BLOCK_SIZE);
+
     /* --- Optional real-save import. The user supplies the fixture explicitly;
      * no save data or machine-local path is part of this repository. The
      * format/check/checksum coverage above is always self-contained. --- */
@@ -229,9 +292,7 @@ int main(void)
         if (err[0])
             fprintf(stderr, "  (post-import check reported: %s)\n", err);
 
-        /* CARD writes only the inactive journal half. Leave imported
-         * counter-1 metadata in copies 1 and restore counter-0 blank metadata
-         * to copies 0. Forcing pair 0 would be DIR_BAT_INCONSISTENT. */
+        /* Repeat the journal check with the optional external container. */
         memcpy(card + (size_t)GCN_MC_BLOCK_SIZE * 1, old_dir, GCN_MC_BLOCK_SIZE);
         memcpy(card + (size_t)GCN_MC_BLOCK_SIZE * 3, old_bat, GCN_MC_BLOCK_SIZE);
         err[0] = '\0';

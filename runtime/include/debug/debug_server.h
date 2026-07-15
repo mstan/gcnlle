@@ -22,6 +22,7 @@
 
 #include "cpu/cpu.h"
 #include "di/di.h"   /* ROADMAP M5: insert_disc/eject_disc reach into the DI device */
+#include "exi/exi.h" /* rtc_state: live one-shot-synchronized RTC state */
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +33,7 @@ extern "C" {
 typedef struct {
     CPUState* cpu;   /* regs + RAM (get_registers, read_ram, write_ram)        */
     GcnDi*    di;     /* disc interface (insert_disc, eject_disc)              */
+    GcnExi*   exi;    /* EXI RTC state (rtc_state)                             */
 } GcnDebugCtx;
 
 /* Start listening if GCN_DEBUG_PORT is set (else a no-op returning 0). Returns

@@ -16,9 +16,9 @@ and disc-detection screen.
   firmware paths exercised so far.
 - The RTC can sample host local time **once at boot** and then advances only
   from emulated CPU cycles; it does not continuously substitute host time.
-- Memory-card image validation and the IPL's copy path have been exercised on
-  Dolphin-compatible raw images. Delete behavior and the final card-manager
-  acceptance pass are still pending.
+- Memory-card image validation and the IPL's copy and erase paths have been
+  exercised end-to-end on Dolphin-compatible raw images, including persisted
+  journal verification after each operation.
 - The software renderer is the correctness baseline. An opt-in Vulkan
   differential/resident backend is active performance work and remains
   experimental.
