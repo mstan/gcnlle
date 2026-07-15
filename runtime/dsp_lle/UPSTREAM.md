@@ -6,6 +6,11 @@ carry under this project's GPL-3.0). It runs the real DSP firmware
 (`bios/dsp_rom.bin` IROM + `bios/dsp_coef.bin` DROM) plus the ucode the IPL
 uploads — i.e. genuine LLE of the DSP, not an HLE stub.
 
+The vendored files were taken from
+[Dolphin commit `6de526c684ee6dd8b6fc3447dae858ae480ccbb5`](https://github.com/dolphin-emu/dolphin/commit/6de526c684ee6dd8b6fc3447dae858ae480ccbb5)
+(checked out 2026-07-09). Original Dolphin copyright and
+`GPL-2.0-or-later` SPDX headers are retained in the imported files.
+
 Included: DSPCore, DSPTables, DSPHWInterface, DSPAccelerator, DSPMemoryMap,
 DSPStacks, DSPAnalyzer, DSPCaptureLogger, and `Interpreter/` (Int{Arithmetic,
 Multiplier,ExtOps,Branch,LoadStore,Tables,CCUtil}). Excluded: `Jit/` (we use the

@@ -1,3 +1,12 @@
+/*
+ * GameCube IPL descrambler reversed by Segher Boessenkool.
+ * Copyright 2008 Segher Boessenkool <segher@kernel.crashing.org>
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * This implementation is preserved from the form carried by the Dolphin
+ * Emulator Project. See README.md and the repository's THIRD_PARTY_NOTICES.md
+ * for provenance.
+ */
 #include "descramble_core.h"
 
 /*

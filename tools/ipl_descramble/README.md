@@ -45,8 +45,9 @@ own bulk copy never touches. See `docs/M1_PLAN.md` and `runtime/src/boot.c`'s
 ## Provenance & correctness
 
 The algorithm was reversed by **Segher Boessenkool (2008)**. The implementation
-in `descramble_core.c` was cross-checked **byte-for-byte against two independent
-sources** before vendoring, per our tool-skepticism rule:
+form is preserved from Dolphin's `EXI_DeviceIPL.cpp` at the commit identified in
+`runtime/dsp_lle/UPSTREAM.md`, and was cross-checked **byte-for-byte against two
+additional sources** before vendoring, per our tool-skepticism rule:
 
 - gc-ipl wiki — `ogamespec/gc-ipl` `wiki/Descrambler.md`
 - `FIX94/Nintendont` `loader/source/ipl.c`

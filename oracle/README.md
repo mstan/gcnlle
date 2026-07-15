@@ -1,11 +1,16 @@
-# oracle/ — Dolphin as the independent differential oracle
+# oracle/ — Dolphin as a differential oracle
 
-Per PRINCIPLES.md, the oracle must be a **separately-authored emulator** that
-shares none of our device/bus/timing models — otherwise it is blind to any bug
-in a shared layer. [Dolphin](https://dolphin-emu.org) fits: it is unrelated to
-our recompiler and it **boots the real GameCube IPL** as "GameCube Main Menu"
-(Options → set a GC IPL/BIOS, or run the IPL directly), giving us a reference
-for the exact boot we are recompiling.
+For independently authored runtime components, [Dolphin](https://dolphin-emu.org)
+is a separately authored system-level comparison target. It boots the real
+GameCube IPL as "GameCube Main Menu" and provides traces for the same boot that
+this project recompiles.
+
+That independence claim does **not** apply to Dolphin-derived components. The
+DSP LLE interpreter under `runtime/dsp_lle/` is vendored from Dolphin, and the
+memory-card image module follows Dolphin's documented layout and algorithms.
+Those components use focused tests, format checks, firmware behavior, and
+hardware documentation as applicable; agreement with Dolphin alone is not
+treated as independent evidence.
 
 ## Plan (Milestone 1)
 
