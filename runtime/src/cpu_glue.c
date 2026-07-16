@@ -24,6 +24,7 @@
  * the runtime is a standalone host of the ABI, exactly as reshine is.
  */
 #include "cpu/cpu.h"
+#include "debug/rings.h"   /* gcn_ring_psq — [gx-fifoprov] psq value audit */
 
 #include <stdio.h>
 #include <string.h>
@@ -102,6 +103,10 @@ void ppc_take_exception(CPUState* cpu, u32 exception, u32 vector, u32 srr0, u32 
 void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia) {
     cpu->program_exception |= cause;
     ppc_take_exception(cpu, PPC_EXC_PROGRAM, PPC_VECTOR_PROGRAM, cia, cause);
+}
+
+void ppc_fp_unavailable(CPUState* cpu, u32 cia) {
+    ppc_take_exception(cpu, PPC_EXC_FP_UNAVAILABLE, PPC_VECTOR_FP_UNAVAIL, cia, 0);
 }
 
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia) {
@@ -298,6 +303,15 @@ static void psq_store_value(CPUState* cpu, u32 ea, u8 type, s32 scale, f64 value
 }
 
 static bool psq_check_enabled(CPUState* cpu, bool indexed, u32 cia) {
+    /* MSR[FP]=0 outranks the HID2 program check: psq is FP-class, so it
+     * takes the FP-unavailable trap (0x800) first — the lazy-FPU context
+     * switch depends on this ordering. (Also enforced by the emitted gate
+     * before the call; kept here so the recompiler's own test CPU and any
+     * non-gated caller keep hardware semantics.) */
+    if ((cpu->msr & PPC_MSR_FP) == 0) {
+        ppc_fp_unavailable(cpu, cia);
+        return false;
+    }
     if ((cpu->hid2 & PPC_HID2_PSE) == 0 || (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0)) {
         ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
         return false;
@@ -323,6 +337,9 @@ void ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool inde
             return;
         cpu->ps1[frD] = psq_load_value(cpu, ps1_ea, type, scale);
     }
+    /* [gx-fifoprov] always-on psq value audit (see rings.c PsqEntry). */
+    gcn_ring_psq(cia, ea, f32_bits((f32)cpu->fpr[frD]),
+                 f32_bits((f32)cpu->ps1[frD]), 0u);
 }
 
 void ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
@@ -341,6 +358,9 @@ void ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
             return;
         psq_store_value(cpu, ps1_ea, type, scale, cpu->ps1[frS]);
     }
+    /* [gx-fifoprov] always-on psq value audit (see rings.c PsqEntry). */
+    gcn_ring_psq(cia, ea, f32_bits((f32)cpu->fpr[frS]),
+                 f32_bits((f32)cpu->ps1[frS]), 1u);
 }
 
 /* --- rfi / locked-cache dcbz / external control / tlbie --- */

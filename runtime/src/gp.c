@@ -51,6 +51,7 @@ static void gp_flush_burst(GcnGp* gp, CPUState* cpu) {
      * memory.CopyToEmu). Bounds-checked; the pointer is guest-physical. */
     u32 phys = wptr & 0x1FFFFFFFu;
     if (cpu && cpu->ram && (u64)phys + GCN_GP_GATHER_SIZE <= (u64)cpu->ram_size) {
+        gcn_ring_watch_check_span(phys, GCN_GP_GATHER_SIZE, 0x6A6A6A00u); /* [gcn-watch] */
         memcpy(cpu->ram + phys, gp->stage, GCN_GP_GATHER_SIZE);
     } else {
         static int warned = 0;

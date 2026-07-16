@@ -11,6 +11,7 @@
 #include "gx/gx_render.h"
 #include "debug/rings.h"
 
+#include <math.h>        /* fabsf — [gx-xfaudit] matrix-scale classification */
 #include <stdio.h>
 #include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
 #include <string.h>
@@ -181,6 +182,122 @@ static void gx_drawlog_dump(void) {
                 j - i, s_drawlog[i].prim, s_drawlog[i].vat,
                 s_drawlog[i].nverts, s_drawlog[i].vsize, s_drawlog[i].dl);
         i = j;
+    }
+    fflush(stderr);
+}
+
+/* ============================================================================
+ * [gx-xfaudit] XF/BP write audit rings (always on; IPL flood investigation).
+ *
+ * The frame-anomaly instrument proved flood frames draw the cube DL
+ * (0x00AF13C0) with cube-scale object vertices but a WALL-scale position
+ * matrix (|linear|~22) and the room-wall TEV program — i.e. the per-instance
+ * top-level state loads (LOAD_XF slot 0 + BP TEV block between CALL_DLs),
+ * provably present with correct values in the pushed stream, did not take
+ * effect. get_posmat reads s_xf[] live with no cache, so only three failure
+ * shapes remain, and these rings distinguish them at the moment of the bad
+ * draw:
+ *   A. the LOAD_XF write never executed (decode skipped/mis-resumed it):
+ *      the ring shows no top-level slot write between the room DL's interior
+ *      write and the bad draw;
+ *   B. the write executed but s_xf[] holds something else (write-handler /
+ *      aliasing bug): the ring shows the write with a cube-scale payload
+ *      while the dump of s_xf[] shows wall scale;
+ *   C. the matrix INDEX is wrong (per-vertex PosMatIdx byte or a leaked CP
+ *      MATINDEX default selects the wall's slot): the trigger dump's posMtx
+ *      != the slot the instance loads target.
+ * Recording is decode-thread-only (sync mode: CPU thread; pipeline mode: the
+ * GX worker — never both at once), same single-writer model as s_drawlog.
+ * The dump trigger lives in gx_raster.c prepare_position_transform (wall-
+ * scale linear part applied while inside the cube DL) and calls
+ * gcn_gx_state_audit_dump().
+ * ==========================================================================*/
+typedef struct {
+    u64   frame;    /* s_gx_frames at write time (completed frames so far) */
+    u32   dl;       /* DL executing the write, 0 = top-level stream */
+    u16   addr;     /* XF target; 0xFFA0/0xFFB0 = CP MATINDEX_A/B loads */
+    u16   count;    /* words written */
+    u32   word0;    /* first payload word (raw) */
+    float maxlin;   /* matrix-memory writes (<0x400): max |float| over the
+                     * non-translation columns written — wall (~22) vs cube
+                     * (<=2.2) classification without decoding word0 */
+} GxXfAuditEntry;
+#define GX_XFAUDIT_CAP 64u
+static GxXfAuditEntry s_xfaudit[GX_XFAUDIT_CAP];
+static u64 s_xfaudit_n;
+
+typedef struct { u64 frame; u32 dl; u32 value; u8 cmd; } GxBpAuditEntry;
+#define GX_BPAUDIT_CAP 256u
+static GxBpAuditEntry s_bpaudit[GX_BPAUDIT_CAP];
+static u64 s_bpaudit_n;
+
+static void xfaudit_record(u16 addr, u16 count, u32 word0, float maxlin) {
+    GxXfAuditEntry* e = &s_xfaudit[s_xfaudit_n & (GX_XFAUDIT_CAP - 1u)];
+    e->frame = s_gx_frames;
+    e->dl    = s_gx.cur_dl_addr;
+    e->addr  = addr;
+    e->count = count;
+    e->word0 = word0;
+    e->maxlin = maxlin;
+    s_xfaudit_n++;
+}
+
+/* ============================================================================
+ * [gx-fifoprov] staging-byte provenance (always on; IPL flood investigation).
+ *
+ * The [gx-xfaudit] rings proved the flood's per-instance slot-0 LOAD_XF
+ * executes in order with a correct opcode/header/first-word but a garbage
+ * payload tail — the corruption is IN THE BYTES the decoder consumed. Two
+ * sources remain: the guest genuinely pushed those bytes (CPU-side bug —
+ * e.g. interrupt clobbering the matrix computation), or the drain copied
+ * bytes the gather pipe never pushed to that FIFO slot (rptr/wptr wrap or
+ * accounting bug). The gather-pipe recorder ring (rings.c, always on) holds
+ * the pushed truth per 32-byte slot; to compare against it we track, for
+ * every chunk appended to the staging buffer by the SYNCHRONOUS drain path,
+ * the guest phys address it was copied from:
+ *   - chunk k (append order) covers stream bytes [k*32, k*32+32) and came
+ *     from s_srcmap_phys[k & mask];
+ *   - gx->buf[0] currently holds stream byte s_buf0_stream (advanced by
+ *     `consumed` after every gx_run/memmove);
+ *   - the command being decoded starts at staging offset s_cur_cmd_buf_off
+ *     (set by gx_run only while decoding from the staging buffer).
+ * The pipeline worker's pull path does NOT maintain this map (its bytes
+ * arrive via the SPSC ring, one copy removed from guest RAM), so the
+ * comparison is only attempted with the pipeline fully off — exactly the
+ * flood's minimal repro config (GCN_GX_PIPELINE=0). Decode-thread only.
+ * ==========================================================================*/
+#define GX_SRCMAP_CAP (1u << 14)   /* 16384 chunks = 512 KiB of stream history */
+static u32 s_srcmap_phys[GX_SRCMAP_CAP];
+static u64 s_srcmap_chunks;        /* chunks appended by the sync drain */
+static u64 s_buf0_stream;          /* stream offset of gx->buf[0] */
+static u32 s_cur_cmd_buf_off = 0xFFFFFFFFu;   /* staging offset of the command
+                                               * being decoded, else ~0 */
+
+void gcn_gx_state_audit_dump(void) {
+    u64 nx = s_xfaudit_n;
+    u64 fx = nx > GX_XFAUDIT_CAP ? nx - GX_XFAUDIT_CAP : 0u;
+    fprintf(stderr, "[gx-xfaudit] XF/MATIDX write ring (%llu total, showing #%llu..#%llu):\n",
+            (unsigned long long)nx, (unsigned long long)fx,
+            (unsigned long long)(nx ? nx - 1u : 0u));
+    for (u64 i = fx; i < nx; i++) {
+        const GxXfAuditEntry* e = &s_xfaudit[i & (GX_XFAUDIT_CAP - 1u)];
+        float w0f;
+        memcpy(&w0f, &e->word0, 4);
+        fprintf(stderr,
+                "  #%llu f=%llu dl=%08X addr=0x%04X n=%u w0=%08X(%.4g) maxlin=%.4g\n",
+                (unsigned long long)i, (unsigned long long)e->frame, e->dl,
+                e->addr, e->count, e->word0, (double)w0f, (double)e->maxlin);
+    }
+    u64 nb = s_bpaudit_n;
+    u64 fb = nb > 48u ? nb - 48u : 0u;
+    fprintf(stderr, "[gx-xfaudit] BP write ring (%llu total, showing #%llu..#%llu):\n",
+            (unsigned long long)nb, (unsigned long long)fb,
+            (unsigned long long)(nb ? nb - 1u : 0u));
+    for (u64 i = fb; i < nb; i++) {
+        const GxBpAuditEntry* e = &s_bpaudit[i & (GX_BPAUDIT_CAP - 1u)];
+        fprintf(stderr, "  #%llu f=%llu dl=%08X reg=0x%02X val=0x%06X\n",
+                (unsigned long long)i, (unsigned long long)e->frame, e->dl,
+                e->cmd, e->value);
     }
     fflush(stderr);
 }
@@ -824,8 +941,14 @@ static void gx_on_cp(GcnGx* gx, u8 cmd, u32 value) {
 
     GxCpState* s = &gx->cpst;
     switch (cmd & GX_CP_COMMAND_MASK) {
-    case GX_CP_MATINDEX_A:   s->matrix_index_a = value; break;
-    case GX_CP_MATINDEX_B:   s->matrix_index_b = value; break;
+    case GX_CP_MATINDEX_A:
+        s->matrix_index_a = value;
+        xfaudit_record(0xFFA0u, 1u, value, 0.0f);   /* [gx-xfaudit] index leak? */
+        break;
+    case GX_CP_MATINDEX_B:
+        s->matrix_index_b = value;
+        xfaudit_record(0xFFB0u, 1u, value, 0.0f);
+        break;
     case GX_CP_VCD_LO:       s->vtx_desc_lo = value; break;
     case GX_CP_VCD_HI:       s->vtx_desc_hi = value; break;
     case GX_CP_VAT_REG_A:    s->vat_g0[cmd & 7u] = value; break;
@@ -844,6 +967,123 @@ static void gx_on_cp(GcnGx* gx, u8 cmd, u32 value) {
  * words starting at `address` into the XF memory array. Matrix/light memory is
  * <0x1000; registers are 0x1000..0x1057.
  * ==========================================================================*/
+/* [gx-fifoprov] Fired by gx_on_xf on a corrupt-looking top-level matrix load
+ * (see the block comment at the srcmap statics). Prints the exact command
+ * bytes the decoder consumed, then for every 32-byte FIFO slot the command
+ * spanned, the bytes the gather pipe pushed to that slot (from the always-on
+ * burst recorder) with the pushing pc/block — byte-for-byte verdict per
+ * chunk — plus the recent interrupt/DMA event ring for timing correlation. */
+static void gx_fifo_provenance_dump(GcnGx* gx, u16 address, u8 count,
+                                    const u8* data, float maxlin) {
+    static u32 s_dumps;
+    static u64 s_hits;
+    s_hits++;
+    if (s_dumps >= 6u) {
+        if ((s_hits & 63u) == 0u)
+            fprintf(stderr, "[gx-fifoprov] %llu corrupt-payload hits total "
+                            "(dumps capped)\n", (unsigned long long)s_hits);
+        return;
+    }
+    s_dumps++;
+
+    const u8* cmd = data - 5;        /* opcode + 32-bit header precede payload */
+    u32 cmdlen = 5u + (u32)count * 4u;
+    fprintf(stderr,
+            "[gx-fifoprov] HIT #%llu: top-level LOAD_XF addr=0x%04X n=%u "
+            "maxlin=%.4g frame=%llu rptr=%08X rw_dist=%u buf_off=%u\n",
+            (unsigned long long)s_hits, address, count, (double)maxlin,
+            (unsigned long long)s_gx_frames,
+            gcn_cp_fifo_read_pointer(gx->cp), gcn_cp_fifo_rw_distance(gx->cp),
+            s_cur_cmd_buf_off);
+    fprintf(stderr, "[gx-fifoprov]   decoded:");
+    for (u32 i = 0; i < cmdlen; i++)
+        fprintf(stderr, "%s%02X", (i & 15u) == 0u ? "\n[gx-fifoprov]     " : " ",
+                cmd[i]);
+    fprintf(stderr, "\n");
+
+    if (s_cur_cmd_buf_off == 0xFFFFFFFFu || s_pipe_on != 0) {
+        fprintf(stderr, "[gx-fifoprov]   no source map (DL bytes or pipeline "
+                        "mode) — cannot compare against pushed bursts\n");
+    } else if (s_buf0_stream + gx->buf_len != s_srcmap_chunks * 32u) {
+        fprintf(stderr, "[gx-fifoprov]   srcmap invariant broken "
+                        "(buf0_stream=%llu buf_len=%u chunks=%llu) — skipped\n",
+                (unsigned long long)s_buf0_stream, gx->buf_len,
+                (unsigned long long)s_srcmap_chunks);
+    } else {
+        u64 s0 = s_buf0_stream + s_cur_cmd_buf_off;
+        u64 s1 = s0 + cmdlen;
+        for (u64 c = s0 & ~31ull; c < s1; c += 32u) {
+            u64 k = c >> 5;
+            if (k >= s_srcmap_chunks || s_srcmap_chunks - k > GX_SRCMAP_CAP) {
+                fprintf(stderr, "[gx-fifoprov]   chunk stream=%llu: source "
+                                "evicted from srcmap\n", (unsigned long long)c);
+                continue;
+            }
+            u32 phys = s_srcmap_phys[k & (GX_SRCMAP_CAP - 1u)];
+            u64 lo = c > s_buf0_stream ? c : s_buf0_stream;
+            u64 hi = c + 32u;   /* staging holds through buf_len; hi <= s1 span */
+            if (hi > s_buf0_stream + gx->buf_len) hi = s_buf0_stream + gx->buf_len;
+            u8 pushed[32];
+            u64 seq = 0, block = 0;
+            u32 pc = 0;
+            int found = gcn_ring_fifo_find(phys, &seq, &pc, &block, pushed);
+            fprintf(stderr, "[gx-fifoprov]   chunk stream=%llu phys=%08X "
+                            "(cmp bytes %llu..%llu):\n",
+                    (unsigned long long)c, phys,
+                    (unsigned long long)(lo - c), (unsigned long long)(hi - c));
+            fprintf(stderr, "[gx-fifoprov]     staged:");
+            for (u64 p = c; p < c + 32u; p++) {
+                if (p < lo || p >= hi) fprintf(stderr, " ..");
+                else fprintf(stderr, " %02X", gx->buf[p - s_buf0_stream]);
+            }
+            fprintf(stderr, "\n");
+            if (!found) {
+                fprintf(stderr, "[gx-fifoprov]     pushed: NO BURST RECORDED "
+                                "for phys %08X\n", phys);
+                continue;
+            }
+            fprintf(stderr, "[gx-fifoprov]     pushed:");
+            for (u32 i = 0; i < 32u; i++) fprintf(stderr, " %02X", pushed[i]);
+            int mismatch = 0;
+            for (u64 p = lo; p < hi; p++)
+                if (gx->buf[p - s_buf0_stream] != pushed[p - c]) mismatch = 1;
+            fprintf(stderr, "\n[gx-fifoprov]     burst seq=%llu pc=%08X "
+                            "blk=%llu -> %s\n",
+                    (unsigned long long)seq, pc, (unsigned long long)block,
+                    mismatch ? "MISMATCH (drain-side corruption)"
+                             : "MATCH (guest pushed these bytes)");
+        }
+    }
+    gcn_ring_event_dump_stderr(24);
+    /* The corrupt payload was pushed by the IPL's psq upload loop at most a
+     * tick before this decode (rw_dist is ~0 at every hit) — the last ~120
+     * psq ops cover the corrupt matrix's load->store pairs plus context. */
+    gcn_ring_psq_dump_stderr(120);
+    /* Producer chain: every resident psq op that touched any of the corrupt
+     * payload's exact bit patterns — the earliest ST of a corrupt word names
+     * the guest routine that computed it. */
+    {
+        u32 words[16];
+        u32 nw = count < 16u ? count : 16u;
+        for (u32 i = 0; i < nw; i++) words[i] = rd32(&data[i * 4u]);
+        gcn_ring_psq_value_trace(words, (int)nw, 80);
+    }
+    /* Write-watch ring: with GCN_WATCH armed on the corrupt source buffer,
+     * the newest entries here are the LAST stores into it before this
+     * corrupt upload — the writer of the corrupt lanes, by pc. */
+    gcn_ring_watch_dump_stderr(700);
+    /* The producer writes via TWO routines (watch-proven): the PSMTXCopy
+     * loop at 0x81339F14..F40 (its LD eas name the corrupt SOURCE matrix)
+     * and PSMTXConcat at 0x81339F44..0x8133A010 (its LDs are the a/b
+     * operands — recompute d by hand to name the wrong ps op). 240 entries
+     * reaches ~130 ops past the upload back through the corrupt copy. */
+    gcn_ring_psq_dump_pc_range(0x81339F00u, 0x8133A014u, 240);
+    /* Pinpoint: the newest psq store into the watched buffer +/- 30 ops —
+     * the PSMTXCopy call that wrote the corrupt payload, WITH its paired
+     * loads (= the corrupt source matrix address and values). */
+    gcn_ring_psq_dump_around_watched_store(30);
+}
+
 static void gx_on_xf(GcnGx* gx, u16 address, u8 count, const u8* data) {
     if (address >= GX_XF_REGISTERS_START &&
         address < GX_XF_REGISTERS_START + 0x60u) {
@@ -854,6 +1094,33 @@ static void gx_on_xf(GcnGx* gx, u16 address, u8 count, const u8* data) {
         if (note_once(&gx->seen_xf_mem))
             fprintf(stderr, "gx: XF matrix/light memory first loaded "
                             "(addr 0x%04X count %u)\n", address, count);
+    }
+
+    /* [gx-xfaudit] always-on write audit: payload word0 + (matrix mem only)
+     * the max |float| across the non-translation columns being written, so
+     * the ring itself classifies wall-scale vs cube-scale uploads. */
+    {
+        float maxlin = 0.0f;
+        if (address < 0x400u) {
+            for (u8 i = 0; i < count; i++) {
+                if ((((u32)address + i) & 3u) == 3u)
+                    continue;               /* translation column of a 3x4 row */
+                u32 v = rd32(&data[i * 4u]);
+                float f;
+                memcpy(&f, &v, 4);
+                float af = fabsf(f);
+                if (af > maxlin) maxlin = af;
+            }
+        }
+        xfaudit_record(address, count, count ? rd32(&data[0]) : 0u, maxlin);
+        /* [gx-fifoprov] corrupt-payload detector: every clean top-level
+         * matrix upload in the IPL menus stays below |0.7| in its
+         * non-translation columns; the flood's corrupted uploads carry
+         * screen-scale junk (hundreds..thousands). Threshold shared with the
+         * [gx-xfaudit] draw-side trigger. */
+        if (address < 0x100u && count >= 8u && gx->cur_dl_addr == 0u &&
+            maxlin > 3.0f)
+            gx_fifo_provenance_dump(gx, address, count, data, maxlin);
     }
 
     for (u8 i = 0; i < count; i++) {
@@ -888,6 +1155,17 @@ const u8* gcn_gx_tmem(void) { return s_gx_tmem; }
 static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     if (note_once(&gx->seen_bp[cmd]))
         fprintf(stderr, "gx: BP reg 0x%02X first written (val 0x%06X)\n", cmd, value);
+
+    /* [gx-xfaudit] always-on write audit (records identical-value rewrites
+     * too — the notify-on-change gate below is itself under audit). */
+    {
+        GxBpAuditEntry* e = &s_bpaudit[s_bpaudit_n & (GX_BPAUDIT_CAP - 1u)];
+        e->frame = s_gx_frames;
+        e->dl    = gx->cur_dl_addr;
+        e->value = value;
+        e->cmd   = cmd;
+        s_bpaudit_n++;
+    }
 
     if (gx->bp[cmd] != value)
         gx_raster_notify_bp_write();
@@ -1189,6 +1467,11 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
 static u32 gx_run(GcnGx* gx, const u8* data, u32 available) {
     u32 off = 0;
     while (off < available) {
+        /* [gx-fifoprov] staging offset of the command about to decode (valid
+         * only for the top-level staging buffer; DL bytes have no FIFO slot).
+         * A nested CALL_DL gx_run clears it; the next loop iteration here
+         * re-derives it, so it is always correct at gx_run_command entry. */
+        s_cur_cmd_buf_off = (data == gx->buf) ? off : 0xFFFFFFFFu;
         u32 sz = gx_run_command(gx, &data[off], available - off);
         if (sz == 0u) break;
         if (s_gxstats) s_gx_commands++;   /* GCN_GX_STATS: commands-decoded counter */
@@ -1329,6 +1612,13 @@ void gcn_gx_tick(u32 cycles) {
             gcn_cp_gpu_consume_chunk(gx->cp);
         }
         drained += GCN_CP_GATHER_PIPE_SIZE;
+        /* [gx-fifoprov] source map: only meaningful with the pipeline fully
+         * off (the worker's pull path appends without recording, which would
+         * desync the stream/chunk invariant — see the srcmap block comment). */
+        if (s_pipe_on == 0) {
+            s_srcmap_phys[s_srcmap_chunks & (GX_SRCMAP_CAP - 1u)] = phys;
+            s_srcmap_chunks++;
+        }
 
         /* Run whole commands out of the staging buffer; keep the leftover partial
          * command for the next chunk (Fifo.cpp:342-352 advances the read ptr past
@@ -1366,6 +1656,7 @@ void gcn_gx_tick(u32 cycles) {
                     memmove(gx->buf, gx->buf + consumed, gx->buf_len - consumed);
                 gx->buf_len -= consumed;
             }
+            s_buf0_stream += consumed;   /* [gx-fifoprov] buf[0]'s stream pos */
         }
     }
 

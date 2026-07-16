@@ -16,6 +16,7 @@
  * 0 — the warning is the signal, we never silently synthesize a value.
  */
 #include "cpu/cpu.h"
+#include "debug/rings.h"   /* [gcn-watch] gcn_ring_watch_check */
 #include "memory/memory.h"
 #include "trace/trace.h"
 
@@ -310,6 +311,7 @@ u32 mem_read32_legacy(CPUState* cpu, u32 addr) { return mem_read32_cia(cpu, addr
 
 void mem_write32_cia(CPUState* cpu, u32 addr, u32 value, u32 cia) {
     u32 avail;
+    gcn_ring_watch_check(addr, value, 4u, cia);   /* [gcn-watch] psq/slow path */
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 4) {
         cpu->pc = cia;
@@ -340,6 +342,7 @@ u16 mem_read16_legacy(CPUState* cpu, u32 addr) { return mem_read16_cia(cpu, addr
 
 void mem_write16_cia(CPUState* cpu, u32 addr, u16 value, u32 cia) {
     u32 avail;
+    gcn_ring_watch_check(addr, value, 2u, cia);   /* [gcn-watch] */
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 2) {
         cpu->pc = cia;
@@ -370,6 +373,7 @@ u8 mem_read8_legacy(CPUState* cpu, u32 addr) { return mem_read8_cia(cpu, addr, c
 
 void mem_write8_cia(CPUState* cpu, u32 addr, u8 value, u32 cia) {
     u32 avail;
+    gcn_ring_watch_check(addr, value, 1u, cia);   /* [gcn-watch] */
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host) {
         cpu->pc = cia;

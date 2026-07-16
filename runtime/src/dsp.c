@@ -432,10 +432,12 @@ static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
     if (aram && len &&
         (u64)mmaddr + len <= cpu->ram_size &&
         (u64)araddr + len <= aram_size) {
-        if (to_aram)
+        if (to_aram) {
             memcpy(aram + araddr, cpu->ram + mmaddr, len);
-        else
+        } else {
+            gcn_ring_watch_check_span(mmaddr, len, 0xD5BD5B00u); /* [gcn-watch] */
             memcpy(cpu->ram + mmaddr, aram + araddr, len);
+        }
     }
 
     dsp->dma_active = true;

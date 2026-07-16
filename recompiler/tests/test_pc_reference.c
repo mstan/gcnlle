@@ -2284,6 +2284,8 @@ static void test_psq_memory(CPUState* cpu) {
 
     cpu_reset(cpu);
     cpu->hid2 = PPC_HID2_PSE | PPC_HID2_LSQE;
+    cpu->msr = 0x00002000u;   /* MSR[FP]: psq is FP-class — without it the
+                               * lazy-FPU trap (0x800) fires first, as on HW */
     cpu->gpr[4] = base;
     mem_write32(cpu, base, 0x3F800000u);
     mem_write32(cpu, base + 4, 0x40000000u);
@@ -2431,27 +2433,50 @@ static void test_psq_memory(CPUState* cpu) {
     exec_raw(cpu, make_psq_dform(60, 23, 4, 0x0D4, true, 0), BASE);
     check_eq(mem_read32(cpu, base + 0xD4), 0, "psq_st f32 denorm stores zero");
 
+    /* Exception-priority ladder. Every delivered exception clears MSR[FP]
+     * (exception_msr), so restore it before each case that tests a LOWER-
+     * priority cause — otherwise the FP-unavailable trap (checked first,
+     * as on hardware) shadows the cause under test. */
     cpu->exception = cpu->program_exception = 0;
+    cpu->msr = 0x00002000u;
     cpu->hid2 = 0;
     exec_raw(cpu, make_psq_dform(56, 24, 4, 0x0B0, false, 1), BASE);
     check_eq(cpu->exception & PPC_EXC_PROGRAM, PPC_EXC_PROGRAM, "psq_l without PSE raises program");
     check_eq(cpu->program_exception & PPC_PROGRAM_ILLEGAL, PPC_PROGRAM_ILLEGAL, "psq_l without PSE is illegal");
 
     cpu->exception = cpu->program_exception = 0;
+    cpu->msr = 0x00002000u;
     cpu->hid2 = PPC_HID2_PSE;
     exec_raw(cpu, make_psq_dform(56, 24, 4, 0x0B0, false, 1), BASE);
     check_eq(cpu->exception & PPC_EXC_PROGRAM, PPC_EXC_PROGRAM, "psq_l without LSQE raises program");
 
     cpu->exception = cpu->program_exception = 0;
+    cpu->msr = 0x00002000u;
     cpu->hid2 = PPC_HID2_PSE | PPC_HID2_LSQE;
     cpu->gqr[0] = 0;
     exec_raw(cpu, make_psq_dform(56, 24, 4, 1, true, 0), BASE);
     check_eq(cpu->exception & PPC_EXC_ALIGNMENT, PPC_EXC_ALIGNMENT, "psq_l f32 unaligned raises alignment");
 
     cpu->exception = cpu->program_exception = 0;
+    cpu->msr = 0x00002000u;
     cpu->gqr[1] = (4u << 16) | 4u;
     exec_raw(cpu, make_psq_dform(56, 24, 4, 1, true, 1), BASE);
     check_eq(cpu->exception, 0, "psq_l integer unaligned allowed");
+
+    /* The new top-priority cause itself: psq with MSR[FP]=0 must take the
+     * FP-unavailable trap (vector 0x800, SRR0 = the faulting instruction so
+     * it re-executes after the OS lazy-FPU handler rfi's) — NOT a program
+     * exception, even with HID2 also disqualifying. */
+    cpu->exception = cpu->program_exception = 0;
+    cpu->msr = 0;
+    cpu->hid2 = 0;
+    exec_raw(cpu, make_psq_dform(56, 24, 4, 0x0B0, false, 1), BASE);
+    check_eq(cpu->exception & PPC_EXC_FP_UNAVAILABLE, PPC_EXC_FP_UNAVAILABLE,
+             "psq_l with MSR[FP]=0 raises FP unavailable");
+    check_eq(cpu->exception & PPC_EXC_PROGRAM, 0,
+             "FP unavailable outranks the HID2 program check");
+    check_eq(cpu->srr0, BASE, "FP unavailable SRR0 = faulting instruction");
+    check_eq(cpu->pc, PPC_VECTOR_FP_UNAVAIL, "FP unavailable vectors to 0x800");
 }
 
 static void test_paired_single_arithmetic(CPUState* cpu) {

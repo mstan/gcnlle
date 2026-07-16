@@ -115,6 +115,67 @@ int gcn_ring_event_json(char* out, int cap, int max_entries);
 int gcn_ring_fifo_json(char* out, int cap, int max_entries);
 int gcn_ring_memcard_json(char* out, int cap, int max_entries);
 
+/* [gx-fifoprov] Newest gather burst whose destination (wptr & 0x1FFFFFFF)
+ * equals `phys`. Fills the producing pc, seq, block stamp and the 32 raw
+ * bytes; returns 0 if no resident burst targeted that address. Lets the GX
+ * decoder compare the bytes it consumed against the bytes the guest actually
+ * pushed to the same FIFO slot (guest-wrote-garbage vs drain-corruption). */
+int gcn_ring_fifo_find(u32 phys, u64* seq, u32* pc, u64* block, u8 out[32]);
+
+/* [gx-fifoprov] One paired-single load/store: the guest pc, ps0-lane EA and
+ * the f32 bit patterns moved through both lanes (see the PsqEntry comment in
+ * rings.c). Recorded by cpu_glue.c's ppc_psq_load/ppc_psq_store; dumped by
+ * the GX corrupt-payload detector to separate RAM-was-already-corrupt from
+ * corrupted-between-load-and-store. */
+void gcn_ring_psq(u32 cia, u32 ea, u32 ps0, u32 ps1, u8 is_store);
+void gcn_ring_psq_dump_stderr(int max_entries);
+
+/* [gx-fifoprov] Print every resident psq ring entry whose ps0/ps1 bit
+ * pattern equals one of `words` (zeros skipped) — the full producer chain of
+ * a corrupt value: the store that first materialized it (its pc names the
+ * computing routine) and every copy since. Oldest->newest, capped. */
+void gcn_ring_psq_value_trace(const u32* words, int nwords, int max_print);
+
+/* [gx-fifoprov] newest `max_entries` psq ring entries whose pc lies in
+ * [pc_lo,pc_hi), printed oldest->newest — isolates one guest routine's
+ * recent load/store traffic (e.g. PSMTXConcat's inputs at the corrupt call). */
+void gcn_ring_psq_dump_pc_range(u32 pc_lo, u32 pc_hi, int max_entries);
+
+/* [gx-fifoprov] locate the NEWEST psq store whose ea falls inside the
+ * GCN_WATCH range and print +/-radius ring entries around it — the copy
+ * loop's paired loads there name the corrupt source matrix exactly. */
+void gcn_ring_psq_dump_around_watched_store(int radius);
+
+/* [gx-fifoprov] guest-RAM write watch. Armed by GCN_WATCH=<lo>:<hi> (hex,
+ * any alias; stored physical). gcn_watch_len stays 0 when unset, so the
+ * store-path check below is one sub+compare. Call gcn_ring_watch_init once
+ * at boot; stores report through gcn_ring_watch_hit (stderr, capped). */
+extern u32 gcn_watch_lo, gcn_watch_len;
+void gcn_ring_watch_init(void);
+void gcn_ring_watch_hit(u32 ea, u64 value, u32 size, u32 cia);
+void gcn_ring_watch_dump_stderr(int max_entries);
+static inline void gcn_ring_watch_check(u32 ea, u64 value, u32 size, u32 cia) {
+    if ((u32)((ea & 0x1FFFFFFFu) - gcn_watch_lo) < gcn_watch_len)
+        gcn_ring_watch_hit(ea, value, size, cia);
+}
+
+/* Span variant for block writers (DMA engines, gather bursts, dcbz):
+ * records one hit if [ea, ea+len) overlaps the watch range. `tag` labels
+ * the writer in place of a guest pc (0xD5BD.. DSP DMA, 0xEC1E.. EXI DMA,
+ * 0x6A6A.. gather burst, 0xDCB2.. dcbz) — see each call site. */
+void gcn_ring_watch_hit_span(u32 ea, u32 len, u32 tag);
+static inline void gcn_ring_watch_check_span(u32 ea, u32 len, u32 tag) {
+    u32 p = ea & 0x1FFFFFFFu;
+    if (gcn_watch_len != 0u &&
+        p < gcn_watch_lo + gcn_watch_len && p + len > gcn_watch_lo)
+        gcn_ring_watch_hit_span(ea, len, tag);
+}
+
+/* [gx-fifoprov] stderr dump of the newest `max_entries` event-ring entries
+ * (interrupt/DMA edges with block stamps) — correlation data for a corrupt
+ * FIFO payload (did an IRQ land while the guest was building/pushing it?). */
+void gcn_ring_event_dump_stderr(int max_entries);
+
 #ifdef __cplusplus
 }
 #endif

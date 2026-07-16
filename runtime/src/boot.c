@@ -718,6 +718,7 @@ int main(int argc, char** argv) {
     /* Observability: bring up the always-on ring buffers and (if GCN_DEBUG_PORT
      * is set) the TCP debug query surface over them + live CPU/RAM state. */
     gcn_rings_init();
+    gcn_ring_watch_init();   /* [gcn-watch] arm GCN_WATCH write watch if set */
     GcnDebugCtx dbg = { .cpu = &cpu, .di = &di, .exi = &exi, .dsp = &dsp };
     int dbg_port = gcn_debug_server_start(&dbg);
 

@@ -387,8 +387,12 @@ static int memcard_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma
         u8* p = gcn_mem_resolve(cpu, guest, &avail);
         u32 n = (len < avail) ? len : avail;
         if (p) {
-            if (rw == 1u) gcn_memcard_dma_write(mc, p, n);
-            else          gcn_memcard_dma_read(mc, p, n);
+            if (rw == 1u) {
+                gcn_memcard_dma_write(mc, p, n);
+            } else {
+                gcn_ring_watch_check_span(guest, n, 0xEC1EC100u); /* [gcn-watch] */
+                gcn_memcard_dma_read(mc, p, n);
+            }
         }
     } else if (rw == 1u) {                 /* immediate WRITE: CPU -> card */
         u32 v = c->data;

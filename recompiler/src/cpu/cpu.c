@@ -323,6 +323,10 @@ void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia) {
     ppc_take_exception(cpu, PPC_EXC_PROGRAM, PPC_VECTOR_PROGRAM, cia, cause);
 }
 
+void ppc_fp_unavailable(CPUState* cpu, u32 cia) {
+    ppc_take_exception(cpu, PPC_EXC_FP_UNAVAILABLE, PPC_VECTOR_FP_UNAVAIL, cia, 0);
+}
+
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia) {
     if (cpu->instruction_fallback) {
         cpu->instruction_fallback(cpu, raw, cia);
@@ -632,6 +636,13 @@ static void psq_store_value(CPUState* cpu, u32 ea, u8 type, s32 scale, f64 value
 }
 
 static bool psq_check_enabled(CPUState* cpu, bool indexed, u32 cia) {
+    /* MSR[FP]=0 outranks the HID2 program check: psq is FP-class, so it
+     * takes the FP-unavailable trap (0x800) first — the lazy-FPU context
+     * switch depends on this ordering. */
+    if ((cpu->msr & PPC_MSR_FP) == 0) {
+        ppc_fp_unavailable(cpu, cia);
+        return false;
+    }
     if ((cpu->hid2 & PPC_HID2_PSE) == 0 || (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0)) {
         ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
         return false;

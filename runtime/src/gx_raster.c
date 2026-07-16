@@ -3629,8 +3629,77 @@ typedef struct {
     u32 ptype;
 } PositionTransform;
 
+/* [gx-xfaudit] trigger: the flood signature is the cube DL's draws running
+ * under a wall-scale position matrix (|linear|~22; every matrix the guest
+ * ever loads for the cubes has |linear|<=2.2 — 10x separation, threshold 3).
+ * The instant that happens, dump everything needed to name the break:
+ * which slot was read (posMtx + the CP MATINDEX default in force), what that
+ * slot holds right now, and the gx.c write-audit rings showing exactly which
+ * XF/BP writes decode executed leading up to this draw (with frame + DL
+ * provenance). Recording is always-on; only this dump is signature-gated.
+ * GCN_GX_XF_AUDIT_DL overrides the watched DL (hex; 0 disables the trigger);
+ * the default is the IPL menu's cube DL under investigation. */
+static void gx_xf_audit_check(u8 pos_mtx, const float* m) {
+    static u32 s_watch_dl = 0xFFFFFFFFu;   /* lazy env sentinel */
+    if (s_watch_dl == 0xFFFFFFFFu) {
+        const char* e = getenv("GCN_GX_XF_AUDIT_DL");
+        s_watch_dl = e ? (u32)strtoul(e, NULL, 16) : 0x00AF13C0u;
+    }
+    if (s_watch_dl == 0u || gcn_gx_current_dl() != s_watch_dl)
+        return;
+    float maxlin = 0.0f;
+    for (int i = 0; i < 12; i++) {
+        if ((i & 3) == 3) continue;        /* translation column */
+        float a = fabsf(m[i]);
+        if (a > maxlin) maxlin = a;
+    }
+    if (maxlin <= 3.0f)
+        return;
+
+    /* Rate limit: floods repeat the bad draw hundreds of times per frame and
+     * recur ~1-2/min for the whole soak — 2 full dumps per frame, 16 total,
+     * then a suppressed-hit counter so the event rate stays measurable. */
+    static u64 s_hits, s_dumps;
+    static u64 s_lastframe = ~0ull;
+    static u32 s_frame_dumps;
+    u64 frame = gcn_gx_frame_count();
+    s_hits++;
+    if (frame != s_lastframe) { s_lastframe = frame; s_frame_dumps = 0u; }
+    if (s_frame_dumps >= 2u || s_dumps >= 16u) {
+        if ((s_hits & 255u) == 0u)
+            fprintf(stderr, "[gx-xfaudit] %llu hits total (dumps capped, "
+                    "latest frame=%llu maxlin=%.4g)\n",
+                    (unsigned long long)s_hits, (unsigned long long)frame,
+                    (double)maxlin);
+        return;
+    }
+    s_frame_dumps++;
+    s_dumps++;
+
+    fprintf(stderr,
+            "[gx-xfaudit] HIT #%llu frame=%llu dl=%08X posMtx=%u matidxA=0x%08X "
+            "maxlin=%.4g\n",
+            (unsigned long long)s_hits, (unsigned long long)frame,
+            gcn_gx_current_dl(), pos_mtx,
+            s_trap_cp ? s_trap_cp->matrix_index_a : 0u, (double)maxlin);
+    for (int r = 0; r < 3; r++)
+        fprintf(stderr, "[gx-xfaudit]   applied r%d = %.6g %.6g %.6g | %.6g\n",
+                r, (double)m[r*4+0], (double)m[r*4+1], (double)m[r*4+2],
+                (double)m[r*4+3]);
+    if (pos_mtx != 0u) {
+        /* The applied matrix came from slot pos_mtx; show what slot 0 (the
+         * per-instance load target) holds RIGHT NOW for the index-leak case. */
+        for (int r = 0; r < 3; r++)
+            fprintf(stderr, "[gx-xfaudit]   slot0   r%d = %.6g %.6g %.6g | %.6g\n",
+                    r, (double)xf_f((u32)r*4+0), (double)xf_f((u32)r*4+1),
+                    (double)xf_f((u32)r*4+2), (double)xf_f((u32)r*4+3));
+    }
+    gcn_gx_state_audit_dump();
+}
+
 static void prepare_position_transform(u8 pos_mtx, PositionTransform* tf) {
     get_posmat(pos_mtx, tf->m);
+    gx_xf_audit_check(pos_mtx, tf->m);
     tf->ptype = s_xf[0x1026];      /* ProjectionType (0 persp, 1 ortho) */
     for (int i = 0; i < 6; i++) tf->p[i] = xf_f(0x1020 + i);
     if (tf->ptype == 0) {

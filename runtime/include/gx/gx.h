@@ -110,6 +110,14 @@ u64 gcn_gx_frame_count(void);
 /* Guest address of the display list currently executing (0 = top-level). */
 u32 gcn_gx_current_dl(void);
 
+/* [gx-xfaudit] Dump the always-on XF/BP write-audit rings (last 64 XF /
+ * MATINDEX and 48 BP register writes, each stamped with frame + source DL).
+ * Fired by gx_raster's wrong-matrix trigger (a wall-scale position matrix
+ * applied while executing the cube DL) to name which of write-skipped /
+ * write-corrupted / wrong-index produced the IPL flood frames. Decode-thread
+ * only, same single-writer model as the draw log. */
+void gcn_gx_state_audit_dump(void);
+
 /* Monotonic producer publication point. It advances only after
  * GXSetDrawDone has flushed/materialized every preceding EFB->XFB copy, so
  * VI can distinguish a finished guest frame from intermediate copies made

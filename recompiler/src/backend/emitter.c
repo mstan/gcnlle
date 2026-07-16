@@ -891,6 +891,54 @@ void emit_footer(FILE* out) {
     fprintf(out, "\n// end\n");
 }
 
+/* FP-class instructions: everything that hardware refuses with the FP-
+ * unavailable exception (vector 0x800) when MSR[FP]=0 — float loads/stores,
+ * FP arithmetic/moves/compares, FPSCR ops, every paired-single op, and the
+ * quantized psq family. Gekko User's Manual 2.1.1/6.4.6.4: paired-single
+ * and quantized ops are FP-class and take 0x800 before any HID2 program
+ * check. The OS relies on this trap for lazy FPU context switching — an
+ * interrupt handler's first FP instruction must fault so the OS can save
+ * the interrupted thread's FPU state. Without the gate, handler FP work
+ * executes on the interrupted code's live registers (this exact bug drew
+ * the IPL menu's flood-garbled frames). */
+static bool ppc_op_is_fp(PPCOpcode op) {
+    switch (op) {
+    case PPC_OP_FADDS: case PPC_OP_FSUBS: case PPC_OP_FMULS: case PPC_OP_FDIVS:
+    case PPC_OP_FRES: case PPC_OP_FMADDS: case PPC_OP_FMSUBS:
+    case PPC_OP_FNMADDS: case PPC_OP_FNMSUBS:
+    case PPC_OP_FADD: case PPC_OP_FSUB: case PPC_OP_FMUL: case PPC_OP_FDIV:
+    case PPC_OP_FRSQRTE: case PPC_OP_FMADD: case PPC_OP_FMSUB:
+    case PPC_OP_FNMADD: case PPC_OP_FNMSUB:
+    case PPC_OP_FCTIW: case PPC_OP_FCTIWZ: case PPC_OP_FRSP: case PPC_OP_FSEL:
+    case PPC_OP_FMR: case PPC_OP_FNEG: case PPC_OP_FABS: case PPC_OP_FNABS:
+    case PPC_OP_FCMPU: case PPC_OP_FCMPO:
+    case PPC_OP_MTFSB0: case PPC_OP_MTFSB1: case PPC_OP_MCRFS:
+    case PPC_OP_MFFS: case PPC_OP_MTFSF: case PPC_OP_MTFSFI:
+    case PPC_OP_PS_ADD: case PPC_OP_PS_SUB: case PPC_OP_PS_MUL:
+    case PPC_OP_PS_DIV: case PPC_OP_PS_RES: case PPC_OP_PS_RSQRTE:
+    case PPC_OP_PS_MADD: case PPC_OP_PS_MSUB: case PPC_OP_PS_NMADD:
+    case PPC_OP_PS_NMSUB: case PPC_OP_PS_NEG: case PPC_OP_PS_ABS:
+    case PPC_OP_PS_NABS: case PPC_OP_PS_MR:
+    case PPC_OP_PS_SUM0: case PPC_OP_PS_SUM1:
+    case PPC_OP_PS_MULS0: case PPC_OP_PS_MULS1:
+    case PPC_OP_PS_MADDS0: case PPC_OP_PS_MADDS1:
+    case PPC_OP_PS_MERGE00: case PPC_OP_PS_MERGE01:
+    case PPC_OP_PS_MERGE10: case PPC_OP_PS_MERGE11:
+    case PPC_OP_PS_CMPU0: case PPC_OP_PS_CMPO0:
+    case PPC_OP_PS_CMPU1: case PPC_OP_PS_CMPO1: case PPC_OP_PS_SEL:
+    case PPC_OP_LFS: case PPC_OP_LFSU: case PPC_OP_LFSX: case PPC_OP_LFSUX:
+    case PPC_OP_LFD: case PPC_OP_LFDU: case PPC_OP_LFDX: case PPC_OP_LFDUX:
+    case PPC_OP_STFS: case PPC_OP_STFSU: case PPC_OP_STFSX: case PPC_OP_STFSUX:
+    case PPC_OP_STFD: case PPC_OP_STFDU: case PPC_OP_STFDX: case PPC_OP_STFDUX:
+    case PPC_OP_STFIWX:
+    case PPC_OP_PSQ_L: case PPC_OP_PSQ_LU: case PPC_OP_PSQ_LX: case PPC_OP_PSQ_LUX:
+    case PPC_OP_PSQ_ST: case PPC_OP_PSQ_STU: case PPC_OP_PSQ_STX: case PPC_OP_PSQ_STUX:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
                                         u32 func_start, u32 func_end,
                                         u32 cycle_charge) {
@@ -901,6 +949,19 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     if (inst->embedded_data) {
         fprintf(out, "    // embedded data\n\n");
         return;
+    }
+
+    /* Lazy-FPU trap (see ppc_op_is_fp above). SRR0 = this instruction so it
+     * re-executes after the OS handler enables FP and rfi's — the exact
+     * hardware restart semantic the lazy context switch depends on. The
+     * helper takes cia explicitly and the dispatcher resumes at the vector,
+     * so no ctx->pc pre-stamp is needed (same reasoning as the Phase B/C
+     * pc-pure whitelist). */
+    if (ppc_op_is_fp(inst->op)) {
+        fprintf(out, "    if (!(ctx->msr & 0x2000u)) {\n");
+        fprintf(out, "        ppc_fp_unavailable(ctx, 0x%08Xu);\n", inst->address);
+        fprintf(out, "        dr_cycles += %uu; DR_RET();\n", cycle_charge);
+        fprintf(out, "    }\n");
     }
 
     switch (inst->op) {
