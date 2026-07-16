@@ -315,9 +315,10 @@ static void handle_line(Client* c, const char* line) {
                  * the image (16 = XFB black level). */
                 n = snprintf(s_resp, GCN_DBG_RESP_CAP,
                     "{\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u,"
-                    "\"xfb_addr\":%u,\"mean_luma\":%.1f}\n",
+                    "\"xfb_addr\":%u,\"mean_luma\":%.1f,\"frame\":%llu}\n",
                     path, fb_w, fb_h, fb_addr,
-                    (double)luma_sum / ((double)fb_w * fb_h));
+                    (double)luma_sum / ((double)fb_w * fb_h),
+                    (unsigned long long)gcn_gx_frame_count());
             }
         }
     }

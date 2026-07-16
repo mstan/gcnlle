@@ -2445,6 +2445,12 @@ typedef struct {
     float normal[3][3];
     u8    color[2][4];      /* [chan][R,G,B,A] */
     float texCoords[8][3];
+    /* Diagnostic provenance (coverage-anomaly census): the untransformed
+     * object-space position and the geometry-matrix slot that transformed
+     * it. Clip-lerped vertices inherit vertex a's values (approximate —
+     * fine for naming a draw's source data, meaningless for math). */
+    float objPos[3];
+    u8    posMtx;
 } OutVtx;
 
 typedef GxRasterSlope Slope;
@@ -2456,6 +2462,23 @@ typedef GxRasterSlope Slope;
  * a template copy is exact). Tev's own aligned(64) keeps workers off each
  * other's cache lines. */
 static Tev    s_tev_w[GX_MT_MAX];
+
+/* Per-frame coverage anomaly state (see the detector in the triangle setup
+ * path and gx_raster_frame_anomaly_mark below). Written on the decode
+ * thread only (triangle setup + the drawdone mark are both stream-ordered). */
+typedef struct {
+    u32 area, prog, dl;
+    s32 minx, miny, maxx, maxy;
+    float mv[3][3], w[3], sx[3], sy[3];
+    float op[3][3];
+    u8 pidx[3];
+} FaTopDraw;
+static u64      s_fa_frame_area;
+static u32      s_fa_frame_tris;
+static FaTopDraw s_fa_top[8];
+static u64      s_fa_hist[32];      /* rolling window of per-frame area sums */
+static u32      s_fa_hist_n;
+static u64      s_fa_anomalies;
 /* Per-TRIANGLE setup outputs, written by the main thread before any fork and
  * read-only for the whole scan (workers included) — shared by design. */
 static Slope  s_ZSlope, s_WSlope, s_ColorSlopes[2][4], s_TexSlopes[8][3];
@@ -3055,6 +3078,45 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
      * (Entry already zeroed it, so the early returns above land in bucket 0.) */
     if (s_draw_stats) s_last_tri_area = (u32)((maxx - minx) * (maxy - miny));
 
+    /* Per-frame coverage anomaly detector (always on, IPL flood/drop
+     * investigation): accumulate every triangle's post-scissor bbox area for
+     * the frame and remember the top-8 largest with provenance (program,
+     * bbox, per-stage vertex positions). gx_raster_frame_anomaly_mark()
+     * (called at GXSetDrawDone) compares the frame's total against a rolling
+     * median: a flood spikes it (many stretched mid-size triangles), a drop
+     * dips it (panel draws missing) — either way the top-8 of the anomalous
+     * frame names the culprit draws. A 50%-screen single-triangle census
+     * already came back EMPTY across garbled frames, so the corruption is
+     * mid-size-many, not one giant triangle — hence per-frame accounting. */
+    {
+        u32 tri_area = (u32)((maxx - minx) * (maxy - miny));
+        s_fa_frame_area += tri_area;
+        s_fa_frame_tris++;
+        if (tri_area > s_fa_top[7].area) {
+            int slot = 7;
+            while (slot > 0 && tri_area > s_fa_top[slot - 1].area) slot--;
+            for (int m = 7; m > slot; m--) s_fa_top[m] = s_fa_top[m - 1];
+            s_fa_top[slot].area = tri_area;
+            s_fa_top[slot].prog = triangle_program;
+            s_fa_top[slot].dl = gcn_gx_current_dl();
+            s_fa_top[slot].minx = minx; s_fa_top[slot].miny = miny;
+            s_fa_top[slot].maxx = maxx; s_fa_top[slot].maxy = maxy;
+            for (int c = 0; c < 3; c++) {
+                const OutVtx* vv = c == 0 ? v0 : (c == 1 ? v1 : v2);
+                s_fa_top[slot].mv[c][0] = vv->mvPosition[0];
+                s_fa_top[slot].mv[c][1] = vv->mvPosition[1];
+                s_fa_top[slot].mv[c][2] = vv->mvPosition[2];
+                s_fa_top[slot].w[c] = vv->projectedPosition[3];
+                s_fa_top[slot].sx[c] = vv->screenPosition[0];
+                s_fa_top[slot].sy[c] = vv->screenPosition[1];
+                s_fa_top[slot].op[c][0] = vv->objPos[0];
+                s_fa_top[slot].op[c][1] = vv->objPos[1];
+                s_fa_top[slot].op[c][2] = vv->objPos[2];
+                s_fa_top[slot].pidx[c] = vv->posMtx;
+            }
+        }
+    }
+
     SlopeCtx ctx = make_ctx(v0, v1, v2, (X1 + 0xF) >> 4, (Y1 + 0xF) >> 4, x_off, y_off);
     float w[3] = { 1.0f / v0->projectedPosition[3], 1.0f / v1->projectedPosition[3],
                    1.0f / v2->projectedPosition[3] };
@@ -3273,6 +3335,8 @@ static int calc_clip_mask(const OutVtx* v) {
 }
 static void vtx_lerp(OutVtx* o, float t, const OutVtx* a, const OutVtx* b) {
 #define LI(OUT, IN) ((OUT) + (((IN) - (OUT)) * t))
+    for (int i = 0; i < 3; i++) o->objPos[i] = a->objPos[i];
+    o->posMtx = a->posMtx;
     for (int i = 0; i < 3; i++) o->mvPosition[i] = LI(a->mvPosition[i], b->mvPosition[i]);
     for (int i = 0; i < 4; i++) o->projectedPosition[i] = LI(a->projectedPosition[i], b->projectedPosition[i]);
     for (int n = 0; n < 3; n++) for (int i = 0; i < 3; i++) o->normal[n][i] = LI(a->normal[n][i], b->normal[n][i]);
@@ -3582,6 +3646,10 @@ static void tf_position_prepared(const InVtx* in, OutVtx* out,
                                  const PositionTransform* tf) {
     const float* m = tf->m;
     const float* p = tf->p;
+    out->objPos[0] = in->position[0];
+    out->objPos[1] = in->position[1];
+    out->objPos[2] = in->position[2];
+    out->posMtx = in->posMtx;
     mul_vec3_mat34(in->position, m, out->mvPosition);
     if (tf->ptype == 0) {          /* Perspective (MultipleVec3Perspective) */
         out->projectedPosition[0] = p[0]*out->mvPosition[0] + p[1]*out->mvPosition[2];
@@ -4909,6 +4977,68 @@ void gx_raster_get_pixel_stats(GxPixelStats* out) {
 /* GCN_GX_TEV_CENSUS: dump the per-config draw/pixel counters (see the census
  * comment near s_census). Called from gx.c's shared stats cadence; no-op
  * unless the knob is on and at least one draw has been censused. */
+/* Frame boundary hook for the per-frame coverage anomaly detector (called
+ * from gx.c at every accepted GXSetDrawDone, on the decode thread). Compares
+ * this frame's accumulated bbox-area sum against the rolling median of the
+ * last 32 frames; +/-33% deviation logs the frame with its top-8 draws. */
+int gx_raster_frame_anomaly_mark(u64 frame) {
+    int anomalous = 0;
+    u64 sum = s_fa_frame_area;
+    /* rolling median of the last 32 sums (insertion copy — 32 elems) */
+    u64 sorted[32];
+    u32 n = s_fa_hist_n < 32u ? s_fa_hist_n : 32u;
+    for (u32 i = 0; i < n; i++) sorted[i] = s_fa_hist[i];
+    for (u32 i = 1; i < n; i++) {
+        u64 key = sorted[i]; u32 j = i;
+        while (j > 0 && sorted[j - 1] > key) { sorted[j] = sorted[j - 1]; j--; }
+        sorted[j] = key;
+    }
+    u64 med = n ? sorted[n / 2] : sum;
+    if (n >= 8u && med && (sum > med + med / 3u || sum + med / 3u < med)) {
+        /* The caller's draw-log dump is reserved for EXTREME deviation: the
+         * flood/drop corruption runs 3-57x off median, while the menu's own
+         * glyph-cascade animation legitimately swings within ~1.6x — dumping
+         * on the mild band burned the whole dump budget before the first
+         * real flood (observed: 24/24 dumps spent by anomaly #24, flood was
+         * anomaly #197). */
+        anomalous = (sum > med * 3u || sum * 3u < med) ? 1 : 0;
+        s_fa_anomalies++;
+        if (s_fa_anomalies <= 512u) {
+            fprintf(stderr,
+                "[gx-frameanom] #%llu frame=%llu area=%llu median=%llu tris=%u\n",
+                (unsigned long long)s_fa_anomalies, (unsigned long long)frame,
+                (unsigned long long)sum, (unsigned long long)med,
+                s_fa_frame_tris);
+            for (int k = 0; k < 8 && s_fa_top[k].area; k++)
+                fprintf(stderr,
+                    "  top[%d] area=%u prog=%u dl=%08X pmtx=(%u,%u,%u) "
+                    "bbox=[%d,%d..%d,%d] "
+                    "obj0=(%.2f,%.2f,%.2f) obj1=(%.2f,%.2f,%.2f) "
+                    "obj2=(%.2f,%.2f,%.2f) "
+                    "mv0=(%.2f,%.2f,%.2f) mv1=(%.2f,%.2f,%.2f) "
+                    "mv2=(%.2f,%.2f,%.2f) w=(%.4f,%.4f,%.4f)\n",
+                    k, s_fa_top[k].area, s_fa_top[k].prog, s_fa_top[k].dl,
+                    s_fa_top[k].pidx[0], s_fa_top[k].pidx[1], s_fa_top[k].pidx[2],
+                    s_fa_top[k].minx, s_fa_top[k].miny,
+                    s_fa_top[k].maxx, s_fa_top[k].maxy,
+                    s_fa_top[k].op[0][0], s_fa_top[k].op[0][1], s_fa_top[k].op[0][2],
+                    s_fa_top[k].op[1][0], s_fa_top[k].op[1][1], s_fa_top[k].op[1][2],
+                    s_fa_top[k].op[2][0], s_fa_top[k].op[2][1], s_fa_top[k].op[2][2],
+                    s_fa_top[k].mv[0][0], s_fa_top[k].mv[0][1], s_fa_top[k].mv[0][2],
+                    s_fa_top[k].mv[1][0], s_fa_top[k].mv[1][1], s_fa_top[k].mv[1][2],
+                    s_fa_top[k].mv[2][0], s_fa_top[k].mv[2][1], s_fa_top[k].mv[2][2],
+                    s_fa_top[k].w[0], s_fa_top[k].w[1], s_fa_top[k].w[2]);
+            fflush(stderr);
+        }
+    }
+    s_fa_hist[s_fa_hist_n % 32u] = sum;
+    s_fa_hist_n++;
+    s_fa_frame_area = 0;
+    s_fa_frame_tris = 0;
+    memset(s_fa_top, 0, sizeof s_fa_top);
+    return anomalous;
+}
+
 void gx_raster_print_census(void) {
     if (s_tev_census != 1) return;
     u64 total_px = 0, total_fused = 0;
@@ -5063,6 +5193,35 @@ static void efb_clear_rect(void) {
     if (right > (int)EFB_WIDTH - 1) right = (int)EFB_WIDTH - 1;
     if (bottom > (int)EFB_HEIGHT - 1) bottom = (int)EFB_HEIGHT - 1;
     u8 cc[4]; memcpy(cc, &clearColor, 4);
+
+    /* Clear-parameter change census (always on, IPL flood investigation):
+     * the menu's clear color/rect should be constant per screen, so every
+     * CHANGE is logged with its frame. A flood frame whose background is a
+     * uniform wrong color while later draws render normally means THIS
+     * clear ran with garbage parameters — the log then shows the exact
+     * value the guest's BP registers held (garbage color => trace the BP
+     * writer; sane color+wrong placement => sequencing). */
+    {
+        static u32 s_prev_color = 0xDEADBEEFu;
+        static int s_prev_rect[4] = {-1, -1, -1, -1};
+        static u64 s_clear_changes;
+        if (clearColor != s_prev_color || left != s_prev_rect[0] ||
+            top != s_prev_rect[1] || right != s_prev_rect[2] ||
+            bottom != s_prev_rect[3]) {
+            s_clear_changes++;
+            if (s_clear_changes <= 4000u)
+                fprintf(stderr,
+                    "[gx-clear] #%llu frame=%llu color=%08X (was %08X) "
+                    "rect=[%d,%d..%d,%d] cu=%d au=%d zu=%d pf=%d z=%06X\n",
+                    (unsigned long long)s_clear_changes,
+                    (unsigned long long)gcn_gx_frame_count(),
+                    clearColor, s_prev_color, left, top, right, bottom,
+                    s_bm_cu, s_bm_au, s_zt_upd, (int)s_pf, clearZ & 0xFFFFFFu);
+            s_prev_color = clearColor;
+            s_prev_rect[0] = left; s_prev_rect[1] = top;
+            s_prev_rect[2] = right; s_prev_rect[3] = bottom;
+        }
+    }
 
     /* Per-clear-rect pixel-store selection, hoisted OUT of the x/y loop (same
      * pattern as gx_raster_efb_copy's copy_getpx — see its big comment):

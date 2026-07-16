@@ -142,6 +142,62 @@ static u64 s_gx_efbcopies;  /* GX_BP_TRIGGER_EFB_COPY writes */
 static u64 s_gx_frames;     /* accepted GXSetDrawDone writes (one per IPL frame) */
 static u64 s_xfb_generation; /* completed frame publication sequence */
 
+/* Display-list tear detector (always on; see the CALL_DL handler). The G3
+ * pipeline executes CALL_DL on the worker while CP status tells the guest
+ * those bytes were already consumed, so the guest may legally rewrite the
+ * list under us. Hash the DL bytes before and after execution: a mismatch
+ * proves the source was rewritten MID-EXECUTION (a rewrite completing
+ * between push and execution still hashes clean — this detector bounds the
+ * class from below, it does not clear it). In synchronous GX no guest code
+ * runs during the decode, so a mismatch is impossible and the check is
+ * free of false positives. */
+static u64 s_dl_execs;      /* hashed CALL_DL executions */
+static u64 s_dl_tears;      /* pre/post hash mismatches */
+static u32 s_dl_max_bytes;  /* largest DL seen (sizing data for a snapshot fix) */
+
+/* Per-frame draw log (companion to gx_raster's coverage-anomaly detector):
+ * one entry per PRIMITIVE decoded, RLE-dumped when the frame's coverage is
+ * anomalous. Distinguishes "one draw with a runaway vertex count" from
+ * "the same draw command repeated" — the two remaining shapes for the IPL
+ * flood after vertex DATA was proven sane. Decode-thread only. */
+typedef struct { u32 prim, vat, nverts, vsize, dl; } GxDrawLogEntry;
+#define GX_DRAWLOG_CAP 8192u
+static GxDrawLogEntry s_drawlog[GX_DRAWLOG_CAP];
+static u32 s_drawlog_n;
+static int s_drawlog_overflow;
+
+static void gx_drawlog_dump(void) {
+    static u64 s_dumps;
+    if (++s_dumps > 200u) return;
+    u32 lines = 0;
+    fprintf(stderr, "[gx-drawlog] %u draws%s:\n", s_drawlog_n,
+            s_drawlog_overflow ? " (TRUNCATED)" : "");
+    for (u32 i = 0; i < s_drawlog_n && lines < 200u; lines++) {
+        u32 j = i + 1;
+        while (j < s_drawlog_n &&
+               !memcmp(&s_drawlog[j], &s_drawlog[i], sizeof s_drawlog[i]))
+            j++;
+        fprintf(stderr, "  %4ux prim=%u vat=%u nverts=%u vsize=%u dl=%08X\n",
+                j - i, s_drawlog[i].prim, s_drawlog[i].vat,
+                s_drawlog[i].nverts, s_drawlog[i].vsize, s_drawlog[i].dl);
+        i = j;
+    }
+    fflush(stderr);
+}
+
+static u64 dl_hash(const u8* p, u32 n) {
+    u64 h = 1469598103934665603ull;
+    while (n >= 8u) {
+        u64 v;
+        memcpy(&v, p, 8);
+        h = (h ^ v) * 1099511628211ull;
+        p += 8; n -= 8u;
+    }
+    while (n--)
+        h = (h ^ *p++) * 1099511628211ull;
+    return h;
+}
+
 /* Log a first-occurrence once; returns 1 the first time a flag is raised. */
 static int note_once(u8* flag) {
     if (*flag) return 0;
@@ -246,6 +302,12 @@ void gcn_gx_xfb_write_end(void)   { ReleaseSRWLockExclusive(&s_xfb_lock); }
 u64 gcn_gx_xfb_generation(void) {
     return __atomic_load_n(&s_xfb_generation, __ATOMIC_ACQUIRE);
 }
+
+u64 gcn_gx_frame_count(void) { return s_gx_frames; }
+
+/* Guest address of the display list currently executing (0 = top-level
+ * stream). Provenance stamp for gx_raster's coverage-anomaly census. */
+u32 gcn_gx_current_dl(void) { return s_gx.cur_dl_addr; }
 
 static DWORD WINAPI gx_pipe_worker(LPVOID param);
 
@@ -375,8 +437,20 @@ void gcn_gx_pipeline_shutdown(void) {
     }
     fprintf(stderr, "gx: completed %llu IPL frames (GXSetDrawDone)\n",
             (unsigned long long)s_gx_frames);
+    fprintf(stderr, "gx: DL tear census: %llu tears / %llu hashed CALL_DL "
+                    "executions (max DL %u bytes)\n",
+            (unsigned long long)s_dl_tears, (unsigned long long)s_dl_execs,
+            s_dl_max_bytes);
     gx_render_shutdown();
 }
+
+/* GCN_GX_PIPE_LOCKSTEP=1: drain the worker after every pushed chunk. All
+ * pipeline machinery still runs (scanner, fences, sync-mode handoffs,
+ * re-seed) but producer/worker lag is pinned at zero, so every
+ * late-guest-RAM-read tear window is closed while every bookkeeping path
+ * still executes. Bisects "worker reads torn data" from "handoff/offset
+ * bookkeeping bug" for pipeline-only rendering corruption. */
+static int s_pipe_lockstep = -1;
 
 static void gx_pipe_push_chunk(const u8* src) {
     gx_pipe_abort_if_failed();
@@ -390,6 +464,15 @@ static void gx_pipe_push_chunk(const u8* src) {
     __atomic_add_fetch(&s_pipe_epoch, 1, __ATOMIC_RELEASE);
     if (__atomic_load_n(&s_pipe_parked, __ATOMIC_SEQ_CST))
         WakeByAddressAll((PVOID)&s_pipe_epoch);
+    if (s_pipe_lockstep == -1) {
+        const char* e = getenv("GCN_GX_PIPE_LOCKSTEP");
+        s_pipe_lockstep = (e && e[0] == '1') ? 1 : 0;
+        if (s_pipe_lockstep)
+            fprintf(stderr, "gx-pipe: LOCKSTEP probe on — draining worker "
+                            "after every chunk (zero-lag pipeline)\n");
+    }
+    if (s_pipe_lockstep)
+        gx_pipe_drain_worker();
 }
 
 /* Size one top-level command at data[0..len). Returns the command size, 0 if
@@ -820,6 +903,18 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
             __atomic_add_fetch(&s_xfb_generation, 1u, __ATOMIC_RELEASE);
             gcn_pe_set_finish(gx->pe);
             ++s_gx_frames;
+            if (gx_raster_frame_anomaly_mark(s_gx_frames)) {
+                gx_drawlog_dump();
+            } else if ((s_gx_frames & 1023u) == 0u) {
+                /* Periodic clean-frame reference dump: the anomaly dumps are
+                 * only interpretable against a known-good frame's draw
+                 * composition, which no anomaly-gated dump ever captures. */
+                fprintf(stderr, "[gx-drawlog] CLEAN reference frame %llu:\n",
+                        (unsigned long long)s_gx_frames);
+                gx_drawlog_dump();
+            }
+            s_drawlog_n = 0;
+            s_drawlog_overflow = 0;
         } else {
             fprintf(stderr, "gx: GXSetDrawDone ??? (val 0x%04X)\n", value & 0xFFFFu);
         }
@@ -963,7 +1058,20 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
             if (s_gxstats) s_gx_dlcalls++;   /* GCN_GX_STATS: DL calls counter */
             gx->dl_depth++;
             gx->cur_dl_addr = addr;
+            u64 pre = dl_hash(cpu->ram + phys, size);
+            if (size > s_dl_max_bytes) s_dl_max_bytes = size;
             gx_run(gx, cpu->ram + phys, size);
+            s_dl_execs++;
+            if (dl_hash(cpu->ram + phys, size) != pre) {
+                s_dl_tears++;
+                if (s_dl_tears <= 8u || (s_dl_tears & 1023u) == 0u)
+                    fprintf(stderr,
+                            "gx: DL TEAR #%llu — display list 0x%08X (%u bytes) "
+                            "rewritten by the guest during execution "
+                            "(frame %llu)\n",
+                            (unsigned long long)s_dl_tears, addr, size,
+                            (unsigned long long)s_gx_frames);
+            }
             gx->cur_dl_addr = 0;
             gx->dl_depth--;
         } else if (size > 0u) {
@@ -1032,6 +1140,13 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
                         gx->cpu ? gx->cpu->pc : 0u, gx->cur_dl_addr,
                         gx->cpst.vtx_desc_lo, gx->cpst.vtx_desc_hi,
                         gx->cpst.vat_g0[vat], gx->cpst.vat_g1[vat], gx->cpst.vat_g2[vat]);
+            if (s_drawlog_n < GX_DRAWLOG_CAP) {
+                GxDrawLogEntry* e = &s_drawlog[s_drawlog_n++];
+                e->prim = prim; e->vat = vat; e->nverts = nverts;
+                e->vsize = vsize; e->dl = gx->cur_dl_addr;
+            } else {
+                s_drawlog_overflow = 1;
+            }
             /* Rasterize (SWVertexLoader -> TransformUnit -> Clipper ->
              * Rasterizer -> Tev). The payload is contiguous in `data`.
              * GCN_GX_STATS bucket 3 (DRAW): timed only at this call site — the

@@ -102,6 +102,14 @@ void gcn_gx_xfb_read_end(void);
 void gcn_gx_xfb_write_begin(void);
 void gcn_gx_xfb_write_end(void);
 
+/* Completed-frame counter (accepted GXSetDrawDone writes). Provenance stamp
+ * for diagnostics that need to name "which frame" (e.g. gx_raster's
+ * big-triangle census). */
+u64 gcn_gx_frame_count(void);
+
+/* Guest address of the display list currently executing (0 = top-level). */
+u32 gcn_gx_current_dl(void);
+
 /* Monotonic producer publication point. It advances only after
  * GXSetDrawDone has flushed/materialized every preceding EFB->XFB copy, so
  * VI can distinguish a finished guest frame from intermediate copies made

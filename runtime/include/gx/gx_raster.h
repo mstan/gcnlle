@@ -172,6 +172,13 @@ void gx_raster_get_pixel_stats(GxPixelStats* out);
  * once at renderer shutdown so short late-state captures still report. */
 void gx_raster_print_census(void);
 
+/* Always-on per-frame coverage anomaly detector: call at every accepted
+ * GXSetDrawDone (decode thread). Logs "[gx-frameanom]" with the frame's
+ * top-8 draws when total triangle bbox area deviates >33% from the rolling
+ * median — catches the IPL flood (area spike) and drop (area dip) frames
+ * with draw-level provenance. */
+int gx_raster_frame_anomaly_mark(u64 frame);   /* returns 1 if anomalous */
+
 /* GCN_GX_STATS: print the per-triangle post-scissor-bbox-area histogram
  * (triangles / shaded pixels / scan-wall share per log2-area bucket) — the
  * sizing input for the tile-parallel rasterizer's fork threshold. No-op

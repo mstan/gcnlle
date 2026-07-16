@@ -36,11 +36,18 @@ void gcn_pi_set_reset_drive_hook(GcnPi* pi, GcnPiResetDriveFn fn) {
     pi->reset_drive_hook = fn;
 }
 
+/* INTSR is a cross-THREAD word, not just a cross-device one: the G3 GX
+ * pipeline worker raises PE finish/token from its own thread mid-drain,
+ * exactly while the CPU thread's per-chunk CP watermark evaluation
+ * level-pushes the CP cause, and the batched DSP core can drive its line
+ * from the DSP thread. A plain |=/&=~ here loses updates under that
+ * overlap (observed as intermittent guest frame-state corruption on the
+ * IPL menu). Every set/clear/read of intsr must therefore be atomic. */
 void gcn_pi_set_interrupt(GcnPi* pi, u32 cause_mask, int set) {
     if (set)
-        pi->intsr |= cause_mask;
+        __atomic_fetch_or(&pi->intsr, cause_mask, __ATOMIC_ACQ_REL);
     else
-        pi->intsr &= ~cause_mask;
+        __atomic_fetch_and(&pi->intsr, ~cause_mask, __ATOMIC_ACQ_REL);
 }
 
 #define PI_MSR_EE 0x00008000u   /* MSR[EE] (PPC bit 16), mirror of cpu_glue.c */
@@ -66,7 +73,8 @@ void gcn_pi_deliver_external(CPUState* cpu) {
         return;                       /* an exception is already mid-delivery */
     if (!(cpu->msr & PI_MSR_EE))
         return;
-    u32 pending = s_pi->intsr & s_pi->reg[GCN_PI_INTMR >> 2];
+    u32 pending = __atomic_load_n(&s_pi->intsr, __ATOMIC_ACQUIRE) &
+                  s_pi->reg[GCN_PI_INTMR >> 2];
     if (!pending)
         return;
     /* Block boundaries are the runtime's safe points: ctx->pc is the next
@@ -89,7 +97,8 @@ u32 gcn_pi_read(void* user, CPUState* cpu, u32 addr, u8 size) {
          * though gcn_pi_deliver_external never ran to trigger a flush
          * indirectly. */
         gcn_dsp_flush_lazy_pi();
-        return pi->intsr;               /* live interrupt-cause word */
+        /* atomic: see gcn_pi_set_interrupt */
+        return __atomic_load_n(&pi->intsr, __ATOMIC_ACQUIRE);
     }
     if (off == GCN_PI_REVISION)
         return GCN_PI_REVISION_RETAIL;  /* read-only chipset revision */
@@ -101,7 +110,10 @@ void gcn_pi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
     GcnPi* pi = (GcnPi*)user;
     u32 off = addr - GCN_PI_BASE;
     if (off == GCN_PI_INTSR) {
-        pi->intsr &= ~value;            /* write-1-to-clear; level sources re-assert */
+        /* write-1-to-clear; level sources re-assert. Atomic so a concurrent
+         * worker/DSP raise cannot be lost under the ack (see
+         * gcn_pi_set_interrupt). */
+        __atomic_fetch_and(&pi->intsr, ~value, __ATOMIC_ACQ_REL);
         return;
     }
     if (off == GCN_PI_INTMR) {

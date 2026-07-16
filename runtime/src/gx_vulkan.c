@@ -544,6 +544,16 @@ static int create_compute_state(void) {
     return 1;
 }
 
+/* GCN_GX_VK_CORUN: differential co-run instrument. Software rasterizes every
+ * triangle (the resident sink records accepted ones but still returns them to
+ * the software scan), so whenever a fallback downloads the GPU planes they
+ * must byte-match the software planes. A mismatch is a resident-path bug
+ * caught at its earliest existing sync boundary — the GPU submission cadence
+ * (async submits, fence points, arena reuse) is left exactly as shipped, so
+ * timing-dependent corruption stays reproducible under the instrument. */
+static int s_corun = -1;
+static u64 s_corun_checks, s_corun_hits;
+
 void gx_vulkan_shadow_shutdown(void) {
     if (s_vk.resident_mode &&
         (s_vk.resident_recording || s_vk.resident_inflight) &&
@@ -605,6 +615,12 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.resident_triangles,
                 (unsigned long long)s_vk.resident_batches,
                 (unsigned long long)s_vk.resident_fallbacks);
+    if (s_corun == 1)
+        fprintf(stderr,
+                "gx_vulkan: co-run differential: %llu plane checks, "
+                "%llu divergences\n",
+                (unsigned long long)s_corun_checks,
+                (unsigned long long)s_corun_hits);
     if (s_vk.resident_mode && s_vk.resident_copy_total_tsc)
         fprintf(stderr,
                 "gx_vulkan: resident timing submit-cpu=%.1f%% wait=%.1f%% "
@@ -741,7 +757,16 @@ int gx_vulkan_shadow_init(void) {
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &subgroup;
     vkGetPhysicalDeviceProperties2(s_vk.physical, &props2);
+    /* The subgroup XFB-copy variant pulls the previous pixel's filtered value
+     * via subgroupShuffleUp() instead of recomputing it — but main() early-
+     * returns for out-of-bounds invocations, and shuffling from an inactive
+     * lane is UNDEFINED, which splatters garbage chroma across the frame
+     * (intermittent pink/yellow flood).  Faithfulness first: the portable path
+     * is the byte-exact default; the subgroup variant is opt-in until its
+     * lane-activity bug is fixed (ENHANCEMENTS Rule 1: default is byte-exact,
+     * enhancement off). */
     s_vk.subgroup_xfb =
+        getenv("GCN_GX_SUBGROUP_XFB") != NULL &&
         (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0u &&
         (subgroup.supportedOperations &
          VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) != 0u;
@@ -838,6 +863,11 @@ int gx_vulkan_resident_init(void) {
     fprintf(stderr,
             "gx_vulkan: resident exact A--S compute path enabled; unsupported "
             "state synchronizes to software\n");
+    s_corun = getenv("GCN_GX_VK_CORUN") != NULL;
+    if (s_corun)
+        fprintf(stderr,
+                "gx_vulkan: CO-RUN differential active — software rasterizes "
+                "everything; GPU planes byte-checked at every fallback sync\n");
     return 1;
 }
 
@@ -1637,6 +1667,49 @@ int gx_vulkan_shadow_end_draw(void) {
     return 1;
 }
 
+static void corun_compare_planes(const u32* sw_color, const u32* sw_depth) {
+    static const char* plane_name[2] = {"color", "depth"};
+    const u32* sw[2] = {sw_color, sw_depth};
+    const u32* gpu[2] = {
+        (const u32*)(s_vk.readback_map + READBACK_COLOR_OFFSET),
+        (const u32*)(s_vk.readback_map + READBACK_DEPTH_OFFSET)
+    };
+    s_corun_checks++;
+    for (u32 plane = 0; plane < 2u; ++plane) {
+        u32 count = 0, got = 0, want = 0;
+        int fx = -1, fy = -1;
+        int minx = EFB_WIDTH, miny = EFB_HEIGHT, maxx = -1, maxy = -1;
+        for (u32 y = 0; y < EFB_HEIGHT; ++y) {
+            const u32* s = sw[plane] + (size_t)y * EFB_WIDTH;
+            const u32* g = gpu[plane] + (size_t)y * EFB_WIDTH;
+            for (u32 x = 0; x < EFB_WIDTH; ++x) {
+                if (s[x] == g[x])
+                    continue;
+                if (!count) { fx = (int)x; fy = (int)y; got = g[x]; want = s[x]; }
+                count++;
+                if ((int)x < minx) minx = (int)x;
+                if ((int)x > maxx) maxx = (int)x;
+                if ((int)y < miny) miny = (int)y;
+                if ((int)y > maxy) maxy = (int)y;
+            }
+        }
+        if (!count)
+            continue;
+        s_corun_hits++;
+        if (s_corun_hits <= 16u || (s_corun_hits & 255u) == 0u)
+            fprintf(stderr,
+                    "gx_vulkan: CO-RUN DIVERGENCE #%llu %s at sync %llu: %u px, "
+                    "first (%d,%d) tile %u gpu=%08X sw=%08X bbox=[%d,%d..%d,%d] "
+                    "batches=%llu fallbacks=%llu\n",
+                    (unsigned long long)s_corun_hits, plane_name[plane],
+                    (unsigned long long)s_corun_checks, count, fx, fy,
+                    (u32)(fy / 16) * EFB_TILE_WIDTH + (u32)(fx / 16),
+                    got, want, minx, miny, maxx, maxy,
+                    (unsigned long long)s_vk.resident_batches,
+                    (unsigned long long)s_vk.resident_fallbacks);
+    }
+}
+
 static int resident_sync_to_software(void) {
     if (!s_vk.resident_efb_valid)
         return 1;
@@ -1689,6 +1762,12 @@ static int resident_sync_to_software(void) {
     gx_raster_efb_data_mutable(&color, &depth, NULL, NULL);
     if (!color || !depth)
         return 0;
+    /* Co-run: software already holds every triangle, so the downloaded GPU
+     * planes must match it byte-for-byte here. Compare before the overwrite
+     * below (which then makes the two sides identical again, so each logged
+     * divergence is one fresh corruption event, not an echo). */
+    if (s_corun == 1)
+        corun_compare_planes(color, depth);
     memcpy(color, s_vk.readback_map + READBACK_COLOR_OFFSET,
            (size_t)EFB_PLANE_BYTES);
     memcpy(depth, s_vk.readback_map + READBACK_DEPTH_OFFSET,
@@ -1718,7 +1797,10 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
     if (supported)
         supported = resident_record_draw(job);
     if (supported)
-        return 1;
+        /* Co-run: the GPU batch keeps the triangle, but report it unhandled
+         * so the software scan rasterizes it too — that reference is what
+         * corun_compare_planes() diffs against at the next fallback sync. */
+        return s_corun == 1 ? 0 : 1;
 
     if (!resident_sync_to_software())
         return -1;
