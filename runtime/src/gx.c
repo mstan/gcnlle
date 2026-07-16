@@ -1181,9 +1181,16 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
             __atomic_add_fetch(&s_xfb_generation, 1u, __ATOMIC_RELEASE);
             gcn_pe_set_finish(gx->pe);
             ++s_gx_frames;
+            /* Draw-log dumps ride the same opt-in as the frame-anomaly
+             * printer (GCN_GX_FRAMEANOM=1): detection/rings stay always-on,
+             * but menu transitions legitimately trip the extreme band
+             * (their zoom IS a >3x coverage sweep), so default-on dumps
+             * spam ordinary navigation now that the flood bug is fixed. */
+            static int s_fa_dumps = -1;
+            if (s_fa_dumps < 0) s_fa_dumps = getenv("GCN_GX_FRAMEANOM") ? 1 : 0;
             if (gx_raster_frame_anomaly_mark(s_gx_frames)) {
-                gx_drawlog_dump();
-            } else if ((s_gx_frames & 1023u) == 0u) {
+                if (s_fa_dumps) gx_drawlog_dump();
+            } else if (s_fa_dumps && (s_gx_frames & 1023u) == 0u) {
                 /* Periodic clean-frame reference dump: the anomaly dumps are
                  * only interpretable against a known-good frame's draw
                  * composition, which no anomaly-gated dump ever captures. */

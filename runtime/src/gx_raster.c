@@ -3640,10 +3640,16 @@ typedef struct {
  * GCN_GX_XF_AUDIT_DL overrides the watched DL (hex; 0 disables the trigger);
  * the default is the IPL menu's cube DL under investigation. */
 static void gx_xf_audit_check(u8 pos_mtx, const float* m) {
+    /* Default DISARMED now that the flood bug is fixed (7fb3d69): during
+     * menu transitions the cube DL legitimately runs |linear| up to ~2700
+     * (zoom sweep), so the trigger burned its dump budget on real matrices
+     * and then printed suppressed-hit counters forever. Arm explicitly with
+     * GCN_GX_XF_AUDIT_DL=<hex dl> (e.g. AF13C0) for a future hunt; the
+     * write-audit RINGS this dumps stay always-on either way. */
     static u32 s_watch_dl = 0xFFFFFFFFu;   /* lazy env sentinel */
     if (s_watch_dl == 0xFFFFFFFFu) {
         const char* e = getenv("GCN_GX_XF_AUDIT_DL");
-        s_watch_dl = e ? (u32)strtoul(e, NULL, 16) : 0x00AF13C0u;
+        s_watch_dl = e ? (u32)strtoul(e, NULL, 16) : 0u;
     }
     if (s_watch_dl == 0u || gcn_gx_current_dl() != s_watch_dl)
         return;
@@ -5072,7 +5078,14 @@ int gx_raster_frame_anomaly_mark(u64 frame) {
          * anomaly #197). */
         anomalous = (sum > med * 3u || sum * 3u < med) ? 1 : 0;
         s_fa_anomalies++;
-        if (s_fa_anomalies <= 512u) {
+        /* Detection + the top-8 ring stay always-on (always-on-rings rule);
+         * the verbose stderr dump is opt-in (GCN_GX_FRAMEANOM=1) now that
+         * the flood bug it hunted is fixed — legit scene transitions
+         * (menu zooms) trip the mild band every time and were spamming the
+         * console on ordinary navigation. */
+        static int s_fa_print = -1;
+        if (s_fa_print < 0) s_fa_print = getenv("GCN_GX_FRAMEANOM") ? 1 : 0;
+        if (s_fa_print && s_fa_anomalies <= 512u) {
             fprintf(stderr,
                 "[gx-frameanom] #%llu frame=%llu area=%llu median=%llu tris=%u\n",
                 (unsigned long long)s_fa_anomalies, (unsigned long long)frame,
