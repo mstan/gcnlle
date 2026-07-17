@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 
-// Exact compute differential for the nineteen fused IPL pixel programs A--S.
-// currently accept only direct I8 textures; the host rejects every other
-// format before dispatch.  Program F has no texture dependency.
+// Exact compute differential for the twenty-four fused IPL pixel programs
+// A--X.  Textured programs accept only the host-validated resident formats;
+// the host rejects every other format before dispatch.  Programs F/J/M/P/T
+// have no texture dependency; W samples a texture the combiner never
+// references, so it skips the fetch (identical output).
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set = 0, binding = 0, r32ui) uniform uimage2D efb_color;
 layout(set = 0, binding = 1, r32ui) uniform uimage2D efb_depth;
@@ -219,7 +221,7 @@ void shade_pixel(int x, int y) {
         return;
 
     uint program = jw(50u);
-    if (program == 11u || program == 12u) {
+    if (program == 11u || program == 12u || program == 24u) {
         int z = int(slope_value(100u, x, y));
         z = clamp(z, 0, 16777215);
         uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
@@ -234,7 +236,7 @@ void shade_pixel(int x, int y) {
     uint out_r = ras_r, out_g = ras_g, out_b = ras_b, out_a = ras_a;
 
     if (program != 6u && program != 10u && program != 13u &&
-        program != 16u) {
+        program != 16u && program != 20u && program != 23u) {
         int bx = x & ~1;
         int by = y & ~1;
         precise vec2 uv = texture_uv(x, y);
@@ -305,12 +307,37 @@ void shade_pixel(int x, int y) {
             out_b = clamp255_s16(si(93u) * 2 + int(texel.b + (texel.b >> 7)));
             uint p = modulate(ras_a, uint(si(97u)));
             out_a = modulate(uint(si(98u)), p);
+        } else if (program == 21u || program == 22u) {
+            // U/V: program-C color, alpha = Reg1.a modulated by texel.a's cc
+            // (signed Reg1.a -> explicit int math, never modulate()'s uint).
+            out_r = core_c_channel(texel.r, si(91u));
+            out_g = core_c_channel(texel.g, si(92u));
+            out_b = core_c_channel(texel.b, si(93u));
+            int cc = int(texel.a + (texel.a >> 7));
+            out_a = clamp255_s16((si(107u) * cc + 128) >> 8);
+            if (program == 22u) {
+                int p = int(out_a);
+                int cc1 = p + (p >> 7);
+                out_a = clamp255_s16((si(98u) * cc1 + 128) >> 8);
+            }
+        } else if (program == 24u) {
+            // X: program-S stage 0 alone, under the K/L depth block above.
+            out_r = clamp255_s16(si(91u) * 2 + int(texel.r + (texel.r >> 7)));
+            out_g = clamp255_s16(si(92u) * 2 + int(texel.g + (texel.g >> 7)));
+            out_b = clamp255_s16(si(93u) * 2 + int(texel.b + (texel.b >> 7)));
+            out_a = modulate(ras_a, uint(si(97u)));
         }
     }
     if (program == 10u) {
         int p = int(ras_a);
         int cc = p + (p >> 7);
         out_a = clamp255_s16((si(98u) * cc + 128) >> 8);
+    }
+    if (program == 20u || program == 23u) {
+        // T/W: color is the RasColor identity (out_* already ras); alpha =
+        // Konst0.a (signed) modulated by ras_a's cc.
+        int cc = int(ras_a) + int(ras_a >> 7);
+        out_a = clamp255_s16((si(97u) * cc + 128) >> 8);
     }
 
     uvec4 src = uvec4(out_a, out_b, out_g, out_r);

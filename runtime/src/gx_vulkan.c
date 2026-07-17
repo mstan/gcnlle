@@ -30,7 +30,7 @@
 #define READBACK_BYTES (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
 #define DRAW_JOB_OFFSET (XFB_SHADOW_OFFSET + XFB_SHADOW_TOTAL)
 #define DRAW_PACKET_BYTES 512u
-#define GX_VK_DRAW_PROGRAM_COUNT 19u
+#define GX_VK_DRAW_PROGRAM_COUNT 24u
 #define DRAW_JOB_BYTES  (8u * 1024u * 1024u)
 #define DRAW_PACKET_ARENA_BYTES (6u * 1024u * 1024u)
 #define EFB_TILE_WIDTH 40u
@@ -158,7 +158,7 @@ typedef struct {
     u64 triangles;
     u64 fused_triangles[GX_VK_DRAW_PROGRAM_COUNT + 1u];
     u32 draw_validate_remaining[GX_VK_DRAW_PROGRAM_COUNT + 1u];
-    u32 draw_validate_program; /* 0=all A--S, otherwise exact program id */
+    u32 draw_validate_program; /* 0=all A--X, otherwise exact program id */
     u32 draw_validation_program;
     int draw_validation_pending;
     u64 draw_validations[GX_VK_DRAW_PROGRAM_COUNT + 1u];
@@ -189,6 +189,10 @@ typedef struct {
     u64 resident_wait_tsc;
     u64 resident_copy_total_tsc;
     u64 resident_copy_memcpy_tsc;
+    u32 corun_tile_programs[EFB_TILE_COUNT]; /* 1<<program per tile since the
+                                              * last corun compare (bit 0 =
+                                              * general/unsupported) — names
+                                              * the culprit on divergence */
     int gpu_stats;
     u32 gpu_query_count;
     u8 gpu_query_kind[GPU_QUERY_MAX / 2u];
@@ -546,13 +550,41 @@ static int create_compute_state(void) {
 
 /* GCN_GX_VK_CORUN: differential co-run instrument. Software rasterizes every
  * triangle (the resident sink records accepted ones but still returns them to
- * the software scan), so whenever a fallback downloads the GPU planes they
- * must byte-match the software planes. A mismatch is a resident-path bug
- * caught at its earliest existing sync boundary — the GPU submission cadence
- * (async submits, fence points, arena reuse) is left exactly as shipped, so
- * timing-dependent corruption stays reproducible under the instrument. */
+ * the software scan), so whenever the GPU planes are downloaded they must
+ * byte-match the software planes. Downloads happen at every fallback sync
+ * AND — corun only — at every EFB copy, so the compare cadence is at least
+ * once per guest frame even on screens the resident program set fully covers
+ * (a fallback-only cadence compared NOTHING on zero-fallback screens, which
+ * silently voided the instrument exactly where the resident path does all
+ * the work). A mismatch is a resident-path bug caught at the next boundary;
+ * within a frame the GPU submission cadence (async submits, fence points,
+ * arena reuse) is left as shipped, so timing-dependent corruption inside a
+ * frame stays reproducible under the instrument. */
 static int s_corun = -1;
 static u64 s_corun_checks, s_corun_hits;
+/* Census of every divergence by (first-tile progmask, plane) so muted hits
+ * (print gate passes only the first 64 + every 256th) still get ATTRIBUTED —
+ * a class hiding between sampled prints was possible before this table. */
+#define CORUN_CENSUS_MAX 32
+static struct { u32 mask; u8 plane; u64 hits; u64 px; } s_corun_census[CORUN_CENSUS_MAX];
+static u32 s_corun_census_used;
+
+static void corun_census_add(u32 mask, u32 plane, u32 px) {
+    for (u32 i = 0; i < s_corun_census_used; ++i) {
+        if (s_corun_census[i].mask == mask && s_corun_census[i].plane == plane) {
+            s_corun_census[i].hits++;
+            s_corun_census[i].px += px;
+            return;
+        }
+    }
+    if (s_corun_census_used < CORUN_CENSUS_MAX) {
+        s_corun_census[s_corun_census_used].mask = mask;
+        s_corun_census[s_corun_census_used].plane = (u8)plane;
+        s_corun_census[s_corun_census_used].hits = 1;
+        s_corun_census[s_corun_census_used].px = px;
+        s_corun_census_used++;
+    }
+}
 
 void gx_vulkan_shadow_shutdown(void) {
     if (s_vk.resident_mode &&
@@ -569,7 +601,8 @@ void gx_vulkan_shadow_shutdown(void) {
                 "gx_vulkan: captured %llu draws / %llu post-clip triangles "
                 "(A=%llu B=%llu C=%llu D=%llu E=%llu F=%llu G=%llu "
                 "H=%llu I=%llu J=%llu K=%llu L=%llu M=%llu N=%llu "
-                "O=%llu P=%llu Q=%llu R=%llu S=%llu general=%llu)\n",
+                "O=%llu P=%llu Q=%llu R=%llu S=%llu T=%llu U=%llu "
+                "V=%llu W=%llu X=%llu general=%llu)\n",
                 (unsigned long long)s_vk.draws,
                 (unsigned long long)s_vk.triangles,
                 (unsigned long long)s_vk.fused_triangles[1],
@@ -591,6 +624,11 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.fused_triangles[17],
                 (unsigned long long)s_vk.fused_triangles[18],
                 (unsigned long long)s_vk.fused_triangles[19],
+                (unsigned long long)s_vk.fused_triangles[20],
+                (unsigned long long)s_vk.fused_triangles[21],
+                (unsigned long long)s_vk.fused_triangles[22],
+                (unsigned long long)s_vk.fused_triangles[23],
+                (unsigned long long)s_vk.fused_triangles[24],
                 (unsigned long long)s_vk.fused_triangles[0]);
     }
     for (u32 program = 1; program <= GX_VK_DRAW_PROGRAM_COUNT; ++program) {
@@ -615,12 +653,21 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.resident_triangles,
                 (unsigned long long)s_vk.resident_batches,
                 (unsigned long long)s_vk.resident_fallbacks);
-    if (s_corun == 1)
+    if (s_corun == 1) {
         fprintf(stderr,
                 "gx_vulkan: co-run differential: %llu plane checks, "
                 "%llu divergences\n",
                 (unsigned long long)s_corun_checks,
                 (unsigned long long)s_corun_hits);
+        for (u32 i = 0; i < s_corun_census_used; ++i)
+            fprintf(stderr,
+                    "gx_vulkan: co-run census: progmask=%08X %s hits=%llu "
+                    "px=%llu\n",
+                    s_corun_census[i].mask,
+                    s_corun_census[i].plane ? "depth" : "color",
+                    (unsigned long long)s_corun_census[i].hits,
+                    (unsigned long long)s_corun_census[i].px);
+    }
     if (s_vk.resident_mode && s_vk.resident_copy_total_tsc)
         fprintf(stderr,
                 "gx_vulkan: resident timing submit-cpu=%.1f%% wait=%.1f%% "
@@ -832,7 +879,7 @@ int gx_vulkan_shadow_init(void) {
       if (e && *e) draw_validate_count = (u32)strtoul(e, NULL, 0); }
     s_vk.draw_validate_program = 6u;
     { const char* e = getenv("GCN_GX_VK_DRAW_PROGRAM");
-      if (e && e[0] && !e[1] && e[0] >= 'A' && e[0] <= 'S')
+      if (e && e[0] && !e[1] && e[0] >= 'A' && e[0] <= 'X')
           s_vk.draw_validate_program = (u32)(e[0] - 'A') + 1u;
       else if (e && strcmp(e, "ALL") == 0)
           s_vk.draw_validate_program = 0u;
@@ -861,7 +908,7 @@ int gx_vulkan_resident_init(void) {
     memset(s_vk.draw_validate_remaining, 0,
            sizeof s_vk.draw_validate_remaining);
     fprintf(stderr,
-            "gx_vulkan: resident exact A--S compute path enabled; unsupported "
+            "gx_vulkan: resident exact A--X compute path enabled; unsupported "
             "state synchronizes to software\n");
     s_corun = getenv("GCN_GX_VK_CORUN") != NULL;
     if (s_corun)
@@ -919,7 +966,8 @@ static int resolve_fused_texture(const GxRasterTriangleJob* job,
                                  GxVkTextureEntry** texture_out) {
     *texture_out = NULL;
     if (job->fused_program != 6u && job->fused_program != 10u &&
-        job->fused_program != 13u && job->fused_program != 16u) {
+        job->fused_program != 13u && job->fused_program != 16u &&
+        job->fused_program != 20u && job->fused_program != 23u) {
         u32 order = s_vk.draw_bp[0x28];
         u32 unit = order & 7u;
         u32 mode0 = s_vk.draw_bp[0x80 + unit];
@@ -1621,7 +1669,7 @@ int gx_vulkan_shadow_triangle(const GxRasterTriangleJob* job,
         label[5] = (char)('A' + program - 1u);
         if (!compare_plane(label, color, gpu))
             return 0;
-        if (program == 11u || program == 12u) {
+        if (program == 11u || program == 12u || program == 24u) {
             const u32* gpu_depth = (const u32*)(s_vk.readback_map +
                                                 READBACK_DEPTH_OFFSET);
             char depth_label[] = "draw-K depth";
@@ -1696,18 +1744,32 @@ static void corun_compare_planes(const u32* sw_color, const u32* sw_depth) {
         if (!count)
             continue;
         s_corun_hits++;
-        if (s_corun_hits <= 16u || (s_corun_hits & 255u) == 0u)
+        corun_census_add(
+            s_vk.corun_tile_programs[(u32)(fy / 16) * EFB_TILE_WIDTH +
+                                     (u32)(fx / 16)], plane, count);
+        if (s_corun_hits <= 64u || (s_corun_hits & 255u) == 0u) {
+            u32 first_tile = (u32)(fy / 16) * EFB_TILE_WIDTH + (u32)(fx / 16);
+            u32 bbox_mask = 0;
+            for (int ty = miny / 16; ty <= maxy / 16; ++ty)
+                for (int tx = minx / 16; tx <= maxx / 16; ++tx)
+                    bbox_mask |=
+                        s_vk.corun_tile_programs[ty * (int)EFB_TILE_WIDTH + tx];
             fprintf(stderr,
-                    "gx_vulkan: CO-RUN DIVERGENCE #%llu %s at sync %llu: %u px, "
-                    "first (%d,%d) tile %u gpu=%08X sw=%08X bbox=[%d,%d..%d,%d] "
+                    "gx_vulkan: CO-RUN DIVERGENCE #%llu %s at sync %llu "
+                    "frame %llu: %u px, first (%d,%d) tile %u progmask=%08X "
+                    "bboxmask=%08X gpu=%08X sw=%08X bbox=[%d,%d..%d,%d] "
                     "batches=%llu fallbacks=%llu\n",
                     (unsigned long long)s_corun_hits, plane_name[plane],
-                    (unsigned long long)s_corun_checks, count, fx, fy,
-                    (u32)(fy / 16) * EFB_TILE_WIDTH + (u32)(fx / 16),
-                    got, want, minx, miny, maxx, maxy,
+                    (unsigned long long)s_corun_checks,
+                    (unsigned long long)gcn_gx_frame_count(), count, fx, fy,
+                    first_tile, s_vk.corun_tile_programs[first_tile],
+                    bbox_mask, got, want, minx, miny, maxx, maxy,
                     (unsigned long long)s_vk.resident_batches,
                     (unsigned long long)s_vk.resident_fallbacks);
+        }
     }
+    /* The mask window is "programs drawn since the last compare". */
+    memset(s_vk.corun_tile_programs, 0, sizeof s_vk.corun_tile_programs);
 }
 
 static int resident_sync_to_software(void) {
@@ -1786,6 +1848,21 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
     s_vk.triangles++;
     if (job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT)
         s_vk.fused_triangles[job->fused_program]++;
+    if (s_corun == 1 && job->scan.maxx > job->scan.minx &&
+        job->scan.maxy > job->scan.miny &&
+        job->scan.minx >= 0 && job->scan.miny >= 0) {
+        u32 bit = 1u << (job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT ?
+                         job->fused_program : 0u);
+        u32 tx0 = (u32)job->scan.minx / 16u;
+        u32 ty0 = (u32)job->scan.miny / 16u;
+        u32 tx1 = (u32)(job->scan.maxx - 1) / 16u;
+        u32 ty1 = (u32)(job->scan.maxy - 1) / 16u;
+        if (tx1 >= EFB_TILE_WIDTH) tx1 = EFB_TILE_WIDTH - 1u;
+        if (ty1 >= EFB_TILE_HEIGHT) ty1 = EFB_TILE_HEIGHT - 1u;
+        for (u32 ty = ty0; ty <= ty1; ++ty)
+            for (u32 tx = tx0; tx <= tx1; ++tx)
+                s_vk.corun_tile_programs[ty * EFB_TILE_WIDTH + tx] |= bit;
+    }
 
     int supported = job->fused_program >= 1u &&
                     job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT;
@@ -1882,6 +1959,24 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     u64 copy_t0 = __rdtsc();
     if (!s_vk.resident_mode || !bp || !ram)
         return -1;
+    /* Co-run: byte-compare the GPU planes against the software reference at
+     * every EFB copy, then hand the copy itself to the software path (return
+     * 0 WITHOUT counting a fallback).  Software performs the authoritative
+     * XFB encode and the copy-time clear on its own planes, keeping the two
+     * sides aligned across copies — the GPU-side copy+clear would clear only
+     * the GPU planes, and since the software reference never sees BP-copy
+     * clears in resident mode, the first validated corun run flagged exactly
+     * that phantom divergence at every sync.  The GPU XFB encode/materialize
+     * machinery is deliberately not exercised under corun; the bounded
+     * golden sw-vs-vk runs cover it. */
+    if (s_corun == 1) {
+        if (s_vk.resident_efb_valid) {
+            if (!resident_sync_to_software())
+                return -1;
+            s_vk.resident_efb_valid = 0;
+        }
+        return 0;
+    }
     GxVkCopyPush copy_push;
     u32 copy_word = bp[0x52];
     if (((copy_word >> 7) & 3u) != 0u ||

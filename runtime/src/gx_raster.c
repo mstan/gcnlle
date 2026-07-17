@@ -1914,6 +1914,65 @@ static int gpu_program_S_match(void) {
            fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0);
 }
 
+/* GPU-only programs T--X: the card-manager screen's five states (2026-07-16
+ * GCN_GX_TEV_CENSUS on that screen, configs a621c9bf / 83c9025f / 5095bc53 /
+ * 62b7a1ff / 34b4545f).  Every one previously classified program 0 and forced
+ * a synchronized resident fallback (413K/30s measured, 42.5 -> 6.6 fps).
+ * Same convention as K--S: software stays on the general tev_draw() path as
+ * the differential authority.  Each fold was brute-force verified bit-exact
+ * against a verbatim draw_color_regular/draw_alpha_regular transcription over
+ * the FULL operand domains (Reg/Konst swept -1024..1023, ras/tex 0..255;
+ * 3,145,984 cases, 0 mismatches — scratchpad verify_txw.c, 2026-07-16). */
+
+/* T: untextured flat color (the dominant card-grid fill state).  Color is
+ * the A=0,B=ONE,C=RasColor identity; alpha = Konst0.a modulated by
+ * RasColor.a's cc.  Stage never samples (enable=0, texgens=0). */
+static int gpu_program_T_match(void) {
+    return fused_common_match_notex() && s_cfg.numtevstages == 0 &&
+           fused_stage_match(0, 0x08FCAFu, 0x08FAF0u, 0, 0);
+}
+
+/* U: program C's color (Reg1.rgb * texel, x2, clamp) but alpha from
+ * Reg1.a * texel.a's cc instead of RasColor.a — the card screen's draw-count
+ * driver (~194K draws per census window). */
+static int gpu_program_U_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 0 &&
+           fused_stage_match(0, 0x18F28Fu, 0x08E670u, 1, 0);
+}
+
+/* V: U plus the standard konst-alpha second stage (same stage-1 words every
+ * two-stage program in this family uses). */
+static int gpu_program_V_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 1 &&
+           fused_stage_match(0, 0x18F28Fu, 0x08E670u, 1, 0) &&
+           fused_stage_match(1, 0x08FC0Fu, 0x08F870u, 0, 0);
+}
+
+/* W: T's exact combiner but with a texture stage enabled (texgens=1) whose
+ * texel no selector references — sampled-and-ignored, so the GPU program
+ * skips the fetch and the output is identical. */
+static int gpu_program_W_match(void) {
+    return fused_common_match() && s_cfg.numtevstages == 0 &&
+           fused_stage_match(0, 0x08FCAFu, 0x08FAF0u, 1, 0);
+}
+
+/* X: S's stage 0 alone (no second stage) under the K/L depth state
+ * (early LEQUAL test + update) — the card-entry transition geometry. */
+static int gpu_program_X_match(void) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == 1 &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 1 && s_cfg.zt_early == 1 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 1 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 1 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x18FD82u, 0x08F770u, 1, 0);
+}
+
 /* ---- config A: stages=1, texgens=1, st0 cc=0x00F8CF ac=0x00F670 ----------
  *
  * cc=0x00F8CF bit-field decode (bits() same as build_draw_cfg):
@@ -3021,6 +3080,11 @@ static u32 compute_program_id(void) {
     if (!s_cfg.fused && gpu_program_Q_match()) return 17;
     if (!s_cfg.fused && gpu_program_R_match()) return 18;
     if (!s_cfg.fused && gpu_program_S_match()) return 19;
+    if (!s_cfg.fused && gpu_program_T_match()) return 20;
+    if (!s_cfg.fused && gpu_program_U_match()) return 21;
+    if (!s_cfg.fused && gpu_program_V_match()) return 22;
+    if (!s_cfg.fused && gpu_program_W_match()) return 23;
+    if (!s_cfg.fused && gpu_program_X_match()) return 24;
     return 0;
 }
 
@@ -3035,7 +3099,14 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
 
     s32 x_off = s_scissor_xoff, y_off = s_scissor_yoff;
     u32 triangle_program = fused_program_id();
-    int rs_gpu_program = triangle_program == 18u || triangle_program == 19u;
+    /* Programs whose z slope is provably dead: R/S plus the zt_enable==0
+     * card-screen programs T/U/V/W (their matchers pin zt_enable==0 and
+     * zupd==0, so both of Position[2]'s gated readers are dead on any path —
+     * same argument as the fused skip below).  X (24) is excluded: its
+     * matcher pins zt_enable==1, and both the GPU depth block and a software
+     * scan of its draws read the z slope. */
+    int rs_gpu_program = triangle_program == 18u || triangle_program == 19u ||
+                         (triangle_program >= 20u && triangle_program <= 23u);
     /* Dead-slope-setup skip (perf task, follow-up to ff6b617): update_zslope
      * populates s_ZSlope, whose one and only reader is raster_pixel_prep's
      * `s32 z = (s32)slope_value(&s_ZSlope, ...)` — reached exclusively via
@@ -3139,9 +3210,14 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
      * comp 3 (alpha) is unaffected and still evaluated either way. General
      * path: s_cfg.fused is NULL, so comp starts at 0 exactly as before —
      * byte-identical. */
+    /* Programs U/V/X (21/22/24) never reference RasColor.rgb in any selector
+     * (their pinned cc words name only Reg1/Tex/ONE/HALF inputs), so their
+     * RGB color slopes are dead exactly like S's.  T/W (20/23) are the
+     * opposite: their color IS the RasColor.rgb identity — comp 0 stays. */
     int first_color_comp =
         ((s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ||
-         triangle_program == 19u) ? 3 : 0;
+         triangle_program == 19u || triangle_program == 21u ||
+         triangle_program == 22u || triangle_program == 24u) ? 3 : 0;
     for (u32 i = 0; i < s_cfg.numcolchans; i++)
         for (int comp = first_color_comp; comp < 4; comp++)
             s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
