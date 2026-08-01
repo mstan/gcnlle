@@ -12,21 +12,26 @@
 #define REL_AUTO_ALIGN 0x10000u
 
 int emit_dol_split(const DOLFile* dol, const char* output_path,
-                   DolRecompCPU cpu, u32 jobs, int local_chunks_dir);
+                   DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                   int local_chunks_dir);
 int emit_ipl_split(const IPLFile* ipl, const char* output_path,
-                   DolRecompCPU cpu, u32 jobs, int local_chunks_dir);
+                   DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                   int local_chunks_dir);
 /* Recompile several flat images (each an IPLFile with its own base) into ONE
  * dispatch table. images[0] supplies the entry point; the rest are extra
  * segments (e.g. low-memory BS2 exception handlers). */
 int emit_ipl_multi_split(const IPLFile* images, u32 image_count,
                          const char* output_path, DolRecompCPU cpu, u32 jobs,
-                         int local_chunks_dir);
+                         u32 chunk_instructions, int local_chunks_dir);
 int emit_rpx_split(const RPXFile* rpx, const char* output_path,
-                   DolRecompCPU cpu, u32 jobs, int local_chunks_dir);
+                   DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                   int local_chunks_dir);
 int emit_rel_split(const RELFile* rel, const char* output_path,
-                   DolRecompCPU cpu, u32 jobs, int local_chunks_dir);
+                   DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                   int local_chunks_dir);
 int emit_rel_directory(const char* input_dir, const char* output_root,
                        const char* title_id, int titleless_mode,
-                       DolRecompCPU cpu, u32 jobs, u32 start_base);
+                       DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                       u32 start_base);
 
 #endif

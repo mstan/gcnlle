@@ -176,6 +176,28 @@ static int test_unaligned_text_rejected(void) {
     return 1;
 }
 
+static int test_module_alignment_rejected(void) {
+    const char* path = "test_module_alignment.rel";
+    CHECK(write_sample_rel(path, 1, R_PPC_ADDR32, 2, 0, 8),
+          "failed to write sample REL");
+    FILE* file = fopen(path, "r+b");
+    CHECK(file != NULL, "failed to reopen sample REL");
+    CHECK(fseek(file, 0x40, SEEK_SET) == 0, "failed to seek alignment");
+    u8 alignment[4];
+    write_be32(alignment, 8);
+    CHECK(fwrite(alignment, 1, sizeof(alignment), file) == sizeof(alignment),
+          "failed to patch alignment");
+    CHECK(fclose(file) == 0, "failed to close sample REL");
+
+    RELFile rel;
+    int loaded = rel_load(&rel, path, 0x80500004u);
+    if (loaded)
+        rel_free(&rel);
+    remove(path);
+    CHECK(!loaded, "misaligned REL module base should be rejected");
+    return 1;
+}
+
 int main(void) {
     int ok = 1;
     ok &= test_self_relocation();
@@ -183,6 +205,7 @@ int main(void) {
     ok &= test_external_import_rejected();
     ok &= test_external_import_with_map();
     ok &= test_unaligned_text_rejected();
+    ok &= test_module_alignment_rejected();
 
     if (!ok)
         return 1;

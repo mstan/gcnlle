@@ -1,4 +1,5 @@
 #include "app/cli.h"
+#include "backend/codegen.h"
 #include "frontend/container/ipl.h"
 #include "platform/strutil.h"
 #include <stdio.h>
@@ -15,6 +16,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -jN                            Use N worker jobs for split C output (e.g. -j14)\n");
+    fprintf(stderr, "  --chunk-instructions <N>       Instructions per C shard (power of two, default: 1024)\n");
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --gamecube-ipl                 Recompile a flat descrambled BS2/IPL blob\n");
@@ -116,6 +118,23 @@ int parse_job_count(const char* text, u32* jobs) {
     return 1;
 }
 
+int parse_chunk_instruction_count(const char* text, u32* count) {
+    char* end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 0);
+    if (errno != 0 || !end || *end != '\0' ||
+        value < EMIT_CHUNK_INSTRUCTIONS_MIN ||
+        value > EMIT_CHUNK_INSTRUCTIONS_MAX ||
+        (value & (value - 1u)) != 0) {
+        fprintf(stderr,
+                "error: chunk instruction count must be a power of two in %u..%u\n",
+                EMIT_CHUNK_INSTRUCTIONS_MIN, EMIT_CHUNK_INSTRUCTIONS_MAX);
+        return 0;
+    }
+    *count = (u32)value;
+    return 1;
+}
+
 int parse_u32_arg(const char* text, const char* name, u32* value_out) {
     char* end = NULL;
     errno = 0;
@@ -136,6 +155,7 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
     memset(opts, 0, sizeof(*opts));
     opts->cpu = DOLRECOMP_CPU_GEKKO;
     opts->jobs = 1;
+    opts->chunk_instructions = EMIT_CHUNK_INSTRUCTIONS_DEFAULT;
 
     for (int i = 1; i < argc; i++) {
         const char* arg = argv[i];
@@ -153,6 +173,24 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
 
         if (strcmp(arg, "--gamecube") == 0 || strcmp(arg, "-gc") == 0) {
             opts->gamecube_mode = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--chunk-instructions") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --chunk-instructions needs a count\n");
+                return 0;
+            }
+            if (!parse_chunk_instruction_count(argv[++i],
+                                               &opts->chunk_instructions))
+                return 0;
+            continue;
+        }
+
+        if (strncmp(arg, "--chunk-instructions=", 21) == 0) {
+            if (!parse_chunk_instruction_count(arg + 21,
+                                               &opts->chunk_instructions))
+                return 0;
             continue;
         }
 

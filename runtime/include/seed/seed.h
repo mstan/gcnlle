@@ -60,6 +60,8 @@ extern "C" {
 /* SRAM flags byte (offset 0x13) bit meanings, from OSRtc.c getters/setters. */
 #define GCN_SRAM_FLAG_VIDEO_MASK   0x03u  /* 0=NTSC 1=PAL 2=MPAL (OSGetVideoMode, clamped <3) */
 #define GCN_SRAM_FLAG_SOUND_STEREO 0x04u  /* OSGetSoundMode: (flags&4)?stereo:mono */
+#define GCN_SRAM_FLAG_OOBE_DONE    0x08u  /* IPL calendar/options initialized */
+#define GCN_SRAM_FLAG_BOOT_TO_MENU 0x40u  /* force IPL menu with a disc present */
 #define GCN_SRAM_FLAG_PROGRESSIVE  0x80u  /* OSGetProgressiveMode: (flags&0x80)>>7 */
 
 /* Language byte values (offset 0x12), from OSRtc.h OS_LANGUAGE_*. */
@@ -95,6 +97,8 @@ typedef struct {
     /* SRAM settings (baked into the fixture with a recomputed checksum). */
     u8  language;           /* [FIXTURE] default English */
     u8  sound_stereo;       /* [FIXTURE] 1=stereo (default), 0=mono */
+    u8  oobe_done;          /* [FIXTURE] 1=calendar/options already initialized */
+    u8  boot_to_menu;       /* [FIXTURE] 1=force IPL menu before mounted disc */
     u8  progressive;        /* [FIXTURE] 0=off (default) */
     u8  video_mode;         /* [FIXTURE] 0=NTSC (default) */
     s8  display_offset_h;   /* [FIXTURE] default 0 */

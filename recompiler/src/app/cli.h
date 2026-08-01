@@ -16,6 +16,7 @@ typedef struct {
     const char* output_arg;
     DolRecompCPU cpu;
     u32 jobs;
+    u32 chunk_instructions;
     u32 rel_base;
     u32 ipl_base;
     u32 ipl_entry;
@@ -39,6 +40,7 @@ int parse_cpu_name(const char* text, DolRecompCPU* cpu);
 const char* cpu_display_name(DolRecompCPU cpu);
 void copy_title_id(char* out, size_t out_size, const char* title_id);
 int parse_job_count(const char* text, u32* jobs);
+int parse_chunk_instruction_count(const char* text, u32* count);
 int parse_u32_arg(const char* text, const char* name, u32* value_out);
 int parse_cli(int argc, char** argv, CliOptions* opts);
 

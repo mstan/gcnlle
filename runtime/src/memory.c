@@ -16,6 +16,7 @@
  * 0 — the warning is the signal, we never silently synthesize a value.
  */
 #include "cpu/cpu.h"
+#include "cpu/native_code.h"
 #include "debug/rings.h"   /* [gcn-watch] gcn_ring_watch_check */
 #include "memory/memory.h"
 #include "trace/trace.h"
@@ -30,6 +31,7 @@
 
 bool cpu_init(CPUState* cpu) {
     memset(cpu, 0, sizeof(*cpu));
+    gcn_native_code_reset();
 
     cpu->ram_size = GC_MAIN_RAM_SIZE;
     cpu->ram = (u8*)calloc(1, cpu->ram_size);
@@ -91,6 +93,7 @@ void cpu_reset(CPUState* cpu) {
     void* external_user_data = cpu->external_user_data;
 
     memset(cpu, 0, sizeof(*cpu));
+    gcn_native_code_reset();
     cpu->ram = ram;
     cpu->ram_size = ram_size;
     cpu->mem2 = mem2;
@@ -289,6 +292,7 @@ void mem_write64_cia(CPUState* cpu, u32 addr, u64 value, u32 cia) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    gcn_native_code_invalidate(addr, 8);
     write_be64(host, value);
 }
 void mem_write64_legacy(CPUState* cpu, u32 addr, u64 value) { mem_write64_cia(cpu, addr, value, cpu->pc); }
@@ -320,6 +324,7 @@ void mem_write32_cia(CPUState* cpu, u32 addr, u32 value, u32 cia) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    gcn_native_code_invalidate(addr, 4);
     write_be32(host, value);
 }
 void mem_write32_legacy(CPUState* cpu, u32 addr, u32 value) { mem_write32_cia(cpu, addr, value, cpu->pc); }
@@ -351,6 +356,7 @@ void mem_write16_cia(CPUState* cpu, u32 addr, u16 value, u32 cia) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    gcn_native_code_invalidate(addr, 2);
     write_be16(host, value);
 }
 void mem_write16_legacy(CPUState* cpu, u32 addr, u16 value) { mem_write16_cia(cpu, addr, value, cpu->pc); }
@@ -382,6 +388,7 @@ void mem_write8_cia(CPUState* cpu, u32 addr, u8 value, u32 cia) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    gcn_native_code_invalidate(addr, 1);
     *host = value;
 }
 void mem_write8_legacy(CPUState* cpu, u32 addr, u8 value) { mem_write8_cia(cpu, addr, value, cpu->pc); }

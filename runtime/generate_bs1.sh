@@ -41,11 +41,15 @@ set -euo pipefail
 export PATH="/c/msys64/mingw64/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIOS_DIR="${GCN_BIOS_DIR:-$ROOT/bios}"
 DESC="$ROOT/tools/ipl_descramble/build/ipl_descramble.exe"
 DOL="$ROOT/recompiler/build/dolrecomp.exe"
-BOOT="$ROOT/runtime/build-boot/gcn_boot.exe"
-IPL="$ROOT/bios/ipl.bin"
-for f in "$DESC" "$DOL" "$BOOT" "$IPL"; do
+BOOT="${GCN_BOOTSTRAP_BOOT:-$ROOT/runtime/build-boot/gcn_boot.exe}"
+IPL="$BIOS_DIR/ipl.bin"
+DSP_ROM="$BIOS_DIR/dsp_rom.bin"
+DSP_COEF="$BIOS_DIR/dsp_coef.bin"
+BUILD_JOBS="${GCN_BUILD_JOBS:-2}"
+for f in "$DESC" "$DOL" "$BOOT" "$IPL" "$DSP_ROM" "$DSP_COEF"; do
   [ -f "$f" ] || { echo "error: missing $f (build phase-1 first)"; exit 1; }
 done
 [ -f "$ROOT/runtime/generated/generated.h" ] || {
@@ -73,6 +77,8 @@ echo "      own inputs fresh, from the CURRENT/unchanged M0 gcn_boot)"
 echo "=================================================================="
 GCN_IPL_ROM="$TMP/descr.bin" \
 GCN_MEM_DUMP="0x81200000:0x270000:$TMP/postdma.bin;0x80000000:0x3000:$TMP/lowmem.bin" \
+GCN_DSP_ROM="$DSP_ROM" \
+GCN_DSP_COEF="$DSP_COEF" \
   "$BOOT" "$TMP/bs2.bin" 5000000 > "$TMP/phase1.log" 2>&1 || true
 [ -f "$TMP/postdma.bin" ] || { echo "error: no postdma.bin (see $TMP/phase1.log)"; cat "$TMP/phase1.log"; exit 1; }
 [ -f "$TMP/lowmem.bin" ]  || { echo "error: no lowmem.bin (see $TMP/phase1.log)";  cat "$TMP/phase1.log"; exit 1; }
@@ -92,7 +98,8 @@ tail -5 "$TMP/phase1.log"
 echo "=================================================================="
 echo "[4/8] recompile BS1-at-ROM STANDALONE (scratch, base/entry 0xFFF00100)"
 echo "=================================================================="
-"$DOL" --gamecube-ipl "$TMP/bs1_rom.bin" "$TMP/stage_a" --base 0xFFF00100 --entry 0xFFF00100 -j8
+"$DOL" --gamecube-ipl "$TMP/bs1_rom.bin" "$TMP/stage_a" --base 0xFFF00100 --entry 0xFFF00100 \
+  --chunk-instructions 1024 -j "$BUILD_JOBS"
 GEN_A="$(dirname "$(find "$TMP/stage_a" -name generated.h | head -1)")"
 [ -n "$GEN_A" ] || { echo "error: stage-A recompile produced no generated.h"; exit 1; }
 
@@ -103,7 +110,7 @@ rm -rf "$ROOT/runtime/generated"
 cp -r "$GEN_A" "$ROOT/runtime/generated"
 cmake -S "$ROOT/runtime" -B "$ROOT/runtime/build-bs1-stageA" -G Ninja \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGCN_WITH_GENERATED=ON
-cmake --build "$ROOT/runtime/build-bs1-stageA" --target gcn_boot -j4
+cmake --build "$ROOT/runtime/build-bs1-stageA" --target gcn_boot --parallel "$BUILD_JOBS"
 
 echo "=================================================================="
 echo "[6/8] RUN BS1-at-ROM from the TRUE hardware reset vector"
@@ -111,7 +118,10 @@ echo "      (real EXI DMA of BS2 through the transparent descrambler)"
 echo "=================================================================="
 GCN_BOOT_BS1=1 \
 GCN_BS1_REFERENCE="$TMP/descr.bin" \
+GCN_STOP_AT_BS1_HANDOFF=1 \
 GCN_MEM_DUMP="0x81300000:0x1B0000:$TMP/postdma_bs1.bin" \
+GCN_DSP_ROM="$DSP_ROM" \
+GCN_DSP_COEF="$DSP_COEF" \
   "$ROOT/runtime/build-bs1-stageA/gcn_boot.exe" "$IPL" 5000000 2>&1 | tee "$TMP/stageA.log"
 [ -f "$TMP/postdma_bs1.bin" ] || { echo "error: no post-DMA dump produced (see above)"; exit 1; }
 
@@ -145,7 +155,8 @@ echo "      0xFFF00100 BS1-ROM segment) and install into runtime/generated/"
 echo "=================================================================="
 "$DOL" --gamecube-ipl "$TMP/postdma.bin" "$TMP/out" --base 0x81200000 --entry 0x81200150 \
   --segment "0x80000000:$TMP/lowmem.bin" \
-  --segment "0xFFF00100:$TMP/bs1_rom.bin" -j8
+  --segment "0xFFF00100:$TMP/bs1_rom.bin" \
+  --chunk-instructions 1024 -j "$BUILD_JOBS"
 GEN_FINAL="$(dirname "$(find "$TMP/out" -name generated.h | head -1)")"
 [ -n "$GEN_FINAL" ] || { echo "error: final recompile produced no generated.h"; exit 1; }
 grep -Rqs '80000C00: mfhid0' "$GEN_FINAL/chunks" || {

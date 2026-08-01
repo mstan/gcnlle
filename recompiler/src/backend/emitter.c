@@ -324,8 +324,7 @@ static void emit_dcbz(FILE* out, const PPCInst* inst) {
     fprintf(out, "        u32 ea = ");
     emit_xform_ea(out, inst->rA, inst->rB, false);
     fprintf(out, ";\n");
-    fprintf(out, "        ea &= ~31u;\n");
-    fprintf(out, "        for (u32 i = 0; i < 32; i += 4) mem_write32(ctx, ea + i, 0, 0x%08Xu);\n",
+    fprintf(out, "        ppc_dcbz(ctx, ea, 0x%08Xu);\n",
             inst->address);
     fprintf(out, "    }\n");
 }
@@ -2032,8 +2031,13 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_DCBTST:
     case PPC_OP_DCBT:
     case PPC_OP_DCBI:
-    case PPC_OP_ICBI:
         fprintf(out, "    (void)ctx;\n");
+        break;
+
+    case PPC_OP_ICBI:
+        fprintf(out, "    {\n        u32 ea = ");
+        emit_xform_ea(out, inst->rA, inst->rB, false);
+        fprintf(out, ";\n        ppc_icbi(ctx, ea);\n    }\n");
         break;
 
     case PPC_OP_LMW:

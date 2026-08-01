@@ -10,12 +10,61 @@
 #include "di/di.h"
 #include "debug/rings.h"
 #include "memory/memory.h"   /* gcn_mem_resolve — direct-into-guest-RAM disc reads */
+#include "cpu/native_code.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* The dispatch loop ticks one DI (like the one VI); registered at init. */
 static GcnDi* s_di = NULL;
+static FILE* s_di_journal = NULL;
+static u64 s_di_command_seq = 0;
+
+/* Optional, append-only command ledger for title bring-up. This is intentionally
+ * below the DI register interface: it records what the real IPL/apploader
+ * programmed, but never changes command execution or timing. GCN_DI_LOG=1 also
+ * mirrors each compact record to stderr for an interactive run. */
+static void di_log_command(const GcnDi* di, const CPUState* cpu, u8 opcode,
+                           u8 subcmd, u8 intr) {
+    const char* journal = getenv("GCN_DI_JOURNAL");
+    const char* loud = getenv("GCN_DI_LOG");
+    u64 seq = ++s_di_command_seq;
+    u64 dvd_offset = 0;
+    u32 dvd_length = 0;
+    if (opcode == GCN_DI_CMD_READ) {
+        if (subcmd == 0x40u) {
+            dvd_length = 0x20u;
+        } else if (subcmd == 0x00u) {
+            dvd_offset = (u64)di->cmdbuf[1] << 2;
+            dvd_length = di->cmdbuf[2];
+        }
+    }
+
+    if (journal && *journal && !s_di_journal)
+        s_di_journal = fopen(journal, "ab");
+    if (s_di_journal) {
+        fprintf(s_di_journal,
+                "{\"seq\":%llu,\"pc\":%u,\"opcode\":%u,\"subcmd\":%u,"
+                "\"cmdbuf1\":%u,\"cmdbuf2\":%u,\"dvd_offset\":%llu,"
+                "\"dvd_length\":%u,\"dma_addr\":%u,\"dma_length\":%u,"
+                "\"interrupt\":%u}\n",
+                (unsigned long long)seq, cpu ? cpu->pc : 0u,
+                (u32)opcode, (u32)subcmd, di->cmdbuf[1], di->cmdbuf[2],
+                (unsigned long long)dvd_offset, dvd_length, di->dimar,
+                di->dilength, (u32)intr);
+        fflush(s_di_journal);
+    }
+    if (loud && *loud && *loud != '0') {
+        fprintf(stderr,
+                "[di-command] #%llu pc=%08X op=%02X/%02X disc=%08llX+%X "
+                "dma=%08X+%X intr=%u\n",
+                (unsigned long long)seq, cpu ? cpu->pc : 0u,
+                (u32)opcode, (u32)subcmd, (unsigned long long)dvd_offset,
+                dvd_length, di->dimar, di->dilength, (u32)intr);
+        fflush(stderr);
+    }
+}
 
 void gcn_di_set_irq(GcnDi* di, GcnDiIrqFn fn, void* user) {
     di->irq = fn;
@@ -151,6 +200,7 @@ static u8 di_do_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
          * (shouldn't happen — disc_size IS the file's own on-open size) or a
          * host I/O error. Zero-fill rather than leave stale RAM, and say so. */
         memset(dst + got, 0, dvd_length - got);
+    gcn_native_code_invalidate(di->dimar, dvd_length);
 
     /* M5 SCOPE BOUNDARY (di.h GCN_DI_APPLOADER_OFFSET): a real disc read just
      * landed the apploader in RAM. Loud, ONE-TIME, general — fires for any
@@ -165,12 +215,10 @@ static u8 di_do_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
             noted = 1;
             fprintf(stdout,
                 "gcn di: NOTE — apploader read (fixed GC disc offset 0x2440) "
-                "landed in guest RAM at 0x%08X (%u bytes). M5's scope ends "
-                "at the disc-load SCREEN: no apploader/game loading is "
-                "modeled beyond this point (docs/ROADMAP.md M5, di.h). If "
+                "landed in guest RAM at 0x%08X (%u bytes). Continuing through "
+                "the retail apploader and title as ordinary guest code. If "
                 "this is the dummy disc (tools/make_dummy_disc.py — entry "
-                "point 0 by construction), expect the IPL to jump to guest "
-                "address 0 next and diverge loudly, never silently.\n",
+                "point 0 by construction), it still diverges loudly.\n",
                 di->dimar, dvd_length);
             fflush(stdout);
         }
@@ -341,6 +389,7 @@ void gcn_di_reset_drive_spinup(void) {
 
 void gcn_di_init(GcnDi* di) {
     memset(di, 0, sizeof *di);
+    s_di_command_seq = 0;
     /* DVDInterface::Init:261-302 — ASSERT(!IsDiscInside()) (:263): the console
      * never has a disc mounted yet at this point, ALWAYS. m_DICVR.Hex=1 is set
      * unconditionally (:268) before ResetDrive(false) even runs (:279), i.e.
@@ -407,6 +456,7 @@ void gcn_di_eject_disc(GcnDi* di) {
 void gcn_di_free(GcnDi* di) {
     if (!di) return;
     if (di->disc_file) { fclose(di->disc_file); di->disc_file = NULL; }
+    if (s_di_journal) { fclose(s_di_journal); s_di_journal = NULL; }
 }
 
 /* ---- MMIO (DVDInterface.cpp RegisterMMIO:547-630) ---- */
@@ -486,6 +536,7 @@ void gcn_di_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
             u8 subcmd = (u8)(di->cmdbuf[0] & 0xFFu);
             di->pending_intr = di_execute_command(di, cpu);
             di->cmd_pending = 1;
+            di_log_command(di, cpu, opcode, subcmd, di->pending_intr);
             /* Sparse, low-volume (a handful of commands per boot/menu
              * transition) — a plain GcnEventKind addition, same shape as
              * GCN_EV_EXI_XFER, rather than a dedicated ring (contrast the

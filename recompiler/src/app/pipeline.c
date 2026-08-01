@@ -22,12 +22,15 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                                     u32 section_count,
                                     const char* output_path,
                                     DolRecompCPU cpu, u32 entry_point, u32 jobs,
+                                    u32 chunk_instructions,
                                     int local_chunks_dir) {
     char stem[1024];
     char header_path[1100];
+    char abi_header_path[1100];
     char chunks_dir[1100];
     char chunks_label[512];
     char include_name[512];
+    char abi_include_name[512];
 
     if (!make_output_stem(output_path, stem, sizeof(stem)))
         return 0;
@@ -38,6 +41,16 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
 
     if (snprintf(header_path, sizeof(header_path), "%s.h", stem) >= (int)sizeof(header_path)) {
         fprintf(stderr, "error: output path is too long\n");
+        return 0;
+    }
+    if (snprintf(abi_header_path, sizeof(abi_header_path), "%s_abi.h", stem) >=
+        (int)sizeof(abi_header_path)) {
+        fprintf(stderr, "error: output path is too long\n");
+        return 0;
+    }
+    if (snprintf(abi_include_name, sizeof(abi_include_name), "%s",
+                 path_basename(abi_header_path)) >= (int)sizeof(abi_include_name)) {
+        fprintf(stderr, "error: ABI include name is too long\n");
         return 0;
     }
 
@@ -72,12 +85,29 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         fclose(manifest);
         return 0;
     }
+    FILE* abi_header = fopen(abi_header_path, "w");
+    if (!abi_header) {
+        fprintf(stderr, "error: can't open output '%s'\n", abi_header_path);
+        fclose(header);
+        fclose(manifest);
+        return 0;
+    }
 
     fprintf(manifest, "// DolRecomp split output\n");
     fprintf(manifest, "#include \"%s\"\n\n", include_name);
     fprintf(manifest, "// Build these C files too:\n");
 
-    emit_header_for_cpu(header, cpu);
+    /*
+     * Chunk TUs include only this stable CPU/runtime ABI. Function prototypes
+     * and dispatch tables live in the small generated.h below, so discovering
+     * or removing another shard does not invalidate every existing object.
+     */
+    emit_header_for_cpu(abi_header, cpu);
+    emit_footer(abi_header);
+    fclose(abi_header);
+
+    fprintf(header, "// DolRecomp dispatch manifest\n");
+    fprintf(header, "#include \"%s\"\n", abi_include_name);
     fprintf(header, "\n// Function entry points\n");
 
     u32 file_count = 0;
@@ -151,7 +181,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         }
 
         u32 section_job_count =
-            (num_insts + EMIT_CHUNK_INSTRUCTIONS - 1u) / EMIT_CHUNK_INSTRUCTIONS;
+            (num_insts + chunk_instructions - 1u) / chunk_instructions;
         ChunkJob* chunk_jobs = (ChunkJob*)calloc(section_job_count, sizeof(ChunkJob));
         if (!chunk_jobs) {
             fprintf(stderr, "error: out of memory\n");
@@ -163,14 +193,14 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             return 0;
         }
 
-        for (u32 start = 0; start < num_insts; start += EMIT_CHUNK_INSTRUCTIONS) {
+        for (u32 start = 0; start < num_insts; start += chunk_instructions) {
             u32 chunk_count = num_insts - start;
             u32 func_addr = base_addr + start * 4u;
             char chunk_name[128];
-            u32 job_index = start / EMIT_CHUNK_INSTRUCTIONS;
+            u32 job_index = start / chunk_instructions;
 
-            if (chunk_count > EMIT_CHUNK_INSTRUCTIONS)
-                chunk_count = EMIT_CHUNK_INSTRUCTIONS;
+            if (chunk_count > chunk_instructions)
+                chunk_count = chunk_instructions;
 
             if (snprintf(chunk_name, sizeof(chunk_name),
                          "chunk_%04u_%s%u_%08X.c", file_count,
@@ -203,7 +233,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             }
 
             if (snprintf(job->include_name, sizeof(job->include_name), "%s",
-                         include_name) >= (int)sizeof(job->include_name)) {
+                         abi_include_name) >= (int)sizeof(job->include_name)) {
                 fprintf(stderr, "error: output include name is too long\n");
                 smc_analysis_free(&smc);
                 function_list_free(&funcs);
@@ -290,12 +320,14 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
 
     printf("done!\n");
     printf("  header: %s\n", header_path);
+    printf("  stable ABI: %s\n", abi_header_path);
     printf("  chunks: %s (%u files)\n", chunks_dir, file_count);
     return 1;
 }
 
 int emit_dol_split(const DOLFile* dol, const char* output_path,
-                          DolRecompCPU cpu, u32 jobs, int local_chunks_dir) {
+                          DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                          int local_chunks_dir) {
     LoadedCodeSection sections[DOL_NUM_TEXT];
     u32 section_count = 0;
 
@@ -320,11 +352,13 @@ int emit_dol_split(const DOLFile* dol, const char* output_path,
 
     return emit_code_sections_split(sections, section_count, output_path, cpu,
                                     dol->header.entry_point, jobs,
+                                    chunk_instructions,
                                     local_chunks_dir);
 }
 
 int emit_rpx_split(const RPXFile* rpx, const char* output_path,
-                          DolRecompCPU cpu, u32 jobs, int local_chunks_dir) {
+                          DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                          int local_chunks_dir) {
     LoadedCodeSection sections[RPX_MAX_CODE_SECTIONS];
 
     for (u32 i = 0; i < rpx->code_section_count; i++) {
@@ -342,11 +376,13 @@ int emit_rpx_split(const RPXFile* rpx, const char* output_path,
 
     return emit_code_sections_split(sections, rpx->code_section_count,
                                     output_path, cpu, 0, jobs,
+                                    chunk_instructions,
                                     local_chunks_dir);
 }
 
 int emit_rel_split(const RELFile* rel, const char* output_path,
-                          DolRecompCPU cpu, u32 jobs, int local_chunks_dir) {
+                          DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                          int local_chunks_dir) {
     LoadedCodeSection* sections =
         (LoadedCodeSection*)calloc(rel->section_count, sizeof(LoadedCodeSection));
     if (!sections) {
@@ -372,13 +408,15 @@ int emit_rel_split(const RELFile* rel, const char* output_path,
     }
 
     int ok = emit_code_sections_split(sections, section_count, output_path, cpu,
-                                      rel->entry_point, jobs, local_chunks_dir);
+                                      rel->entry_point, jobs,
+                                      chunk_instructions, local_chunks_dir);
     free(sections);
     return ok;
 }
 
 int emit_ipl_split(const IPLFile* ipl, const char* output_path,
-                          DolRecompCPU cpu, u32 jobs, int local_chunks_dir) {
+                          DolRecompCPU cpu, u32 jobs, u32 chunk_instructions,
+                          int local_chunks_dir) {
     // A flat blob is exactly ONE code section spanning the whole image. We use
     // the DOL embedded-data mode so the inline data heuristic runs (BS2 is
     // DOL-like SDK C with interleaved constants) and so SMC analysis fires --
@@ -394,12 +432,13 @@ int emit_ipl_split(const IPLFile* ipl, const char* output_path,
     section.embedded_data_mode = EMBEDDED_DATA_DOL;
 
     return emit_code_sections_split(&section, 1, output_path, cpu,
-                                    ipl->entry_point, jobs, local_chunks_dir);
+                                    ipl->entry_point, jobs,
+                                    chunk_instructions, local_chunks_dir);
 }
 
 int emit_ipl_multi_split(const IPLFile* images, u32 image_count,
                          const char* output_path, DolRecompCPU cpu, u32 jobs,
-                         int local_chunks_dir) {
+                         u32 chunk_instructions, int local_chunks_dir) {
     if (image_count == 0)
         return 0;
 
@@ -426,7 +465,7 @@ int emit_ipl_multi_split(const IPLFile* images, u32 image_count,
 
     int ok = emit_code_sections_split(sections, image_count, output_path, cpu,
                                       images[0].entry_point, jobs,
-                                      local_chunks_dir);
+                                      chunk_instructions, local_chunks_dir);
     free(sections);
     return ok;
 }
@@ -483,7 +522,8 @@ int check_duplicate_rel_module(const RELBatchItem* items, u32 count,
 
 int emit_rel_directory(const char* input_dir, const char* output_root,
                               const char* title_id, int titleless_mode,
-                              DolRecompCPU cpu, u32 jobs, u32 start_base) {
+                              DolRecompCPU cpu, u32 jobs,
+                              u32 chunk_instructions, u32 start_base) {
     PathList paths = {0};
     RELBatchItem* items = NULL;
     RELModuleMapEntry* map_entries = NULL;
@@ -544,7 +584,8 @@ int emit_rel_directory(const char* input_dir, const char* output_root,
             goto done;
         }
         printf("\nwriting output to: %s\n", rel_output_path);
-        if (!emit_rel_split(&items[i].rel, rel_output_path, cpu, jobs, 1))
+        if (!emit_rel_split(&items[i].rel, rel_output_path, cpu, jobs,
+                            chunk_instructions, 1))
             goto done;
     }
 
@@ -556,4 +597,3 @@ done:
     path_list_free(&paths);
     return ok;
 }
-

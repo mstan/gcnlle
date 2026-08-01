@@ -54,7 +54,7 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* ctx);\n");
     /* Resolve pc -> recompiled function. The naive form is one range check per
      * function — O(N) per dispatch, and dispatch runs once per executed block, so
-     * for a large image (the IPL is ~156 contiguous 0x4000 chunks) the hot path
+     * for a large image (the IPL is hundreds of contiguous page-sized chunks)
      * walked dozens of compares every block. Instead, collapse each maximal run of
      * uniform-size, perfectly-tiling functions into a single O(1) table indexed by
      * (address-base)/stride; isolated functions keep a range check. Worst case (no

@@ -80,6 +80,8 @@ void gcn_seed_build_sram(u8 sram[GCN_SRAM_SIZE], const GcnSeedConfig* cfg) {
     u8 flags = 0;
     flags |= (u8)(cfg->video_mode & GCN_SRAM_FLAG_VIDEO_MASK);
     if (cfg->sound_stereo) flags |= GCN_SRAM_FLAG_SOUND_STEREO;
+    if (cfg->oobe_done)    flags |= GCN_SRAM_FLAG_OOBE_DONE;
+    if (cfg->boot_to_menu) flags |= GCN_SRAM_FLAG_BOOT_TO_MENU;
     if (cfg->progressive)  flags |= GCN_SRAM_FLAG_PROGRESSIVE;
     sram[0x13] = flags;
 
@@ -104,6 +106,8 @@ void gcn_seed_default_config(GcnSeedConfig* cfg) {
     cfg->mem1_fill = GCN_SEED_MEM1_FILL;             /* [DEFAULT] */
     cfg->language = GCN_SRAM_LANG_ENGLISH;           /* [FIXTURE] */
     cfg->sound_stereo = 1;                           /* [FIXTURE] stereo */
+    cfg->oobe_done = 1;                              /* [FIXTURE] initialized */
+    cfg->boot_to_menu = 0;                           /* [FIXTURE] auto-boot disc */
     cfg->progressive = 0;                            /* [FIXTURE] off */
     cfg->video_mode = 0;                             /* [FIXTURE] NTSC */
     cfg->display_offset_h = 0;                       /* [FIXTURE] */

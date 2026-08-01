@@ -195,8 +195,8 @@ enum {
  * lands this region in RAM — M5's SCOPE BOUNDARY (docs/ROADMAP.md M5): DI is
  * modeled faithfully up to and including that read landing in guest RAM; what
  * the IPL does with the apploader's CONTENTS (jump to its entry point, run
- * apploader code, load the game) is the next phase and is deliberately NOT
- * modeled here. The dummy disc's apploader entry point is 0 by construction
+ * apploader code, load the game) now continues through normal guest execution.
+ * The dummy disc's apploader entry point is 0 by construction
  * (tools/make_dummy_disc.py) — a real disc's apploader would take over from
  * here; ours can only diverge (loudly, via this note), never fake success. */
 #define GCN_DI_APPLOADER_OFFSET 0x2440u

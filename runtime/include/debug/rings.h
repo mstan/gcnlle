@@ -62,6 +62,8 @@ typedef enum {
     GCN_EV_DI_MOUNT   = 8,  /* disc mounted(detail=1)/ejected(detail=0), via
                              * GCN_DISC at boot or the insert_disc/eject_disc
                              * debug commands                                 */
+    GCN_EV_NATIVE_MISS = 9, /* native dispatch miss; detail=pc, aux=page CRC32 */
+    GCN_EV_INTERP_EDGE = 10,/* interpreted edge; detail=from PC, aux=to PC     */
 } GcnEventKind;
 
 /* Bring the rings up (clears all three, resets the block index). Idempotent. */

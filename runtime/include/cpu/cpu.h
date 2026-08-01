@@ -181,6 +181,7 @@ enum {
     GCN_HALT_EXCEPTION = 1,   /* unhandled/interesting exception raised */
     GCN_HALT_NO_FUNCTION = 2, /* dispatch found no func for ctx->pc (host entry) */
     GCN_HALT_STUCK = 3,       /* pc did not advance (self-loop) */
+    GCN_HALT_INTERPRETER_UNSUPPORTED = 4,
 };
 
 /* --- lifecycle + flat memory (implemented in memory.c) --- */
@@ -275,7 +276,9 @@ u32 ppc_mftb(CPUState* cpu, u16 tbr, u32 cia);
 u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia);
 void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia);
 void ppc_rfi(CPUState* cpu, u32 cia);
+void ppc_dcbz(CPUState* cpu, u32 ea, u32 cia);
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia);
+void ppc_icbi(CPUState* cpu, u32 ea);
 void ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
 void ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
 u32 ppc_eciwx(CPUState* cpu, u32 ea, u32 cia);

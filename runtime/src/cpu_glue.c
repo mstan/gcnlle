@@ -24,7 +24,9 @@
  * the runtime is a standalone host of the ABI, exactly as reshine is.
  */
 #include "cpu/cpu.h"
+#include "cpu/native_code.h"
 #include "debug/rings.h"   /* gcn_ring_psq — [gx-fifoprov] psq value audit */
+#include "memory/memory.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -363,7 +365,7 @@ void ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
                  f32_bits((f32)cpu->ps1[frS]), 1u);
 }
 
-/* --- rfi / locked-cache dcbz / external control / tlbie --- */
+/* --- rfi / cache operations / external control / tlbie --- */
 
 void ppc_rfi(CPUState* cpu, u32 cia) {
     if (cpu->msr & PPC_MSR_PR) {
@@ -379,6 +381,36 @@ void ppc_rfi(CPUState* cpu, u32 cia) {
      * still live. */
     cpu->exception = 0;
     cpu->program_exception = 0;
+}
+
+void ppc_dcbz(CPUState* cpu, u32 ea, u32 cia) {
+    u32 block = ea & ~31u;
+    u32 avail = 0;
+    u8* host = gcn_mem_resolve(cpu, block, &avail);
+    if (host && avail >= 32u) {
+        /* dcbz allocates a zeroed DATA-cache line. It does not invalidate the
+         * corresponding instruction-cache line. This distinction is
+         * load-bearing at the retail IPL handoff: the IPL zeroes its own RAM
+         * image while finishing from I-cache, then branches to the title.
+         * Treating these writes like coherent host stores makes dispatch fetch
+         * the newly-zero RAM halfway through that loop. */
+        if (cpu->reserve_valid &&
+            ((cpu->reserve_addr ^ block) & ~31u) == 0u)
+            cpu->reserve_valid = false;
+        memset(host, 0, 32u);
+        return;
+    }
+    /* Preserve the existing exception/MMIO behavior for a non-RAM effective
+     * address. Ordinary writes are the conservative fallback there. */
+    for (u32 i = 0; i < 32u; i += 4u)
+        mem_write32(cpu, block + i, 0u, cia);
+}
+
+void ppc_icbi(CPUState* cpu, u32 ea) {
+    (void)cpu;
+    /* Guest visibility of modified instructions begins at the explicit
+     * instruction-cache invalidation, not at the preceding data writes. */
+    gcn_native_code_invalidate(ea & ~31u, 32u);
 }
 
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {

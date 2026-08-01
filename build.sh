@@ -12,6 +12,7 @@ export PATH="$MINGW:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEN="${CMAKE_GENERATOR:-Ninja}"
+BUILD_JOBS="${GCN_BUILD_JOBS:-2}"
 
 build_dir() {  # <src-subdir>
   local sub="$1"
@@ -19,7 +20,7 @@ build_dir() {  # <src-subdir>
   echo "=== building $sub ==="
   # RelWithDebInfo is the standing default — never configure without it.
   cmake -S "$ROOT/$sub" -B "$ROOT/$sub/build" -G "$GEN" -DCMAKE_BUILD_TYPE=RelWithDebInfo
-  cmake --build "$ROOT/$sub/build"
+  cmake --build "$ROOT/$sub/build" --parallel "$BUILD_JOBS"
 }
 
 build_dir recompiler

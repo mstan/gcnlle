@@ -8,6 +8,8 @@
  */
 #include "generated.h"        /* DolRecomp dispatch inlines + func_ decls */
 #include "dispatch/dispatch.h"
+#include "cpu/interpreter.h"
+#include "cpu/native_code.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
 #include "ai/ai.h"            /* advance the AI sample counter/AIINT per block */
 #include "vi/vi.h"            /* advance the VI beam counter per block       */
@@ -401,6 +403,14 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                     ctx->gpr[1], ctx->gpr[3], ctx->gpr[4]);
                 fflush(stdout);
             }
+            const char* stop_at_handoff = getenv("GCN_STOP_AT_BS1_HANDOFF");
+            if (stop_at_handoff && *stop_at_handoff &&
+                *stop_at_handoff != '0') {
+                fprintf(stdout,
+                        "gcn dispatch: stopped at BS1->BS2 handoff by "
+                        "GCN_STOP_AT_BS1_HANDOFF\n");
+                return 1;
+            }
         }
 
         u32 pending = ctx->exception;
@@ -435,7 +445,12 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * never needs calibrating. Off by default; ~zero cost when off. */
         if (s_dstats) {
             u64 t0 = __rdtsc();
-            int ok = dolrecomp_call(ctx, ctx->pc);
+            int ok = !gcn_native_code_is_invalid(ctx->pc) &&
+                     dolrecomp_call(ctx, ctx->pc);
+            if (!ok) {
+                gcn_interpreter_note_native_miss(ctx);
+                ok = gcn_interpreter_step(ctx);
+            }
             u64 t1 = __rdtsc(); s_tsc[0] += t1 - t0;
             if (!ok) { ctx->exception = pending; return 0; }
             u32 dsp_cycles, ai_cycles;
@@ -465,7 +480,13 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                 fflush(stderr);
             }
         } else {
-        if (!dolrecomp_call(ctx, ctx->pc)) {   /* off-image PC / no handler */
+        int dispatch_ok = !gcn_native_code_is_invalid(ctx->pc) &&
+                          dolrecomp_call(ctx, ctx->pc);
+        if (!dispatch_ok) {
+            gcn_interpreter_note_native_miss(ctx);
+            dispatch_ok = gcn_interpreter_step(ctx);
+        }
+        if (!dispatch_ok) {   /* off-image PC and interpreter cannot continue */
             ctx->exception = pending;
             return 0;
         }

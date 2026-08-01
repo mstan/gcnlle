@@ -390,6 +390,20 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
     u32 bss_alignment = rel->file_size >= 0x48 ? read_be32(h + 0x44) : 4;
     rel->base_address = base_address;
 
+    /*
+     * REL v3's sectionAlignment is the required alignment of the loaded module
+     * image, not a promise that every file-relative section offset shares that
+     * alignment. Retail Wind Waker RELs commonly require an 8-byte module base
+     * while placing executable sections at offsets that are only 4-byte
+     * instruction-aligned.
+     */
+    u32 module_alignment = section_alignment ? section_alignment : 4;
+    if ((base_address % module_alignment) != 0) {
+        fprintf(stderr, "error: REL base address does not meet module alignment\n");
+        rel_free(rel);
+        return false;
+    }
+
     if (rel->section_count == 0 ||
         rel->section_count > REL_MAX_SECTION_COUNT ||
         !range_fits(section_info_offset,
@@ -477,13 +491,6 @@ bool rel_load_image(RELFile* rel, const char* path, u32 base_address) {
             rel_free(rel);
             return false;
         }
-        if (section_alignment > 1 && executable &&
-            (section->address % section_alignment) != 0) {
-            fprintf(stderr, "error: REL executable section %u is not aligned\n", i);
-            rel_free(rel);
-            return false;
-        }
-
         section->owned_data = (u8*)malloc(size);
         if (!section->owned_data) {
             fprintf(stderr, "error: out of memory\n");

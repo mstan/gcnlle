@@ -6,7 +6,9 @@
 #include "backend/emitter.h"
 #include "analysis/code_section.h"
 
-#define EMIT_CHUNK_INSTRUCTIONS 4096u
+#define EMIT_CHUNK_INSTRUCTIONS_DEFAULT 1024u
+#define EMIT_CHUNK_INSTRUCTIONS_MIN 64u
+#define EMIT_CHUNK_INSTRUCTIONS_MAX 4096u
 
 typedef struct {
     const PPCInst* insts;

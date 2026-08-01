@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.16)
 project(gcnrecomp_runtime C CXX)
 
+option(GCN_USE_CCACHE "Use ccache when it is available" ON)
+if(GCN_USE_CCACHE)
+  find_program(GCN_CCACHE_PROGRAM ccache)
+  if(GCN_CCACHE_PROGRAM)
+    if(NOT CMAKE_C_COMPILER_LAUNCHER)
+      set(CMAKE_C_COMPILER_LAUNCHER "${GCN_CCACHE_PROGRAM}")
+    endif()
+    if(NOT CMAKE_CXX_COMPILER_LAUNCHER)
+      set(CMAKE_CXX_COMPILER_LAUNCHER "${GCN_CCACHE_PROGRAM}")
+    endif()
+    message(STATUS "gcnrecomp compiler cache: ${GCN_CCACHE_PROGRAM}")
+  endif()
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
@@ -77,11 +91,18 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tools/ipl_descramble
 add_library(gcn_runtime_core STATIC
   src/memory.c
   src/cpu_glue.c
+  src/interpreter.c
+  src/native_code.c
+  src/rings.c
   src/seed.c
   src/trace.c
   src/util/crc32.c
+  ../recompiler/src/frontend/decoder.c
+  ../recompiler/src/backend/ppc_cycles.c
 )
 target_include_directories(gcn_runtime_core PUBLIC include)
+target_include_directories(gcn_runtime_core PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../recompiler/src)
 # trace.c emits the shared oracle record format (oracle/trace_format.h).
 target_include_directories(gcn_runtime_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../oracle)
 
@@ -98,28 +119,32 @@ enable_testing()
 
 add_executable(test_seed tests/test_seed.c)
 target_link_libraries(test_seed PRIVATE gcn_runtime_core)
-add_test(NAME seed_contract COMMAND $<TARGET_FILE:test_seed>)
+add_test(NAME seed_contract COMMAND test_seed)
+
+add_executable(test_interpreter tests/test_interpreter.c)
+target_link_libraries(test_interpreter PRIVATE gcn_runtime_core)
+add_test(NAME gekko_interpreter COMMAND test_interpreter)
 
 # M4: EXI memcard device model + GCMemcard image module. Both are standalone
 # (only libc + their own headers), so they build/test without the generated C.
 add_executable(test_memcard tests/test_memcard.c src/memcard.c)
 target_include_directories(test_memcard PRIVATE include)
-add_test(NAME memcard_device COMMAND $<TARGET_FILE:test_memcard>)
+add_test(NAME memcard_device COMMAND test_memcard)
 
 add_executable(test_memcard_image tests/test_memcard_image.c src/memcard_image.c)
 target_include_directories(test_memcard_image PRIVATE include)
-add_test(NAME memcard_image COMMAND $<TARGET_FILE:test_memcard_image>)
+add_test(NAME memcard_image COMMAND test_memcard_image)
 
 add_executable(test_rtc tests/test_rtc.c src/rtc.c)
 target_include_directories(test_rtc PRIVATE include)
-add_test(NAME rtc_boot_sync COMMAND $<TARGET_FILE:test_rtc>)
+add_test(NAME rtc_boot_sync COMMAND test_rtc)
 
 add_executable(test_host_audio tests/test_host_audio.c src/host_audio.c)
 target_include_directories(test_host_audio PRIVATE include)
 if(WIN32)
   target_link_libraries(test_host_audio PRIVATE ole32 uuid avrt)
 endif()
-add_test(NAME host_audio_pcm COMMAND $<TARGET_FILE:test_host_audio>)
+add_test(NAME host_audio_pcm COMMAND test_host_audio)
 
 add_executable(gcn_memcard_inspect tools/memcard_inspect.c src/memcard_image.c)
 target_include_directories(gcn_memcard_inspect PRIVATE include)
@@ -138,6 +163,9 @@ if(GCN_WITH_GENERATED)
   endif()
   file(GLOB GCN_GENERATED_CHUNKS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_SOURCE_DIR}/generated/chunks/*.c)
+  set(GCN_GENERATED_BUILD_PROFILE "ITERATE" CACHE STRING
+      "Generated guest-code compile profile: ITERATE or RELEASE")
+  set_property(CACHE GCN_GENERATED_BUILD_PROFILE PROPERTY STRINGS ITERATE RELEASE)
   # Phase D2 (codegen speed campaign, static analysis): -fopt-info-missed on a
   # representative 16KB chunk (chunk_0000, ~4096 case labels/one giant
   # function) showed 66% (797/1206) of the Phase C
@@ -162,9 +190,21 @@ if(GCN_WITH_GENERATED)
   # measurement (real CALL instructions removed on the hot RAM-hit path);
   # the actual wall-clock effect needs the coordinator's boot-time/rdtsc
   # attribution harness (see docs/ROADMAP.md), not asserted from this alone.
-  set_source_files_properties(${GCN_GENERATED_CHUNKS} PROPERTIES
-    COMPILE_OPTIONS "--param;large-function-insns=20000;--param;large-function-growth=250;--param;inline-unit-growth=100"
-  )
+  if(GCN_GENERATED_BUILD_PROFILE STREQUAL "ITERATE")
+    # The default development loop values compile latency over final host-code
+    # shape. -O1 follows the configuration's -O2 and therefore wins; -g1 keeps
+    # usable symbols without emitting full debug data for every guest label.
+    set_source_files_properties(${GCN_GENERATED_CHUNKS} PROPERTIES
+      COMPILE_OPTIONS "-O1;-g1"
+    )
+  elseif(GCN_GENERATED_BUILD_PROFILE STREQUAL "RELEASE")
+    set_source_files_properties(${GCN_GENERATED_CHUNKS} PROPERTIES
+      COMPILE_OPTIONS "--param;large-function-insns=20000;--param;large-function-growth=250;--param;inline-unit-growth=100"
+    )
+  else()
+    message(FATAL_ERROR
+      "GCN_GENERATED_BUILD_PROFILE must be ITERATE or RELEASE")
+  endif()
   add_executable(gcn_boot
     src/boot.c
     src/dispatch.c
@@ -187,7 +227,6 @@ if(GCN_WITH_GENERATED)
     src/gx_render.c
     src/gx_raster.c
     src/gx_vulkan.c
-    src/rings.c
     src/debug_server.c
     src/host_audio.c
     src/host_window.c

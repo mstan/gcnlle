@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 project(DolRecomp C)
 
+option(DOLRECOMP_USE_CCACHE "Use ccache when it is available" ON)
+if(DOLRECOMP_USE_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER)
+    find_program(DOLRECOMP_CCACHE_PROGRAM ccache)
+    if(DOLRECOMP_CCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER "${DOLRECOMP_CCACHE_PROGRAM}")
+        message(STATUS "DolRecomp compiler cache: ${DOLRECOMP_CCACHE_PROGRAM}")
+    endif()
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

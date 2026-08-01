@@ -96,8 +96,9 @@ static void test_sram_algorithm(void) {
     u8 sram[GCN_SRAM_SIZE];
     gcn_seed_build_sram(sram, &cfg);
 
-    /* flags byte must be exactly 0x04 (stereo, NTSC, non-progressive). */
-    CHECK(sram[0x13] == 0x04, "SRAM flags == 0x04 (stereo/NTSC/non-progressive)");
+    /* A normal initialized console auto-boots a mounted disc. */
+    CHECK(sram[0x13] == 0x0C,
+          "SRAM flags == 0x0C (stereo/OOBE-done/NTSC/non-progressive/auto-boot)");
     CHECK(sram[0x12] == 0x00, "SRAM language == English (0)");
 
     /* Manually recompute the checksum over the four BE16 words 0x0C..0x12. */

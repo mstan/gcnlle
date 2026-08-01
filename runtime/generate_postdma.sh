@@ -15,11 +15,15 @@ set -euo pipefail
 export PATH="/c/msys64/mingw64/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIOS_DIR="${GCN_BIOS_DIR:-$ROOT/bios}"
 DESC="$ROOT/tools/ipl_descramble/build/ipl_descramble.exe"
 DOL="$ROOT/recompiler/build/dolrecomp.exe"
-BOOT="$ROOT/runtime/build-boot/gcn_boot.exe"
-IPL="$ROOT/bios/ipl.bin"
-for f in "$DESC" "$DOL" "$BOOT" "$IPL"; do
+BOOT="${GCN_BOOTSTRAP_BOOT:-$ROOT/runtime/build-boot/gcn_boot.exe}"
+IPL="$BIOS_DIR/ipl.bin"
+DSP_ROM="$BIOS_DIR/dsp_rom.bin"
+DSP_COEF="$BIOS_DIR/dsp_coef.bin"
+BUILD_JOBS="${GCN_BUILD_JOBS:-2}"
+for f in "$DESC" "$DOL" "$BOOT" "$IPL" "$DSP_ROM" "$DSP_COEF"; do
   [ -f "$f" ] || { echo "error: missing $f (build phase-1 first: build.sh, generate.sh, then -DGCN_WITH_GENERATED build)"; exit 1; }
 done
 
@@ -39,9 +43,19 @@ echo "[2/4] run stage-1 to DMA stage-2, dump post-DMA image + low-mem handlers"
 # runtime stops at that `sc`, at which point both are present in MEM1.
 GCN_IPL_ROM="$TMP/descr.bin" \
 GCN_MEM_DUMP="0x81200000:0x270000:$TMP/postdma.bin;0x80000000:0x3000:$TMP/lowmem.bin" \
-  "$BOOT" "$TMP/bs2.bin" 5000000 >/dev/null 2>&1 || true   # runs through the sc to the block budget
-[ -f "$TMP/postdma.bin" ] || { echo "error: no post-DMA dump produced"; exit 1; }
-[ -f "$TMP/lowmem.bin" ]  || { echo "error: no low-mem dump produced"; exit 1; }
+GCN_DSP_ROM="$DSP_ROM" \
+GCN_DSP_COEF="$DSP_COEF" \
+  "$BOOT" "$TMP/bs2.bin" 5000000 >"$TMP/phase1.log" 2>&1 || true
+[ -f "$TMP/postdma.bin" ] || {
+  echo "error: no post-DMA dump produced"
+  tail -80 "$TMP/phase1.log"
+  exit 1
+}
+[ -f "$TMP/lowmem.bin" ]  || {
+  echo "error: no low-mem dump produced"
+  tail -80 "$TMP/phase1.log"
+  exit 1
+}
 
 # The first syscall below enters physical 0x00000C00, dispatched through the
 # cached 0x80000C00 alias. A stale/early dump can be the right size yet contain
@@ -64,7 +78,8 @@ echo "[3/4] recompile the post-DMA image + low-mem handlers into one table"
 # exception handlers at 0x80000000; the 0xC00 syscall vector routes there via
 # the dispatch's physical-PC alias (0xC00 -> 0x80000C00).
 "$DOL" --gamecube-ipl "$TMP/postdma.bin" "$TMP/out" --base 0x81200000 --entry 0x81200150 \
-  --segment "0x80000000:$TMP/lowmem.bin" -j8 >/dev/null
+  --segment "0x80000000:$TMP/lowmem.bin" \
+  --chunk-instructions 1024 -j "$BUILD_JOBS" >/dev/null
 
 echo "[4/4] install into runtime/generated/"
 GEN="$(dirname "$(find "$TMP/out" -name generated.h | head -1)")"

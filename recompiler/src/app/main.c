@@ -136,9 +136,10 @@ int main(int argc, char** argv) {
         printf("\nwriting output to: %s\n", output_path);
         int ok = (image_count > 1)
             ? emit_ipl_multi_split(images, image_count, output_path,
-                                   effective_cpu, opts.jobs, local_chunks_dir)
+                                   effective_cpu, opts.jobs,
+                                   opts.chunk_instructions, local_chunks_dir)
             : emit_ipl_split(&images[0], output_path, effective_cpu, opts.jobs,
-                             local_chunks_dir);
+                             opts.chunk_instructions, local_chunks_dir);
 
         for (u32 k = 0; k < image_count; k++) ipl_free(&images[k]);
         return ok ? 0 : 1;
@@ -176,7 +177,7 @@ int main(int argc, char** argv) {
 
         printf("\nwriting output to: %s\n", output_path);
         if (!emit_rpx_split(&rpx, output_path, effective_cpu, opts.jobs,
-                            local_chunks_dir)) {
+                            opts.chunk_instructions, local_chunks_dir)) {
             rpx_free(&rpx);
             return 1;
         }
@@ -198,7 +199,7 @@ int main(int argc, char** argv) {
         printf("REL base start: 0x%08X\n", rel_start_base);
         if (!emit_rel_directory(input_path, output_arg, title_id,
                                 titleless_mode, effective_cpu, opts.jobs,
-                                rel_start_base)) {
+                                opts.chunk_instructions, rel_start_base)) {
             return 1;
         }
         return 0;
@@ -239,7 +240,7 @@ int main(int argc, char** argv) {
 
         printf("\nwriting output to: %s\n", output_path);
         if (!emit_rel_split(&rel, output_path, effective_cpu, opts.jobs,
-                            local_chunks_dir)) {
+                            opts.chunk_instructions, local_chunks_dir)) {
             rel_free(&rel);
             return 1;
         }
@@ -280,7 +281,8 @@ int main(int argc, char** argv) {
     }
 
     printf("\nwriting output to: %s\n", output_path);
-    if (!emit_dol_split(&dol, output_path, effective_cpu, opts.jobs, local_chunks_dir)) {
+    if (!emit_dol_split(&dol, output_path, effective_cpu, opts.jobs,
+                        opts.chunk_instructions, local_chunks_dir)) {
         dol_free(&dol);
         return 1;
     }
