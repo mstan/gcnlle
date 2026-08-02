@@ -6,7 +6,11 @@
  */
 #include "pe/pe.h"
 #include "debug/rings.h"
+#include "gx/gx.h"
+#include "gx/gx_raster.h"
+#include "gx/gx_render.h"
 
+#include <stdio.h>
 #include <string.h>
 
 void gcn_pe_set_irq(GcnPe* pe, GcnPeIrqFn fn, void* user) {
@@ -125,6 +129,50 @@ void gcn_pe_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
         pe_write16(pe, off, (u16)(value >> 16));
         pe_write16(pe, off + 2u, (u16)value);
         return;
+    }
+}
+
+u32 gcn_pe_efb_read(void* user, CPUState* cpu, u32 addr, u8 size) {
+    (void)user;
+    (void)cpu;
+    static int warned_width;
+    static int warned_kind;
+    if (size != 4u) {
+        if (!warned_width++) {
+            fprintf(stderr,
+                    "gcn pe: unsupported %u-bit CPU EFB read at 0x%08X "
+                    "(only aligned 32-bit peeks modeled)\n",
+                    (unsigned)size * 8u, addr);
+        }
+        return 0;
+    }
+
+    /* A CPU peek is an ordered GPU synchronization point. First retire the
+     * FIFO worker, then download a resident Vulkan EFB if that backend owns
+     * accepted draws, leaving gx_raster's packed planes authoritative here. */
+    gcn_gx_pipeline_drain();
+    gx_render_sync_efb_to_software();
+    u32 value = 0;
+    if (!gx_raster_efb_cpu_read(addr, &value)) {
+        if (!warned_kind++) {
+            fprintf(stderr,
+                    "gcn pe: unsupported CPU EFB read kind at 0x%08X "
+                    "(returns 0 loudly)\n", addr);
+        }
+        return 0;
+    }
+    return value;
+}
+
+void gcn_pe_efb_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
+    (void)user;
+    (void)cpu;
+    static int warned;
+    if (!warned++) {
+        fprintf(stderr,
+                "gcn pe: CPU EFB poke unimplemented at 0x%08X size=%u "
+                "value=0x%08X (ignored loudly)\n",
+                addr, (unsigned)size, value);
     }
 }
 

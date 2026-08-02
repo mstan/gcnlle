@@ -1837,6 +1837,10 @@ static int resident_sync_to_software(void) {
     return 1;
 }
 
+int gx_vulkan_resident_sync_to_software(void) {
+    return resident_sync_to_software();
+}
+
 int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
                                 int after_software) {
     if (!s_vk.resident_mode || !s_vk.draw_active || !job)
@@ -2408,5 +2412,6 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
 int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     (void)bp; (void)ram; (void)ram_size; return -1;
 }
+int gx_vulkan_resident_sync_to_software(void) { return 1; }
 
 #endif

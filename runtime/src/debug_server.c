@@ -14,11 +14,13 @@
 #include "dsp_lle_c.h"     /* dsp_state: live DSP pc/control/mailbox peeks */
 #include "dsp/dsp.h"       /* gcn_dsp_flush: catch a batched core up before dsp_state peeks it */
 #include "gx/gx.h"         /* gcn_gx_pipeline_drain — screenshot join (G3) */
+#include "gx/gx_raster.h"  /* retained TEV/texture snapshots */
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
 #include "vi/yuy2.h"       /* screenshot: YUY2->RGB (shared with host_window.c) */
 #include "si/si.h"         /* set_input: injected pad-report surface */
 #include "di/di.h"         /* insert_disc/eject_disc: runtime disc mount lifecycle */
 #include "host/host_audio.h" /* audio_state: WASAPI queue/signal acceptance */
+#include "memory/memory.h"   /* coherent MEM1/MEM2/locked-L1 debug reads */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -29,7 +31,7 @@
 #define GCN_DBG_MAX_CLIENTS 4
 #define GCN_DBG_LINE_CAP    (64 * 1024)      /* max request line               */
 #define GCN_DBG_RESP_CAP    (4 * 1024 * 1024) /* max response (ring dumps)      */
-#define GC_RAM_BASE_ADDR    0x80000000u
+#define GCN_COSIM_CPU_BLOB_CAP (16 * 1024)
 
 typedef struct {
     SOCKET sock;
@@ -43,6 +45,18 @@ static Client   s_clients[GCN_DBG_MAX_CLIENTS];
 static GcnDebugCtx s_ctx;
 static int      s_quit;
 static char     s_resp[GCN_DBG_RESP_CAP];
+static int      s_cosim_enabled;
+static int      s_cosim_parked;
+static u64      s_cosim_budget;
+static u64      s_cosim_instructions;
+static int      s_cosim_stop_pc_armed;
+static u32      s_cosim_stop_pc;
+static int      s_checkpoint_armed;
+static int      s_checkpoint_parked;
+static u32      s_checkpoint_pc;
+static int      s_checkpoint_have_gpr;
+static u32      s_checkpoint_gpr;
+static u32      s_checkpoint_gpr_value;
 
 /* ---- tiny JSON field extractors (flat objects only) ---- */
 
@@ -108,11 +122,130 @@ static void send_all(Client* c, const char* buf, int len) {
 
 static u8* ram_ptr(u32 guest_addr, u32* avail) {
     CPUState* cpu = s_ctx.cpu;
-    if (!cpu || !cpu->ram) return NULL;
-    u32 phys = guest_addr & 0x1FFFFFFFu;           /* cached/uncached mirror -> MEM1 */
-    if (phys >= cpu->ram_size) return NULL;
-    *avail = cpu->ram_size - phys;
-    return cpu->ram + phys;
+    if (!cpu) return NULL;
+    return gcn_mem_resolve(cpu, guest_addr, avail);
+}
+
+/* Canonical byte-order-independent FNV-1a. This intentionally hashes fields
+ * one by one instead of raw structs: padding, callbacks, host pointers and
+ * other implementation-only state must never enter a co-sim comparison. */
+static void hash_bytes(u64* h, const void* src, size_t len) {
+    const u8* p = (const u8*)src;
+    for (size_t i = 0; i < len; i++) {
+        *h ^= p[i];
+        *h *= 1099511628211ull;
+    }
+}
+
+static void hash_u32(u64* h, u32 v) {
+    u8 b[4] = {
+        (u8)(v >> 24), (u8)(v >> 16), (u8)(v >> 8), (u8)v
+    };
+    hash_bytes(h, b, sizeof b);
+}
+
+static void hash_u64(u64* h, u64 v) {
+    u8 b[8] = {
+        (u8)(v >> 56), (u8)(v >> 48), (u8)(v >> 40), (u8)(v >> 32),
+        (u8)(v >> 24), (u8)(v >> 16), (u8)(v >> 8), (u8)v
+    };
+    hash_bytes(h, b, sizeof b);
+}
+
+static u64 hash_memory(const u8* p, u32 len) {
+    u64 h = 1469598103934665603ull;
+    if (p && len)
+        hash_bytes(&h, p, len);
+    return h;
+}
+
+typedef struct {
+    u8*    data;
+    size_t cap;
+    size_t len;
+} CanonicalBytes;
+
+static void canonical_u32(CanonicalBytes* out, u32 v) {
+    if (!out || out->len + 4u > out->cap)
+        return;
+    out->data[out->len++] = (u8)(v >> 24);
+    out->data[out->len++] = (u8)(v >> 16);
+    out->data[out->len++] = (u8)(v >> 8);
+    out->data[out->len++] = (u8)v;
+}
+
+static void canonical_u64(CanonicalBytes* out, u64 v) {
+    if (!out || out->len + 8u > out->cap)
+        return;
+    out->data[out->len++] = (u8)(v >> 56);
+    out->data[out->len++] = (u8)(v >> 48);
+    out->data[out->len++] = (u8)(v >> 40);
+    out->data[out->len++] = (u8)(v >> 32);
+    out->data[out->len++] = (u8)(v >> 24);
+    out->data[out->len++] = (u8)(v >> 16);
+    out->data[out->len++] = (u8)(v >> 8);
+    out->data[out->len++] = (u8)v;
+}
+
+/* Serialize exactly the CPU fields covered by cosim_state's CPU sub-hash.
+ * This is deliberately independent of the host struct layout so Gate 4 can
+ * compare the canonical bytes rather than merely trusting equal hashes. */
+static size_t canonical_cpu_arch(const CPUState* cpu, u8* data, size_t cap) {
+    CanonicalBytes out = { data, cap, 0u };
+    if (!cpu || !data)
+        return 0u;
+    for (int i = 0; i < 32; i++) canonical_u32(&out, cpu->gpr[i]);
+    for (int i = 0; i < 32; i++) {
+        u64 bits;
+        memcpy(&bits, &cpu->fpr[i], sizeof bits);
+        canonical_u64(&out, bits);
+    }
+    for (int i = 0; i < 32; i++) {
+        u64 bits;
+        memcpy(&bits, &cpu->ps1[i], sizeof bits);
+        canonical_u64(&out, bits);
+    }
+    canonical_u32(&out, cpu->pc);
+    canonical_u32(&out, cpu->lr);
+    canonical_u32(&out, cpu->ctr);
+    canonical_u32(&out, cpu->cr);
+    canonical_u32(&out, cpu->xer);
+    canonical_u32(&out, cpu->fpscr);
+    canonical_u32(&out, cpu->msr);
+    canonical_u32(&out, cpu->srr0);
+    canonical_u32(&out, cpu->srr1);
+    canonical_u32(&out, cpu->dar);
+    canonical_u32(&out, cpu->dsisr);
+    canonical_u32(&out, cpu->ear);
+    canonical_u32(&out, cpu->hid2);
+    canonical_u64(&out, cpu->timebase);
+    for (int i = 0; i < 16; i++) canonical_u32(&out, cpu->sr[i]);
+    for (int i = 0; i < 8; i++) canonical_u32(&out, cpu->gqr[i]);
+    for (int i = 0; i < 1024; i++) canonical_u32(&out, cpu->spr[i]);
+    canonical_u32(&out, cpu->exception);
+    canonical_u32(&out, cpu->program_exception);
+    canonical_u32(&out, cpu->tlb_last_vps);
+    canonical_u32(&out, cpu->tlb_last_index);
+    canonical_u32(&out, cpu->tlb_invalidate_count);
+    canonical_u32(&out, cpu->external_addr);
+    canonical_u32(&out, cpu->external_value);
+    canonical_u32(&out, cpu->external_rid);
+    canonical_u32(&out, cpu->external_read_count);
+    canonical_u32(&out, cpu->external_write_count);
+    canonical_u32(&out, cpu->reserve_addr);
+    canonical_u32(&out, cpu->reserve_valid ? 1u : 0u);
+    for (int i = 0; i < 512; i++) {
+        canonical_u32(&out, cpu->locked_cache_tag[i]);
+        canonical_u32(&out, cpu->locked_cache_valid[i] ? 1u : 0u);
+    }
+    canonical_u64(&out, cpu->cycles);
+    return out.len;
+}
+
+static u64 hash_cpu_arch(const CPUState* cpu) {
+    u8 data[GCN_COSIM_CPU_BLOB_CAP];
+    size_t len = canonical_cpu_arch(cpu, data, sizeof data);
+    return hash_memory(data, (u32)len);
 }
 
 static void handle_line(Client* c, const char* line) {
@@ -132,6 +265,258 @@ static void handle_line(Client* c, const char* line) {
         n = snprintf(s_resp, GCN_DBG_RESP_CAP,
             "{\"ok\":true,\"block\":%llu,\"pc\":%u}\n",
             (unsigned long long)gcn_ring_block_index(), cpu ? cpu->pc : 0);
+    }
+    else if (!strcmp(cmd, "cosim_status")) {
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"enabled\":%s,\"parked\":%s,"
+            "\"instruction\":%llu,\"budget\":%llu,\"cycles\":%llu,\"pc\":%u,"
+            "\"stop_pc_armed\":%s,\"stop_pc\":%u}\n",
+            s_cosim_enabled ? "true" : "false",
+            s_cosim_parked ? "true" : "false",
+            (unsigned long long)s_cosim_instructions,
+            (unsigned long long)s_cosim_budget,
+            (unsigned long long)(cpu ? cpu->cycles : 0u),
+            cpu ? cpu->pc : 0u,
+            s_cosim_stop_pc_armed ? "true" : "false", s_cosim_stop_pc);
+    }
+    else if (!strcmp(cmd, "checkpoint_status")) {
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"armed\":%s,\"parked\":%s,\"pc\":%u,"
+            "\"have_gpr\":%s,\"gpr\":%u,\"gpr_value\":%u,"
+            "\"live_pc\":%u,\"block\":%llu}\n",
+            s_checkpoint_armed ? "true" : "false",
+            s_checkpoint_parked ? "true" : "false",
+            s_checkpoint_pc,
+            s_checkpoint_have_gpr ? "true" : "false",
+            s_checkpoint_gpr, s_checkpoint_gpr_value,
+            cpu ? cpu->pc : 0u,
+            (unsigned long long)gcn_ring_block_index());
+    }
+    else if (!strcmp(cmd, "checkpoint_arm")) {
+        u32 pc = 0, gpr = 0, gpr_value = 0;
+        int have_pc = json_uint(line, "pc", &pc);
+        int have_gpr = json_uint(line, "gpr", &gpr);
+        int have_gpr_value = json_uint(line, "gpr_value", &gpr_value);
+        if (!have_pc) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"missing pc\"}\n");
+        } else if (have_gpr != have_gpr_value || (have_gpr && gpr >= 32u)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"gpr and gpr_value must both be present; gpr must be 0..31\"}\n");
+        } else if (s_checkpoint_parked) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"resume the current checkpoint before arming another\"}\n");
+        } else {
+            s_checkpoint_pc = pc;
+            s_checkpoint_have_gpr = have_gpr;
+            s_checkpoint_gpr = gpr;
+            s_checkpoint_gpr_value = gpr_value;
+            s_checkpoint_armed = 1;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"armed\":true,\"pc\":%u,"
+                "\"have_gpr\":%s,\"gpr\":%u,\"gpr_value\":%u}\n",
+                pc, have_gpr ? "true" : "false", gpr, gpr_value);
+        }
+    }
+    else if (!strcmp(cmd, "checkpoint_resume")) {
+        int was_parked = s_checkpoint_parked;
+        s_checkpoint_armed = 0;
+        s_checkpoint_parked = 0;
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"resumed\":%s}\n",
+            was_parked ? "true" : "false");
+    }
+    else if (!strcmp(cmd, "cosim_step")) {
+        u32 count = 1;
+        json_uint(line, "count", &count);
+        if (!s_cosim_enabled) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"GCN_COSIM is not enabled\"}\n");
+        } else if (!s_cosim_parked) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"guest is not parked\"}\n");
+        } else if (count == 0u) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"count must be nonzero\"}\n");
+        } else {
+            s_cosim_stop_pc_armed = 0;
+            s_cosim_budget = count;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"granted\":%u,\"instruction\":%llu}\n",
+                count, (unsigned long long)s_cosim_instructions);
+        }
+    }
+    else if (!strcmp(cmd, "cosim_run_to")) {
+        u32 pc = 0, max_instructions = 10000000u;
+        int have_pc = json_uint(line, "pc", &pc);
+        json_uint(line, "max_instructions", &max_instructions);
+        if (!s_cosim_enabled) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"GCN_COSIM is not enabled\"}\n");
+        } else if (!s_cosim_parked) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"guest is not parked\"}\n");
+        } else if (!have_pc || max_instructions == 0u) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"pc and nonzero max_instructions are required\"}\n");
+        } else if (cpu && cpu->pc == pc) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"already_there\":true,\"pc\":%u,"
+                "\"instruction\":%llu}\n",
+                pc, (unsigned long long)s_cosim_instructions);
+        } else {
+            s_cosim_stop_pc = pc;
+            s_cosim_stop_pc_armed = 1;
+            s_cosim_budget = max_instructions;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"target_pc\":%u,\"max_instructions\":%u,"
+                "\"instruction\":%llu}\n",
+                pc, max_instructions,
+                (unsigned long long)s_cosim_instructions);
+        }
+    }
+    else if (!strcmp(cmd, "cosim_state") || !strcmp(cmd, "state_hash")) {
+        if (!cpu) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"no cpu\"}\n");
+        } else if (s_cosim_enabled && !s_cosim_parked) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"guest must be parked for a coherent snapshot\"}\n");
+        } else {
+            /* GX can still own pending XFB/DL accesses in a non-cosim query.
+             * Co-sim itself is single-threaded, but the drain is harmless and
+             * preserves the ordinary synchronous snapshot contract. */
+            gcn_gx_pipeline_drain();
+            u64 cpu_hash = hash_cpu_arch(cpu);
+            u64 mem1_hash = hash_memory(cpu->ram, cpu->ram_size);
+            u64 mem2_hash = hash_memory(cpu->mem2, cpu->mem2_size);
+            u32 l1_size = 0;
+            u8* l1 = gcn_mem_locked_l1(cpu, &l1_size);
+            u64 l1_hash = hash_memory(l1, l1_size);
+            u64 combined = 1469598103934665603ull;
+            hash_u64(&combined, cpu_hash);
+            hash_u64(&combined, mem1_hash);
+            hash_u64(&combined, mem2_hash);
+            hash_u64(&combined, l1_hash);
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"instruction\":%llu,\"cycles\":%llu,\"pc\":%u,"
+                "\"hash\":\"%016llx\",\"sub\":{\"cpu\":\"%016llx\","
+                "\"mem1\":\"%016llx\",\"mem2\":\"%016llx\","
+                "\"l1\":\"%016llx\"},"
+                "\"layout\":{\"mem1\":{\"base\":2147483648,\"size\":%u},"
+                "\"mem2\":{\"base\":2415919104,\"size\":%u},"
+                "\"l1\":{\"base\":3758096384,\"size\":%u}},"
+                "\"coverage\":{\"cpu\":true,\"mem1\":true,\"mem2\":true,"
+                "\"l1\":true,\"devices\":false},\"complete\":false}\n",
+                (unsigned long long)s_cosim_instructions,
+                (unsigned long long)cpu->cycles, cpu->pc,
+                (unsigned long long)combined,
+                (unsigned long long)cpu_hash,
+                (unsigned long long)mem1_hash,
+                (unsigned long long)mem2_hash,
+                (unsigned long long)l1_hash,
+                cpu->ram_size, cpu->mem2_size, l1_size);
+        }
+    }
+    else if (!strcmp(cmd, "cosim_cpu_bytes")) {
+        if (!cpu) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"no cpu\"}\n");
+        } else if (!s_cosim_enabled || !s_cosim_parked) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"CPU byte audit requires a parked co-sim guest\"}\n");
+        } else {
+            u8 data[GCN_COSIM_CPU_BLOB_CAP];
+            size_t len = canonical_cpu_arch(cpu, data, sizeof data);
+            u64 hash = hash_memory(data, (u32)len);
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"encoding\":\"hex\",\"length\":%llu,"
+                "\"hash\":\"%016llx\",\"hex\":\"",
+                (unsigned long long)len, (unsigned long long)hash);
+            static const char hex[] = "0123456789abcdef";
+            for (size_t i = 0; i < len && n + 2 < GCN_DBG_RESP_CAP; i++) {
+                s_resp[n++] = hex[data[i] >> 4];
+                s_resp[n++] = hex[data[i] & 15u];
+            }
+            n += snprintf(s_resp + n, GCN_DBG_RESP_CAP - n, "\"}\n");
+        }
+    }
+    else if (!strcmp(cmd, "cosim_pages")) {
+        char space[16] = "mem1";
+        u32 start = 0, count = 64;
+        json_str(line, "space", space, sizeof space);
+        json_uint(line, "start", &start);
+        json_uint(line, "count", &count);
+        if (count > 256u) count = 256u;
+        const u8* base = NULL;
+        u32 size = 0;
+        if (cpu && !strcmp(space, "mem1")) {
+            base = cpu->ram; size = cpu->ram_size;
+        } else if (cpu && !strcmp(space, "mem2")) {
+            base = cpu->mem2; size = cpu->mem2_size;
+        } else if (cpu && !strcmp(space, "l1")) {
+            base = gcn_mem_locked_l1(cpu, &size);
+        }
+        const u32 page_size = 4096u;
+        u32 pages = (size + page_size - 1u) / page_size;
+        if (!base || start >= pages) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"page range unavailable\"}\n");
+        } else {
+            if (count > pages - start) count = pages - start;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"space\":\"%s\",\"page_size\":%u,"
+                "\"start\":%u,\"hashes\":[", space, page_size, start);
+            for (u32 i = 0; i < count; i++) {
+                u32 off = (start + i) * page_size;
+                u32 len = size - off;
+                if (len > page_size) len = page_size;
+                u64 h = hash_memory(base + off, len);
+                n += snprintf(s_resp + n, GCN_DBG_RESP_CAP - n,
+                    "%s\"%016llx\"", i ? "," : "", (unsigned long long)h);
+            }
+            n += snprintf(s_resp + n, GCN_DBG_RESP_CAP - n, "]}\n");
+        }
+    }
+    else if (!strcmp(cmd, "cosim_inject")) {
+        char kind[16] = {0};
+        u32 index = 0, addr = 0, xor_mask = 1u, value_hi = 0, value_lo = 0;
+        json_str(line, "kind", kind, sizeof kind);
+        json_uint(line, "index", &index);
+        json_uint(line, "addr", &addr);
+        json_uint(line, "xor", &xor_mask);
+        json_uint(line, "value_hi", &value_hi);
+        json_uint(line, "value_lo", &value_lo);
+        if (!s_cosim_enabled || !s_cosim_parked || !cpu) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"injection requires a parked co-sim guest\"}\n");
+        } else if (!strcmp(kind, "gpr") && index < 32u) {
+            cpu->gpr[index] ^= xor_mask;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"kind\":\"gpr\",\"index\":%u,\"value\":%u}\n",
+                index, cpu->gpr[index]);
+        } else if (!strcmp(kind, "ram")) {
+            u32 avail = 0;
+            u8* p = ram_ptr(addr, &avail);
+            if (!p || avail == 0u) {
+                n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                    "{\"ok\":false,\"error\":\"injection address unavailable\"}\n");
+            } else {
+                p[0] ^= (u8)xor_mask;
+                n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                    "{\"ok\":true,\"kind\":\"ram\",\"addr\":%u,\"value\":%u}\n",
+                    addr, (unsigned)p[0]);
+            }
+        } else if (!strcmp(kind, "timebase")) {
+            cpu->timebase = ((u64)value_hi << 32) | value_lo;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"kind\":\"timebase\","
+                "\"value_hi\":%u,\"value_lo\":%u}\n",
+                value_hi, value_lo);
+        } else {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"kind must be gpr, ram, or timebase\"}\n");
+        }
     }
     else if (!strcmp(cmd, "get_registers") || !strcmp(cmd, "regs")) {
         if (!cpu) { n = snprintf(s_resp, GCN_DBG_RESP_CAP, "{\"ok\":false,\"error\":\"no cpu\"}\n"); }
@@ -199,6 +584,17 @@ static void handle_line(Client* c, const char* line) {
     else if (!strcmp(cmd, "block_dump")) {
         u32 count = 256; json_uint(line, "count", &count);
         n = gcn_ring_block_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
+    }
+    else if (!strcmp(cmd, "pc_seen")) {
+        u32 pc = 0;
+        if (!json_uint(line, "pc", &pc)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                         "{\"ok\":false,\"error\":\"missing pc\"}\n");
+        } else {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                         "{\"ok\":true,\"pc\":%u,\"seen\":%s}\n",
+                         pc, gcn_ring_pc_seen(pc) ? "true" : "false");
+        }
     }
     else if (!strcmp(cmd, "event_dump")) {
         u32 count = 256; json_uint(line, "count", &count);
@@ -270,6 +666,17 @@ static void handle_line(Client* c, const char* line) {
             (unsigned long long)a.wait_milliseconds,
             (unsigned long long)a.dropped_frames,
             aid_source, aid_cur_addr, aid_blocks_left, aid_ctrl);
+    }
+    else if (!strcmp(cmd, "gx_draw_state")) {
+        /* Retire the GX queue before reading the retained per-config draw
+         * snapshots. Each active texture reports a draw-time content hash and
+         * physical MEM1 range, which can then be localized with cosim_pages
+         * and fetched with read_ram. */
+        gcn_gx_pipeline_drain();
+        n = gx_raster_debug_draw_state_json(s_resp, GCN_DBG_RESP_CAP);
+        if (n < 0)
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"GX snapshot unavailable\"}\n");
     }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
         /* Decode the XFB the VI is scanning out into a PPM on disk. Geometry
@@ -413,6 +820,19 @@ int gcn_debug_server_start(const GcnDebugCtx* ctx) {
     if (port <= 0 || port > 65535) return 0;
 
     s_ctx = *ctx;
+    const char* cosim = getenv("GCN_COSIM");
+    s_cosim_enabled = cosim && *cosim && *cosim != '0';
+    s_cosim_parked = 0;
+    s_cosim_budget = 0;
+    s_cosim_instructions = 0;
+    s_cosim_stop_pc_armed = 0;
+    s_cosim_stop_pc = 0;
+    s_checkpoint_armed = 0;
+    s_checkpoint_parked = 0;
+    s_checkpoint_pc = 0;
+    s_checkpoint_have_gpr = 0;
+    s_checkpoint_gpr = 0;
+    s_checkpoint_gpr_value = 0;
     for (int i = 0; i < GCN_DBG_MAX_CLIENTS; i++) s_clients[i].sock = INVALID_SOCKET;
 
     WSADATA wsa;
@@ -436,6 +856,9 @@ int gcn_debug_server_start(const GcnDebugCtx* ctx) {
     s_enabled = 1; s_quit = 0;
     fprintf(stdout, "gcn debug: TCP debug server on 127.0.0.1:%d "
                     "(always-on rings; JSON-over-newline)\n", port);
+    if (s_cosim_enabled)
+        fprintf(stdout, "gcn cosim: deterministic interpreter path armed; "
+                        "parked before reset-vector instruction 0\n");
     fflush(stdout);
     return port;
 }
@@ -495,6 +918,56 @@ void gcn_debug_server_pump(void) {
 
 int gcn_debug_server_quit_requested(void) { return s_quit; }
 
+int gcn_debug_server_cosim_enabled(void) { return s_cosim_enabled; }
+
+int gcn_debug_server_checkpoint_before_block(void) {
+    CPUState* cpu = s_ctx.cpu;
+    if (!s_enabled || !s_checkpoint_armed || !cpu ||
+        cpu->pc != s_checkpoint_pc)
+        return !s_quit;
+    if (s_checkpoint_have_gpr &&
+        cpu->gpr[s_checkpoint_gpr] != s_checkpoint_gpr_value)
+        return !s_quit;
+
+    s_checkpoint_armed = 0;
+    s_checkpoint_parked = 1;
+    fprintf(stdout,
+        "gcn checkpoint: parked before pc=0x%08X at block=%llu%s\n",
+        cpu->pc, (unsigned long long)gcn_ring_block_index(),
+        s_checkpoint_have_gpr ? " (GPR condition matched)" : "");
+    fflush(stdout);
+    while (s_enabled && !s_quit && s_checkpoint_parked) {
+        gcn_debug_server_pump();
+        Sleep(1);
+    }
+    return !s_quit;
+}
+
+int gcn_debug_server_cosim_before_instruction(void) {
+    if (!s_cosim_enabled)
+        return !s_quit;
+    if (s_cosim_stop_pc_armed && s_ctx.cpu &&
+        s_ctx.cpu->pc == s_cosim_stop_pc) {
+        s_cosim_stop_pc_armed = 0;
+        s_cosim_budget = 0;
+    }
+    s_cosim_parked = 1;
+    while (s_enabled && !s_quit && s_cosim_budget == 0u) {
+        gcn_debug_server_pump();
+        Sleep(1);
+    }
+    s_cosim_parked = 0;
+    return !s_quit;
+}
+
+void gcn_debug_server_cosim_after_instruction(void) {
+    if (!s_cosim_enabled)
+        return;
+    s_cosim_instructions++;
+    if (s_cosim_budget > 0u)
+        s_cosim_budget--;
+}
+
 void gcn_debug_server_park(void) {
     if (!s_enabled) return;
     fprintf(stdout, "gcn debug: parked — serving debug queries; send \"quit\" to exit.\n");
@@ -511,4 +984,10 @@ void gcn_debug_server_stop(void) {
     if (s_listen != INVALID_SOCKET) { closesocket(s_listen); s_listen = INVALID_SOCKET; }
     WSACleanup();
     s_enabled = 0;
+    s_cosim_enabled = 0;
+    s_cosim_parked = 0;
+    s_cosim_budget = 0;
+    s_cosim_stop_pc_armed = 0;
+    s_checkpoint_armed = 0;
+    s_checkpoint_parked = 0;
 }

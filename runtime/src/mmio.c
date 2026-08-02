@@ -59,14 +59,16 @@ bool gcn_mmio_register(GcnMmioBus* bus, const char* name, u32 base, u32 size,
 
 /* Track unmapped addresses so we warn once per address, not once per access
  * (a busy-wait on an unmodeled status bit would otherwise flood stderr). */
-static void warn_unmapped(u32 addr, int is_write) {
+static void warn_unmapped(u32 addr, int is_write, u32 pc) {
     static u32 seen[64];
     static u32 seen_n = 0;
     for (u32 i = 0; i < seen_n; i++)
         if (seen[i] == addr) return;
     if (seen_n < 64) seen[seen_n++] = addr;
-    fprintf(stderr, "gcn mmio: %s unmapped 0x%08X (no device model; returns 0)\n",
-            is_write ? "write" : "read", addr);
+    fprintf(stderr,
+            "gcn mmio: %s unmapped 0x%08X at pc=0x%08X "
+            "(no device model; returns 0)\n",
+            is_write ? "write" : "read", addr, pc);
 }
 
 static u64 mmio_ext_read(CPUState* cpu, u32 ea, u8 size) {
@@ -77,7 +79,7 @@ static u64 mmio_ext_read(CPUState* cpu, u32 ea, u8 size) {
     if (d && d->read)
         value = d->read(d->user, cpu, ea, size);
     else
-        warn_unmapped(ea, 0);
+        warn_unmapped(ea, 0, cpu->pc);
     if (gcn_trace_active())
         gcn_trace_mmio(cpu->pc, ea, value, size, 0);
     gcn_ring_mmio(cpu->pc, ea, value, size, 0, d ? 1 : 0);
@@ -94,7 +96,7 @@ static void mmio_ext_write(CPUState* cpu, u32 ea, u64 value, u8 size) {
     if (d && d->write)
         d->write(d->user, cpu, ea, (u32)value, size);
     else
-        warn_unmapped(ea, 1);
+        warn_unmapped(ea, 1, cpu->pc);
 }
 
 void gcn_mmio_install(GcnMmioBus* bus, CPUState* cpu) {

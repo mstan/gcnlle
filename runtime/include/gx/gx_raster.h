@@ -36,6 +36,7 @@
 #define GCN_GX_GX_RASTER_H
 
 #include "cpu/cpu.h"
+#include <stddef.h>
 
 /* CP vertex-descriptor state needed by the vertex loader + array fetch. Mirror
  * of the size-affecting subset of Dolphin CPState (CPMemory.h). Shared with
@@ -81,6 +82,14 @@ void gx_raster_efb_data(const u32** color, const u32** depth,
                         u32* width, u32* height);
 void gx_raster_efb_data_mutable(u32** color, u32** depth,
                                 u32* width, u32* height);
+
+/* CPU EFB aperture access (physical 0x08000000..0x0BFFFFFF, normally reached
+ * through the SDK's 0xC8000000 effective mapping). `address` keeps the encoded
+ * x/y and color-vs-depth plane bits. Returns 1 when the access is implemented;
+ * unsupported combined/color cases return 0 so the PE bus layer can report
+ * them loudly rather than fabricate a value. The caller must first retire
+ * queued GX work and materialize any resident GPU EFB. */
+int gx_raster_efb_cpu_read(u32 address, u32* value);
 
 /* Exact post-clip triangle work packet for the GPU shadow. Geometry remains
  * owned by the LLE software vertex loader/transform/clipper; this is the
@@ -171,6 +180,14 @@ void gx_raster_get_pixel_stats(GxPixelStats* out);
  * No-op unless the knob is on. Called from gx.c's shared stats cadence and
  * once at renderer shutdown so short late-state captures still report. */
 void gx_raster_print_census(void);
+
+/* TCP/co-sim diagnostic snapshot of the last draw observed for each
+ * GCN_GX_TEV_CENSUS configuration. The JSON contains raw BP/TEV texture
+ * registers plus hashes and byte samples of every texture actually consumed
+ * by that draw. This connects a rendered-pixel mismatch to the exact guest
+ * MEM1 pages that cosim_pages/read_ram can compare. Returns bytes written,
+ * including the trailing newline, or a negative value when `out` is invalid. */
+int gx_raster_debug_draw_state_json(char* out, size_t cap);
 
 /* Always-on per-frame coverage anomaly detector: call at every accepted
  * GXSetDrawDone (decode thread). Logs "[gx-frameanom]" with the frame's

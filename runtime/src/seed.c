@@ -140,40 +140,46 @@ bool gcn_seed_apply(CPUState* cpu, GcnSeedDevices* devices, const GcnSeedConfig*
      * low-mem (DESIGN.md §6). */
     gcn_mem_fill_mem1(cpu, cfg->mem1_fill);
 
-    /* [ROM] Load the descrambled BS2 image at its real target address. */
-    if (!gcn_mem_load_blob(cpu, cfg->load_addr, cfg->payload, cfg->payload_size))
+    /* [ORACLE/ROM] Mirror Dolphin Load_BS2's two byte-for-byte copies:
+     *   payload[0,0x700)   -> 0x81200000 (BS1 tail entered at +0x150)
+     *   payload[0x720,end) -> 0x81300000 (BS2 body; IPL file off 0x820)
+     * Loading the full body contiguously at 0x81200000 was an old M0
+     * approximation and populated bytes the independent oracle leaves zero. */
+    if (!gcn_mem_load_blob(cpu, cfg->load_addr, cfg->payload,
+                           GCN_BS2_BOOT_COPY_SIZE))
+        return false;
+    if (!gcn_mem_load_blob(cpu, GCN_BS2_STAGE2_LOAD_ADDR,
+                           cfg->payload + GCN_BS2_STAGE2_PAYLOAD_OFF,
+                           cfg->payload_size - GCN_BS2_STAGE2_PAYLOAD_OFF))
         return false;
 
     /* [ROM] Enter at the true IPL start routine. */
     cpu->pc = cfg->entry_pc;
 
-    /* ---- CPU latches ----
-     * These are the only genuinely Dolphin-adjacent unknowns. Dolphin VERIFIES
-     * them; it never feeds them (DESIGN.md §6). What we can justify from docs we
-     * set with provenance; the rest are [DEBT] to be pinned from BS1 disasm in
-     * M1 (real BS1 will set them itself, at which point these seeds go away).
-     */
+    /* ---- CPU latches at the shared Dolphin Load_BS2 seam ---- */
 
     /* [YAGCD] PVR (SPR 287) reads as the Gekko id. cpu_init already set this;
      * cpu_reset restored it. Asserted here for clarity. */
     cpu->spr[287] = PPC_GEKKO_PVR;
 
-    /* [DEBT] HID2: the IPL menu's rolling-cube scene uses paired singles, which
-     * require HID2[PSE] (and HID2[LSQE] for non-indexed psq). The real BS1/BS2
-     * sets HID2 via mtspr before any ps op; we pre-enable PSE|LSQE so that if we
-     * enter slightly past that mtspr the ps path still works. FLAGGED: confirm
-     * the exact HID2 value BS2 writes from BS1/BS2 disasm in M1. */
+    /* [ORACLE + M1 CROSS-CHECK] Exact Load_BS2 entry state. Dolphin's
+     * independently-authored Boot.cpp writes these immediately before setting
+     * PC=0x81200150; real BS1 produces the same GPR/MSR/BAT values. */
+    cpu->gpr[3] = 0xFFF0001Fu;
+    cpu->gpr[4] = 0x00002030u;
+    cpu->gpr[5] = 0x0000009Cu;
+    cpu->msr = 0x00002030u;       /* FP | IR | DR */
+    cpu->spr[1008] = 0x0011C464u; /* HID0, Dolphin Load_BS2 GC value */
+
+    cpu->spr[528] = 0x80001FFFu; cpu->spr[529] = 0x00000002u; /* IBAT0 */
+    cpu->spr[536] = 0x80001FFFu; cpu->spr[537] = 0x00000002u; /* DBAT0 */
+    cpu->spr[538] = 0xC0001FFFu; cpu->spr[539] = 0x0000002Au; /* DBAT1 */
+    cpu->spr[534] = 0xFFF0001Fu; cpu->spr[535] = 0xFFF00001u; /* IBAT3 */
+    cpu->spr[542] = 0xFFF0001Fu; cpu->spr[543] = 0xFFF00001u; /* DBAT3 */
+
+    /* M0 still enables paired-single/quantized-load support in the simplified
+     * CPU ABI. True-reset M1 does not seed this field. */
     cpu->hid2 = PPC_HID2_PSE | PPC_HID2_LSQE;
-
-    /* [DEBT] MSR: at BS2 entry the machine runs supervisor, FP-enabled, with
-     * translation configured by BS1's BAT setup. We set FP + ME as a documented
-     * best-effort; EE/IR/DR/IP and the BAT/SR contents are NOT yet derived and
-     * are the primary M1 debt. FLAGGED. */
-    cpu->msr = 0x00002000u;   /* FP (bit 18) on; everything else left at reset 0 */
-
-    /* [DEBT] BATs (SPR 528..543), SRs (sr[0..15]), GQRs (gqr[0..7]) are left at
-     * reset 0. BS1 programs the BATs and the SDK programs GQR0 for standard
-     * float quantisation; deriving the exact values is M1 work. FLAGGED. */
 
     cpu->cycles = 0;
     cpu->halted = false;

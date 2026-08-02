@@ -17,6 +17,11 @@ void gx_render_draw(const GxCpState* cp, u32 prim, u32 vat,
 void gx_render_efb_copy(const GxCpState* cp);
 void gx_render_flush(void);
 
+/* Make the software EFB planes current for a synchronous CPU peek. Software
+ * and Vulkan-shadow modes are already current; resident Vulkan downloads its
+ * ordered color/depth planes. */
+void gx_render_sync_efb_to_software(void);
+
 /* Diagnostic identity only; never use this to infer acceleration. */
 const char* gx_render_backend_name(void);
 

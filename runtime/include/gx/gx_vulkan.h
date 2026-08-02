@@ -24,5 +24,6 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
 /* 1=handled on GPU, 0=synchronized software fallback required, -1=fatal. */
 int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size);
 int gx_vulkan_resident_flush(void);
+int gx_vulkan_resident_sync_to_software(void);
 
 #endif /* GCN_GX_GX_VULKAN_H */

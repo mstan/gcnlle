@@ -33,6 +33,16 @@ extern "C" {
 #define GCN_BS2_LOAD_ADDR   0x81200000u
 #define GCN_BS2_ENTRY_PC    0x81200150u
 
+/* Dolphin's independently-authored Load_BS2 seam copies only the executable
+ * BS1 tail [payload+0, +0x700) to 0x81200000, and copies the BS2 body beginning
+ * at original IPL offset 0x820 (payload-relative 0x720) to 0x81300000. The
+ * bytes between 0x81200700 and 0x812FFFFF remain reset RAM. Mirroring this
+ * documented boot layout makes the M0 diagnostic seed comparable at the
+ * shared 0x81200150 checkpoint; M1 true-reset still performs the real path. */
+#define GCN_BS2_BOOT_COPY_SIZE       0x00000700u
+#define GCN_BS2_STAGE2_PAYLOAD_OFF   0x00000720u
+#define GCN_BS2_STAGE2_LOAD_ADDR     0x81300000u
+
 /* [ROM] Exact size of the USA BS2 payload = descrambled [0x100, 0x1AFF00) =
  * 0x1AFE00 bytes (oracle-corrected: the code image begins at file offset 0x100,
  * after the copyright header, not 0x820). A payload of any other size is a
@@ -121,9 +131,10 @@ u16  gcn_sram_checksum(const u8 sram[GCN_SRAM_SIZE], u16* inv);
  * recomputation — i.e. the SRAM the IPL would accept without resetting it. */
 bool gcn_sram_validate(const u8 sram[GCN_SRAM_SIZE]);
 
-/* Apply the full seed: reset the CPU, fill MEM1, load the payload, set entry PC
- * and the (flagged) CPU latches, and populate the device fixtures. Returns false
- * on any inconsistency (bad size, load overflow). Does NOT execute PPC. */
+/* Apply the Dolphin-comparable M0 seed: reset the CPU, fill MEM1, place the
+ * two documented IPL slices, set the 0x81200150 HLE-seam CPU state, and
+ * populate the device fixtures. Returns false on any inconsistency. M1 does
+ * not use this path. Does NOT execute PPC. */
 bool gcn_seed_apply(CPUState* cpu, GcnSeedDevices* devices, const GcnSeedConfig* cfg);
 
 /* Populate the device fixtures only (SRAM + RTC) — the same [FIXTURE] logic

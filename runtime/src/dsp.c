@@ -201,7 +201,7 @@ static void dsp_latch_mailbox_int(GcnDsp* dsp) {
 }
 
 void gcn_dsp_init(GcnDsp* dsp, const u8* irom, const u8* coef, u8* mem1, u32 mem1_size) {
-    memset(dsp, 0, sizeof *dsp);
+    gcn_dsp_reset_registers(dsp);
     dsp->mem1 = mem1;
     dsp->mem1_size = mem1_size;
     dsp_lle_init(irom, coef, mem1, mem1_size);   /* brings up the core + ARAM */
@@ -410,6 +410,7 @@ void gcn_dsp_tick(u32 ppc_cycles, u32 aid_core_cycles) {
      * expensive DSP core step above is deferred. */
     if (s_dsp) {
         dsp_latch_mailbox_int(s_dsp);
+        gcn_dsp_aram_advance(s_dsp, ppc_cycles);
         dsp_aid_tick(s_dsp, aid_core_cycles);
         dsp_update_interrupts(s_dsp);
     }
@@ -419,11 +420,13 @@ static u16 idx16(u32 off) { return (u16)(off >> 1); }
 
 /* Perform the ARAM DMA the guest just kicked (Flipper AR engine, CPU-side). See
  * the header for the register layout; direction bit 31 of AR_CNT. */
-static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
+static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu) {
     u32 mmaddr = ((u32)dsp->reg[idx16(GCN_DSP_AR_MMADDR)]     << 16) |
                   (u32)dsp->reg[idx16(GCN_DSP_AR_MMADDR) + 1];
     u32 araddr = ((u32)dsp->reg[idx16(GCN_DSP_AR_ARADDR)]     << 16) |
                   (u32)dsp->reg[idx16(GCN_DSP_AR_ARADDR) + 1];
+    u32 cnt    = ((u32)dsp->reg[idx16(GCN_DSP_AR_CNT)]        << 16) |
+                  (u32)dsp->reg[idx16(GCN_DSP_AR_CNT) + 1];
     u32 len    = cnt & 0x03FFFFFFu;
     int to_aram = ((cnt & 0x80000000u) == 0);
     u8* aram = dsp_lle_aram();          /* shared with the DSP accelerator */
@@ -441,7 +444,9 @@ static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu, u32 cnt) {
     }
 
     dsp->dma_active = true;
-    dsp->dma_polls_left = GCN_DSP_ARAM_DMA_NOMINAL_POLLS;
+    dsp->dma_cycles_left = (len / 32u) * GCN_DSP_ARAM_TICKS_PER_32B;
+    if (!dsp->dma_cycles_left)
+        dsp->dma_cycles_left = 1u;
     gcn_ring_event(GCN_EV_ARAM_DMA, (u32)to_aram, len, cpu->pc);
 }
 
@@ -457,12 +462,9 @@ static u32 read_csr(GcnDsp* dsp) {
           | (dsp->dma_active ? GCN_DSP_CSR_DMA : 0u)
           | ((u32)dsp_lle_read_control() & GCN_DSP_CONTROL_MASK);
 
-    if (dsp->dma_active && --dsp->dma_polls_left == 0) {
-        dsp->dma_active = false;
-        dsp->csr |= GCN_DSP_CSR_ARINT;   /* AR DMA complete raises the ARAM int */
-    }
     /* Any of the six interrupt/mask bits may have just changed (DSPINT latched
-     * above, ARINT on DMA completion): re-evaluate the line. */
+     * above): re-evaluate the line. ARAM completion is driven from the regular
+     * hardware tick, so an interrupt-driven client need not poll this CSR. */
     dsp_update_interrupts(dsp);
     return v;
 }
@@ -517,8 +519,9 @@ u32 gcn_dsp_read(void* user, CPUState* cpu, u32 addr, u8 size) {
         return read16_aid(dsp, off);
     }
     if (size == 4)
-        return ((u32)dsp->reg[idx16(off)] << 16) | (u32)dsp->reg[idx16(off) + 1];
-    return dsp->reg[idx16(off)];
+        return ((u32)gcn_dsp_reg_read16(dsp, off) << 16) |
+               (u32)gcn_dsp_reg_read16(dsp, off + 2u);
+    return gcn_dsp_reg_read16(dsp, off);
 }
 
 /* Audio-DMA 16-bit register write (DSP.cpp RegisterMMIO:314-361). The GCN
@@ -586,15 +589,17 @@ void gcn_dsp_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
         return;
     }
 
-    /* store into the generic 16-bit backing (32-bit writes fill two halves) */
+    /* Store into the direct 16-bit register bank (32-bit writes fill two
+     * halves). The helper applies hardware masks and read-only behavior. */
     if (size == 4) {
-        dsp->reg[idx16(off)]     = (u16)(value >> 16);
-        dsp->reg[idx16(off) + 1] = (u16)value;
+        gcn_dsp_reg_write16(dsp, off, (u16)(value >> 16));
+        gcn_dsp_reg_write16(dsp, off + 2u, (u16)value);
     } else {
-        dsp->reg[idx16(off)] = (u16)value;
+        gcn_dsp_reg_write16(dsp, off, (u16)value);
     }
 
-    /* the AR_CNT write kicks the ARAM DMA (MMADDR/ARADDR were set just before) */
-    if (off == GCN_DSP_AR_CNT)
-        aram_dma_kick(dsp, cpu, value);
+    /* Hardware starts ARAM DMA when the low count half is written. A 32-bit
+     * write beginning at AR_CNT includes that low-half write. */
+    if ((off == GCN_DSP_AR_CNT && size == 4) || off == GCN_DSP_AR_CNT_LO)
+        aram_dma_kick(dsp, cpu);
 }

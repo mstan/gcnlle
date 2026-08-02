@@ -10,6 +10,7 @@
 #include "dispatch/dispatch.h"
 #include "cpu/interpreter.h"
 #include "cpu/native_code.h"
+#include "cpu/timing.h"
 #include "cpu/title_module.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
 #include "ai/ai.h"            /* advance the AI sample counter/AIINT per block */
@@ -217,7 +218,7 @@ static inline int gcn_dispatch_charge(CPUState* ctx, u64* prev_cycles,
                                        u64* tb_remainder, u64* dsp_remainder,
                                        u64* device_cycles, u32 dsp_cycles_per_block,
                                        int uniform, u32* dsp_cycles_out,
-                                       u32* ai_cycles_out) {
+                                       u32* ai_cycles_out, u32* tb_ticks_out) {
     u64 cycles_now = ctx->cycles;
     u64 delta = cycles_now - *prev_cycles;
     *prev_cycles = cycles_now;
@@ -229,6 +230,7 @@ static inline int gcn_dispatch_charge(CPUState* ctx, u64* prev_cycles,
         *ai_cycles_out   = 0;   /* unused by the caller (gcn_ai_tick_legacy takes
                                   * no argument) — set anyway so the out-param is
                                   * never left uninitialized on this path. */
+        *tb_ticks_out = GCN_TB_TICKS_PER_BLOCK;
         return 0;
     }
 
@@ -242,7 +244,8 @@ static inline int gcn_dispatch_charge(CPUState* ctx, u64* prev_cycles,
     { u64 numer = delta + *tb_remainder;
       u64 tb_delta = numer / 12u;
       *tb_remainder = numer % 12u;
-      ctx->timebase += tb_delta; }
+      ctx->timebase += tb_delta;
+      *tb_ticks_out = (u32)tb_delta; }
 
     /* Device clock (VI beam, etc.): device_cycles IS the Gekko core clock, the
      * exact same domain ctx->cycles counts — 1:1 passthrough, no scaling.
@@ -327,7 +330,8 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     static int s_cycles_uniform = -1;
     if (s_cycles_uniform < 0) {
         const char* d = getenv("GCN_CYCLES_DERIVED");
-        int derived_req = (d && *d && *d != '0') && !getenv("GCN_CYCLES_UNIFORM");
+        int derived_req = gcn_debug_server_cosim_enabled() ||
+                          ((d && *d && *d != '0') && !getenv("GCN_CYCLES_UNIFORM"));
         s_cycles_uniform = derived_req ? 0 : 1;
         if (derived_req)
             gcn_dsp_set_flush_min(96u);   /* see gcn_dsp_flush_lazy (dsp.c) */
@@ -352,6 +356,13 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     if (s_dstats < 0) s_dstats = getenv("GCN_DISPATCH_STATS") ? 1 : 0;
 
     while (max_blocks == 0u || blocks < max_blocks) {
+        /* GCN_COSIM=1 is the deterministic diagnostic path from
+         * recomp-template/DIFFERENTIAL-COSIMULATION.md. Park before the very
+         * first guest instruction and at every coordinator-granted boundary.
+         * Normal execution never enters this branch. */
+        if (!gcn_debug_server_cosim_before_instruction())
+            return 1;
+
         /* A block that raises an exception returns with ctx->pc set to the vector
          * (e.g. 0xC00 for `sc`) and ctx->exception still set — the generated
          * per-instruction guards use that flag to abort the FAULTING block. But
@@ -366,6 +377,9 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * handler entry then flows through the same pending/clear dance as any
          * synchronous exception below. */
         gcn_pi_deliver_external(ctx);
+        ppc_deliver_decrementer(ctx);
+        if (!gcn_debug_server_checkpoint_before_block())
+            return 1;
         gcn_ring_block(ctx->pc);   /* always-on retired-block/PC timeline */
 
         /* M1 (opt-in, GCN_LOG_BS1_HANDOFF=1): one-shot dump of the FULL CPU
@@ -456,18 +470,23 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * never needs calibrating. Off by default; ~zero cost when off. */
         if (s_dstats) {
             u64 t0 = __rdtsc();
-            int ok = gcn_dispatch_native(ctx);
+            int ok = 0;
+            if (!gcn_debug_server_cosim_enabled()) {
+                ok = gcn_dispatch_native(ctx);
+                if (!ok)
+                    gcn_interpreter_note_native_miss(ctx);
+            }
             if (!ok) {
-                gcn_interpreter_note_native_miss(ctx);
                 ok = gcn_interpreter_step(ctx);
             }
             u64 t1 = __rdtsc(); s_tsc[0] += t1 - t0;
             if (!ok) { ctx->exception = pending; return 0; }
-            u32 dsp_cycles, ai_cycles;
+            u32 dsp_cycles, ai_cycles, tb_ticks;
             int derived = gcn_dispatch_charge(ctx, &prev_cycles, &tb_remainder,
                                                &dsp_remainder, &device_cycles,
                                                dsp_cycles_per_block, s_cycles_uniform,
-                                               &dsp_cycles, &ai_cycles);
+                                               &dsp_cycles, &ai_cycles, &tb_ticks);
+            ppc_decrementer_tick(ctx, tb_ticks);
             gcn_dsp_tick(dsp_cycles,
                          derived ? ai_cycles : GCN_CORE_CYCLES_PER_BLOCK);
             u64 t2 = __rdtsc(); s_tsc[1] += t2 - t1;
@@ -490,9 +509,13 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                 fflush(stderr);
             }
         } else {
-        int dispatch_ok = gcn_dispatch_native(ctx);
+        int dispatch_ok = 0;
+        if (!gcn_debug_server_cosim_enabled()) {
+            dispatch_ok = gcn_dispatch_native(ctx);
+            if (!dispatch_ok)
+                gcn_interpreter_note_native_miss(ctx);
+        }
         if (!dispatch_ok) {
-            gcn_interpreter_note_native_miss(ctx);
             dispatch_ok = gcn_interpreter_step(ctx);
         }
         if (!dispatch_ok) {   /* off-image PC and interpreter cannot continue */
@@ -503,11 +526,12 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * charges — fallback (fixed legacy constants, byte-identical to
          * before derived cycle accuracy) or derived (real per-block
          * ctx->cycles delta) per gcn_dispatch_charge's doc comment above. */
-        u32 dsp_cycles, ai_cycles;
+        u32 dsp_cycles, ai_cycles, tb_ticks;
         int derived = gcn_dispatch_charge(ctx, &prev_cycles, &tb_remainder,
                                            &dsp_remainder, &device_cycles,
                                            dsp_cycles_per_block, s_cycles_uniform,
-                                           &dsp_cycles, &ai_cycles);
+                                           &dsp_cycles, &ai_cycles, &tb_ticks);
+        ppc_decrementer_tick(ctx, tb_ticks);
         /* Accrues DSP-cycle debt and flushes it at CPU observation points or
          * the K-cycle cap (default 4096 PPC cycles, GCN_DSP_BATCH_PPC) —
          * no longer runs the DSP core every block; see gcn_dsp_flush (dsp.c). */
@@ -519,6 +543,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         gcn_di_tick();                           /* complete a deferred DI command */
         gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */
         }
+        gcn_debug_server_cosim_after_instruction();
         /* Service the debug server between blocks: non-blocking, so it stays
          * responsive even while the guest busy-waits on unmodeled hardware. A
          * client "quit" ends the run cleanly. Pumped every 262144 blocks rather than

@@ -42,6 +42,12 @@
 #define GCN_PE_BASE  0xCC001000u
 #define GCN_PE_SIZE  0x1000u        /* full PE block (Dolphin registers within it) */
 
+/* CPU-facing EFB mapping used by GXPeekARGB/GXPeekZ. The PowerPC MMU maps the
+ * SDK's 0xC8000000 effective aperture to physical 0x08000000; this flat LLE
+ * runtime receives the effective address directly. */
+#define GCN_EFB_CPU_BASE 0xC8000000u
+#define GCN_EFB_CPU_SIZE 0x04000000u
+
 /* Register offsets (PixelEngine.h:29-58). */
 #define GCN_PE_ZCONF        0x00u
 #define GCN_PE_ALPHACONF    0x02u
@@ -86,6 +92,8 @@ void gcn_pe_init(GcnPe* pe);
 void gcn_pe_set_irq(GcnPe* pe, GcnPeIrqFn fn, void* user);
 u32  gcn_pe_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_pe_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
+u32  gcn_pe_efb_read(void* user, CPUState* cpu, u32 addr, u8 size);
+void gcn_pe_efb_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 
 /* Video-backend entry points (PixelEngine.cpp:229-252). WIRED BUT UNCALLED this
  * increment — the future FIFO parser calls them when the GPU processes a

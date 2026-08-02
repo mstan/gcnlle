@@ -94,6 +94,7 @@ add_library(gcn_runtime_core STATIC
   src/interpreter.c
   src/aot_module.c
   src/native_code.c
+  src/dsp_regs.c
   src/title_module_none.c
   src/rings.c
   src/seed.c
@@ -130,6 +131,18 @@ add_test(NAME gekko_interpreter COMMAND test_interpreter)
 add_executable(test_aot_module tests/test_aot_module.c)
 target_link_libraries(test_aot_module PRIVATE gcn_runtime_core)
 add_test(NAME aot_module_identity COMMAND test_aot_module)
+
+add_executable(test_dsp_registers tests/test_dsp_registers.c)
+target_link_libraries(test_dsp_registers PRIVATE gcn_runtime_core)
+add_test(NAME dsp_register_reset COMMAND test_dsp_registers)
+
+add_executable(test_decrementer tests/test_decrementer.c)
+target_link_libraries(test_decrementer PRIVATE gcn_runtime_core)
+add_test(NAME decrementer_timing COMMAND test_decrementer)
+
+add_executable(test_locked_l1 tests/test_locked_l1.c)
+target_link_libraries(test_locked_l1 PRIVATE gcn_runtime_core)
+add_test(NAME locked_l1_memory COMMAND test_locked_l1)
 
 # M4: EXI memcard device model + GCMemcard image module. Both are standalone
 # (only libc + their own headers), so they build/test without the generated C.
