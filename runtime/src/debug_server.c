@@ -680,7 +680,8 @@ static void handle_line(Client* c, const char* line) {
     }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
         /* Decode the XFB the VI is scanning out into a PPM on disk. Geometry
-         * comes from the guest-programmed VI registers (gcn_vi_xfb_info); the
+         * comes from the guest-programmed VI registers (gcn_vi_xfb_info,
+         * including default-progressive interlaced-field reconstruction); the
          * XFB pixel format is YUY2 — 4 bytes [Y0,U,Y1,V] per 2 px — converted
          * with the inverse BT.601 matrix exactly as Dolphin's XFB decode
          * (TextureConversionShader.cpp:1009-1035). If the guest has not

@@ -223,21 +223,59 @@ int gcn_vi_xfb_info(u32* addr, u32* width, u32* height, u32* stride) {
     GcnVi* vi = s_vi;
     if (!vi)
         return 0;
-    /* XFB top-field base (VideoInterface.cpp GetXFBAddressTop:450-456): the
-     * FB_LEFT_TOP u32 holds FBB[23:0] + XOFF + POFF (bit 28); POFF means the
-     * stored address is >>5. */
-    u32 fb_hi = vi->reg[GCN_VI_FB_LEFT_TOP_HI >> 1];
-    u32 fb_lo = vi->reg[(GCN_VI_FB_LEFT_TOP_HI + 2u) >> 1];
-    u32 fb    = ((fb_hi << 16) | fb_lo);
-    u32 fbb   = fb & 0x00FFFFFFu;
-    u32 poff  = (fb >> 28) & 1u;
-    *addr = poff ? (fbb << 5) : fbb;
-    /* Geometry (OutputField:814-816): width = WPL*16, height = ACV,
-     * stride = STD*16*2 bytes (picture-config reg 0x48: STD[7:0], WPL[14:8]). */
+    /* XFB field bases (VideoInterface.cpp GetXFBAddressTop/Bottom:450-465).
+     * POFF for both fields is physically connected to the top register. */
+    u32 top_word = ((u32)vi->reg[GCN_VI_FB_LEFT_TOP_HI >> 1] << 16) |
+                   vi->reg[(GCN_VI_FB_LEFT_TOP_HI + 2u) >> 1];
+    u32 bottom_word =
+        ((u32)vi->reg[GCN_VI_FB_LEFT_BOTTOM_HI >> 1] << 16) |
+        vi->reg[(GCN_VI_FB_LEFT_BOTTOM_HI + 2u) >> 1];
+    u32 poff = (top_word >> 28) & 1u;
+    u32 top = top_word & 0x00FFFFFFu;
+    u32 bottom = bottom_word & 0x00FFFFFFu;
+    if (poff) {
+        top <<= 5;
+        bottom <<= 5;
+    }
+
+    /* OutputField:804-861. STD/WPL==2 plus an odd halfline count describes
+     * the usual interlaced XFB: top and bottom point at alternating source
+     * rows and the field stride skips one row. Dolphin's default
+     * ForceProgressive presentation reads the useful rows from both fields as
+     * one full-height frame. Do the same for the debug/headed surfaces;
+     * presenting only ACV rows and vertically stretching them showed the top
+     * half of Wind Waker's title screen and discarded its lower ocean/waves. */
     u32 pcfg = vi->reg[0x48 >> 1];
-    *width  = ((pcfg >> 8) & 0x7Fu) * 16u;
-    *height = (vi->reg[GCN_VI_VTR >> 1] >> 4) & 0x3FFu;
-    *stride = (pcfg & 0xFFu) * 16u * 2u;
+    u32 wpl = (pcfg >> 8) & 0x7Fu;
+    u32 std = pcfg & 0xFFu;
+    u32 acv = (vi->reg[GCN_VI_VTR >> 1] >> 4) & 0x3FFu;
+    u32 field_stride = std * 16u * 2u;
+    int potentially_interlaced = wpl != 0u && std / wpl == 2u;
+    int interlaced_mode =
+        (vi_halflines_field(vi, GCN_VI_VTE_HI, GCN_VI_VTE_LO) & 1u) != 0u;
+
+    *addr = top;
+    *width = wpl * 16u;
+    *height = acv;
+    *stride = field_stride;
+    if (top && bottom && potentially_interlaced && interlaced_mode) {
+        u32 full_stride = std * 16u;
+        u32 odd_prb = vi->reg[GCN_VI_VTO_LO >> 1] & 0x3FFu;
+        u32 even_prb = vi->reg[GCN_VI_VTE_LO >> 1] & 0x3FFu;
+
+        /* Match OutputField's PRB rule: the field whose PRB is one greater
+         * begins on the second source row, so step back one full-frame row to
+         * obtain the first row. The min fallback handles conventional
+         * top/bottom=row0/row1 programming when PRB is noncanonical. */
+        if (odd_prb == even_prb + 1u && top >= full_stride)
+            *addr = top - full_stride;
+        else if (even_prb == odd_prb + 1u && bottom >= full_stride)
+            *addr = bottom - full_stride;
+        else
+            *addr = top < bottom ? top : bottom;
+        *height = acv * 2u;
+        *stride = full_stride;
+    }
     return (*addr != 0 && *width != 0 && *height != 0) ? 1 : 0;
 }
 

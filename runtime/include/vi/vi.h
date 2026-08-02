@@ -166,12 +166,12 @@ void gcn_vi_set_cpu(GcnVi* vi, CPUState* cpu);
  * dispatch loop (called per block). MUST be monotonic; never the guest TB. */
 void gcn_vi_tick(u64 core_cycles);
 
-/* Current scanout geometry, for the debug-surface screenshot (Dolphin
- * GetXFBAddressTop + OutputField): top-field XFB physical address (FBB,
- * <<5 when POFF), width = WPL*16 px, height = ACV lines, stride = STD*16*2
- * bytes/line. Returns 0 (and zeros) until the guest has programmed an XFB
- * base and a nonzero active-video height — i.e. "nothing is being scanned
- * out", which the caller must report rather than fake. */
+/* Current scanout geometry for the debug/headed surface. The ordinary
+ * STD/WPL==2 interlaced layout is reconstructed like Dolphin's default
+ * ForceProgressive output: both alternating fields become one ACV*2 frame
+ * with a STD*16 byte stride. Other modes retain the literal top-field
+ * ACV/STD*16*2 geometry. Returns 0 (and zeros) until the guest has programmed
+ * an XFB base and nonzero active-video geometry. */
 int gcn_vi_xfb_info(u32* addr, u32* width, u32* height, u32* stride);
 u32  gcn_vi_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_vi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
