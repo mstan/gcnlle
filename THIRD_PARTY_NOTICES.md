@@ -12,6 +12,16 @@ the official [ExpansionPak/DolRecomp](https://github.com/ExpansionPak/DolRecomp)
 project. It is licensed GPL-3.0-or-later. The exact source pin and local changes
 are documented in `recompiler/UPSTREAM.md`.
 
+## ModernGekko/RecompCore module activation
+
+The content-validated title-module activation in `runtime/src/aot_module.c`
+and `runtime/tools/gen_title_module_tables.py` adapts the chunk identity and
+invalidate/reverify design from
+[ExpansionPak/ModernGekko](https://github.com/ExpansionPak/ModernGekko) and its
+RecompCore-ModernGekko dependency, licensed GPL-3.0-or-later. Exact reference
+revisions and the retained LLE boundary are documented in
+`docs/GPL_EXPERIMENT.md`.
+
 ## Dolphin DSP LLE and format references
 
 `runtime/dsp_lle/Core/DSP/` and selected support headers are derived from the

@@ -25,6 +25,7 @@
  */
 #include "cpu/cpu.h"
 #include "cpu/native_code.h"
+#include "cpu/title_module.h"
 #include "debug/rings.h"   /* gcn_ring_psq — [gx-fifoprov] psq value audit */
 #include "memory/memory.h"
 
@@ -411,6 +412,7 @@ void ppc_icbi(CPUState* cpu, u32 ea) {
     /* Guest visibility of modified instructions begins at the explicit
      * instruction-cache invalidation, not at the preceding data writes. */
     gcn_native_code_invalidate(ea & ~31u, 32u);
+    gcn_title_module_icbi(ea & ~31u, 32u);
 }
 
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {
