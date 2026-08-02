@@ -78,6 +78,22 @@ Launch the runtime with `GCN_CHECKPOINT_PC=0x802463E8`,
 AOT block and avoids racing past this one-time initialization while the TCP
 client connects.
 
+For a post-normalization comparison, `dolphin-run-to --after-pc` uses
+`checkpoint_continue` to install the next runtime condition before releasing
+the first park. This is the race-free path from the RNG seam to `drawWave`:
+
+```text
+--after-pc 0x8009A148 --after-gpr 24 --after-gpr-value 3
+```
+
+`--gpr-memory` ranges are sampled at that second gate when it is present.
+The runtime half of this handoff was smoke-tested against adjacent live AOT
+blocks `0x80247910` and `0x802478D4`: the two parks had consecutive block
+indices, proving that `checkpoint_continue` did not execute an unarmed block.
+The complete RNG-to-`drawWave` Dolphin comparison still requires the validated
+patched oracle launch profile; a stock Dolphin batch profile did not reach the
+first title breakpoint and is not accepted as divergence evidence.
+
 ## Measured BS2-to-apploader gates
 
 The runtime receives the IPL's decrypted `0x1AFE00`-byte BS2 payload and starts

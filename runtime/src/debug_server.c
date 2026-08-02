@@ -350,6 +350,43 @@ static void handle_line(Client* c, const char* line) {
             "{\"ok\":true,\"resumed\":%s}\n",
             was_parked ? "true" : "false");
     }
+    else if (!strcmp(cmd, "checkpoint_continue")) {
+        u32 pc = 0, gpr = 0, gpr_value = 0, lr = 0;
+        int have_pc = json_uint(line, "pc", &pc);
+        int have_gpr = json_uint(line, "gpr", &gpr);
+        int have_gpr_value = json_uint(line, "gpr_value", &gpr_value);
+        int have_lr = json_uint(line, "lr", &lr);
+        if (!have_pc) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"missing pc\"}\n");
+        } else if (have_gpr != have_gpr_value || (have_gpr && gpr >= 32u)) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"gpr and gpr_value must both be present; gpr must be 0..31\"}\n");
+        } else if (!s_checkpoint_parked) {
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":false,\"error\":\"guest is not parked\"}\n");
+        } else {
+            /*
+             * Install the next condition before releasing the current park.
+             * A coordinator can therefore cross an arbitrarily short native
+             * interval without an arm-after-resume race.
+             */
+            s_checkpoint_pc = pc;
+            s_checkpoint_have_gpr = have_gpr;
+            s_checkpoint_gpr = gpr;
+            s_checkpoint_gpr_value = gpr_value;
+            s_checkpoint_have_lr = have_lr;
+            s_checkpoint_lr = lr;
+            s_checkpoint_armed = 1;
+            s_checkpoint_parked = 0;
+            n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                "{\"ok\":true,\"continued\":true,\"armed\":true,\"pc\":%u,"
+                "\"have_gpr\":%s,\"gpr\":%u,\"gpr_value\":%u,"
+                "\"have_lr\":%s,\"lr\":%u}\n",
+                pc, have_gpr ? "true" : "false", gpr, gpr_value,
+                have_lr ? "true" : "false", lr);
+        }
+    }
     else if (!strcmp(cmd, "cosim_step")) {
         u32 count = 1;
         json_uint(line, "count", &count);

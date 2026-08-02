@@ -552,12 +552,25 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
         raise ProtocolError("--gpr and --gpr-value must be supplied together")
     if args.gpr is not None and not 0 <= args.gpr < 32:
         raise ProtocolError("--gpr must be in 0..31")
+    if (args.after_gpr is None) != (args.after_gpr_value is None):
+        raise ProtocolError(
+            "--after-gpr and --after-gpr-value must be supplied together"
+        )
+    if args.after_gpr is not None and not 0 <= args.after_gpr < 32:
+        raise ProtocolError("--after-gpr must be in 0..31")
+    if args.after_pc is None and any(
+        value is not None
+        for value in (args.after_gpr, args.after_gpr_value, args.after_lr)
+    ):
+        raise ProtocolError("--after-pc is required for an after condition")
+    if args.after_pc is not None and args.runtime_port is None:
+        raise ProtocolError("--after-pc requires --runtime-port")
     gdb = GdbRemote(args.port, timeout=args.timeout)
-    breakpoint_added = False
+    breakpoints: set[int] = set()
     try:
         start = gdb.registers()
         gdb.add_breakpoint(args.pc)
-        breakpoint_added = True
+        breakpoints.add(args.pc)
         stop = ""
         end = start
         hits = 0
@@ -574,16 +587,36 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
             if condition_matched:
                 break
         reached = end["pc"] == args.pc and condition_matched
+        first_end = end
+        first_stop = stop
+        first_hits = hits
+        first_reached = reached
+        runtime = (
+            JsonTcp(args.runtime_port, timeout=args.timeout)
+            if args.runtime_port is not None else None
+        )
+        runtime_gate = None
+        if args.normalize_u32 or args.after_pc is not None:
+            if runtime is None:
+                raise ProtocolError(
+                    "memory normalization and after gates require --runtime-port"
+                )
+            runtime_gate = runtime.request("checkpoint_status")
+            if (
+                not runtime_gate.get("parked")
+                or runtime_gate.get("live_pc") != args.pc
+            ):
+                raise ProtocolError(
+                    "runtime is not parked at the requested initial checkpoint"
+                )
         normalizations = []
         if args.normalize_u32:
-            if args.runtime_port is None:
-                raise ProtocolError("--normalize-u32 requires --runtime-port")
             if not reached:
                 raise ProtocolError(
                     "refusing to normalize memory before the requested "
                     "conditional checkpoint is reached"
                 )
-            runtime = JsonTcp(args.runtime_port, timeout=args.timeout)
+            assert runtime is not None
             for address, value in args.normalize_u32:
                 fixed = value.to_bytes(4, "big")
                 native_before = runtime_memory(runtime, address, 4)
@@ -604,11 +637,92 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
                     "runtime_after": native_after.hex(),
                     "dolphin_after": oracle_after.hex(),
                 })
+        after = None
+        if args.after_pc is not None:
+            if not reached:
+                raise ProtocolError(
+                    "refusing to continue before the initial Dolphin "
+                    "checkpoint is reached"
+                )
+            assert runtime is not None
+            gdb.remove_breakpoint(args.pc)
+            breakpoints.remove(args.pc)
+            gdb.add_breakpoint(args.after_pc)
+            breakpoints.add(args.after_pc)
+
+            continue_params: dict[str, int] = {"pc": args.after_pc}
+            if args.after_gpr is not None:
+                continue_params["gpr"] = args.after_gpr
+                continue_params["gpr_value"] = args.after_gpr_value
+            if args.after_lr is not None:
+                continue_params["lr"] = args.after_lr
+            runtime.request("checkpoint_continue", **continue_params)
+
+            after_stop = ""
+            after_end = end
+            after_hits = 0
+            after_condition_matched = (
+                args.after_gpr is None and args.after_lr is None
+            )
+            while after_hits < args.max_hits:
+                after_stop = gdb.continue_signal()
+                after_end = gdb.registers()
+                if after_end["pc"] != args.after_pc:
+                    break
+                after_hits += 1
+                after_condition_matched = (
+                    args.after_gpr is None
+                    or after_end["gpr"][args.after_gpr] == args.after_gpr_value
+                ) and (
+                    args.after_lr is None or after_end["lr"] == args.after_lr
+                )
+                if after_condition_matched:
+                    break
+
+            deadline = time.monotonic() + args.after_runtime_timeout
+            runtime_after = runtime.request("checkpoint_status")
+            while not runtime_after.get("parked"):
+                if not runtime_after.get("armed"):
+                    raise ProtocolError(
+                        "runtime disarmed before reaching the after checkpoint"
+                    )
+                if time.monotonic() >= deadline:
+                    raise ProtocolError(
+                        "runtime did not reach the after checkpoint within "
+                        f"{args.after_runtime_timeout:g} seconds"
+                    )
+                time.sleep(0.01)
+                runtime_after = runtime.request("checkpoint_status")
+
+            after_reached = (
+                after_end["pc"] == args.after_pc
+                and after_condition_matched
+                and runtime_after.get("live_pc") == args.after_pc
+            )
+            after = {
+                "target_pc": f"0x{args.after_pc:08X}",
+                "stop": after_stop,
+                "end": after_end,
+                "hits": after_hits,
+                "condition": None if args.after_gpr is None else {
+                    "gpr": args.after_gpr,
+                    "value": f"0x{args.after_gpr_value:08X}",
+                    "matched": after_condition_matched,
+                },
+                "lr_condition": None if args.after_lr is None else {
+                    "value": f"0x{args.after_lr:08X}",
+                    "matched": after_end["lr"] == args.after_lr,
+                },
+                "runtime": runtime_after,
+                "reached": after_reached,
+            }
+            end = after_end
+            reached = reached and after_reached
         relative_memory = []
         if args.gpr_memory:
             if args.runtime_port is None:
                 raise ProtocolError("--gpr-memory requires --runtime-port")
-            runtime = JsonTcp(args.runtime_port, timeout=args.timeout)
+            assert runtime is not None
             native = runtime.request("get_registers")
             for gpr, offset, length in args.gpr_memory:
                 native_address = (native["gpr"][gpr] + offset) & 0xFFFFFFFF
@@ -658,9 +772,9 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
         report = {
             "start_pc": f"0x{start['pc']:08X}",
             "target_pc": f"0x{args.pc:08X}",
-            "stop": stop,
-            "end": end,
-            "hits": hits,
+            "stop": first_stop,
+            "end": first_end,
+            "hits": first_hits,
             "condition": None if args.gpr is None else {
                 "gpr": args.gpr,
                 "value": f"0x{args.gpr_value:08X}",
@@ -668,18 +782,20 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
             },
             "lr_condition": None if args.lr is None else {
                 "value": f"0x{args.lr:08X}",
-                "matched": end["lr"] == args.lr,
+                "matched": first_end["lr"] == args.lr,
             },
+            "runtime": runtime_gate,
             "normalizations": normalizations,
+            "after": after,
             "relative_memory": relative_memory,
-            "reached": reached,
+            "reached": first_reached and reached,
         }
         print(json.dumps(report, separators=(",", ":")))
         return 0 if report["reached"] else 1
     finally:
-        if breakpoint_added:
+        for breakpoint in breakpoints:
             try:
-                gdb.remove_breakpoint(args.pc)
+                gdb.remove_breakpoint(breakpoint)
             except (OSError, ProtocolError):
                 pass
         gdb.close()
@@ -1266,6 +1382,32 @@ def main() -> int:
             "after the conditional checkpoint is reached, write the same "
             "big-endian guest word to both parked machines as ADDRESS:VALUE; "
             "repeatable and reported as an explicit oracle seam"
+        ),
+    )
+    dolphin_run_to.add_argument(
+        "--after-pc", type=lambda value: int(value, 0),
+        help=(
+            "after normalization, atomically resume the parked runtime and "
+            "continue both machines to this second AOT checkpoint"
+        ),
+    )
+    dolphin_run_to.add_argument(
+        "--after-gpr", type=int,
+        help="accept the second checkpoint only when this live GPR matches",
+    )
+    dolphin_run_to.add_argument(
+        "--after-gpr-value", type=lambda value: int(value, 0),
+        help="required live value for --after-gpr",
+    )
+    dolphin_run_to.add_argument(
+        "--after-lr", type=lambda value: int(value, 0),
+        help="accept the second checkpoint only when the live LR matches",
+    )
+    dolphin_run_to.add_argument(
+        "--after-runtime-timeout", type=float, default=300.0,
+        help=(
+            "seconds to wait for the runtime's second checkpoint after "
+            "Dolphin reaches it (default: 300)"
         ),
     )
     dolphin_run_to.set_defaults(func=cmd_dolphin_run_to)
