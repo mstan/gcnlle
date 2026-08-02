@@ -47,6 +47,9 @@
  *                      seeds the EXI RTC, then advances it only from emulated
  *                      Gekko cycles. Never set it for oracle-diff runs. It
  *                      wins over a persisted counter; SRAM settings still load.
+ *   GCN_RTC_FIXED      exact GameCube RTC counter (seconds since 2000-01-01)
+ *                      for deterministic oracle runs. Applied after persisted
+ *                      SRAM/RTC loading and wins over GCN_RTC_HOST.
  *   GCN_GX_PIPELINE    default-on CPU/GX execution overlap. "0" selects the
  *                      fully synchronous fallback for diagnostics. Both paths
  *                      retain the pinned XFB/oracle results. GXSetDrawDone
@@ -111,6 +114,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 /* M1: BS1's real EXI-DMA bulk-copy size, measured empirically (see boot.c's
  * GCN_BOOT_BS1 integrity-check comment below) — NOT docs/M1_PLAN.md §0's
@@ -421,6 +425,29 @@ int main(int argc, char** argv) {
             argv[0]);
         return 2;
     }
+
+    /* Parse deterministic RTC input before allocating any runtime state, so a
+     * typo fails the launch instead of silently producing a different random/
+     * time seed than the oracle. The value is the hardware counter exposed by
+     * EXI, not Unix time: subtract 946684800 from Dolphin's CustomRTCValue. */
+    u32 fixed_rtc = 0;
+    int has_fixed_rtc = 0;
+    const char* rtc_fixed = getenv("GCN_RTC_FIXED");
+    if (rtc_fixed && *rtc_fixed) {
+        char* end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(rtc_fixed, &end, 0);
+        if (errno != 0 || end == rtc_fixed || *end != '\0' ||
+            parsed > 0xFFFFFFFFull) {
+            fprintf(stderr,
+                    "gcn boot: invalid GCN_RTC_FIXED='%s' (expected a 32-bit "
+                    "GameCube seconds-since-2000 counter)\n", rtc_fixed);
+            return 2;
+        }
+        fixed_rtc = (u32)parsed;
+        has_fixed_rtc = 1;
+    }
+
     u32 max_blocks = (argc >= 3) ? (u32)strtoul(argv[2], NULL, 0) : 200000u;
 
     u8* payload = NULL;
@@ -536,12 +563,16 @@ int main(int argc, char** argv) {
         gcn_exi_set_persist(&exi, sram_persist_to_file, &s_sram_persist_ctx);
     }
 
-    /* [ENHANCEMENT, opt-in] GCN_RTC_HOST=1: sample host local time exactly
-     * once. The EXI RTC then advances from emulated cycles, never by reading
-     * the host clock again. Applied after persistence load so the boot sync
-     * wins while SRAM settings remain intact. */
+    /* Deterministic oracle clock, or the opt-in host-time enhancement. Both
+     * are applied after persistence load so SRAM settings remain intact.
+     * GCN_RTC_FIXED is exact and therefore wins when both knobs are present. */
     const char* rtc_host = getenv("GCN_RTC_HOST");
-    if (rtc_host && *rtc_host && *rtc_host != '0') {
+    if (has_fixed_rtc) {
+        gcn_exi_set_rtc(&exi, fixed_rtc);
+        fprintf(stdout,
+                "gcn boot: GCN_RTC_FIXED — exact RTC=%u; subsequent time is "
+                "emulated\n", fixed_rtc);
+    } else if (rtc_host && *rtc_host && *rtc_host != '0') {
         u32 sampled_rtc = gcn_exi_sync_rtc_from_host(&exi, cpu.cycles);
         fprintf(stdout, "gcn boot: GCN_RTC_HOST — sampled host local time once "
                 "at boot (RTC=%u); subsequent time is emulated\n", sampled_rtc);

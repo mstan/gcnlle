@@ -10,6 +10,12 @@ The gcnrecomp runtime (`gcn_boot`) exposes a TCP debug surface over its
   **unbounded** and, if the guest stops or parks on unmodeled hardware, keeps
   serving queries until a client sends `quit`. When unset, the rings still
   record — there is just no query surface.
+- **Race-free AOT checkpoint:** set `GCN_CHECKPOINT_PC` before launch.
+  Optionally set both `GCN_CHECKPOINT_GPR` and `GCN_CHECKPOINT_GPR_VALUE`.
+  `GCN_CHECKPOINT_LR` adds an independent live-link-register condition.
+  The server auto-arms that condition before the first recompiled block runs;
+  this is equivalent to `checkpoint_arm` but cannot miss one-time early title
+  initialization while a TCP coordinator is connecting.
 
 The rings record continuously from runtime start (PRINCIPLES: always-on;
 probes **query** a window, never arm-then-run-then-hope). Bind is localhost-only.
@@ -46,7 +52,7 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `mmio_dump` | opt `addr`, `rw`, `count` | newest N MMIO entries; `addr`/`rw` filter over the **full** ring before the cap |
 | `block_dump` | opt `count` | newest N retired-block PCs |
 | `pc_seen` | `pc` | non-evicting exact coverage query for an AOT dispatcher-entry PC in MEM1/MEM2 or the IPL ROM window; records continuously from process start |
-| `checkpoint_arm` | `pc`; optional `gpr` + `gpr_value` | arm an AOT-safe dispatcher-boundary checkpoint, optionally conditional on one live GPR; native shards remain enabled |
+| `checkpoint_arm` | `pc`; optional `gpr` + `gpr_value`; optional `lr` | arm an AOT-safe dispatcher-boundary checkpoint, optionally conditional on one live GPR and/or LR; native shards remain enabled |
 | `checkpoint_status` | — | report armed/parked state, condition, live PC, and block index |
 | `checkpoint_resume` | — | resume a parked checkpoint and disarm it |
 | `event_dump` | opt `count` | newest N device edges |

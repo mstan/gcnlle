@@ -52,6 +52,32 @@ The clean oracle configuration used for the results below also disables panic
 handlers, audio output, and graphics output. It uses
 `F:\Projects\gcnrecomp\oracle\dolphin-user`, which contains the matching IPL.
 
+For screenshot/audio oracle work, the isolated visual profile currently fixes
+Dolphin's Unix RTC to `1785690000` (`2026-08-02 17:00:00 UTC`). Launch the
+runtime with `GCN_RTC_FIXED=839005200`—the same instant expressed as GameCube
+seconds since 2000-01-01. Do not compare randomized wave/scene state from the
+runtime's default 2004 fixture against that profile.
+
+Wind Waker's `cM_rnd` state is three guest words at `0x803F7338`,
+`0x803F733C`, and `0x803F7340`. The title initializes them to `(100, 100,
+100)`, but unrelated random consumers can advance the streams before a later
+visual milestone. `dolphin-run-to --normalize-u32 ADDRESS:VALUE` can set fixed
+values in both parked machines after a conditional checkpoint is reached.
+Every before/after word is included in its JSON report. This is a diagnostic
+oracle seam only: it requires `--runtime-port`, never runs on an unparked
+machine, and is not part of the ordinary AOT/LLE runtime path.
+
+The first title-wave initialization calls `cM_rndFX` at `0x802463E8` with
+`LR == 0x80091234` and `r23 == 0`. The current fixed-RTC visual oracle observed PRNG words
+`(0x000033C8, 0x00000797, 0x000033A1)` there. The configurable title defaults
+are recorded in `WindWakerRecomp/game.toml`; pass those values explicitly when
+normalizing a run rather than treating them as framework constants.
+Launch the runtime with `GCN_CHECKPOINT_PC=0x802463E8`,
+`GCN_CHECKPOINT_LR=0x80091234`, `GCN_CHECKPOINT_GPR=23`, and
+`GCN_CHECKPOINT_GPR_VALUE=0`; launch-time auto-arm happens before the first
+AOT block and avoids racing past this one-time initialization while the TCP
+client connects.
+
 ## Measured BS2-to-apploader gates
 
 The runtime receives the IPL's decrypted `0x1AFE00`-byte BS2 payload and starts
@@ -105,4 +131,3 @@ compared strictly.
    draw or DSP task.
 4. Keep screenshots and audio samples as acceptance gates after architectural
    comparisons; matching hashes do not replace visible/audible validation.
-

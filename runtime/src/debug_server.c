@@ -57,6 +57,23 @@ static u32      s_checkpoint_pc;
 static int      s_checkpoint_have_gpr;
 static u32      s_checkpoint_gpr;
 static u32      s_checkpoint_gpr_value;
+static int      s_checkpoint_have_lr;
+static u32      s_checkpoint_lr;
+
+static int env_u32(const char* name, u32* out) {
+    const char* value = getenv(name);
+    if (!value || !*value) return 0;
+    char* end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 0);
+    if (end == value || *end != '\0' || parsed > 0xFFFFFFFFull) {
+        fprintf(stderr,
+                "gcn checkpoint: invalid %s='%s' (expected a 32-bit integer)\n",
+                name, value);
+        return -1;
+    }
+    *out = (u32)parsed;
+    return 1;
+}
 
 /* ---- tiny JSON field extractors (flat objects only) ---- */
 
@@ -283,20 +300,23 @@ static void handle_line(Client* c, const char* line) {
         n = snprintf(s_resp, GCN_DBG_RESP_CAP,
             "{\"ok\":true,\"armed\":%s,\"parked\":%s,\"pc\":%u,"
             "\"have_gpr\":%s,\"gpr\":%u,\"gpr_value\":%u,"
+            "\"have_lr\":%s,\"lr\":%u,"
             "\"live_pc\":%u,\"block\":%llu}\n",
             s_checkpoint_armed ? "true" : "false",
             s_checkpoint_parked ? "true" : "false",
             s_checkpoint_pc,
             s_checkpoint_have_gpr ? "true" : "false",
             s_checkpoint_gpr, s_checkpoint_gpr_value,
+            s_checkpoint_have_lr ? "true" : "false", s_checkpoint_lr,
             cpu ? cpu->pc : 0u,
             (unsigned long long)gcn_ring_block_index());
     }
     else if (!strcmp(cmd, "checkpoint_arm")) {
-        u32 pc = 0, gpr = 0, gpr_value = 0;
+        u32 pc = 0, gpr = 0, gpr_value = 0, lr = 0;
         int have_pc = json_uint(line, "pc", &pc);
         int have_gpr = json_uint(line, "gpr", &gpr);
         int have_gpr_value = json_uint(line, "gpr_value", &gpr_value);
+        int have_lr = json_uint(line, "lr", &lr);
         if (!have_pc) {
             n = snprintf(s_resp, GCN_DBG_RESP_CAP,
                 "{\"ok\":false,\"error\":\"missing pc\"}\n");
@@ -311,11 +331,15 @@ static void handle_line(Client* c, const char* line) {
             s_checkpoint_have_gpr = have_gpr;
             s_checkpoint_gpr = gpr;
             s_checkpoint_gpr_value = gpr_value;
+            s_checkpoint_have_lr = have_lr;
+            s_checkpoint_lr = lr;
             s_checkpoint_armed = 1;
             n = snprintf(s_resp, GCN_DBG_RESP_CAP,
                 "{\"ok\":true,\"armed\":true,\"pc\":%u,"
-                "\"have_gpr\":%s,\"gpr\":%u,\"gpr_value\":%u}\n",
-                pc, have_gpr ? "true" : "false", gpr, gpr_value);
+                "\"have_gpr\":%s,\"gpr\":%u,\"gpr_value\":%u,"
+                "\"have_lr\":%s,\"lr\":%u}\n",
+                pc, have_gpr ? "true" : "false", gpr, gpr_value,
+                have_lr ? "true" : "false", lr);
         }
     }
     else if (!strcmp(cmd, "checkpoint_resume")) {
@@ -834,6 +858,32 @@ int gcn_debug_server_start(const GcnDebugCtx* ctx) {
     s_checkpoint_have_gpr = 0;
     s_checkpoint_gpr = 0;
     s_checkpoint_gpr_value = 0;
+    s_checkpoint_have_lr = 0;
+    s_checkpoint_lr = 0;
+    u32 auto_pc = 0, auto_gpr = 0, auto_gpr_value = 0, auto_lr = 0;
+    int have_auto_pc = env_u32("GCN_CHECKPOINT_PC", &auto_pc);
+    int have_auto_gpr = env_u32("GCN_CHECKPOINT_GPR", &auto_gpr);
+    int have_auto_gpr_value =
+        env_u32("GCN_CHECKPOINT_GPR_VALUE", &auto_gpr_value);
+    int have_auto_lr = env_u32("GCN_CHECKPOINT_LR", &auto_lr);
+    if (have_auto_pc > 0 && have_auto_lr >= 0 &&
+        ((have_auto_gpr == 0 && have_auto_gpr_value == 0) ||
+         (have_auto_gpr > 0 && have_auto_gpr_value > 0 && auto_gpr < 32u))) {
+        s_checkpoint_armed = 1;
+        s_checkpoint_pc = auto_pc;
+        s_checkpoint_have_gpr = have_auto_gpr > 0;
+        s_checkpoint_gpr = auto_gpr;
+        s_checkpoint_gpr_value = auto_gpr_value;
+        s_checkpoint_have_lr = have_auto_lr > 0;
+        s_checkpoint_lr = auto_lr;
+    } else if (have_auto_pc != 0 || have_auto_gpr != 0 ||
+               have_auto_gpr_value != 0 || have_auto_lr != 0) {
+        fprintf(stderr,
+                "gcn checkpoint: launch-time auto-arm disabled; "
+                "GCN_CHECKPOINT_PC must be valid and GCN_CHECKPOINT_GPR/"
+                "GCN_CHECKPOINT_GPR_VALUE must be supplied together with "
+                "GPR in 0..31\n");
+    }
     for (int i = 0; i < GCN_DBG_MAX_CLIENTS; i++) s_clients[i].sock = INVALID_SOCKET;
 
     WSADATA wsa;
@@ -857,6 +907,16 @@ int gcn_debug_server_start(const GcnDebugCtx* ctx) {
     s_enabled = 1; s_quit = 0;
     fprintf(stdout, "gcn debug: TCP debug server on 127.0.0.1:%d "
                     "(always-on rings; JSON-over-newline)\n", port);
+    if (s_checkpoint_armed) {
+        fprintf(stdout, "gcn checkpoint: launch-time auto-arm pc=0x%08X",
+                s_checkpoint_pc);
+        if (s_checkpoint_have_gpr)
+            fprintf(stdout, " r%u=0x%08X",
+                    s_checkpoint_gpr, s_checkpoint_gpr_value);
+        if (s_checkpoint_have_lr)
+            fprintf(stdout, " lr=0x%08X", s_checkpoint_lr);
+        fputc('\n', stdout);
+    }
     if (s_cosim_enabled)
         fprintf(stdout, "gcn cosim: deterministic interpreter path armed; "
                         "parked before reset-vector instruction 0\n");
@@ -929,13 +989,16 @@ int gcn_debug_server_checkpoint_before_block(void) {
     if (s_checkpoint_have_gpr &&
         cpu->gpr[s_checkpoint_gpr] != s_checkpoint_gpr_value)
         return !s_quit;
+    if (s_checkpoint_have_lr && cpu->lr != s_checkpoint_lr)
+        return !s_quit;
 
     s_checkpoint_armed = 0;
     s_checkpoint_parked = 1;
     fprintf(stdout,
         "gcn checkpoint: parked before pc=0x%08X at block=%llu%s\n",
         cpu->pc, (unsigned long long)gcn_ring_block_index(),
-        s_checkpoint_have_gpr ? " (GPR condition matched)" : "");
+        (s_checkpoint_have_gpr || s_checkpoint_have_lr)
+            ? " (register condition matched)" : "");
     fflush(stdout);
     while (s_enabled && !s_quit && s_checkpoint_parked) {
         gcn_debug_server_pump();

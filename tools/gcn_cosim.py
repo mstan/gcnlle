@@ -170,6 +170,13 @@ class GdbRemote:
             )
         return bytes.fromhex(reply)
 
+    def write_memory(self, address: int, data: bytes) -> None:
+        reply = self.request(f"M{address:x},{len(data):x}:{data.hex()}")
+        if reply != "OK":
+            raise ProtocolError(
+                f"Dolphin memory write {address:08x}+{len(data):x} failed: {reply}"
+            )
+
     def step(self) -> dict[str, Any]:
         self.step_signal()
         return self.registers()
@@ -554,7 +561,7 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
         stop = ""
         end = start
         hits = 0
-        condition_matched = args.gpr is None
+        condition_matched = args.gpr is None and args.lr is None
         while hits < args.max_hits:
             stop = gdb.continue_signal()
             end = gdb.registers()
@@ -563,9 +570,40 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
             hits += 1
             condition_matched = (
                 args.gpr is None or end["gpr"][args.gpr] == args.gpr_value
-            )
+            ) and (args.lr is None or end["lr"] == args.lr)
             if condition_matched:
                 break
+        reached = end["pc"] == args.pc and condition_matched
+        normalizations = []
+        if args.normalize_u32:
+            if args.runtime_port is None:
+                raise ProtocolError("--normalize-u32 requires --runtime-port")
+            if not reached:
+                raise ProtocolError(
+                    "refusing to normalize memory before the requested "
+                    "conditional checkpoint is reached"
+                )
+            runtime = JsonTcp(args.runtime_port, timeout=args.timeout)
+            for address, value in args.normalize_u32:
+                fixed = value.to_bytes(4, "big")
+                native_before = runtime_memory(runtime, address, 4)
+                oracle_before = dolphin_memory(gdb, address, 4)
+                runtime.request("write_ram", addr=address, hex=fixed.hex())
+                gdb.write_memory(address, fixed)
+                native_after = runtime_memory(runtime, address, 4)
+                oracle_after = dolphin_memory(gdb, address, 4)
+                if native_after != fixed or oracle_after != fixed:
+                    raise ProtocolError(
+                        f"normalization readback failed at 0x{address:08X}"
+                    )
+                normalizations.append({
+                    "address": f"0x{address:08X}",
+                    "value": f"0x{value:08X}",
+                    "runtime_before": native_before.hex(),
+                    "dolphin_before": oracle_before.hex(),
+                    "runtime_after": native_after.hex(),
+                    "dolphin_after": oracle_after.hex(),
+                })
         relative_memory = []
         if args.gpr_memory:
             if args.runtime_port is None:
@@ -628,8 +666,13 @@ def cmd_dolphin_run_to(args: argparse.Namespace) -> int:
                 "value": f"0x{args.gpr_value:08X}",
                 "matched": condition_matched,
             },
+            "lr_condition": None if args.lr is None else {
+                "value": f"0x{args.lr:08X}",
+                "matched": end["lr"] == args.lr,
+            },
+            "normalizations": normalizations,
             "relative_memory": relative_memory,
-            "reached": end["pc"] == args.pc and condition_matched,
+            "reached": reached,
         }
         print(json.dumps(report, separators=(",", ":")))
         return 0 if report["reached"] else 1
@@ -771,6 +814,23 @@ def parse_gpr_range(spec: str) -> tuple[int, int, int]:
     if length <= 0:
         raise argparse.ArgumentTypeError("range length must be positive")
     return gpr, offset, length
+
+
+def parse_u32_patch(spec: str) -> tuple[int, int]:
+    address, separator, value = spec.partition(":")
+    if not separator:
+        raise argparse.ArgumentTypeError(
+            "32-bit normalization must be ADDRESS:VALUE"
+        )
+    try:
+        parsed = (int(address, 0), int(value, 0))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 <= parsed[0] <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("normalization address must fit in 32 bits")
+    if not 0 <= parsed[1] <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("normalization value must fit in 32 bits")
+    return parsed
 
 
 def runtime_memory(client: JsonTcp, address: int, length: int) -> bytes:
@@ -1182,6 +1242,10 @@ def main() -> int:
         help="required live value for --gpr",
     )
     dolphin_run_to.add_argument(
+        "--lr", type=lambda value: int(value, 0),
+        help="accept the breakpoint only when the live link register matches",
+    )
+    dolphin_run_to.add_argument(
         "--max-hits", type=int, default=100000,
         help="maximum breakpoint hits to inspect before failing the condition",
     )
@@ -1194,6 +1258,14 @@ def main() -> int:
         help=(
             "compare bytes relative to each machine's own live GPR as "
             "GPR:OFFSET:LENGTH (repeatable)"
+        ),
+    )
+    dolphin_run_to.add_argument(
+        "--normalize-u32", type=parse_u32_patch, action="append",
+        help=(
+            "after the conditional checkpoint is reached, write the same "
+            "big-endian guest word to both parked machines as ADDRESS:VALUE; "
+            "repeatable and reported as an explicit oracle seam"
         ),
     )
     dolphin_run_to.set_defaults(func=cmd_dolphin_run_to)
