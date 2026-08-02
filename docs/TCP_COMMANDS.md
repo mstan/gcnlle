@@ -55,6 +55,7 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `checkpoint_arm` | `pc`; optional `gpr` + `gpr_value`; optional `lr` | arm an AOT-safe dispatcher-boundary checkpoint, optionally conditional on one live GPR and/or LR; native shards remain enabled |
 | `checkpoint_status` | — | report armed/parked state, condition, live PC, and block index |
 | `checkpoint_resume` | — | resume a parked checkpoint and disarm it |
+| `checkpoint_continue` | `pc`; optional `gpr` + `gpr_value`; optional `lr` | while parked, atomically arm the next AOT checkpoint and resume; this avoids losing short intervals to an arm-after-resume race |
 | `event_dump` | opt `count` | newest N device edges |
 | `screenshot` (`screenshot_file`) | opt `path` (default `_work/screenshot.ppm`) | decode the XFB the VI is scanning out to a PPM: geometry from the guest-programmed VI regs (`gcn_vi_xfb_info`), YUY2→RGB via inverse BT.601 exactly as Dolphin's XFB decode (TextureConversionShader.cpp:1009). Returns `{path, width, height, xfb_addr, mean_luma}` — `mean_luma` ≈16 means black. Errors honestly if the guest has no XFB programmed. |
 | `dsp_state` | — | live DSP-LLE core state: `pc`, `control`, non-consuming peeks of both mailboxes (bit 31 = mail pending). For diagnosing CPU↔DSP handshake stalls. |
