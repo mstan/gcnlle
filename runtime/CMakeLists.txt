@@ -92,7 +92,9 @@ add_library(gcn_runtime_core STATIC
   src/memory.c
   src/cpu_glue.c
   src/interpreter.c
+  src/aot_module.c
   src/native_code.c
+  src/title_module_none.c
   src/rings.c
   src/seed.c
   src/trace.c
@@ -124,6 +126,10 @@ add_test(NAME seed_contract COMMAND test_seed)
 add_executable(test_interpreter tests/test_interpreter.c)
 target_link_libraries(test_interpreter PRIVATE gcn_runtime_core)
 add_test(NAME gekko_interpreter COMMAND test_interpreter)
+
+add_executable(test_aot_module tests/test_aot_module.c)
+target_link_libraries(test_aot_module PRIVATE gcn_runtime_core)
+add_test(NAME aot_module_identity COMMAND test_aot_module)
 
 # M4: EXI memcard device model + GCMemcard image module. Both are standalone
 # (only libc + their own headers), so they build/test without the generated C.
@@ -205,6 +211,72 @@ if(GCN_WITH_GENERATED)
     message(FATAL_ERROR
       "GCN_GENERATED_BUILD_PROFILE must be ITERATE or RELEASE")
   endif()
+
+  # Optional per-title DOL module. Its generated dispatcher is linked beside,
+  # never instead of, the IPL dispatcher. Live MEM1 bytes must match the
+  # generated content hashes before any title chunk can execute natively.
+  set(GCN_TITLE_GENERATED_DIR "" CACHE PATH
+      "DolRecomp output directory for an optional content-validated title DOL")
+  set(GCN_TITLE_DOL "" CACHE FILEPATH
+      "Exact DOL input used to generate GCN_TITLE_GENERATED_DIR")
+  set(GCN_TITLE_MODULE_SOURCE)
+  set(GCN_TITLE_GENERATED_CHUNKS)
+  set(GCN_TITLE_MODULE_TABLES)
+  if(GCN_TITLE_GENERATED_DIR)
+    if(NOT GCN_TITLE_DOL)
+      message(FATAL_ERROR "GCN_TITLE_GENERATED_DIR requires GCN_TITLE_DOL")
+    endif()
+    foreach(GCN_TITLE_REQUIRED generated.h generated_abi.h)
+      if(NOT EXISTS "${GCN_TITLE_GENERATED_DIR}/${GCN_TITLE_REQUIRED}")
+        message(FATAL_ERROR
+          "title module is missing ${GCN_TITLE_GENERATED_DIR}/${GCN_TITLE_REQUIRED}")
+      endif()
+    endforeach()
+    if(NOT EXISTS "${GCN_TITLE_DOL}")
+      message(FATAL_ERROR "title DOL does not exist: ${GCN_TITLE_DOL}")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    file(GLOB GCN_TITLE_GENERATED_CHUNKS CONFIGURE_DEPENDS
+         "${GCN_TITLE_GENERATED_DIR}/chunks/*.c")
+    if(NOT GCN_TITLE_GENERATED_CHUNKS)
+      message(FATAL_ERROR
+        "title module has no chunks: ${GCN_TITLE_GENERATED_DIR}/chunks")
+    endif()
+    set(GCN_TITLE_MODULE_TABLES
+        "${CMAKE_CURRENT_BINARY_DIR}/title_module_tables.inc")
+    add_custom_command(
+      OUTPUT "${GCN_TITLE_MODULE_TABLES}"
+      COMMAND Python3::Interpreter
+              "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_title_module_tables.py"
+              --generated-header "${GCN_TITLE_GENERATED_DIR}/generated.h"
+              --dol "${GCN_TITLE_DOL}"
+              --output "${GCN_TITLE_MODULE_TABLES}"
+      DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_title_module_tables.py"
+        "${GCN_TITLE_GENERATED_DIR}/generated.h"
+        "${GCN_TITLE_DOL}"
+      VERBATIM
+      COMMENT "Generating content identities for the title AOT module")
+    file(TO_CMAKE_PATH "${GCN_TITLE_GENERATED_DIR}/generated.h"
+         GCN_TITLE_GENERATED_HEADER)
+    configure_file(src/title_module.c.in
+                   "${CMAKE_CURRENT_BINARY_DIR}/title_module.c" @ONLY)
+    set(GCN_TITLE_MODULE_SOURCE
+        "${CMAKE_CURRENT_BINARY_DIR}/title_module.c")
+    set_source_files_properties("${GCN_TITLE_MODULE_TABLES}" PROPERTIES
+      GENERATED TRUE HEADER_FILE_ONLY TRUE)
+    if(GCN_GENERATED_BUILD_PROFILE STREQUAL "ITERATE")
+      set_source_files_properties(${GCN_TITLE_GENERATED_CHUNKS} PROPERTIES
+        COMPILE_OPTIONS "-O1;-g1")
+    else()
+      set_source_files_properties(${GCN_TITLE_GENERATED_CHUNKS} PROPERTIES
+        COMPILE_OPTIONS
+          "--param;large-function-insns=20000;--param;large-function-growth=250;--param;inline-unit-growth=100")
+    endif()
+    message(STATUS
+      "LLE content-validated title module: ${GCN_TITLE_GENERATED_DIR}")
+  endif()
+
   add_executable(gcn_boot
     src/boot.c
     src/dispatch.c
@@ -230,6 +302,9 @@ if(GCN_WITH_GENERATED)
     src/debug_server.c
     src/host_audio.c
     src/host_window.c
+    ${GCN_TITLE_MODULE_SOURCE}
+    ${GCN_TITLE_MODULE_TABLES}
+    ${GCN_TITLE_GENERATED_CHUNKS}
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )
@@ -255,6 +330,11 @@ if(GCN_WITH_GENERATED)
   # include dir (M1: exi.c/boot.c call the vendored segher descrambler
   # verbatim — one algorithm, one compiled object, two consumers).
   target_include_directories(gcn_boot PRIVATE include generated)
+  if(GCN_TITLE_GENERATED_DIR)
+    target_include_directories(gcn_boot PRIVATE
+      "${GCN_TITLE_GENERATED_DIR}"
+      "${CMAKE_CURRENT_BINARY_DIR}")
+  endif()
   # ws2_32: Winsock for the TCP debug server (debug_server.c).
   # synchronization: WaitOnAddress/WakeByAddressAll for the GX-MT worker
   # pool's hybrid spin/sleep wait (gx_raster.c).

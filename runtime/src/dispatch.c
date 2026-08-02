@@ -10,6 +10,7 @@
 #include "dispatch/dispatch.h"
 #include "cpu/interpreter.h"
 #include "cpu/native_code.h"
+#include "cpu/title_module.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
 #include "ai/ai.h"            /* advance the AI sample counter/AIINT per block */
 #include "vi/vi.h"            /* advance the VI beam counter per block       */
@@ -279,6 +280,16 @@ static inline int gcn_dispatch_charge(CPUState* ctx, u64* prev_cycles,
     return 1;
 }
 
+/* IPL native code remains the first candidate. Title code is a separate,
+ * content-validated module: the real IPL/apploader must have placed the exact
+ * expected bytes in MEM1 before its dispatcher is allowed to run. */
+static inline int gcn_dispatch_native(CPUState* ctx) {
+    if (!gcn_native_code_is_invalid(ctx->pc) &&
+        dolrecomp_call(ctx, ctx->pc))
+        return 1;
+    return gcn_title_module_call(ctx, ctx->pc);
+}
+
 /* Own the run loop (rather than the generated static-inline dolrecomp_run_blocks)
  * so we can advance the time base between blocks — otherwise mftb reads a frozen
  * TB and firmware delay loops spin forever. */
@@ -445,8 +456,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * never needs calibrating. Off by default; ~zero cost when off. */
         if (s_dstats) {
             u64 t0 = __rdtsc();
-            int ok = !gcn_native_code_is_invalid(ctx->pc) &&
-                     dolrecomp_call(ctx, ctx->pc);
+            int ok = gcn_dispatch_native(ctx);
             if (!ok) {
                 gcn_interpreter_note_native_miss(ctx);
                 ok = gcn_interpreter_step(ctx);
@@ -480,8 +490,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                 fflush(stderr);
             }
         } else {
-        int dispatch_ok = !gcn_native_code_is_invalid(ctx->pc) &&
-                          dolrecomp_call(ctx, ctx->pc);
+        int dispatch_ok = gcn_dispatch_native(ctx);
         if (!dispatch_ok) {
             gcn_interpreter_note_native_miss(ctx);
             dispatch_ok = gcn_interpreter_step(ctx);

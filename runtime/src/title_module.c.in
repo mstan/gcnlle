@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * GPL experiment: bind a DolRecomp title module only after hashing the live
+ * LLE-loaded guest bytes. The descriptor/table approach derives from
+ * ModernGekko's module-template and RecompCore StaticRecomp module verifier;
+ * see docs/GPL_EXPERIMENT.md.
+ */
+#include "@GCN_TITLE_GENERATED_HEADER@"
+#include "cpu/aot_module.h"
+#include "cpu/title_module.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "title_module_tables.inc"
+
+static u8 s_states[GCN_TITLE_CHUNK_COUNT];
+static GcnAotModule s_module = {
+    s_title_chunks,
+    s_title_hashes,
+    s_states,
+    GCN_TITLE_CHUNK_COUNT,
+};
+static int s_started;
+
+static void print_summary(void) {
+    fprintf(stderr,
+            "[aot-title] summary: native=%llu verifications=%llu "
+            "verified=%u failed=%u invalidations=%llu\n",
+            (unsigned long long)s_module.native_dispatches,
+            (unsigned long long)s_module.verifications,
+            s_module.verified, s_module.failed,
+            (unsigned long long)s_module.invalidations);
+}
+
+bool gcn_title_module_call(CPUState* cpu, u32 address) {
+    u32 index;
+    u32 failed_before = s_module.failed;
+    if (!gcn_aot_module_dispatchable(&s_module, cpu, address, &index)) {
+        if (s_module.failed != failed_before) {
+            const GcnAotRange* chunk = &s_title_chunks[index];
+            fprintf(stderr,
+                    "[aot-title] content mismatch: [0x%08X,0x%08X); "
+                    "using loud interpreter until icbi\n",
+                    chunk->start, chunk->end);
+        }
+        return false;
+    }
+    if (!s_started) {
+        s_started = 1;
+        atexit(print_summary);
+        fprintf(stderr,
+                "[aot-title] activated @ 0x%08X after live-byte verification "
+                "(%u chunks available)\n",
+                address, GCN_TITLE_CHUNK_COUNT);
+    }
+    if (!dolrecomp_call(cpu, address))
+        return false;
+    s_module.native_dispatches++;
+    return true;
+}
+
+void gcn_title_module_icbi(u32 address, u32 size) {
+    gcn_aot_module_invalidate(&s_module, address, size);
+}

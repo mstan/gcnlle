@@ -57,6 +57,20 @@ sequential cost therefore falls from about 18 seconds to about 12 seconds,
 with larger practical wins from finer parallel scheduling and rebuilding only
 the pages discovered in a new capture.
 
+## Wind Waker whole-title measurement
+
+The first combined Wind Waker build compiled 628 IPL shards and 822 main-DOL
+shards at below-normal priority with two parallel jobs. A cold build and link
+took 2,503.8 seconds (41.7 minutes). After a generated-module identity change,
+the same pipeline reused cached objects and completed in 58.6 seconds. A
+subsequent stable end-to-end invocation regenerated no files, Ninja reported
+no work, and the wrapper completed in 7.011 seconds.
+
+This is the intended recompilation loop: stable per-page source names and
+generated contents preserve both Ninja dependency results and compiler-cache
+keys. Newly harvested coverage should add or replace only affected shards,
+not force a monolithic title rebuild.
+
 ## Build scheduling
 
 Generated-code builds should run with conservative parallelism and below-normal
