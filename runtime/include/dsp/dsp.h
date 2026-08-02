@@ -40,10 +40,13 @@
 #define GCN_DSP_MBOX_OUT_H  0x04u     /* DSP->CPU mailbox high (r/o)      */
 #define GCN_DSP_MBOX_OUT_L  0x06u     /* DSP->CPU mailbox low  (r/o)      */
 #define GCN_DSP_CSR         0x0Au     /* control/status register          */
-#define GCN_DSP_AR_SIZE     0x12u     /* ARAM size/mode                   */
+#define GCN_DSP_AR_INFO     0x12u     /* ARAM configuration information   */
+#define GCN_DSP_AR_MODE     0x16u     /* ARAM controller ready (read-only)*/
+#define GCN_DSP_AR_REFRESH  0x1Au     /* ARAM refresh rate                */
 #define GCN_DSP_AR_MMADDR   0x20u     /* ARAM DMA main-memory address     */
 #define GCN_DSP_AR_ARADDR   0x24u     /* ARAM DMA ARAM address            */
 #define GCN_DSP_AR_CNT      0x28u     /* ARAM DMA control/length (kicks)  */
+#define GCN_DSP_AR_CNT_LO   0x2Au     /* low-half write starts the DMA    */
 
 /* Audio DMA (MEM1 -> AI FIFO) registers (Dolphin DSP.cpp:63-67). */
 #define GCN_DSP_AID_START_HI    0x30u /* source address hi (GCN: & 0x03FF) */
@@ -85,10 +88,9 @@
  * masks + the ARAM-DMA in-progress bit) are CPU-side hardware, kept here. */
 #define GCN_DSP_CONTROL_MASK  0x0C07u
 
-/* Nominal number of CSR polls the ARAM DMA stays "in progress" for. The real
- * duration is Gekko cycle timing we don't model; the poll-aware diff collapses
- * the identical poll reads, so any value >= 1 matches by value+order. */
-#define GCN_DSP_ARAM_DMA_NOMINAL_POLLS  4u
+/* Measured Flipper ARAM transfer rate used by RecompCore/Dolphin:
+ * 246 Gekko ticks per 32-byte hardware transfer unit. */
+#define GCN_DSP_ARAM_TICKS_PER_32B  246u
 
 /* Level change on the DSP->PI interrupt line (level: 1 assert, 0 deassert). */
 typedef void (*GcnDspIrqFn)(void* user, int level);
@@ -97,7 +99,7 @@ typedef struct {
     u16   reg[GCN_DSP_SIZE / 2];      /* generic 16-bit register backing  */
     u16   csr;                        /* CPU-side CSR bits (int status/masks) */
     bool  dma_active;                 /* ARAM DMA in flight               */
-    u32   dma_polls_left;             /* CSR polls until it "completes"    */
+    u32   dma_cycles_left;            /* Gekko ticks until completion IRQ */
 
     /* Audio DMA engine (Dolphin DSP.cpp AudioDMA / UpdateAudioDMA). */
     u32   aid_source;                 /* programmed source address         */
@@ -118,6 +120,15 @@ typedef struct {
     GcnDspIrqFn irq;                  /* sink for the DSP interrupt line (boot.c -> PI) */
     void*       irq_user;
 } GcnDsp;
+
+/* Reset/direct-register behavior is split from the DSP execution engine so it
+ * can be tested without firmware ROMs. */
+void gcn_dsp_reset_registers(GcnDsp* dsp);
+u16 gcn_dsp_reg_read16(const GcnDsp* dsp, u32 off);
+void gcn_dsp_reg_write16(GcnDsp* dsp, u32 off, u16 value);
+/* Advance the CPU-side ARAM engine. Returns true exactly when this call
+ * completes an active transfer and latches ARINT. */
+bool gcn_dsp_aram_advance(GcnDsp* dsp, u32 ppc_cycles);
 
 /* irom/coef are the raw big-endian DSP ROM bytes (dsp_rom.bin / dsp_coef.bin);
  * mem1 is the guest MEM1 backing the DSP DMAs against. */

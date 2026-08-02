@@ -104,6 +104,13 @@ void gcn_ring_memcard(u32 pc, u8 channel, u8 cs, u8 command, u8 rw, u8 dma,
 /* Current monotonic block index (number of blocks retired so far). */
 u64  gcn_ring_block_index(void);
 
+/* Exact, always-on dispatch-entry coverage. Unlike the rolling block ring,
+ * these bits do not evict: MEM1/MEM2 executable aliases and the 2 MiB IPL
+ * window remain queryable for the life of the process. This deliberately
+ * records AOT dispatcher boundaries, not every instruction executed inside a
+ * generated shard. */
+int gcn_ring_pc_seen(u32 pc);
+
 /* --- query: emit a bounded JSON tail (oldest->newest of the last N) --- *
  * Each returns bytes written into `out` (never exceeding cap). These run on the
  * main thread during a server pump, reading the same rings the hot path writes.

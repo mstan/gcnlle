@@ -3,8 +3,8 @@
  * gcnrecomp runtime — M0 seed-contract unit test.
  *
  * Asserts the M0 deliverable without executing any PPC:
- *   1. MEM1 holds the BS2 payload bytes at 0x81300000 (cached + uncached alias).
- *   2. The entry PC is set to 0x81300000.
+ *   1. MEM1 mirrors Dolphin's two Load_BS2 slices at 0x81200000/0x81300000.
+ *   2. CPU registers and entry PC match the shared 0x81200150 seam.
  *   3. The SRAM fixture's stored checksum validates (OSRtc.c algorithm).
  * Plus faithfulness checks on the bus: big-endian round-trip and the
  * cached/uncached mirror collapsing to the same bytes; and the MEM1 reset fill
@@ -40,20 +40,22 @@ static void fill_synth(u8* buf, u32 size) {
     for (u32 i = 0; i < size; i++) buf[i] = synth_byte(i);
 }
 
-/* Verify the seed landed `payload` at load_addr in MEM1, entry pc, SRAM. */
+/* Verify the seed mirrored the independent Load_BS2 seam in MEM1/CPU state. */
 static void check_seeded(CPUState* cpu, const GcnSeedDevices* dev,
                          const GcnSeedConfig* cfg) {
     /* (2) entry PC */
-    CHECK(cpu->pc == GCN_BS2_ENTRY_PC, "entry PC == 0x81300000");
+    CHECK(cpu->pc == GCN_BS2_ENTRY_PC, "entry PC == 0x81200150");
 
-    /* (1) payload bytes present at load addr via the cached view */
+    /* (1) the executable BS1 tail is the only payload at 0x81200000 */
     u32 avail = 0;
     u8* host = gcn_mem_resolve(cpu, cfg->load_addr, &avail);
     CHECK(host != NULL, "load address resolves into MEM1");
-    CHECK(avail >= cfg->payload_size, "payload fits within MEM1 from load addr");
+    CHECK(avail >= GCN_BS2_BOOT_COPY_SIZE, "boot slice fits within MEM1");
     if (host) {
-        CHECK(memcmp(host, cfg->payload, cfg->payload_size) == 0,
-              "MEM1 holds the BS2 payload bytes at 0x81300000");
+        CHECK(memcmp(host, cfg->payload, GCN_BS2_BOOT_COPY_SIZE) == 0,
+              "MEM1 holds the 0x700-byte BS1 tail at 0x81200000");
+        CHECK(read_be32(host + GCN_BS2_BOOT_COPY_SIZE) == cfg->mem1_fill,
+              "MEM1 immediately after the BS1 tail remains reset-filled");
     }
 
     /* (1b) same bytes visible through the uncached mirror (0xC0000000 alias) */
@@ -62,17 +64,36 @@ static void check_seeded(CPUState* cpu, const GcnSeedDevices* dev,
     CHECK(host_uncached == host,
           "uncached mirror aliases the same MEM1 bytes as cached");
 
-    /* (1c) spot-check the last payload word via the big-endian bus primitive */
-    u32 last_off = cfg->payload_size - 4;
-    u32 expect = read_be32(cfg->payload + last_off);
-    u32 got = mem_read32(cpu, cfg->load_addr + last_off);
-    CHECK(got == expect, "mem_read32 returns big-endian payload tail word");
+    /* (1c) the BS2 body begins at payload-relative 0x720, guest 0x81300000. */
+    u32 stage2_size = cfg->payload_size - GCN_BS2_STAGE2_PAYLOAD_OFF;
+    u8* stage2 = gcn_mem_resolve(cpu, GCN_BS2_STAGE2_LOAD_ADDR, &avail);
+    CHECK(stage2 != NULL && avail >= stage2_size, "BS2 body fits at 0x81300000");
+    if (stage2) {
+        CHECK(memcmp(stage2, cfg->payload + GCN_BS2_STAGE2_PAYLOAD_OFF,
+                     stage2_size) == 0,
+              "MEM1 holds the BS2 body bytes at 0x81300000");
+    }
+    u32 expect = read_be32(cfg->payload + cfg->payload_size - 4);
+    u32 got = mem_read32(cpu, GCN_BS2_STAGE2_LOAD_ADDR + stage2_size - 4);
+    CHECK(got == expect, "mem_read32 returns big-endian BS2 tail word");
 
     /* (1d) MEM1 immediately before the payload holds the reset fill */
     if (cfg->load_addr > GC_RAM_BASE) {
         u32 before = mem_read32(cpu, cfg->load_addr - 4);
         CHECK(before == cfg->mem1_fill, "MEM1 before payload == reset fill");
     }
+
+    CHECK(cpu->gpr[3] == 0xFFF0001Fu && cpu->gpr[4] == 0x00002030u &&
+          cpu->gpr[5] == 0x0000009Cu,
+          "Load_BS2 seam GPR3/GPR4/GPR5 match the oracle");
+    CHECK(cpu->msr == 0x00002030u, "Load_BS2 seam MSR == FP|IR|DR");
+    CHECK(cpu->spr[1008] == 0x0011C464u, "Load_BS2 seam HID0 matches GC");
+    CHECK(cpu->spr[528] == 0x80001FFFu && cpu->spr[529] == 0x00000002u &&
+          cpu->spr[536] == 0x80001FFFu && cpu->spr[537] == 0x00000002u &&
+          cpu->spr[538] == 0xC0001FFFu && cpu->spr[539] == 0x0000002Au &&
+          cpu->spr[534] == 0xFFF0001Fu && cpu->spr[535] == 0xFFF00001u &&
+          cpu->spr[542] == 0xFFF0001Fu && cpu->spr[543] == 0xFFF00001u,
+          "Load_BS2 seam BAT state matches the oracle");
 
     /* (3) SRAM checksum validates */
     CHECK(gcn_sram_validate(dev->sram),

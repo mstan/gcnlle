@@ -25,6 +25,7 @@
  */
 #include "cpu/cpu.h"
 #include "cpu/native_code.h"
+#include "cpu/timing.h"
 #include "cpu/title_module.h"
 #include "debug/rings.h"   /* gcn_ring_psq — [gx-fifoprov] psq value audit */
 #include "memory/memory.h"
@@ -140,6 +141,36 @@ void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia) {
     ppc_take_exception(cpu, PPC_EXC_ALIGNMENT, PPC_VECTOR_ALIGNMENT, cia, 0);
 }
 
+/* Gekko's decrementer advances in the time-base clock domain (bus/4, exactly
+ * core/12). Nintendo's OS alarm queue programs DEC and relies on vector 0x900
+ * to resume alarm-suspended threads. */
+static bool s_decrementer_pending;
+
+void ppc_decrementer_reset(CPUState* cpu) {
+    s_decrementer_pending = false;
+    if (cpu)
+        cpu->spr[22] = 0xFFFFFFFFu;
+}
+
+void ppc_decrementer_tick(CPUState* cpu, u32 tb_ticks) {
+    if (!cpu || !tb_ticks)
+        return;
+    u32 old = cpu->spr[22];
+    u32 next = old - tb_ticks;
+    cpu->spr[22] = next;
+    if (!(old & 0x80000000u) && (next & 0x80000000u))
+        s_decrementer_pending = true;
+}
+
+void ppc_deliver_decrementer(CPUState* cpu) {
+    if (!cpu || !s_decrementer_pending || cpu->exception ||
+        !(cpu->msr & PPC_MSR_EE))
+        return;
+    s_decrementer_pending = false;
+    ppc_take_exception(cpu, PPC_EXC_DECREMENTER, PPC_VECTOR_DECREMENTER,
+                       cpu->pc, 0);
+}
+
 /* --- time base + SPRs --- */
 
 u32 ppc_mftb(CPUState* cpu, u16 tbr, u32 cia) {
@@ -220,6 +251,11 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
     case 9:   cpu->ctr = value; return;
     case 18:  cpu->dsisr = value; return;
     case 19:  cpu->dar = value; return;
+    case 22:
+        cpu->spr[22] = value;
+        if (!(value & 0x80000000u))
+            s_decrementer_pending = false;
+        return;
     case 26:  cpu->srr0 = value; return;
     case 27:  cpu->srr1 = value; return;
     case 282: cpu->ear = value; return;

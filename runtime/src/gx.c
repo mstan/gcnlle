@@ -70,6 +70,7 @@
 #define GX_BP_CLEAR_GB         0x50u
 #define GX_BP_CLEAR_Z          0x51u
 #define GX_BP_TRIGGER_EFB_COPY 0x52u
+#define GX_BP_MASK             0xFEu
 
 #define GX_XF_REGISTERS_START  0x1000u
 #define GX_XF_REGISTERS_END    0x1058u   /* XFMemory.h:240 (register region end) */
@@ -1153,6 +1154,21 @@ static u8 s_gx_tmem[0x100000];
 const u8* gcn_gx_tmem(void) { return s_gx_tmem; }
 
 static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
+    /* Flipper BPMEM_BP_MASK is a one-shot write mask, not an ordinary state
+     * register. Merge the next BP write with the old destination, then reset
+     * the mask to all 24 payload bits. J3D relies on this for PE state: its
+     * material DL writes 0x001FE7 before BLENDMODE specifically so the global
+     * GXSetColorUpdate/GXSetAlphaUpdate bits survive the material update.
+     * Treating the following payload as an unmasked replacement turns both
+     * writes off and makes correctly shaded sky geometry write no EFB color. */
+    {
+        const u32 mask = gx->bp[GX_BP_MASK] & 0x00FFFFFFu;
+        const u32 old = gx->bp[cmd] & 0x00FFFFFFu;
+        value = ((old & ~mask) | (value & mask)) & 0x00FFFFFFu;
+        if (cmd != GX_BP_MASK)
+            gx->bp[GX_BP_MASK] = 0x00FFFFFFu;
+    }
+
     if (note_once(&gx->seen_bp[cmd]))
         fprintf(stderr, "gx: BP reg 0x%02X first written (val 0x%06X)\n", cmd, value);
 
@@ -1492,6 +1508,9 @@ static u32 gx_run(GcnGx* gx, const u8* data, u32 available) {
  * ==========================================================================*/
 void gcn_gx_init(CPUState* cpu, GcnCp* cp, GcnPe* pe) {
     memset(&s_gx, 0, sizeof s_gx);
+    /* Hardware reset value: all 24 BP payload bits writable. A zero reset
+     * would mask every BP command until the guest explicitly touched 0xFE. */
+    s_gx.bp[GX_BP_MASK] = 0x00FFFFFFu;
     s_gx_frames = 0;
     __atomic_store_n(&s_xfb_generation, 0u, __ATOMIC_RELAXED);
     s_gx.cpu = cpu;

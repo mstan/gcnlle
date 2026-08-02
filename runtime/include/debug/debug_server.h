@@ -47,6 +47,24 @@ int  gcn_debug_server_start(const GcnDebugCtx* ctx);
  * send responses. Call once per block from the dispatch loop. No-op if disabled. */
 void gcn_debug_server_pump(void);
 
+/* Differential co-simulation control. GCN_COSIM=1 plus GCN_DEBUG_PORT parks
+ * the CPU before the first guest instruction and makes the TCP coordinator
+ * grant deterministic instruction budgets with `cosim_step`. The ordinary
+ * runtime remains AOT-first; this interpreter-only mode is a diagnostic
+ * surface for full-state first-divergence work, never the shipping path.
+ *
+ * before_instruction blocks (while pumping TCP) until a budget is available.
+ * after_instruction retires exactly one granted instruction. */
+int  gcn_debug_server_cosim_enabled(void);
+int  gcn_debug_server_cosim_before_instruction(void);
+void gcn_debug_server_cosim_after_instruction(void);
+
+/* AOT-safe milestone checkpoint. `checkpoint_arm` names a dispatcher-entry PC
+ * and may additionally require one GPR value. Normal native dispatch remains
+ * enabled. When the condition matches, this parks before the block executes
+ * while continuing to serve TCP queries until `checkpoint_resume`. */
+int  gcn_debug_server_checkpoint_before_block(void);
+
 /* True after a client issued "quit" (or "continue"-style stop) — lets the run
  * loop end cleanly on request. */
 int  gcn_debug_server_quit_requested(void);

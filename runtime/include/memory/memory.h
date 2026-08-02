@@ -31,6 +31,12 @@ extern "C" {
 #define GCN_MEM1_UNCACHED  GC_RAM_UNCACHED    /* 0xC0000000 uncached mirror */
 #define GCN_MEM1_SIZE      GC_MAIN_RAM_SIZE   /* 24 MB */
 
+/* Gekko locked L1 data-cache backing. The hardware tags are programmable, but
+ * retail software conventionally addresses allocated lines through
+ * 0xE0000000. Dolphin's LLE memory model exposes a 256-KiB backing here. */
+#define GCN_L1_CACHE_BASE  0xE0000000u
+#define GCN_L1_CACHE_SIZE  0x00040000u
+
 /* Flipper MMIO aperture (for address classification; models land later). */
 #define GCN_MMIO_BASE      0xCC000000u
 #define GCN_MMIO_SIZE      0x01000000u
@@ -46,11 +52,15 @@ extern "C" {
  * in mmio.c's dispatch translation. */
 #define GCN_MMIO_PHYS_BASE 0x0C000000u
 
-/* Resolve a guest address to a host pointer into MEM1 (or MEM2 if allocated),
- * collapsing the cached (0x80..) and uncached (0xC0..) mirrors to the same
- * bytes. Returns NULL if the address is not RAM-backed; *avail (if non-NULL)
- * receives the number of contiguous bytes available from that pointer. */
+/* Resolve a guest address to a host pointer into MEM1, MEM2 if allocated, or
+ * the locked-L1 window, collapsing cached/uncached RAM mirrors to the same
+ * bytes. Returns NULL if the address is not memory-backed; *avail (if
+ * non-NULL) receives the contiguous byte count. */
 u8* gcn_mem_resolve(CPUState* cpu, u32 addr, u32* avail);
+
+/* Canonical locked-L1 backing for debug/co-sim hashing. The runtime owns one
+ * guest CPU per process; `cpu` must be that initialized instance. */
+u8* gcn_mem_locked_l1(CPUState* cpu, u32* size);
 
 /* True if addr (cached or uncached alias) lands in MEM1. */
 bool gcn_mem_in_mem1(u32 addr, u32 need_bytes);

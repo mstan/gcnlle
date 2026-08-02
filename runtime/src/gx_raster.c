@@ -11,6 +11,7 @@
 #include "gx/gx.h"       /* gcn_gx_tmem() — TLUT reads for paletted textures */
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
 #include <string.h>
@@ -223,7 +224,7 @@ static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
  * `pixels` were shaded via a fused_pixel_A/B/C specialization instead of the
  * general tev_draw() — the coverage number the task's VERIFY step asks for,
  * gated on this same knob so it costs nothing when census is off. */
-#define GX_CENSUS_MAX 32
+#define GX_CENSUS_MAX 128
 typedef struct { int used; u32 hash; u64 draws, pixels, fused_pixels; } GxCensusEntry;
 static int s_tev_census = -1;
 static GxCensusEntry s_census[GX_CENSUS_MAX];
@@ -381,9 +382,7 @@ typedef struct {
     /* order (bp 0x28+s2) fields, pre-split per stage — no more odd/even math
      * or s_bp reads at TEV-draw time (Tev.cpp SetupTextures/SetRasColor). */
     u32 texcoordSel, texmap, enable, colorchan;
-    int tevind_active;   /* bits(tevind,9,2)!=0 || bits(tevind,7,2)!=0 (decode
-                           * only; the TRAP itself still fires at its original
-                           * per-pixel-per-stage call site in tev_draw). */
+    u32 tevind;           /* raw BP 0x10+stage indirect-stage descriptor */
 
     u32 cc, ac;           /* raw TevStageCombiner color/alpha words */
 
@@ -418,7 +417,7 @@ typedef struct {
     int w1, h1;                 /* width-1, height-1 (TX_SETIMAGE0) */
     u32 wrap_s, wrap_t;         /* TX_SETMODE0 bits 0-2, 2-2 */
     u32 magf, minf;             /* TX_SETMODE0 bits 4 (mag), 7 (min) */
-    int mipmapfilter_bad;       /* TX_SETMODE0 bits 5-2 != 0 */
+    u32 mipmap_filter;          /* TX_SETMODE0 bits 5-2: none/point/linear */
     int lod_edge;               /* TX_SETMODE0 bit 8 */
     s32 lod_bias_half;          /* sext(TX_SETMODE0[16:9], 8) >> 1, precomputed */
     u32 minlod, maxlod;         /* TX_SETMODE1 bits 0-8 / 8-8 */
@@ -497,6 +496,95 @@ static u64 s_cfg_bp_generation = 0;
 static u64 s_cfg_cache_hits;
 static u64 s_cfg_cache_misses;
 static u64 s_draw_shapes[8][17]; /* nverts 0..15, 16=16+ */
+
+/* Last observed draw for every shading-census bucket. This is deliberately a
+ * fixed, append-only-by-bucket diagnostic surface: a late TCP query can still
+ * inspect the full-screen movie draw even after later menu draws have replaced
+ * live BP state. Texture bytes themselves remain in guest RAM and may be
+ * reused, so capture their hash and a short sample at draw time as well as the
+ * address. */
+typedef struct {
+    u32 mode0, mode1, image0, image3, tlut;
+    u32 fmt, width, height, phys, bytes;
+    u64 hash;
+    u8 sample[32];
+    u32 sample_len;
+    int active, valid;
+} GxDebugTexture;
+
+typedef struct {
+    int valid;
+    u64 sequence, frame;
+    u32 cpu_pc, dl, prim, vat, nverts, vstride;
+    u32 vertex_bytes;
+    u64 vertex_hash;
+    u8 vertex_head[32], vertex_tail[32];
+    u32 vertex_head_len, vertex_tail_len;
+    u32 census_hash, program_id;
+    u32 genmode, alpha_test;
+    u32 zmode, blendmode, dstalpha, pecontrol;
+    u32 numtexgens, numcolchans, numtevstages;
+    u32 bp_tev_ra[4], bp_tev_bg[4];
+    s16 tev_reg[4][4], tev_konst[4][4];
+    u64 pixels;
+    u64 alpha_tested, alpha_rejected, alpha_sum, last_tex_alpha_sum;
+    u32 alpha_min, alpha_max, last_tex_alpha_min, last_tex_alpha_max;
+    u64 blend_inputs, z_rejected, color_writes;
+    u64 output_rgba_sum[4], efb_rgba_sum[4];
+    u32 triangles_submitted, triangles_trivial_rejected, triangles_culled;
+    u32 triangles_clipped, triangles_rasterized;
+    u64 bbox_area_sum;
+    int bbox_valid;
+    s32 bbox_minx, bbox_miny, bbox_maxx, bbox_maxy;
+    u32 largest_triangle_area;
+    struct {
+        float obj[3], mv[3], clip[4], screen[3];
+        float normal[3][3], texcoord[8][3];
+        u8 color[2][4];
+        u8 pos_mtx;
+    } largest_triangle[3];
+    struct {
+        u32 order, texcoord, texmap, enable, colorchan, cc, ac, tevind;
+        u32 ksel, kcsel, kasel;
+        s16 konst[4];
+    } stage[16];
+    GxDebugTexture tex[8];
+} GxDebugDraw;
+
+static GxDebugDraw s_debug_draw[GX_CENSUS_MAX];
+static GxDebugDraw s_debug_pending;
+static int s_debug_pending_index = -1;
+static u64 s_debug_pending_pixels_before;
+static u64 s_debug_draw_sequence;
+
+#define GX_DEBUG_RECENT_MAX 2048u
+#define GX_DEBUG_LARGE_MAX 4096u
+typedef struct {
+    u64 sequence, frame;
+    u32 cpu_pc, dl, census_hash, prim, nverts, vstride;
+    u64 vertex_hash, pixels, alpha_tested, alpha_rejected, alpha_sum;
+    u32 alpha_min, alpha_max;
+    u64 blend_inputs, z_rejected, color_writes;
+    u32 triangles_submitted, triangles_trivial_rejected, triangles_culled;
+    u32 triangles_clipped, triangles_rasterized;
+    u64 bbox_area_sum;
+    int bbox_valid;
+    s32 bbox_minx, bbox_miny, bbox_maxx, bbox_maxy;
+    u32 largest_triangle_area;
+    float largest_screen[3][3];
+    u32 alpha_test, zmode, blendmode, pecontrol;
+} GxDebugRecent;
+static GxDebugRecent s_debug_recent[GX_DEBUG_RECENT_MAX];
+static u32 s_debug_recent_head, s_debug_recent_count;
+static u64 s_debug_recent_sequence, s_debug_recent_latest_frame;
+/* Dedicated chronological journal for scene-sized draws.  The general recent
+ * ring intentionally also keeps tiny zero-pixel draws so rejected geometry can
+ * be diagnosed, but Wind Waker can submit enough of those to evict an entire
+ * title frame.  Keep large draws in their own ring so the base ocean pass and
+ * later wave/composite passes survive until a TCP query. */
+static GxDebugRecent s_debug_large[GX_DEBUG_LARGE_MAX];
+static u32 s_debug_large_head, s_debug_large_count;
+static u64 s_debug_large_latest_frame;
 
 void gx_raster_notify_bp_write(void) {
     if (++s_bp_generation == 0) {
@@ -633,6 +721,67 @@ static void SetPixelAlphaOnly(u32 off, u8 a) {
 }
 static void SetPixelDepth(u32 off, u32 depth) { s_efb_depth[off] = depth & 0x00ffffffu; }
 static u32  GetPixelDepth(u32 off)            { return s_efb_depth[off] & 0x00ffffffu; }
+
+/* VideoCommon/VideoCommon.h CompressZ16. Flipper's RGB565_Z16 mode exposes
+ * one of four 16-bit encodings through GXPeekZ; the other EFB formats return
+ * the stored 24-bit value directly. */
+static u32 compress_z16(u32 z24, u32 format) {
+    if (format == 0u || format > 3u)
+        return z24 >> 8;
+
+    u32 shifted = z24 << 8;
+    u32 inverted = ~shifted;
+    u32 leading = inverted ? (u32)__builtin_clz(inverted) : 32u;
+    u32 exp_bits;
+    int next_one = 0;
+    if (format == 1u) {
+        exp_bits = 2u;
+        if (leading >= 3u) { leading = 3u; next_one = 1; }
+    } else if (format == 2u) {
+        exp_bits = 3u;
+        if (leading >= 7u) { leading = 7u; next_one = 1; }
+    } else {
+        exp_bits = 4u;
+        if (leading >= 12u) { leading = 12u; next_one = 1; }
+    }
+
+    u32 mantissa_bits = 16u - exp_bits;
+    u32 top = 24u - leading;
+    if (top < mantissa_bits) top = mantissa_bits;
+    if (!next_one) top--;
+    u32 bottom = top - mantissa_bits;
+    u32 mantissa = (z24 >> bottom) & ((1u << mantissa_bits) - 1u);
+    return (leading << mantissa_bits) | mantissa;
+}
+
+int gx_raster_efb_cpu_read(u32 address, u32* value) {
+    if (!value || !s_bp)
+        return 0;
+
+    /* Core/PowerPC/MMU.cpp EFB_Read: the low address bits encode one 32-bit
+     * pixel per x and one 4 KiB row per y. The same decode works for physical
+     * 0x08xxxxxx and the SDK's effective 0xC8xxxxxx mapping. */
+    u32 x = (address & 0xFFFu) >> 2;
+    u32 y = (address >> 12) & 0x3FFu;
+    if (x >= EFB_WIDTH || y >= EFB_HEIGHT) {
+        *value = 0;
+        return 1;
+    }
+    if (address & 0x00800000u) {
+        TRAP(efb_cpu_zcolor, "combined Z+color CPU EFB read");
+        return 0;
+    }
+    if (address & 0x00400000u) {
+        u32 depth = GetPixelDepth(y * EFB_WIDTH + x);
+        if (pixel_format() == PF_RGB565_Z16)
+            depth = compress_z16(depth, bits(s_bp[0x43], 3, 3));
+        *value = depth;
+        return 1;
+    }
+
+    TRAP(efb_cpu_color, "CPU EFB color read");
+    return 0;
+}
 
 /* BlendMode (bp 0x41) accessors. */
 static u32 bm(void) { return s_bp[0x41]; }
@@ -791,11 +940,17 @@ enum { TEXFMT_I4 = 0x0, TEXFMT_I8 = 0x1, TEXFMT_IA4 = 0x2, TEXFMT_IA8 = 0x3,
        TEXFMT_C4 = 0x8, TEXFMT_C8 = 0x9, TEXFMT_C14X2 = 0xA, TEXFMT_CMPR = 0xE };
 enum { WRAP_CLAMP = 0, WRAP_REPEAT = 1, WRAP_MIRROR = 2 };
 
-/* Per-unit BP register base: unit 0 lives at 0x80.. (BPMemory.h:82-88). */
-static u32 tx_mode0(u32 unit) { return s_bp[0x80 + unit]; }
-static u32 tx_mode1(u32 unit) { return s_bp[0x84 + unit]; }
-static u32 tx_image0(u32 unit){ return s_bp[0x88 + unit]; }
-static u32 tx_image3(u32 unit){ return s_bp[0x94 + unit]; }
+/* GX texture-register addressing is split into two banks. Units 0..3 use
+ * BP 0x80..0x9b, while units 4..7 use 0xa0..0xbb. Within either bank the
+ * low two unit bits select a column and the register kind advances by four
+ * words (TexUnitAddress::ComputeOffset in Dolphin's BPMemory model). */
+static u32 tx_unit_base(u32 unit) {
+    return (unit & 3u) | ((unit & 4u) << 3);
+}
+static u32 tx_mode0(u32 unit) { return s_bp[0x80 + tx_unit_base(unit)]; }
+static u32 tx_mode1(u32 unit) { return s_bp[0x84 + tx_unit_base(unit)]; }
+static u32 tx_image0(u32 unit){ return s_bp[0x88 + tx_unit_base(unit)]; }
+static u32 tx_image3(u32 unit){ return s_bp[0x94 + tx_unit_base(unit)]; }
 
 static int wrap_coord(int coord, u32 wrap, int size) {
     switch (wrap) {
@@ -1068,17 +1223,17 @@ static void decode_texel(u32 fmt, const u8* src, u32 src_len, int s, int t,
  * SIZE / LAYOUT: direct-mapped, power-of-two entry count so the index is a
  * plain AND-mask (no modulo). Entry is deliberately kept as two u32s + 4
  * bytes (key, gen, rgba) rather than folding gen into the tag word: menu
- * textures are small, but texmap (3 bits) + iS + iT (up to 10 bits each,
- * GX's max texture dimension is 1024) already want 23 bits for a collision-
+ * textures are small, but texmap (3 bits) + mip (4 bits) + iS + iT (up to
+ * 10 bits each, GX's max texture dimension is 1024) want 27 bits for a collision-
  * free key, leaving too few spare bits to also carry a generation counter
  * that wouldn't wrap (and re-trigger the full-clear path) many times a
  * second. Two separate u32s cost 4 more bytes per entry but keep both fields
  * exact and the wraparound vanishingly rare.
  *
- * KEY: texmap<<20 | iT<<10 | iS — exact and collision-free (iS/iT < 1024,
- * texmap < 8), used only for the tag comparison, not the index.
+ * KEY: texmap<<24 | mip<<20 | iT<<10 | iS — exact and collision-free
+ * (iS/iT < 1024, mip < 16, texmap < 8), used only for tag comparison.
  *
- * INDEX MIX: (iS ^ (iT<<5) ^ (texmap<<11)) & MASK. iS lands in the index's
+ * INDEX MIX: (iS ^ (iT<<5) ^ (mip<<9) ^ (texmap<<11)) & MASK. iS lands in the index's
  * low bits untouched, so horizontally-adjacent texels in the same scanline
  * (iS, iS+1, iS+2, ...) get distinct, sequential index slots instead of all
  * colliding on the same one; the <<5 on iT and <<11 on texmap spread rows
@@ -1092,7 +1247,7 @@ static void decode_texel(u32 fmt, const u8* src, u32 src_len, int s, int t,
 #define TEXEL_CACHE_MASK  (TEXEL_CACHE_SIZE - 1u)
 
 typedef struct {
-    u32 key;      /* texmap<<20 | iT<<10 | iS — exact tag, see comment above */
+    u32 key;      /* texmap<<24 | mip<<20 | iT<<10 | iS — exact tag */
     u32 gen;      /* draw generation this slot was last written in */
     u8  rgba[4];  /* decode_texel's exact out[4] for that (texmap,iS,iT) */
 } TexelCacheEntry;
@@ -1114,11 +1269,11 @@ static TexelCacheEntry s_texel_cache_w[GX_MT_MAX][TEXEL_CACHE_SIZE]
  * while no fork is in flight), workers just compare against it. */
 static u32 s_texel_cache_gen;
 
-static inline u32 texel_cache_key(u32 texmap, u32 iS, u32 iT) {
-    return (texmap << 20) | (iT << 10) | iS;
+static inline u32 texel_cache_key(u32 texmap, u32 mip, u32 iS, u32 iT) {
+    return (texmap << 24) | (mip << 20) | (iT << 10) | iS;
 }
-static inline u32 texel_cache_index(u32 texmap, u32 iS, u32 iT) {
-    return (iS ^ (iT << 5) ^ (texmap << 11)) & TEXEL_CACHE_MASK;
+static inline u32 texel_cache_index(u32 texmap, u32 mip, u32 iS, u32 iT) {
+    return (iS ^ (iT << 5) ^ (mip << 9) ^ (texmap << 11)) & TEXEL_CACHE_MASK;
 }
 
 /* Cache-checked decode_texel wrapper. Hooked INSIDE tex_sample (this is its
@@ -1126,11 +1281,12 @@ static inline u32 texel_cache_index(u32 texmap, u32 iS, u32 iT) {
  * directly, though a repo-wide grep found no other caller) so callers of
  * decode_texel that might not share tex_sample's per-draw-frozen-texmap
  * invariant are unaffected by construction, not just by accident. */
-static inline void decode_texel_cached(int wid, u32 texmap, u32 fmt, const u8* src, u32 src_len,
+static inline void decode_texel_cached(int wid, u32 texmap, u32 mip, u32 fmt,
+                                        const u8* src, u32 src_len,
                                         int iS, int iT, int w1, const u8* tlut, u32 tlutfmt,
                                         u8 out[4]) {
-    u32 key = texel_cache_key(texmap, (u32)iS, (u32)iT);
-    u32 idx = texel_cache_index(texmap, (u32)iS, (u32)iT);
+    u32 key = texel_cache_key(texmap, mip, (u32)iS, (u32)iT);
+    u32 idx = texel_cache_index(texmap, mip, (u32)iS, (u32)iT);
     TexelCacheEntry* e = &s_texel_cache_w[wid][idx];
 
     if (e->gen == s_texel_cache_gen && e->key == key) {
@@ -1152,7 +1308,26 @@ static inline void decode_texel_cached(int wid, u32 texmap, u32 fmt, const u8* s
     if (s_pixel_stats) s_ps_texel_cache_misses++;
 }
 
-static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*RGBA*/) {
+/* TextureDecoder block geometry used to advance through packed mip levels in
+ * MEM1. Depth is in nibbles per texel. */
+static void tex_format_layout(u32 fmt, int* block_w, int* block_h,
+                              int* depth_nibbles) {
+    switch (fmt) {
+    case TEXFMT_I4: case TEXFMT_C4: case TEXFMT_CMPR:
+        *block_w = 8; *block_h = 8; *depth_nibbles = 1; break;
+    case TEXFMT_I8: case TEXFMT_IA4: case TEXFMT_C8:
+        *block_w = 8; *block_h = 4; *depth_nibbles = 2; break;
+    case TEXFMT_IA8: case TEXFMT_RGB565: case TEXFMT_RGB5A3: case TEXFMT_C14X2:
+        *block_w = 4; *block_h = 4; *depth_nibbles = 4; break;
+    case TEXFMT_RGBA8:
+        *block_w = 4; *block_h = 4; *depth_nibbles = 8; break;
+    default:
+        *block_w = 4; *block_h = 4; *depth_nibbles = 8; break;
+    }
+}
+
+static void tex_sample_mip(int wid, u32 texmap, s32 s, s32 t, u32 mip,
+                           int linear, u8* out /*RGBA*/) {
     /* tx_mode0/mode1/image0/image3 field extraction is per-draw-constant (BP
      * loads never interleave with a draw's vertex payload) — decoded once by
      * build_draw_cfg() into s_cfg.tex[texmap] instead of every sample. Trap
@@ -1182,7 +1357,29 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
     const u8* src = tc->src;
     u32 src_len = tc->src_len;
     u32 wrap_s = tc->wrap_s, wrap_t = tc->wrap_t;
-    if (tc->mipmapfilter_bad) TRAP(mipmapfilter, "texture mipmap filter (mipmaps)");
+
+    /* TextureSampler::SampleMip: reduce sample coordinates and dimensions,
+     * and skip the complete tiled images preceding the requested level. */
+    if (mip) {
+        int mip_w = w1 + 1, mip_h = h1 + 1;
+        int block_w, block_h, depth_nibbles;
+        tex_format_layout(fmt, &block_w, &block_h, &depth_nibbles);
+        w1 >>= mip;
+        h1 >>= mip;
+        s >>= mip;
+        t >>= mip;
+        for (u32 level = 0; level < mip; level++) {
+            int stored_w = mip_w > block_w ? mip_w : block_w;
+            int stored_h = mip_h > block_h ? mip_h : block_h;
+            u64 level_size = ((u64)stored_w * (u64)stored_h *
+                              (u64)depth_nibbles) >> 1;
+            u32 advance = level_size > src_len ? src_len : (u32)level_size;
+            src += advance;
+            src_len -= advance;
+            mip_w >>= 1;
+            mip_h >>= 1;
+        }
+    }
 
     if (linear) {
         s -= 64; t -= 64;
@@ -1198,10 +1395,10 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
          * pixels in a scanline and adjacent samples' own 4 taps repeat the
          * same (texmap,iS,iT) constantly, this is exactly what the cache
          * memoizes. */
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT,  w1, tc->tlut, tc->tlutfmt, v00);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT,  w1, tc->tlut, tc->tlutfmt, v10);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS,  iT1, w1, tc->tlut, tc->tlutfmt, v01);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS1, iT1, w1, tc->tlut, tc->tlutfmt, v11);
+        decode_texel_cached(wid, texmap, mip, fmt, src, src_len, iS,  iT,  w1, tc->tlut, tc->tlutfmt, v00);
+        decode_texel_cached(wid, texmap, mip, fmt, src, src_len, iS1, iT,  w1, tc->tlut, tc->tlutfmt, v10);
+        decode_texel_cached(wid, texmap, mip, fmt, src, src_len, iS,  iT1, w1, tc->tlut, tc->tlutfmt, v01);
+        decode_texel_cached(wid, texmap, mip, fmt, src, src_len, iS1, iT1, w1, tc->tlut, tc->tlutfmt, v11);
         for (int c = 0; c < 4; c++) {
             u32 acc = v00[c] * (u32)((128 - fS) * (128 - fT)) +
                       v10[c] * (u32)((fS)       * (128 - fT)) +
@@ -1212,7 +1409,38 @@ static void tex_sample(int wid, u32 texmap, s32 s, s32 t, int linear, u8* out /*
     } else {
         int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
         int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
-        decode_texel_cached(wid, texmap, fmt, src, src_len, iS, iT, w1, tc->tlut, tc->tlutfmt, out);
+        decode_texel_cached(wid, texmap, mip, fmt, src, src_len,
+                            iS, iT, w1, tc->tlut, tc->tlutfmt, out);
+    }
+}
+
+/* TextureSampler::Sample: choose mip(s) from the s28.4 LOD and TX_SETMODE0's
+ * mip filter. Point mode rounds at 0.5; linear mode blends adjacent levels. */
+static void tex_sample(int wid, u32 texmap, s32 s, s32 t, s32 lod,
+                       int linear, u8 out[4]) {
+    const TexUnitCfg* tc = &s_cfg.tex[texmap];
+    u32 base_mip = 0;
+    int mip_linear = 0;
+    u32 lod_fract = (u32)lod & 0xFu;
+
+    if (tc->mipmap_filter == 3u)
+        TRAP(mipmapfilter, "invalid texture mipmap filter 3");
+    if (lod > 0 && tc->mipmap_filter != 0u) {
+        base_mip = (u32)lod >> 4;
+        mip_linear = lod_fract != 0u && tc->mipmap_filter == 2u;
+        if (tc->mipmap_filter == 1u && lod_fract >= 8u)
+            base_mip++;
+    }
+
+    if (mip_linear) {
+        u8 a[4], b[4];
+        tex_sample_mip(wid, texmap, s, t, base_mip, linear, a);
+        tex_sample_mip(wid, texmap, s, t, base_mip + 1u, linear, b);
+        for (int c = 0; c < 4; c++)
+            out[c] = (u8)(((u32)a[c] * (16u - lod_fract) +
+                           (u32)b[c] * lod_fract) >> 4);
+    } else {
+        tex_sample_mip(wid, texmap, s, t, base_mip, linear, out);
     }
 }
 
@@ -1239,6 +1467,7 @@ struct Tev {   /* tagged (not anonymous) so the DrawCfg::fused forward
     s32    TexCoordS, TexCoordT;
     u8     AlphaBump;
     s32    TextureLod[16];  int TextureLinear[16];
+    s32    IndirectLod[4];  int IndirectLinear[4];
     int    wid;             /* GX-MT worker id owning this instance — indexes
                              * s_texel_cache_w/s_rb_w so the whole per-pixel
                              * path stays parameterized by the one Tev* it
@@ -1446,6 +1675,119 @@ static int alpha_test(int alpha) {
     }
 }
 
+static int iround(float x);
+static float vp_wd(void);
+
+static float fog_float(u32 word) {
+    u32 raw = (((word >> 19) & 1u) << 31) |
+              (((word >> 11) & 0xffu) << 23) |
+              ((word & 0x7ffu) << 12);
+    float f;
+    memcpy(&f, &raw, sizeof f);
+    return f;
+}
+
+static u32 ztexture_depth(const Tev* t) {
+    u32 ztex2 = s_bp[0xF5];
+    u32 op = bits(ztex2, 2, 2);
+    if (op == 0u) return (u32)t->Position[2] & 0x00ffffffu;
+    if (op > 2u) {
+        TRAPF(ztexop, "invalid z-texture operation %u", op);
+        return (u32)t->Position[2] & 0x00ffffffu;
+    }
+
+    u32 type = bits(ztex2, 0, 2);
+    u32 tex;
+    if (type == 0u) {
+        tex = (u32)(u8)t->RawTexColor.a;
+    } else if (type == 1u) {
+        tex = (u32)(u8)t->RawTexColor.r |
+              ((u32)(u8)t->RawTexColor.a << 8);
+    } else if (type == 2u) {
+        tex = ((u32)(u8)t->RawTexColor.r << 16) |
+              ((u32)(u8)t->RawTexColor.g << 8) |
+              (u32)(u8)t->RawTexColor.b;
+    } else {
+        TRAP(ztextype, "invalid z-texture format");
+        tex = 0;
+    }
+    tex += s_bp[0xF4] & 0x00ffffffu;
+    if (op == 1u) tex += (u32)t->Position[2];
+    return tex & 0x00ffffffu;
+}
+
+/* GX fog is applied to the TEV result before blending. */
+static void apply_fog(const Tev* t, u8 output[4]) {
+    u32 f3 = s_bp[0xF1];
+    u32 fsel = bits(f3, 21, 3);
+    if (fsel == 0u) return;
+    if (fsel != 2u && fsel < 4u) {
+        TRAPF(fogtype, "invalid fog type %u", fsel);
+        return;
+    }
+
+    u32 a_word = s_bp[0xEE], c_word = f3;
+    float a = fog_float(a_word), c = fog_float(c_word);
+    if (((a_word >> 11) & 0xffu) == 0xffu &&
+        ((c_word >> 11) & 0xffu) == 0xffu) {
+        a = 0.0f;
+        c = (!(a_word & (1u << 19)) && !(c_word & (1u << 19)))
+            ? -INFINITY : INFINITY;
+    }
+
+    u32 z = ztexture_depth(t);
+    float ze;
+    if (bits(f3, 20, 1) == 0u) {
+        u32 shift = s_bp[0xF0] & 31u;
+        s32 denom = (s32)(s_bp[0xEF] & 0x00ffffffu) - (s32)(z >> shift);
+        ze = denom ? (a * 16777216.0f) / (float)denom
+                   : (a < 0.0f ? -INFINITY : INFINITY);
+    } else {
+        ze = a * (float)z * (1.0f / 16777216.0f);
+    }
+
+    u32 range_base = s_bp[0xE8];
+    if (bits(range_base, 10, 1)) {
+        float vp_width = fabsf(vp_wd() * 2.0f);
+        if (vp_width > 0.0f) {
+            float center = (float)((s32)bits(range_base, 0, 10) - 342);
+            float screen_center = center / vp_width * 2.0f - 1.0f;
+            float offset = 2.0f * ((float)t->Position[0] / vp_width) -
+                           1.0f - screen_center;
+            float findex = 9.0f - fabsf(offset) * 9.0f;
+            if (findex < 0.0f) findex = 0.0f;
+            if (findex > 9.0f) findex = 9.0f;
+            u32 lo = (u32)findex, hi = lo < 9u ? lo + 1u : 9u;
+            u32 lo_word = s_bp[0xE9 + lo / 2u];
+            u32 hi_word = s_bp[0xE9 + hi / 2u];
+            float klo = (float)bits(lo_word, (lo & 1u) ? 0 : 12, 12) / 64.0f;
+            float khi = (float)bits(hi_word, (hi & 1u) ? 0 : 12, 12) / 64.0f;
+            float frac = findex - (float)lo;
+            float k = klo + (khi - klo) * frac;
+            if (k != 0.0f) ze *= sqrtf(offset * offset + k * k) / k;
+        }
+    }
+
+    float fog = ze - c;
+    if (fog < 0.0f) fog = 0.0f;
+    if (fog > 1.0f) fog = 1.0f;
+    switch (fsel) {
+    case 4: fog = 1.0f - exp2f(-8.0f * fog); break;
+    case 5: fog = 1.0f - exp2f(-8.0f * fog * fog); break;
+    case 6: fog = exp2f(-8.0f * (1.0f - fog)); break;
+    case 7: fog = 1.0f - fog; fog = exp2f(-8.0f * fog * fog); break;
+    default: break;
+    }
+    int ifog = iround(fog * 256.0f);
+    u32 fog_color = s_bp[0xF2];
+    u8 fb = (u8)bits(fog_color, 0, 8);
+    u8 fg = (u8)bits(fog_color, 8, 8);
+    u8 fr = (u8)bits(fog_color, 16, 8);
+    output[BLU_C] = (u8)((output[BLU_C] * (256 - ifog) + fb * ifog) >> 8);
+    output[GRN_C] = (u8)((output[GRN_C] * (256 - ifog) + fg * ifog) >> 8);
+    output[RED_C] = (u8)((output[RED_C] * (256 - ifog) + fr * ifog) >> 8);
+}
+
 /* GCN_GX_PIXEL_STATS BLEND bucket: everything from the moment alpha_test()
  * PASSES onward — late-Z (EmulatedZ::Late; it lives here, gated on the shaded
  * result, not in SLOPE which only ever runs early-Z) and BlendTev. Factored
@@ -1454,11 +1796,32 @@ static int alpha_test(int alpha) {
  * same technique as raster_pixel_prep. Behavior is unchanged from the inline
  * version this replaces. */
 static void blend_stage(Tev* t, u8* output) {
+    if (s_debug_pending_index >= 0) {
+        s_debug_pending.blend_inputs++;
+        s_debug_pending.output_rgba_sum[0] += output[RED_C];
+        s_debug_pending.output_rgba_sum[1] += output[GRN_C];
+        s_debug_pending.output_rgba_sum[2] += output[BLU_C];
+        s_debug_pending.output_rgba_sum[3] += output[ALP_C];
+    }
     if (s_cfg.zt_enable && !s_cfg.zt_early) {
-        if (!ZCompare((u16)t->Position[0], (u16)t->Position[1], (u32)t->Position[2]))
+        if (!ZCompare((u16)t->Position[0], (u16)t->Position[1], ztexture_depth(t))) {
+            if (s_debug_pending_index >= 0)
+                s_debug_pending.z_rejected++;
             return;
+        }
     }
     BlendTev((u16)t->Position[0], (u16)t->Position[1], output);
+    if (s_debug_pending_index >= 0 && s_bm_cu) {
+        u32 off = (u32)(u16)t->Position[0] +
+                  (u32)(u16)t->Position[1] * EFB_WIDTH;
+        u32 efb = GetPixelColor(off);
+        const u8* p = (const u8*)&efb;
+        s_debug_pending.color_writes++;
+        s_debug_pending.efb_rgba_sum[0] += p[RED_C];
+        s_debug_pending.efb_rgba_sum[1] += p[GRN_C];
+        s_debug_pending.efb_rgba_sum[2] += p[BLU_C];
+        s_debug_pending.efb_rgba_sum[3] += p[ALP_C];
+    }
     if (s_pixel_stats) s_ps_blend_writes++;   /* GCN_GX_PIXEL_STATS: blend_writes counter */
 }
 
@@ -1490,15 +1853,137 @@ static inline void tev_stats_enter(int fused) {
  * itself (was tev_draw's inline if/else). Used by tev_draw's stage loop AND
  * every fused function's one tex_sample call (config A/B/C all sample
  * exactly once per pixel — see the fused derivation comments). */
-static inline void tev_sample_stat(int wid, u32 texmap, s32 texS, s32 texT, int linear, u8* texel) {
+static inline void tev_sample_stat(int wid, u32 texmap, s32 texS, s32 texT,
+                                   s32 lod, int linear, u8* texel) {
     if (s_pixel_stats) {
         s_ps_tex_calls++;
         if (linear) s_ps_tex_linear++; else s_ps_tex_point++;
         u64 tex_t0 = __rdtsc();
-        tex_sample(wid, texmap, texS, texT, linear, texel);
+        tex_sample(wid, texmap, texS, texT, lod, linear, texel);
         s_tsc_tex += __rdtsc() - tex_t0;
     } else {
-        tex_sample(wid, texmap, texS, texT, linear, texel);
+        tex_sample(wid, texmap, texS, texT, lod, linear, texel);
+    }
+}
+
+static inline s32 tev_s24(s32 v) {
+    return sext((u32)v & 0x00ffffffu, 24);
+}
+
+static inline s32 tev_ind_wrap(s32 coord, u32 mode) {
+    if (mode == 0) return coord;
+    if (mode < 6) return coord & (s32)(0xfffeu >> mode);
+    return 0;
+}
+
+/* Apply one BP TevStageIndirect descriptor to the stage's regular S17.7
+ * coordinate. This follows the low-level BP register model directly:
+ * RAS1_IREF selects the indirect texcoord/texmap, TEXSCALE scales the lookup,
+ * IND_MTXA/B/C supplies the 2x3 offset matrix, and the descriptor controls
+ * format/bias/wrap/previous-coordinate carry. */
+static void tev_indirect_coord(Tev* t, const TevStageCfg* sc,
+                               s32 fixed_s, s32 fixed_t) {
+    const u32 tevind = sc->tevind;
+    if (tevind == 0) {
+        t->TexCoordS = fixed_s;
+        t->TexCoordT = fixed_t;
+        return;
+    }
+
+    const u32 bt = bits(tevind, 0, 2);
+    const u32 fmt = bits(tevind, 2, 2);
+    const u32 bias = bits(tevind, 4, 3);
+    const u32 bs = bits(tevind, 7, 2);
+    const u32 matrix_index = bits(tevind, 9, 2);
+    const u32 matrix_id = bits(tevind, 11, 2);
+    s32 trans_s = 0, trans_t = 0;
+
+    /* A lookup only affects the result when bump alpha or a matrix consumes
+     * it. When bt names a disabled indirect stage the lookup result is
+     * undefined on hardware; leave the translation at zero while preserving
+     * wrapping/addprev below. */
+    if ((bs != 0 || matrix_index != 0) && bt < gm_numindstages()) {
+        const u32 iref = s_bp[0x27];
+        const u32 ind_texmap = bits(iref, bt * 6, 3);
+        u32 ind_texcoord = bits(iref, bt * 6 + 3, 3);
+        if (ind_texcoord >= s_cfg.numtexgens) ind_texcoord = 0;
+
+        const u32 scale_word = s_bp[0x25 + (bt >> 1)];
+        const u32 scale_shift = (bt & 1) ? 8 : 0;
+        const u32 scale_s = bits(scale_word, scale_shift, 4);
+        const u32 scale_t = bits(scale_word, scale_shift + 4, 4);
+        const s32 lookup_s = t->UvS[ind_texcoord] >> scale_s;
+        const s32 lookup_t = t->UvT[ind_texcoord] >> scale_t;
+
+        u8 sample[4];
+        /* Indirect lookups use the selected texture unit's ordinary LOD and
+         * filter, computed for this indirect stage by build_block. */
+        tev_sample_stat(t->wid, ind_texmap, lookup_s, lookup_t,
+                        t->IndirectLod[bt], t->IndirectLinear[bt], sample);
+
+        /* GX indirect data is sampled as A, B, G (S, T, U). */
+        s32 ind[3] = { sample[3], sample[2], sample[1] };
+        if (bs != 0) t->AlphaBump = (u8)ind[bs - 1];
+
+        if (fmt == 0) {
+            for (u32 i = 0; i < 3; i++)
+                if (bias & (1u << i)) ind[i] -= 128;
+            t->AlphaBump &= 0xf8;
+        } else {
+            const u32 shift = fmt == 1 ? 3 : fmt == 2 ? 4 : 5;
+            for (u32 i = 0; i < 3; i++)
+                ind[i] = (ind[i] >> shift) + ((bias >> i) & 1u);
+            t->AlphaBump = (u8)(t->AlphaBump << (8 - shift));
+        }
+
+        if (matrix_index != 0) {
+            const u32 base = 0x06 + (matrix_index - 1) * 3;
+            const u32 ma_word = s_bp[base + 0];
+            const u32 mc_word = s_bp[base + 1];
+            const u32 me_word = s_bp[base + 2];
+            const s32 ma = sext(bits(ma_word, 0, 11), 11);
+            const s32 mb = sext(bits(ma_word, 11, 11), 11);
+            const s32 mc = sext(bits(mc_word, 0, 11), 11);
+            const s32 md = sext(bits(mc_word, 11, 11), 11);
+            const s32 me = sext(bits(me_word, 0, 11), 11);
+            const s32 mf = sext(bits(me_word, 11, 11), 11);
+            const u32 scale = bits(ma_word, 22, 2) |
+                              (bits(mc_word, 22, 2) << 2) |
+                              (bits(me_word, 22, 1) << 4);
+            const s32 matrix_shift = 17 - (s32)scale;
+
+            if (matrix_id == 0) {
+                trans_s = (s32)(((s64)ma * ind[0] + (s64)mc * ind[1] +
+                                  (s64)me * ind[2]) >> 3);
+                trans_t = (s32)(((s64)mb * ind[0] + (s64)md * ind[1] +
+                                  (s64)mf * ind[2]) >> 3);
+            } else if (matrix_id == 1) {
+                trans_s = (s32)(((s64)fixed_s * ind[0]) >> 8);
+                trans_t = (s32)(((s64)fixed_t * ind[0]) >> 8);
+            } else if (matrix_id == 2) {
+                trans_s = (s32)(((s64)fixed_s * ind[1]) >> 8);
+                trans_t = (s32)(((s64)fixed_t * ind[1]) >> 8);
+            }
+
+            if (matrix_shift >= 0) {
+                trans_s >>= matrix_shift;
+                trans_t >>= matrix_shift;
+            } else {
+                const u32 left = (u32)(-matrix_shift) & 31;
+                trans_s = (s32)((u32)trans_s << left);
+                trans_t = (s32)((u32)trans_t << left);
+            }
+        }
+    }
+
+    const s32 wrapped_s = tev_ind_wrap(fixed_s, bits(tevind, 13, 3));
+    const s32 wrapped_t = tev_ind_wrap(fixed_t, bits(tevind, 16, 3));
+    if (bits(tevind, 20, 1)) {
+        t->TexCoordS = tev_s24(t->TexCoordS + wrapped_s + trans_s);
+        t->TexCoordT = tev_s24(t->TexCoordT + wrapped_t + trans_t);
+    } else {
+        t->TexCoordS = tev_s24(wrapped_s + trans_s);
+        t->TexCoordT = tev_s24(wrapped_t + trans_t);
     }
 }
 
@@ -1515,6 +2000,7 @@ static inline u64 tev_comb_begin(u64* tex_before) {
  * have identical signatures, so one shared timed-call site covers either. */
 static inline void tev_comb_finish(Tev* t, u8* output, u64 comb_t0, u64 tex_before,
                                     void (*blend_fn)(Tev*, u8*)) {
+    apply_fog(t, output);
     if (s_pixel_stats) {
         s_tsc_comb += (__rdtsc() - comb_t0) - (s_tsc_tex - tex_before);
         u64 blend_t0 = __rdtsc();
@@ -1555,6 +2041,9 @@ static void tev_draw(Tev* t) {
 
     u32 numstages = s_cfg.numtevstages;  /* actual count is +1 */
     u32 numtexgens = s_cfg.numtexgens;
+    t->TexCoordS = 0;
+    t->TexCoordT = 0;
+    t->AlphaBump = 0;
 
     for (u32 stage = 0; stage <= numstages; stage++) {
         const TevStageCfg* sc = &s_cfg.stage[stage];
@@ -1563,15 +2052,13 @@ static void tev_draw(Tev* t) {
         u32 enable      = sc->enable;
         u32 colorchan   = sc->colorchan;
 
-        /* Indirect: no indirect stages in scope -> TexCoord = Uv (Tev.cpp:369-384). */
-        if (sc->tevind_active) TRAP(indactive, "active indirect stage");
-        t->TexCoordS = t->UvS[texcoordSel];
-        t->TexCoordT = t->UvT[texcoordSel];
+        tev_indirect_coord(t, sc, t->UvS[texcoordSel], t->UvT[texcoordSel]);
 
         if (enable) {
             u8 texel[4];
             if (numtexgens > 0) {
                 tev_sample_stat(t->wid, texmap, t->TexCoordS, t->TexCoordT,
+                                 t->TextureLod[stage],
                                  t->TextureLinear[stage], texel);
             } else {
                 memset(texel, 0, 4);
@@ -1597,9 +2084,11 @@ static void tev_draw(Tev* t) {
             if (col) {
                 t->RasColor.r = col[rsw[0]]; t->RasColor.g = col[rsw[1]];
                 t->RasColor.b = col[rsw[2]]; t->RasColor.a = col[rsw[3]];
+            } else if (colorchan == 5 || colorchan == 6) {
+                u8 bump = t->AlphaBump;
+                if (colorchan == 6) bump |= bump >> 5;
+                t->RasColor.r = t->RasColor.g = t->RasColor.b = t->RasColor.a = bump;
             } else {
-                /* AlphaBump / normalized / zero: menu uses only Color0/1; others -> 0. */
-                if (colorchan != 7) TRAP(raschan, "ras color channel (alpha bump)");
                 t->RasColor.r = t->RasColor.g = t->RasColor.b = t->RasColor.a = 0;
             }
         }
@@ -1631,7 +2120,24 @@ static void tev_draw(Tev* t) {
     output[GRN_C] = (u8)t->Reg[color_dest].g;
     output[RED_C] = (u8)t->Reg[color_dest].r;
 
+    if (s_debug_pending_index >= 0) {
+        u32 alpha = output[ALP_C];
+        u32 tex_alpha = (u8)t->RawTexColor.a;
+        s_debug_pending.alpha_tested++;
+        s_debug_pending.alpha_sum += alpha;
+        s_debug_pending.last_tex_alpha_sum += tex_alpha;
+        if (alpha < s_debug_pending.alpha_min)
+            s_debug_pending.alpha_min = alpha;
+        if (alpha > s_debug_pending.alpha_max)
+            s_debug_pending.alpha_max = alpha;
+        if (tex_alpha < s_debug_pending.last_tex_alpha_min)
+            s_debug_pending.last_tex_alpha_min = tex_alpha;
+        if (tex_alpha > s_debug_pending.last_tex_alpha_max)
+            s_debug_pending.last_tex_alpha_max = tex_alpha;
+    }
     if (!alpha_test(output[ALP_C])) {
+        if (s_debug_pending_index >= 0)
+            s_debug_pending.alpha_rejected++;
         /* COMB bucket boundary (fail exit): stage loop + alpha_test, minus the
          * nested TEX delta accumulated above. */
         if (s_pixel_stats) s_tsc_comb += (__rdtsc() - comb_t0) - (s_tsc_tex - tex_before);
@@ -1792,6 +2298,8 @@ static inline void fused_blend_stage(Tev* t, u8* output) {
  * table entry 0 itself currently holds (a separate BP-register-driven array)
  * — see the derivation table's "swaptab[0]==identity" note. */
 static int fused_blend_common_match(void) {
+    for (u32 stage = 0; stage <= s_cfg.numtevstages; stage++)
+        if (s_cfg.stage[stage].tevind != 0) return 0;
     return s_cfg.numcolchans == 1 &&
            s_cfg.zt_enable == 0 &&
            s_cfg.da_enable == 0 &&
@@ -2008,7 +2516,8 @@ static void fused_pixel_A(Tev* t) {
      * of this config's signature), so UvS[0]/UvT[0] is the only possible
      * index — no need to read sc->texcoordSel at all. */
     u8 texel[4];
-    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0],
+                    t->TextureLod[0], t->TextureLinear[0], texel);
 
     /* colorchan==0, rswap_id==0 with swaptab[0]==identity (both checked at
      * selection time) -> RasColor.a == t->Color[0][3] directly. */
@@ -2041,7 +2550,7 @@ static void fused_pixel_H(Tev* t) {
     u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
     u8 texel[4], output[4];
     tev_sample_stat(t->wid, s_cfg.stage[0].texmap, t->UvS[0], t->UvT[0],
-                    t->TextureLinear[0], texel);
+                    t->TextureLod[0], t->TextureLinear[0], texel);
     output[RED_C] = texel[0];
     output[GRN_C] = texel[1];
     output[BLU_C] = texel[2];
@@ -2072,7 +2581,7 @@ static void fused_pixel_I(Tev* t) {
     u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
     u8 texel[4], output[4];
     tev_sample_stat(t->wid, s_cfg.stage[0].texmap, t->UvS[0], t->UvT[0],
-                    t->TextureLinear[0], texel);
+                    t->TextureLod[0], t->TextureLinear[0], texel);
     output[RED_C] = texel[0];
     output[GRN_C] = texel[1];
     output[BLU_C] = texel[2];
@@ -2136,7 +2645,8 @@ static void fused_pixel_J(Tev* t) {
 static inline void fused_core_C(Tev* t, u8 output[4]) {
     u32 texmap = s_cfg.stage[0].texmap;
     u8 texel[4];
-    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0],
+                    t->TextureLod[0], t->TextureLinear[0], texel);
 
     u8 ras_a = t->Color[0][3];         /* colorchan==0, rswap_id==0 identity */
     const TColor* reg1 = &t->Reg[1];   /* "Color0" TEV const register, per-draw */
@@ -2283,7 +2793,8 @@ static void fused_pixel_D(Tev* t) {
      * sc->texcoordSel to 0 if it's >= numtexgens, and numtexgens==1 is part
      * of this config's signature) -- same reasoning as fused_pixel_A. */
     u8 texel[4];
-    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0],
+                    t->TextureLod[0], t->TextureLinear[0], texel);
 
     /* colorchan==0, rswap_id==0 with swaptab[0]==identity (both checked at
      * selection time) -> RasColor.{r,g,b,a} == t->Color[0][0..3] directly. */
@@ -2372,7 +2883,8 @@ static void fused_pixel_D(Tev* t) {
 static inline void fused_core_E(Tev* t, u8 output[4]) {
     u32 texmap = s_cfg.stage[0].texmap;
     u8 texel[4];
-    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0], t->TextureLinear[0], texel);
+    tev_sample_stat(t->wid, texmap, t->UvS[0], t->UvT[0],
+                    t->TextureLod[0], t->TextureLinear[0], texel);
 
     u8 ras_a = t->Color[0][3];         /* colorchan==0, rswap_id==0 identity */
     const TColor* reg2 = &t->Reg[2];   /* "Color1" TEV const register, per-draw */
@@ -2627,6 +3139,18 @@ static void build_block(Tev* t, s32 bx, s32 by) {
                 p->Uv[i][0] = slope_value(&s_TexSlopes[i][0], x, y) * projection;
                 p->Uv[i][1] = slope_value(&s_TexSlopes[i][1], x, y) * projection;
             }
+        }
+    }
+    {
+        u32 ind_count = gm_numindstages();
+        if (ind_count > 4u) ind_count = 4u;
+        u32 iref = s_bp[0x27];
+        for (u32 i = 0; i < ind_count; i++) {
+            u32 texmap = bits(iref, i * 6, 3);
+            u32 texcoord = bits(iref, i * 6 + 3, 3);
+            if (texcoord >= numtexgens) texcoord = 0;
+            calc_lod(t, &t->IndirectLod[i], &t->IndirectLinear[i],
+                     texmap, texcoord);
         }
     }
     u32 last = s_cfg.numtevstages;
@@ -3145,6 +3669,43 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     if (miny < s_scissor_top)    miny = s_scissor_top;
     if (maxy > s_scissor_bottom) maxy = s_scissor_bottom;
     if (minx >= maxx || miny >= maxy) return;
+    if (s_debug_pending_index >= 0) {
+        GxDebugDraw* d = &s_debug_pending;
+        u32 tri_area = (u32)((maxx - minx) * (maxy - miny));
+        d->triangles_rasterized++;
+        d->bbox_area_sum += tri_area;
+        if (!d->bbox_valid) {
+            d->bbox_valid = 1;
+            d->bbox_minx = minx; d->bbox_miny = miny;
+            d->bbox_maxx = maxx; d->bbox_maxy = maxy;
+        } else {
+            if (minx < d->bbox_minx) d->bbox_minx = minx;
+            if (miny < d->bbox_miny) d->bbox_miny = miny;
+            if (maxx > d->bbox_maxx) d->bbox_maxx = maxx;
+            if (maxy > d->bbox_maxy) d->bbox_maxy = maxy;
+        }
+        if (tri_area > d->largest_triangle_area) {
+            d->largest_triangle_area = tri_area;
+            for (u32 i = 0; i < 3u; ++i) {
+                const OutVtx* v = i == 0 ? v0 : (i == 1 ? v1 : v2);
+                memcpy(d->largest_triangle[i].obj, v->objPos,
+                       sizeof d->largest_triangle[i].obj);
+                memcpy(d->largest_triangle[i].mv, v->mvPosition,
+                       sizeof d->largest_triangle[i].mv);
+                memcpy(d->largest_triangle[i].clip, v->projectedPosition,
+                       sizeof d->largest_triangle[i].clip);
+                memcpy(d->largest_triangle[i].screen, v->screenPosition,
+                       sizeof d->largest_triangle[i].screen);
+                memcpy(d->largest_triangle[i].normal, v->normal,
+                       sizeof d->largest_triangle[i].normal);
+                memcpy(d->largest_triangle[i].color, v->color,
+                       sizeof d->largest_triangle[i].color);
+                memcpy(d->largest_triangle[i].texcoord, v->texCoords,
+                       sizeof d->largest_triangle[i].texcoord);
+                d->largest_triangle[i].pos_mtx = v->posMtx;
+            }
+        }
+    }
     /* Histogram input for the draw_triangle wrapper: post-scissor bbox area.
      * (Entry already zeroed it, so the early returns above land in bucket 0.) */
     if (s_draw_stats) s_last_tri_area = (u32)((maxx - minx) * (maxy - miny));
@@ -3505,13 +4066,23 @@ static void clip_triangle(int* indices, int* numIndices, int mask) {
 }
 
 static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
+    if (s_debug_pending_index >= 0)
+        s_debug_pending.triangles_submitted++;
     int m = calc_clip_mask(v0) & calc_clip_mask(v1) & calc_clip_mask(v2);
-    if (m != 0) return;   /* trivially rejected */
+    if (m != 0) {
+        if (s_debug_pending_index >= 0)
+            s_debug_pending.triangles_trivial_rejected++;
+        return;   /* trivially rejected */
+    }
 
     int backface = is_backface(v0, v1, v2);
     u32 cull = s_cfg.cullmode;
-    if (!backface) { if (cull == 1 || cull == 3) return; }   /* cull Back/All */
-    else           { if (cull == 2 || cull == 3) return; }   /* cull Front/All */
+    if ((!backface && (cull == 1 || cull == 3)) ||
+        (backface && (cull == 2 || cull == 3))) {
+        if (s_debug_pending_index >= 0)
+            s_debug_pending.triangles_culled++;
+        return;
+    }
 
     for (int i = 3; i < NUM_CLIPPED + 3; i++) s_verts[i] = &s_clipped[i - 3];
     int indices[NUM_CLIPPED + 3];
@@ -3523,7 +4094,11 @@ static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
     else          { s_verts[0] = v0; s_verts[1] = v1; s_verts[2] = v2; }
 
     int mask = calc_clip_mask(s_verts[0]) | calc_clip_mask(s_verts[1]) | calc_clip_mask(s_verts[2]);
-    if (mask != 0) clip_triangle(indices, &numIndices, mask);
+    if (mask != 0) {
+        if (s_debug_pending_index >= 0)
+            s_debug_pending.triangles_clipped++;
+        clip_triangle(indices, &numIndices, mask);
+    }
 
     for (int i = 0; i + 3 <= numIndices; i += 3) {
         if (indices[i] == -1) continue;
@@ -3641,6 +4216,13 @@ typedef struct {
     u8    posMtx;
     u8    texMtx[8];
 } InVtx;
+
+/* The GX vertex loader retains the last submitted normal/NBT values. If a
+ * later vertex format omits those attributes, TransformUnit consumes the
+ * retained values rather than zero. This is observable in lit draws with no
+ * normal field (Dolphin's VertexLoaderManager normal/tangent/binormal caches)
+ * and is hardware-facing vertex state, not an HLE title workaround. */
+static float s_normal_cache[3][3];
 
 static void mul_vec3_mat34(const float* v, const float* m, float* r) {
     r[0] = m[0]*v[0] + m[1]*v[1] + m[2]*v[2] + m[3];
@@ -3941,8 +4523,9 @@ static void tf_color_n(const InVtx* in, OutVtx* out, u32 channels) {
         if (bits(colorreg, 1, 1)) {   /* enablelighting */
             float lightCol[3];
             if (bits(colorreg, 6, 1)) {   /* ambsource == Vertex */
-                TRAP(ambvtx, "vertex ambient color");
-                lightCol[0] = lightCol[1] = lightCol[2] = 0;
+                lightCol[0] = (float)in->color[chan][1];
+                lightCol[1] = (float)in->color[chan][2];
+                lightCol[2] = (float)in->color[chan][3];
             } else {
                 u32 amb = s_xf[0x100a + chan];
                 lightCol[0] = (float)((amb >> 8) & 0xff);   /* b? follows abgr idx1..3 */
@@ -3969,7 +4552,7 @@ static void tf_color_n(const InVtx* in, OutVtx* out, u32 channels) {
         u8 mata = bits(alphareg, 0, 1) ? in->color[chan][0] : (u8)matc;
         if (bits(alphareg, 1, 1)) {   /* alpha lighting */
             float la;
-            if (bits(alphareg, 6, 1)) { TRAP(ambavtx, "vertex ambient alpha"); la = 0; }
+            if (bits(alphareg, 6, 1)) la = (float)in->color[chan][0];
             else la = (float)(s_xf[0x100a + chan] & 0xff);
             u32 mask = bits(alphareg, 2, 4) | (bits(alphareg, 11, 4) << 4);
             u32 diffusefunc = bits(alphareg, 7, 2), attnfunc = bits(alphareg, 9, 2);
@@ -4002,28 +4585,53 @@ static void tf_texcoord(const InVtx* in, OutVtx* out) {
         u32 sourcerow = bits(info, 7, 5);
         u32 projection = bits(info, 1, 1);   /* TexSize: 0 ST, 1 STQ */
         u32 inputform = bits(info, 2, 1);    /* 0 AB11, 1 ABC1 */
-        if (texgentype != 0) { TRAP(texgentype, "tex gen type != Regular"); continue; }
-
-        float src[3];
-        if (sourcerow == 0) { src[0]=in->position[0]; src[1]=in->position[1]; src[2]=in->position[2]; }
-        else if (sourcerow == 1) { src[0]=out->normal[0][0]; src[1]=out->normal[0][1]; src[2]=out->normal[0][2]; }
-        else if (sourcerow >= 5 && sourcerow <= 12) {
-            u32 tn = sourcerow - 5;
-            src[0] = out->texCoords[tn][0]; src[1] = out->texCoords[tn][1]; src[2] = 1.0f;
-            /* texCoords not yet transformed for source; use input tex coords */
-            src[0] = in->texCoords[tn][0]; src[1] = in->texCoords[tn][1]; src[2] = 1.0f;
-        } else { TRAP(texsrcrow, "tex source row (binormal)"); src[0]=src[1]=0; src[2]=1; }
-
-        float m[12]; get_texmat(in->texMtx[c], m);
         float* dst = out->texCoords[c];
-        if (projection == 0) {   /* ST */
-            if (inputform == 0) mul_vec2_mat24(src, m, dst);
-            else                mul_vec3_mat24(src, m, dst);
-        } else {                 /* STQ */
-            if (inputform == 0) mul_vec2_mat34(src, m, dst);
-            else                mul_vec3_mat34_tex(src, m, dst);
+        if (texgentype == 1u) {                         /* EmbossMap */
+            u32 source = bits(info, 12, 3);
+            u32 light = bits(info, 15, 3);
+            if (source >= c) {
+                TRAP(embosssrc, "emboss source texgen is not earlier");
+                dst[0] = dst[1] = dst[2] = 0.0f;
+            } else {
+                u8 col[4]; float cosatt[3], distatt[3], lpos[3], ldirL[3];
+                light_ptr((int)light, col, cosatt, distatt, lpos, ldirL);
+                float ldir[3] = {
+                    lpos[0] - out->mvPosition[0],
+                    lpos[1] - out->mvPosition[1],
+                    lpos[2] - out->mvPosition[2]
+                };
+                normalize3(ldir);
+                dst[0] = out->texCoords[source][0] + dot3(ldir, out->normal[1]);
+                dst[1] = out->texCoords[source][1] + dot3(ldir, out->normal[2]);
+                dst[2] = out->texCoords[source][2];
+            }
+        } else if (texgentype == 2u || texgentype == 3u) { /* Color0/Color1 */
+            u32 chan = texgentype - 2u;
+            dst[0] = (float)out->color[chan][0] * (1.0f / 255.0f);
+            dst[1] = (float)out->color[chan][1] * (1.0f / 255.0f);
+            dst[2] = 1.0f;
+        } else if (texgentype == 0u) {
+            float src[3];
+            if (sourcerow == 0) { src[0]=in->position[0]; src[1]=in->position[1]; src[2]=in->position[2]; }
+            else if (sourcerow == 1) { src[0]=out->normal[0][0]; src[1]=out->normal[0][1]; src[2]=out->normal[0][2]; }
+            else if (sourcerow >= 5 && sourcerow <= 12) {
+                u32 tn = sourcerow - 5;
+                src[0] = in->texCoords[tn][0]; src[1] = in->texCoords[tn][1]; src[2] = 1.0f;
+            } else { TRAP(texsrcrow, "tex source row (binormal)"); src[0]=src[1]=0; src[2]=1; }
+
+            float m[12]; get_texmat(in->texMtx[c], m);
+            if (projection == 0) {   /* ST */
+                if (inputform == 0) mul_vec2_mat24(src, m, dst);
+                else                mul_vec3_mat24(src, m, dst);
+            } else {                 /* STQ */
+                if (inputform == 0) mul_vec2_mat34(src, m, dst);
+                else                mul_vec3_mat34_tex(src, m, dst);
+            }
+        } else {
+            TRAPF(texgentype, "invalid texgen type %u", texgentype);
+            dst[0] = dst[1] = dst[2] = 0.0f;
         }
-        if (dualtex) {
+        if (dualtex && texgentype == 0u) {
             u32 pinfo = s_xf[0x1050 + c];
             u32 pidx = bits(pinfo, 0, 6);
             int norm = bits(pinfo, 8, 1);
@@ -4033,7 +4641,7 @@ static void tf_texcoord(const InVtx* in, OutVtx* out) {
             float pm[12]; get_postmat((u8)pidx, pm);
             mul_vec3_mat34(tmp, pm, dst);
         }
-        if (dst[2] == 0.0f) {
+        if (texgentype == 0u && dst[2] == 0.0f) {
             float x = dst[0] / 2.0f, y = dst[1] / 2.0f;
             dst[0] = x < -1 ? -1 : x > 1 ? 1 : x;
             dst[1] = y < -1 ? -1 : y > 1 ? 1 : y;
@@ -4122,6 +4730,23 @@ static float read_direct_elem(const u8* v, u32* off, u32 fmt) {
     }
 }
 
+/* Texture-coordinate VAT fields straddle VAT g0/g1/g2. */
+static void texcoord_vat_fields(const GxCpState* cp, u32 vat, u32 tc,
+                                u32* elem, u32* fmt, u32* frac) {
+    u32 g0 = cp->vat_g0[vat], g1 = cp->vat_g1[vat], g2 = cp->vat_g2[vat];
+    switch (tc) {
+    case 0: *elem = bits(g0, 21, 1); *fmt = bits(g0, 22, 3); *frac = bits(g0, 25, 5); break;
+    case 1: *elem = bits(g1,  0, 1); *fmt = bits(g1,  1, 3); *frac = bits(g1,  4, 5); break;
+    case 2: *elem = bits(g1,  9, 1); *fmt = bits(g1, 10, 3); *frac = bits(g1, 13, 5); break;
+    case 3: *elem = bits(g1, 18, 1); *fmt = bits(g1, 19, 3); *frac = bits(g1, 22, 5); break;
+    case 4: *elem = bits(g1, 27, 1); *fmt = bits(g1, 28, 3); *frac = bits(g2,  0, 5); break;
+    case 5: *elem = bits(g2,  5, 1); *fmt = bits(g2,  6, 3); *frac = bits(g2,  9, 5); break;
+    case 6: *elem = bits(g2, 14, 1); *fmt = bits(g2, 15, 3); *frac = bits(g2, 18, 5); break;
+    default:
+        *elem = bits(g2, 23, 1); *fmt = bits(g2, 24, 3); *frac = bits(g2, 27, 5); break;
+    }
+}
+
 /* Color0/Color1 vertex attribute (VertexLoader_Color.cpp SetCol/SetCol565/
  * SetCol4444/SetCol6666 + Read24/Read32; CPMemory.h ColorFormat 0..5). Every
  * format decodes to full 8-bit R/G/B/A (sub-8-bit channels expanded via the
@@ -4182,6 +4807,7 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
     u32 g0 = cp->vat_g0[vat];
     u32 off = 0;
     memset(out, 0, sizeof *out);
+    memcpy(out->normal, s_normal_cache, sizeof out->normal);
 
     /* matrix indices (bits 0-8) — none present in the IPL frame. */
     if (low & 1) { out->posMtx = v[off++]; }
@@ -4207,14 +4833,15 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
         for (u32 i = 0; i < n; i++) p[i] = read_direct_elem(v, &off, posfmt) * scale;
         out->position[0] = p[0]; out->position[1] = p[1]; out->position[2] = p[2];
     } else {
-        if (posfmt != 4) { TRAP(posfmt, "indexed position format != float"); return 0; }
         u32 idx = read_index(v, &off, postype);
         u32 n = poselem ? 3 : 2;
-        const u8* p = array_ptr(cp, 0, idx, n * 4);
+        u32 esize = posfmt < 2u ? 1u : posfmt < 4u ? 2u : 4u;
+        float scale = posfmt < 4u ? 1.0f / (float)(1u << posfrac) : 1.0f;
+        const u8* p = array_ptr(cp, 0, idx, n * esize);
         if (!p) { TRAP(posoob, "position array out of MEM1"); return 0; }
-        out->position[0] = be_f32(p);
-        out->position[1] = be_f32(p + 4);
-        out->position[2] = (n == 3) ? be_f32(p + 8) : 0.0f;
+        u32 poff = 0;
+        for (u32 i = 0; i < n; i++)
+            out->position[i] = read_direct_elem(p, &poff, posfmt) * scale;
     }
 
     /* normal (VertexLoader_Normal.cpp): Direct or Index8/16, every component
@@ -4259,6 +4886,9 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
                     out->normal[gI][c] = read_direct_elem(p, &o, normfmt) * scale;
                 }
         }
+        for (u32 gI = 0; gI < groups; ++gI)
+            memcpy(s_normal_cache[gI], out->normal[gI],
+                   sizeof s_normal_cache[gI]);
     }
 
     /* color0/color1 (VertexLoader_Color.cpp): Direct or Index8/16, all 6 GX
@@ -4313,10 +4943,8 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
     for (int tc = 0; tc < 8; tc++) {
         u32 tctype = (high >> (2 * tc)) & 3;
         if (tctype == VCF_NONE) continue;
-        /* VAT tex fields (only tc0 in scope). */
         u32 fmt, elem, frac;
-        if (tc == 0) { elem = (g0 >> 21) & 1; fmt = (g0 >> 22) & 7; frac = (g0 >> 25) & 0x1f; }
-        else { TRAP(tcgt0, "texcoord index > 0"); return 0; }
+        texcoord_vat_fields(cp, vat, (u32)tc, &elem, &fmt, &frac);
         u32 n = elem ? 2 : 1;
         float scale = ((fmt & 7u) < 4u) ? 1.0f / (float)(1u << frac) : 1.0f;
         if (tctype == VCF_DIRECT) {
@@ -4324,12 +4952,13 @@ static int load_vertex(const GxCpState* cp, u32 vat, const u8* v, u32 vstride, I
             for (u32 i = 0; i < n; i++) t[i] = read_direct_elem(v, &off, fmt) * scale;
             out->texCoords[tc][0] = t[0]; out->texCoords[tc][1] = t[1];
         } else {
-            if (fmt != 3) { TRAP(tcfmt, "indexed texcoord format != short"); return 0; }
             u32 idx = read_index(v, &off, tctype);
-            const u8* p = array_ptr(cp, 4 + tc, idx, n * 2);
+            u32 esize = fmt < 2u ? 1u : fmt < 4u ? 2u : 4u;
+            const u8* p = array_ptr(cp, 4 + tc, idx, n * esize);
             if (!p) { TRAP(tcoob, "texcoord array out of MEM1"); return 0; }
-            out->texCoords[tc][0] = be_s16(p) * scale;
-            out->texCoords[tc][1] = (n == 2) ? be_s16(p + 2) * scale : 0.0f;
+            u32 poff = 0;
+            for (u32 i = 0; i < n; i++)
+                out->texCoords[tc][i] = read_direct_elem(p, &poff, fmt) * scale;
         }
     }
 
@@ -4363,12 +4992,14 @@ static int load_rs_vertex_rest(const GxCpState* cp, u32 vat, const u8* v,
     memset(out, 0, sizeof *out);
     out->posMtx = pos_mtx;
     memcpy(out->position, position, sizeof position);
+    memcpy(out->normal, s_normal_cache, sizeof out->normal);
     const u8* normal = array_ptr(cp, 1, v[pos_bytes], 6u);
     if (!normal)
         return 0;
     out->normal[0][0] = be_s16(normal) * (1.0f / 16384.0f);
     out->normal[0][1] = be_s16(normal + 2) * (1.0f / 16384.0f);
     out->normal[0][2] = be_s16(normal + 4) * (1.0f / 16384.0f);
+    memcpy(s_normal_cache[0], out->normal[0], sizeof s_normal_cache[0]);
     memset(out->color, 0xFF, sizeof out->color);
     return 1;
 }
@@ -4573,14 +5204,6 @@ static void build_draw_cfg(void) {
 
     for (u32 id = 0; id < 4; id++) swap_table(id, s_cfg.swaptab[id]);
 
-    /* indstages/ztex/fog (Tev::Draw guard, Tev.cpp:387-390): BP-genmode/ztex2/
-     * fogparam3 conditions only — no per-pixel data involved — so the trap
-     * check itself (not just its decode) moves here: same trap-once message,
-     * evaluated once per draw instead of once per pixel. */
-    if (gm_numindstages() != 0) TRAP(indstages, "indirect TEV stages");
-    if (bits(s_bp[0xF5], 2, 2) != 0) TRAP(ztex, "z-texture (ztex2.op)");
-    if (bits(s_bp[0xF1], 21, 3) != 0) TRAP(fog, "fog (FogParam3.fsel)");
-
     for (u32 stage = 0; stage <= s_cfg.numtevstages; stage++) {
         TevStageCfg* sc = &s_cfg.stage[stage];
         u32 s2 = stage >> 1, odd = stage & 1;
@@ -4595,8 +5218,7 @@ static void build_draw_cfg(void) {
         sc->colorchan   = odd ? bits(order, 19, 3) : bits(order, 7, 3);
         if (sc->texcoordSel >= s_cfg.numtexgens) sc->texcoordSel = 0;
 
-        u32 tevind = s_bp[0x10 + stage];
-        sc->tevind_active = (bits(tevind, 9, 2) != 0 || bits(tevind, 7, 2) != 0);
+        sc->tevind = s_bp[0x10 + stage];
 
         sc->tswap_id = bits(ac, 2, 2);
         sc->rswap_id = bits(ac, 0, 2);
@@ -4650,7 +5272,7 @@ static void build_draw_cfg(void) {
         u32 mode0 = tx_mode0(unit), mode1 = tx_mode1(unit);
         tc->wrap_s = bits(mode0, 0, 2);
         tc->wrap_t = bits(mode0, 2, 2);
-        tc->mipmapfilter_bad = (bits(mode0, 5, 2) != 0);
+        tc->mipmap_filter = bits(mode0, 5, 2);
         tc->magf = bits(mode0, 4, 1);
         tc->minf = bits(mode0, 7, 1);
         tc->lod_edge = (int)bits(mode0, 8, 1);
@@ -4781,6 +5403,535 @@ static void build_draw_cfg(void) {
     }
 }
 
+static u64 debug_hash_bytes(const u8* p, u32 len) {
+    u64 h = 1469598103934665603ull;
+    for (u32 i = 0; p && i < len; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/* Exact size of GX's tiled base-level texture storage. Every listed block is
+ * 32 bytes except RGBA8's split AR/GB block, which is 64. Unknown formats are
+ * left at zero and remain visible through the raw register fields. */
+static u32 debug_texture_bytes(const TexUnitCfg* tc) {
+    u32 bw = 0, bh = 0, block_bytes = 32;
+    switch (tc->fmt) {
+    case 0: case 8: case 14: bw = 8; bh = 8; break; /* I4/C4/CMPR */
+    case 1: case 2: case 9:  bw = 8; bh = 4; break; /* I8/IA4/C8 */
+    case 3: case 4: case 5: case 10:
+        bw = 4; bh = 4; break;                       /* 16-bit formats */
+    case 6:
+        bw = 4; bh = 4; block_bytes = 64; break;    /* RGBA8 */
+    default:
+        return 0;
+    }
+    u64 width = (u32)tc->w1 + 1u;
+    u64 height = (u32)tc->h1 + 1u;
+    u64 blocks_x = (width + bw - 1u) / bw;
+    u64 blocks_y = (height + bh - 1u) / bh;
+    u64 bytes = blocks_x * blocks_y * block_bytes;
+    if (bytes > tc->src_len) bytes = tc->src_len;
+    if (bytes > 0xffffffffull) bytes = 0xffffffffull;
+    return (u32)bytes;
+}
+
+static void debug_capture_draw(u32 prim, u32 vat, const u8* verts,
+                               u32 nverts, u32 vstride) {
+    s_debug_pending_index = -1;
+    if (!s_tev_census || s_census_cur < 0 ||
+        s_census_cur >= GX_CENSUS_MAX)
+        return;
+
+    GxDebugDraw* d = &s_debug_pending;
+    memset(d, 0, sizeof *d);
+    d->alpha_min = 255u;
+    d->last_tex_alpha_min = 255u;
+    d->valid = 1;
+    d->frame = gcn_gx_frame_count();
+    d->cpu_pc = s_cpu ? s_cpu->pc : 0u;
+    d->dl = gcn_gx_current_dl();
+    d->prim = prim;
+    d->vat = vat;
+    d->nverts = nverts;
+    d->vstride = vstride;
+    {
+        u64 bytes = (u64)nverts * vstride;
+        if (bytes > 0xffffffffull)
+            bytes = 0xffffffffull;
+        d->vertex_bytes = (u32)bytes;
+        d->vertex_hash = debug_hash_bytes(verts, d->vertex_bytes);
+        d->vertex_head_len = d->vertex_bytes < sizeof d->vertex_head ?
+                             d->vertex_bytes : (u32)sizeof d->vertex_head;
+        d->vertex_tail_len = d->vertex_bytes < sizeof d->vertex_tail ?
+                             d->vertex_bytes : (u32)sizeof d->vertex_tail;
+        if (d->vertex_head_len)
+            memcpy(d->vertex_head, verts, d->vertex_head_len);
+        if (d->vertex_tail_len)
+            memcpy(d->vertex_tail,
+                   verts + d->vertex_bytes - d->vertex_tail_len,
+                   d->vertex_tail_len);
+    }
+    d->census_hash = s_census[s_census_cur].hash;
+    d->program_id = s_cfg.program_id;
+    d->genmode = s_bp[0x00];
+    d->alpha_test = s_bp[0xF3];
+    d->zmode = s_bp[0x40];
+    d->blendmode = s_bp[0x41];
+    d->dstalpha = s_bp[0x42];
+    d->pecontrol = s_bp[0x43];
+    d->numtexgens = s_cfg.numtexgens;
+    d->numcolchans = s_cfg.numcolchans;
+    d->numtevstages = s_cfg.numtevstages + 1u;
+    for (u32 reg = 0; reg < 4u; ++reg) {
+        const TColor* tev_reg = &s_tev_w[0].Reg[reg];
+        const TColor* tev_konst = &s_tev_w[0].Konst[reg];
+        d->bp_tev_ra[reg] = s_bp[0xE0u + reg * 2u];
+        d->bp_tev_bg[reg] = s_bp[0xE1u + reg * 2u];
+        d->tev_reg[reg][0] = tev_reg->r;
+        d->tev_reg[reg][1] = tev_reg->g;
+        d->tev_reg[reg][2] = tev_reg->b;
+        d->tev_reg[reg][3] = tev_reg->a;
+        d->tev_konst[reg][0] = tev_konst->r;
+        d->tev_konst[reg][1] = tev_konst->g;
+        d->tev_konst[reg][2] = tev_konst->b;
+        d->tev_konst[reg][3] = tev_konst->a;
+    }
+
+    u32 active_textures = 0;
+    for (u32 stage = 0; stage < d->numtevstages && stage < 16u; ++stage) {
+        const TevStageCfg* sc = &s_cfg.stage[stage];
+        u32 order = s_bp[0x28 + (stage >> 1)];
+        d->stage[stage].order = order;
+        d->stage[stage].texcoord = sc->texcoordSel;
+        d->stage[stage].texmap = sc->texmap;
+        d->stage[stage].enable = sc->enable;
+        d->stage[stage].colorchan = sc->colorchan;
+        d->stage[stage].cc = sc->cc;
+        d->stage[stage].ac = sc->ac;
+        d->stage[stage].tevind = sc->tevind;
+        d->stage[stage].ksel = s_bp[0xF6u + (stage >> 1)];
+        d->stage[stage].kcsel =
+            (stage & 1u) ? bits(d->stage[stage].ksel, 14, 5) :
+                           bits(d->stage[stage].ksel, 4, 5);
+        d->stage[stage].kasel =
+            (stage & 1u) ? bits(d->stage[stage].ksel, 19, 5) :
+                           bits(d->stage[stage].ksel, 9, 5);
+        d->stage[stage].konst[0] = sc->stage_konst.r;
+        d->stage[stage].konst[1] = sc->stage_konst.g;
+        d->stage[stage].konst[2] = sc->stage_konst.b;
+        d->stage[stage].konst[3] = sc->stage_konst.a;
+        if (sc->enable && sc->texmap < 8u)
+            active_textures |= 1u << sc->texmap;
+    }
+
+    for (u32 unit = 0; unit < 8u; ++unit) {
+        const TexUnitCfg* tc = &s_cfg.tex[unit];
+        GxDebugTexture* t = &d->tex[unit];
+        t->mode0 = tx_mode0(unit);
+        t->mode1 = tx_mode1(unit);
+        t->image0 = tc->image0_raw;
+        t->image3 = tc->image3_raw;
+        t->tlut = s_bp[(unit < 4u ? 0x98u : 0xB8u) + (unit & 3u)];
+        t->fmt = tc->fmt;
+        t->width = (u32)tc->w1 + 1u;
+        t->height = (u32)tc->h1 + 1u;
+        t->phys = tc->phys;
+        t->active = (active_textures & (1u << unit)) != 0;
+        t->valid = tc->valid;
+        if (t->active && t->valid) {
+            t->bytes = debug_texture_bytes(tc);
+            t->hash = debug_hash_bytes(tc->src, t->bytes);
+            t->sample_len = t->bytes < sizeof t->sample ?
+                            t->bytes : (u32)sizeof t->sample;
+            memcpy(t->sample, tc->src, t->sample_len);
+        }
+    }
+    s_debug_pending_index = s_census_cur;
+    s_debug_pending_pixels_before = s_census[s_census_cur].pixels;
+}
+
+static void debug_copy_recent(GxDebugRecent* recent,
+                              const GxDebugDraw* pending,
+                              u64 sequence) {
+    memset(recent, 0, sizeof *recent);
+    recent->sequence = sequence;
+    recent->frame = pending->frame;
+    recent->cpu_pc = pending->cpu_pc;
+    recent->dl = pending->dl;
+    recent->census_hash = pending->census_hash;
+    recent->prim = pending->prim;
+    recent->nverts = pending->nverts;
+    recent->vstride = pending->vstride;
+    recent->vertex_hash = pending->vertex_hash;
+    recent->pixels = pending->pixels;
+    recent->alpha_tested = pending->alpha_tested;
+    recent->alpha_rejected = pending->alpha_rejected;
+    recent->alpha_sum = pending->alpha_sum;
+    recent->alpha_min = pending->alpha_min;
+    recent->alpha_max = pending->alpha_max;
+    recent->blend_inputs = pending->blend_inputs;
+    recent->z_rejected = pending->z_rejected;
+    recent->color_writes = pending->color_writes;
+    recent->triangles_submitted = pending->triangles_submitted;
+    recent->triangles_trivial_rejected =
+        pending->triangles_trivial_rejected;
+    recent->triangles_culled = pending->triangles_culled;
+    recent->triangles_clipped = pending->triangles_clipped;
+    recent->triangles_rasterized = pending->triangles_rasterized;
+    recent->bbox_area_sum = pending->bbox_area_sum;
+    recent->bbox_valid = pending->bbox_valid;
+    recent->bbox_minx = pending->bbox_minx;
+    recent->bbox_miny = pending->bbox_miny;
+    recent->bbox_maxx = pending->bbox_maxx;
+    recent->bbox_maxy = pending->bbox_maxy;
+    recent->largest_triangle_area = pending->largest_triangle_area;
+    for (u32 v = 0; v < 3u; ++v)
+        memcpy(recent->largest_screen[v],
+               pending->largest_triangle[v].screen,
+               sizeof recent->largest_screen[v]);
+    recent->alpha_test = pending->alpha_test;
+    recent->zmode = pending->zmode;
+    recent->blendmode = pending->blendmode;
+    recent->pecontrol = pending->pecontrol;
+}
+
+static void debug_finalize_draw(void) {
+    int index = s_debug_pending_index;
+    if (index < 0 || index >= GX_CENSUS_MAX)
+        return;
+    GxDebugDraw* pending = &s_debug_pending;
+    pending->pixels = s_census[index].pixels - s_debug_pending_pixels_before;
+    if (pending->frame > s_debug_recent_latest_frame)
+        s_debug_recent_latest_frame = pending->frame;
+    /* Keep the ring focused on draws that can explain a missing large scene
+     * element. The title submits thousands of tiny object draws in one GX
+     * frame; retaining all of them evicts the preceding frame before TCP can
+     * inspect it. Preserve every small, zero-pixel primitive (the hidden
+     * rejected-sky case), plus every draw with material raster coverage, but
+     * only when BP color-update is enabled. Depth-only prepasses are already
+     * represented by the per-config snapshots above. */
+    if (bits(pending->blendmode, 3, 1) &&
+        pending->triangles_submitted != 0u &&
+        ((pending->pixels == 0u && pending->triangles_submitted <= 8u) ||
+         pending->bbox_area_sum >= 8192u ||
+         pending->largest_triangle_area >= 4096u)) {
+        u64 sequence = ++s_debug_recent_sequence;
+        GxDebugRecent* recent =
+            &s_debug_recent[s_debug_recent_head % GX_DEBUG_RECENT_MAX];
+        debug_copy_recent(recent, pending, sequence);
+        s_debug_recent_head++;
+        if (s_debug_recent_count < GX_DEBUG_RECENT_MAX)
+            s_debug_recent_count++;
+        if (pending->bbox_area_sum >= 8192u ||
+            pending->largest_triangle_area >= 4096u ||
+            pending->pixels >= 4096u) {
+            GxDebugRecent* large =
+                &s_debug_large[s_debug_large_head % GX_DEBUG_LARGE_MAX];
+            debug_copy_recent(large, pending, sequence);
+            s_debug_large_head++;
+            if (s_debug_large_count < GX_DEBUG_LARGE_MAX)
+                s_debug_large_count++;
+            if (pending->frame > s_debug_large_latest_frame)
+                s_debug_large_latest_frame = pending->frame;
+        }
+    }
+    GxDebugDraw* saved = &s_debug_draw[index];
+    /* Retain the draw with the greatest actual pixel contribution for each
+     * shading configuration. A tie favors the latest observation so moving
+     * texture contents remain inspectable. This makes the late TCP snapshot
+     * useful for scene coverage instead of preserving an arbitrary tiny tail
+     * draw that happened to share the same TEV program. */
+    if (!saved->valid || pending->pixels >= saved->pixels) {
+        *saved = *pending;
+        saved->sequence = ++s_debug_draw_sequence;
+    }
+    s_debug_pending_index = -1;
+}
+
+static int debug_json_append(char* out, size_t cap, int n,
+                             const char* fmt, ...) {
+    if (!out || cap == 0 || n < 0 || (size_t)n >= cap)
+        return n;
+    va_list ap;
+    va_start(ap, fmt);
+    int wrote = vsnprintf(out + n, cap - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (wrote < 0)
+        return n;
+    if ((size_t)wrote >= cap - (size_t)n)
+        return (int)cap - 1;
+    return n + wrote;
+}
+
+static int debug_json_append_recent(char* out, size_t cap, int n,
+                                    const GxDebugRecent* r) {
+    return debug_json_append(out, cap, n,
+        "{\"sequence\":%llu,\"frame\":%llu,\"pc\":%u,\"dl\":%u,"
+        "\"hash\":\"%08x\",\"prim\":%u,\"nverts\":%u,\"vstride\":%u,"
+        "\"vertex_hash\":\"%016llx\",\"pixels\":%llu,"
+        "\"alpha_tested\":%llu,\"alpha_rejected\":%llu,"
+        "\"alpha_min\":%u,\"alpha_max\":%u,\"alpha_sum\":%llu,"
+        "\"blend_inputs\":%llu,\"z_rejected\":%llu,\"color_writes\":%llu,"
+        "\"triangles\":[%u,%u,%u,%u,%u],"
+        "\"bbox\":[%s,%d,%d,%d,%d,%llu],"
+        "\"largest\":{\"area\":%u,\"screen\":["
+        "[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g]]},"
+        "\"alpha_test\":%u,\"zmode\":%u,\"blendmode\":%u,"
+        "\"pecontrol\":%u}",
+        (unsigned long long)r->sequence,
+        (unsigned long long)r->frame, r->cpu_pc, r->dl,
+        r->census_hash, r->prim, r->nverts, r->vstride,
+        (unsigned long long)r->vertex_hash,
+        (unsigned long long)r->pixels,
+        (unsigned long long)r->alpha_tested,
+        (unsigned long long)r->alpha_rejected,
+        r->alpha_min, r->alpha_max,
+        (unsigned long long)r->alpha_sum,
+        (unsigned long long)r->blend_inputs,
+        (unsigned long long)r->z_rejected,
+        (unsigned long long)r->color_writes,
+        r->triangles_submitted, r->triangles_trivial_rejected,
+        r->triangles_culled, r->triangles_clipped,
+        r->triangles_rasterized,
+        r->bbox_valid ? "true" : "false",
+        r->bbox_minx, r->bbox_miny, r->bbox_maxx, r->bbox_maxy,
+        (unsigned long long)r->bbox_area_sum,
+        r->largest_triangle_area,
+        r->largest_screen[0][0], r->largest_screen[0][1],
+        r->largest_screen[0][2], r->largest_screen[1][0],
+        r->largest_screen[1][1], r->largest_screen[1][2],
+        r->largest_screen[2][0], r->largest_screen[2][1],
+        r->largest_screen[2][2], r->alpha_test, r->zmode,
+        r->blendmode, r->pecontrol);
+}
+
+int gx_raster_debug_draw_state_json(char* out, size_t cap) {
+    if (!out || cap < 2)
+        return -1;
+    static const char hex[] = "0123456789abcdef";
+    int n = debug_json_append(out, cap, 0,
+        "{\"ok\":true,\"kind\":\"gx_draw_state\",\"sequence\":%llu,"
+        "\"configs\":[", (unsigned long long)s_debug_draw_sequence);
+    int emitted = 0;
+    for (int i = 0; i < GX_CENSUS_MAX; ++i) {
+        const GxDebugDraw* d = &s_debug_draw[i];
+        if (!d->valid)
+            continue;
+        n = debug_json_append(out, cap, n,
+            "%s{\"index\":%d,\"hash\":\"%08x\",\"sequence\":%llu,"
+            "\"frame\":%llu,\"pc\":%u,\"dl\":%u,\"prim\":%u,\"vat\":%u,"
+            "\"nverts\":%u,\"vstride\":%u,\"vertex_bytes\":%u,"
+            "\"vertex_hash\":\"%016llx\",\"vertex_head\":\"",
+            emitted++ ? "," : "", i, d->census_hash,
+            (unsigned long long)d->sequence,
+            (unsigned long long)d->frame, d->cpu_pc, d->dl, d->prim, d->vat,
+            d->nverts, d->vstride, d->vertex_bytes,
+            (unsigned long long)d->vertex_hash);
+        for (u32 b = 0; b < d->vertex_head_len && (size_t)n + 2u < cap; ++b) {
+            out[n++] = hex[d->vertex_head[b] >> 4];
+            out[n++] = hex[d->vertex_head[b] & 15u];
+        }
+        n = debug_json_append(out, cap, n,
+            "\",\"vertex_tail\":\"");
+        for (u32 b = 0; b < d->vertex_tail_len && (size_t)n + 2u < cap; ++b) {
+            out[n++] = hex[d->vertex_tail[b] >> 4];
+            out[n++] = hex[d->vertex_tail[b] & 15u];
+        }
+        n = debug_json_append(out, cap, n,
+            "\",\"program\":%u,\"pixels\":%llu,"
+            "\"pixel_flow\":{\"alpha_tested\":%llu,\"alpha_rejected\":%llu,"
+            "\"alpha_min\":%u,\"alpha_max\":%u,\"alpha_sum\":%llu,"
+            "\"last_tex_alpha_min\":%u,\"last_tex_alpha_max\":%u,"
+            "\"last_tex_alpha_sum\":%llu,"
+            "\"blend_inputs\":%llu,\"z_rejected\":%llu,"
+            "\"color_writes\":%llu,\"output_rgba_sum\":[%llu,%llu,%llu,%llu],"
+            "\"efb_rgba_sum\":[%llu,%llu,%llu,%llu]},"
+            "\"triangles\":{\"submitted\":%u,\"trivial_rejected\":%u,"
+            "\"culled\":%u,\"clipped\":%u,\"rasterized\":%u},"
+            "\"bbox\":{\"valid\":%s,\"minx\":%d,\"miny\":%d,"
+            "\"maxx\":%d,\"maxy\":%d,\"area_sum\":%llu},"
+            "\"largest_triangle\":{\"area\":%u,\"vertices\":[",
+            d->program_id, (unsigned long long)d->pixels,
+            (unsigned long long)d->alpha_tested,
+            (unsigned long long)d->alpha_rejected,
+            d->alpha_min, d->alpha_max,
+            (unsigned long long)d->alpha_sum,
+            d->last_tex_alpha_min, d->last_tex_alpha_max,
+            (unsigned long long)d->last_tex_alpha_sum,
+            (unsigned long long)d->blend_inputs,
+            (unsigned long long)d->z_rejected,
+            (unsigned long long)d->color_writes,
+            (unsigned long long)d->output_rgba_sum[0],
+            (unsigned long long)d->output_rgba_sum[1],
+            (unsigned long long)d->output_rgba_sum[2],
+            (unsigned long long)d->output_rgba_sum[3],
+            (unsigned long long)d->efb_rgba_sum[0],
+            (unsigned long long)d->efb_rgba_sum[1],
+            (unsigned long long)d->efb_rgba_sum[2],
+            (unsigned long long)d->efb_rgba_sum[3],
+            d->triangles_submitted, d->triangles_trivial_rejected,
+            d->triangles_culled, d->triangles_clipped,
+            d->triangles_rasterized, d->bbox_valid ? "true" : "false",
+            d->bbox_minx, d->bbox_miny, d->bbox_maxx, d->bbox_maxy,
+            (unsigned long long)d->bbox_area_sum, d->largest_triangle_area);
+        for (u32 v = 0; v < 3u; ++v) {
+            const float* obj = d->largest_triangle[v].obj;
+            const float* mv = d->largest_triangle[v].mv;
+            const float* clip = d->largest_triangle[v].clip;
+            const float* screen = d->largest_triangle[v].screen;
+            n = debug_json_append(out, cap, n,
+                "%s{\"pos_mtx\":%u,\"obj\":[%.9g,%.9g,%.9g],"
+                "\"mv\":[%.9g,%.9g,%.9g],"
+                "\"clip\":[%.9g,%.9g,%.9g,%.9g],"
+                "\"screen\":[%.9g,%.9g,%.9g],"
+                "\"normal\":[[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g],"
+                "[%.9g,%.9g,%.9g]],"
+                "\"color\":[[%u,%u,%u,%u],[%u,%u,%u,%u]],"
+                "\"texcoord\":[",
+                v ? "," : "", d->largest_triangle[v].pos_mtx,
+                obj[0], obj[1], obj[2], mv[0], mv[1], mv[2],
+                clip[0], clip[1], clip[2], clip[3],
+                screen[0], screen[1], screen[2],
+                d->largest_triangle[v].normal[0][0],
+                d->largest_triangle[v].normal[0][1],
+                d->largest_triangle[v].normal[0][2],
+                d->largest_triangle[v].normal[1][0],
+                d->largest_triangle[v].normal[1][1],
+                d->largest_triangle[v].normal[1][2],
+                d->largest_triangle[v].normal[2][0],
+                d->largest_triangle[v].normal[2][1],
+                d->largest_triangle[v].normal[2][2],
+                d->largest_triangle[v].color[0][0],
+                d->largest_triangle[v].color[0][1],
+                d->largest_triangle[v].color[0][2],
+                d->largest_triangle[v].color[0][3],
+                d->largest_triangle[v].color[1][0],
+                d->largest_triangle[v].color[1][1],
+                d->largest_triangle[v].color[1][2],
+                d->largest_triangle[v].color[1][3]);
+            for (u32 tc = 0; tc < 8u; ++tc) {
+                n = debug_json_append(out, cap, n,
+                    "%s[%.9g,%.9g,%.9g]", tc ? "," : "",
+                    d->largest_triangle[v].texcoord[tc][0],
+                    d->largest_triangle[v].texcoord[tc][1],
+                    d->largest_triangle[v].texcoord[tc][2]);
+            }
+            n = debug_json_append(out, cap, n, "]}");
+        }
+        n = debug_json_append(out, cap, n,
+            "]},\"genmode\":%u,\"alpha_test\":%u,\"zmode\":%u,"
+            "\"blendmode\":%u,\"dstalpha\":%u,\"pecontrol\":%u,\"texgens\":%u,"
+            "\"colchans\":%u,\"tev_registers\":[",
+            d->genmode, d->alpha_test, d->zmode, d->blendmode,
+            d->dstalpha, d->pecontrol, d->numtexgens, d->numcolchans);
+        for (u32 reg = 0; reg < 4u; ++reg) {
+            n = debug_json_append(out, cap, n,
+                "%s{\"index\":%u,\"bp_ra\":%u,\"bp_bg\":%u,"
+                "\"reg\":[%d,%d,%d,%d],\"konst\":[%d,%d,%d,%d]}",
+                reg ? "," : "", reg, d->bp_tev_ra[reg], d->bp_tev_bg[reg],
+                d->tev_reg[reg][0], d->tev_reg[reg][1],
+                d->tev_reg[reg][2], d->tev_reg[reg][3],
+                d->tev_konst[reg][0], d->tev_konst[reg][1],
+                d->tev_konst[reg][2], d->tev_konst[reg][3]);
+        }
+        n = debug_json_append(out, cap, n, "],\"stages\":[");
+        for (u32 st = 0; st < d->numtevstages && st < 16u; ++st) {
+            n = debug_json_append(out, cap, n,
+                "%s{\"index\":%u,\"order\":%u,\"texcoord\":%u,"
+                "\"texmap\":%u,\"enable\":%u,\"colorchan\":%u,"
+                "\"cc\":%u,\"ac\":%u,\"tevind\":%u,"
+                "\"ksel\":%u,\"kcsel\":%u,\"kasel\":%u,"
+                "\"konst\":[%d,%d,%d,%d]}",
+                st ? "," : "", st, d->stage[st].order,
+                d->stage[st].texcoord, d->stage[st].texmap,
+                d->stage[st].enable, d->stage[st].colorchan,
+                d->stage[st].cc, d->stage[st].ac,
+                d->stage[st].tevind, d->stage[st].ksel,
+                d->stage[st].kcsel, d->stage[st].kasel,
+                d->stage[st].konst[0], d->stage[st].konst[1],
+                d->stage[st].konst[2], d->stage[st].konst[3]);
+        }
+        n = debug_json_append(out, cap, n, "],\"textures\":[");
+        int tex_emitted = 0;
+        for (u32 unit = 0; unit < 8u; ++unit) {
+            const GxDebugTexture* t = &d->tex[unit];
+            if (!t->active)
+                continue;
+            n = debug_json_append(out, cap, n,
+                "%s{\"unit\":%u,\"valid\":%s,\"fmt\":%u,"
+                "\"width\":%u,\"height\":%u,\"phys\":%u,\"bytes\":%u,"
+                "\"hash\":\"%016llx\",\"mode0\":%u,\"mode1\":%u,"
+                "\"image0\":%u,\"image3\":%u,\"tlut\":%u,\"sample\":\"",
+                tex_emitted++ ? "," : "", unit,
+                t->valid ? "true" : "false", t->fmt, t->width, t->height,
+                t->phys, t->bytes, (unsigned long long)t->hash,
+                t->mode0, t->mode1, t->image0, t->image3, t->tlut);
+            for (u32 b = 0; b < t->sample_len && (size_t)n + 2u < cap; ++b) {
+                out[n++] = hex[t->sample[b] >> 4];
+                out[n++] = hex[t->sample[b] & 15u];
+            }
+            n = debug_json_append(out, cap, n, "\"}");
+        }
+        n = debug_json_append(out, cap, n, "]}");
+    }
+    {
+        u64 recent_frame = 0;
+        for (u32 i = 0; i < s_debug_recent_count; ++i) {
+            const GxDebugRecent* r =
+                &s_debug_recent[(s_debug_recent_head - s_debug_recent_count + i) %
+                                GX_DEBUG_RECENT_MAX];
+            if (r->frame < s_debug_recent_latest_frame &&
+                r->frame > recent_frame)
+                recent_frame = r->frame;
+        }
+        if (recent_frame == 0)
+            recent_frame = s_debug_recent_latest_frame;
+        n = debug_json_append(out, cap, n,
+            "],\"recent_frame\":%llu,\"recent\":[",
+            (unsigned long long)recent_frame);
+        int recent_emitted = 0;
+        for (u32 i = 0; i < s_debug_recent_count; ++i) {
+            const GxDebugRecent* r =
+                &s_debug_recent[(s_debug_recent_head - s_debug_recent_count + i) %
+                                GX_DEBUG_RECENT_MAX];
+            if (r->frame != recent_frame)
+                continue;
+            if (recent_emitted++)
+                n = debug_json_append(out, cap, n, ",");
+            n = debug_json_append_recent(out, cap, n, r);
+        }
+        u64 large_frame = 0;
+        for (u32 i = 0; i < s_debug_large_count; ++i) {
+            const GxDebugRecent* r =
+                &s_debug_large[(s_debug_large_head - s_debug_large_count + i) %
+                               GX_DEBUG_LARGE_MAX];
+            if (r->frame < s_debug_large_latest_frame &&
+                r->frame > large_frame)
+                large_frame = r->frame;
+        }
+        if (large_frame == 0)
+            large_frame = s_debug_large_latest_frame;
+        n = debug_json_append(out, cap, n,
+            "],\"large_frame\":%llu,\"large\":[",
+            (unsigned long long)large_frame);
+        int large_emitted = 0;
+        for (u32 i = 0; i < s_debug_large_count; ++i) {
+            const GxDebugRecent* r =
+                &s_debug_large[(s_debug_large_head - s_debug_large_count + i) %
+                               GX_DEBUG_LARGE_MAX];
+            if (r->frame != large_frame)
+                continue;
+            if (large_emitted++)
+                n = debug_json_append(out, cap, n, ",");
+            n = debug_json_append_recent(out, cap, n, r);
+        }
+        n = debug_json_append(out, cap, n, "]}\n");
+    }
+    return n;
+}
+
 /* Shared subset of build_draw_cfg() the EFB-copy path needs: pixel_format /
  * color_update / alpha_update / z-update back GetPixelColor & friends, used by
  * BOTH gx_raster_draw (s_pf/s_zt_upd/s_bm_cu/s_bm_au, set above) and here —
@@ -4882,8 +6033,12 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
 
     int is_quad = (prim == 0 || prim == 1);
     int is_line = (prim == 5);
-    if (!is_quad && prim != 4 && !is_line) {
-        TRAPF(nonfan, "primitive != TRIANGLE_FAN/QUADS/LINES (prim %u opcode-class, vat %u, "
+    int is_tri = (prim == 2);
+    int is_tri_strip = (prim == 3);
+    int is_line_strip = (prim == 6);
+    if (!is_quad && prim != 4 && !is_line && !is_tri &&
+        !is_tri_strip && !is_line_strip) {
+        TRAPF(nonfan, "unsupported primitive (prim %u opcode-class, vat %u, "
               "%u verts) pc=0x%08X vcd_lo=0x%08X vcd_hi=0x%08X",
               prim, vat, nverts, s_cpu ? s_cpu->pc : 0u, cp->vtx_desc_lo, cp->vtx_desc_hi);
         return;
@@ -4902,7 +6057,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
                     cp->vtx_desc_hi, cp->vat_g0[vat], cp->vat_g1[vat], cp->vat_g2[vat]);
         }
     }
-    if (nverts < (is_line ? 2u : 3u)) return;
+    if (nverts < ((is_line || is_line_strip) ? 2u : 3u)) return;
 
     /* BP register loads are separate FIFO commands, so no BP-derived state
      * can change between two draws unless gx_on_bp() advanced the generation.
@@ -4920,6 +6075,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
     } else {
         ++s_cfg_cache_hits;
     }
+    debug_capture_draw(prim, vat, verts, nverts, vstride);
 
     /* Late-menu programs R/S submit millions of 3/4-vertex fans, most wholly
      * clipped or culled. Position/cull depends only on tf_position output, so
@@ -4976,6 +6132,41 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
                 process_triangle(&s_tev_w[0], &out[0], &out[2], &out[3]);
             return;
         }
+    }
+
+    /* Lists and strips have no persistent fan anchor.  A three-slot ring is
+     * sufficient for all of them and preserves the strip's alternating
+     * winding: even triangles are (n-2,n-1,n), odd are (n-2,n,n-1). */
+    if (is_tri || is_tri_strip || is_line_strip) {
+        OutVtx ring[3];
+        for (u32 i = 0; i < nverts; i++) {
+            InVtx in;
+            OutVtx* cur = &ring[i % 3u];
+            if (!load_vertex(cp, vat, verts + (u64)i * vstride, vstride, &in))
+                return;
+            memset(cur, 0, sizeof *cur);
+            tf_position(&in, cur);
+            tf_normal(&in, cur);
+            tf_color(&in, cur);
+            tf_texcoord(&in, cur);
+
+            if (is_line_strip) {
+                if (i != 0u)
+                    process_line(&s_tev_w[0], &ring[(i - 1u) % 3u], cur);
+            } else if (is_tri) {
+                if (i % 3u == 2u)
+                    process_triangle(&s_tev_w[0], &ring[(i - 2u) % 3u],
+                                     &ring[(i - 1u) % 3u], cur);
+            } else if (i >= 2u) {
+                OutVtx* a = &ring[(i - 2u) % 3u];
+                OutVtx* b = &ring[(i - 1u) % 3u];
+                if (i & 1u)
+                    process_triangle(&s_tev_w[0], a, cur, b);
+                else
+                    process_triangle(&s_tev_w[0], a, b, cur);
+            }
+        }
+        return;
     }
 
     /* SetupUnit vertex assembly (SetupUnit.cpp:12-130): v0 stays in store[0]
@@ -5052,12 +6243,14 @@ void gx_raster_draw(const GxCpState* cp, u32 prim, u32 vat,
 
     if (!s_draw_stats) {
         gx_raster_draw_impl(cp, prim, vat, verts, nverts, vstride);
+        debug_finalize_draw();
         return;
     }
 
     u64 tri_before = s_tsc_tri;
     u64 t0 = __rdtsc();
     gx_raster_draw_impl(cp, prim, vat, verts, nverts, vstride);
+    debug_finalize_draw();
     u64 total = __rdtsc() - t0;
     u64 tri_delta = s_tsc_tri - tri_before;
     s_tsc_vtx += (total > tri_delta) ? (total - tri_delta) : 0;
@@ -5977,6 +7170,129 @@ static int efb_copy_pack_avx2(u8* row, int x0, int src_w, const int* scanY,
     return x;
 }
 
+typedef struct {
+    u8 r, g, b, a;
+} EfbCopyTexel;
+
+static EfbCopyTexel efb_copy_texture_sample(
+        int x, int y, int left, int top, int right, int bottom,
+        int clamp_top, int clamp_bottom, int half_scale, int depth,
+        int intensity_yuv, int wab, int wcde, int wfg,
+        u32 (*getpx)(u32)) {
+    if (half_scale) {
+        x = left + (x - left) * 2;
+        y = top + (y - top) * 2;
+    }
+    x = clampi(x, 0, (int)EFB_WIDTH - 1);
+    y = clampi(y, 0, (int)EFB_HEIGHT - 1);
+    int yprev = y - 1;
+    int ynext = y + 1;
+    if (clamp_top && yprev < top) yprev = top;
+    if (clamp_bottom && ynext >= bottom) ynext = bottom - 1;
+    yprev = clampi(yprev, 0, (int)EFB_HEIGHT - 1);
+    ynext = clampi(ynext, 0, (int)EFB_HEIGHT - 1);
+
+    EfbCopyTexel rows[3];
+    const int ys[3] = { yprev, y, ynext };
+    for (int i = 0; i < 3; i++) {
+        if (depth) {
+            u32 z = GetPixelDepth((u32)ys[i] * EFB_WIDTH + (u32)x);
+            rows[i].r = (u8)(z >> 16);
+            rows[i].g = (u8)(z >> 8);
+            rows[i].b = (u8)z;
+            rows[i].a = 0xFFu;
+        } else {
+            u32 c = getpx((u32)ys[i] * EFB_WIDTH + (u32)x);
+            rows[i].a = (u8)c;
+            rows[i].b = (u8)(c >> 8);
+            rows[i].g = (u8)(c >> 16);
+            rows[i].r = (u8)(c >> 24);
+        }
+    }
+
+    EfbCopyTexel out;
+#define FILTER_COPY_CH(ch) \
+    (u8)clampi(((int)rows[0].ch * wab + (int)rows[1].ch * wcde + \
+                (int)rows[2].ch * wfg) >> 6, 0, 255)
+    out.r = FILTER_COPY_CH(r);
+    out.g = FILTER_COPY_CH(g);
+    out.b = FILTER_COPY_CH(b);
+    out.a = rows[1].a;
+#undef FILTER_COPY_CH
+
+    if (intensity_yuv) {
+        int yr = 66 * out.r + 129 * out.g + 25 * out.b + 4096;
+        int ur = -38 * out.r - 74 * out.g + 112 * out.b + 32768;
+        int vr = 112 * out.r - 94 * out.g - 18 * out.b + 32768;
+        out.r = (u8)clampi((yr >> 8) + ((yr >> 7) & 1), 0, 255);
+        out.g = (u8)clampi((ur >> 8) + ((ur >> 7) & 1), 0, 255);
+        out.b = (u8)clampi((vr >> 8) + ((vr >> 7) & 1), 0, 255);
+    }
+    return out;
+}
+
+static void efb_copy_texture_write_block(
+        u8* dst, u32 fmt, int bx, int by, int out_w, int out_h,
+        int left, int top, int right, int bottom, int clamp_top,
+        int clamp_bottom, int half_scale, int depth, int intensity_yuv,
+        int wab, int wcde, int wfg, u32 (*getpx)(u32)) {
+    int bw = fmt == 0 ? 8 : (fmt == 1 || fmt == 2 || fmt == 7 ||
+                            fmt == 8 || fmt == 9 || fmt == 10) ? 8 : 4;
+    int bh = fmt == 0 ? 8 : (fmt == 1 || fmt == 2 || fmt == 7 ||
+                            fmt == 8 || fmt == 9 || fmt == 10) ? 4 : 4;
+    EfbCopyTexel px[64];
+    for (int y = 0; y < bh; y++) {
+        for (int x = 0; x < bw; x++) {
+            int ox = bx * bw + x, oy = by * bh + y;
+            int sx = left + (ox < out_w ? ox : out_w - 1);
+            int sy = top + (oy < out_h ? oy : out_h - 1);
+            px[y * bw + x] = efb_copy_texture_sample(
+                sx, sy, left, top, right, bottom, clamp_top, clamp_bottom,
+                half_scale, depth, intensity_yuv, wab, wcde, wfg, getpx);
+        }
+    }
+
+    if (fmt == 0) {                              /* R4 / I4 */
+        for (int i = 0; i < 64; i += 2)
+            dst[i >> 1] = (u8)((px[i].r & 0xF0u) | (px[i + 1].r >> 4));
+    } else if (fmt == 1 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 7) {
+        for (int i = 0; i < 32; i++) {            /* R8/G8/B8/A8 */
+            EfbCopyTexel p = px[i];
+            dst[i] = fmt == 9 ? p.g : fmt == 10 ? p.b : fmt == 7 ? p.a : p.r;
+        }
+    } else if (fmt == 2) {                        /* RA4 / IA4 */
+        for (int i = 0; i < 32; i++)
+            dst[i] = (u8)((px[i].a & 0xF0u) | (px[i].r >> 4));
+    } else if (fmt == 3 || fmt == 11 || fmt == 12) {
+        for (int i = 0; i < 16; i++) {            /* RA8 / RG8 / GB8 */
+            EfbCopyTexel p = px[i];
+            dst[i * 2] = fmt == 11 ? p.g : fmt == 12 ? p.b : p.a;
+            dst[i * 2 + 1] = fmt == 11 ? p.r : fmt == 12 ? p.g : p.r;
+        }
+    } else if (fmt == 4) {                        /* RGB565 */
+        for (int i = 0; i < 16; i++) {
+            u16 v = (u16)(((u16)(px[i].r >> 3) << 11) |
+                          ((u16)(px[i].g >> 2) << 5) | (px[i].b >> 3));
+            dst[i * 2] = (u8)(v >> 8); dst[i * 2 + 1] = (u8)v;
+        }
+    } else if (fmt == 5) {                        /* RGB5A3 */
+        for (int i = 0; i < 16; i++) {
+            EfbCopyTexel p = px[i];
+            u16 v = p.a > 224u
+                ? (u16)(0x8000u | ((u16)(p.r >> 3) << 10) |
+                      ((u16)(p.g >> 3) << 5) | (p.b >> 3))
+                : (u16)(((u16)(p.a >> 5) << 12) | ((u16)(p.r >> 4) << 8) |
+                      ((u16)(p.g >> 4) << 4) | (p.b >> 4));
+            dst[i * 2] = (u8)(v >> 8); dst[i * 2 + 1] = (u8)v;
+        }
+    } else {                                      /* RGBA8: AR plane, then GB */
+        for (int i = 0; i < 16; i++) {
+            dst[i * 2] = px[i].a; dst[i * 2 + 1] = px[i].r;
+            dst[32 + i * 2] = px[i].g; dst[33 + i * 2] = px[i].b;
+        }
+    }
+}
+
 void gx_raster_efb_copy(const GxCpState* cp) {
     (void)cp;
     /* Lazy-init same as gx_raster_draw's own copy (line ~4153): an EFB copy
@@ -6015,6 +7331,15 @@ void gx_raster_efb_copy(const GxCpState* cp) {
     int clear = bits(copy, 11, 1);
     int copy_to_xfb = bits(copy, 14, 1);
     u32 gamma = bits(copy, 7, 2);
+    int half_scale = bits(copy, 9, 1);
+    int intensity = bits(copy, 15, 1);
+    int auto_conv = bits(copy, 16, 1);
+    u32 flow = s_bp[0x53], fhigh = s_bp[0x54];
+    int w0 = bits(flow, 0, 6), w1 = bits(flow, 6, 6);
+    int w2 = bits(flow, 12, 6), w3 = bits(flow, 18, 6);
+    int w4 = bits(fhigh, 0, 6), w5 = bits(fhigh, 6, 6);
+    int w6 = bits(fhigh, 12, 6);
+    if (gamma != 0) TRAP(gammacopy, "EFB copy gamma != 1.0");
 
     if (copy_to_xfb) {
         int left = (int)bits(s_bp[0x49], 0, 10);
@@ -6029,12 +7354,6 @@ void gx_raster_efb_copy(const GxCpState* cp) {
         u32 yscale_reg = s_bp[0x4e];
         float yscale = scale_invert ? (yscale_reg ? 256.0f / (float)yscale_reg : 1.0f)
                                     : (float)yscale_reg / 256.0f;
-        if (gamma != 0) TRAP(gammacopy, "EFB copy gamma != 1.0");
-
-        /* copy filter coefficients (bp 0x53 Low, 0x54 High). */
-        u32 flow = s_bp[0x53], fhigh = s_bp[0x54];
-        int w0 = bits(flow, 0, 6), w1 = bits(flow, 6, 6), w2 = bits(flow, 12, 6), w3 = bits(flow, 18, 6);
-        int w4 = bits(fhigh, 0, 6), w5 = bits(fhigh, 6, 6), w6 = bits(fhigh, 12, 6);
 
         int src_w = right - left;
         int src_h = bottom - top;
@@ -6190,7 +7509,59 @@ void gx_raster_efb_copy(const GxCpState* cp) {
             gcn_gx_xfb_write_end();
         }
     } else {
-        TRAP(efbtex, "EFB->texture copy (copy_to_xfb=0)");
+        int left = (int)bits(s_bp[0x49], 0, 10);
+        int top = (int)bits(s_bp[0x49], 10, 10);
+        int src_w = (int)bits(s_bp[0x4a], 0, 10) + 1;
+        int src_h = (int)bits(s_bp[0x4a], 10, 10) + 1;
+        int right = left + src_w, bottom = top + src_h;
+        int out_w = half_scale ? (src_w + 1) >> 1 : src_w;
+        int out_h = half_scale ? (src_h + 1) >> 1 : src_h;
+        u32 target = bits(copy, 3, 4);
+        u32 fmt = target / 2u + (target & 1u) * 8u;
+        int depth = s_pf == PF_Z24;
+        int bw = fmt == 0 ? 8 : (fmt == 1 || fmt == 2 || fmt == 7 ||
+                                fmt == 8 || fmt == 9 || fmt == 10) ? 8 : 4;
+        int bh = fmt == 0 ? 8 : (fmt == 1 || fmt == 2 || fmt == 7 ||
+                                fmt == 8 || fmt == 9 || fmt == 10) ? 4 : 4;
+        u32 block_bytes = fmt == 6 ? 64u : 32u;
+        u32 tiles_x = (u32)(out_w + bw - 1) / (u32)bw;
+        u32 tiles_y = (u32)(out_h + bh - 1) / (u32)bh;
+        u32 dest_addr = s_bp[0x4b] << 5;
+        u32 dest_stride = s_bp[0x4d] << 5;
+        u32 phys = dest_addr & 0x1FFFFFFFu;
+        u64 last = (u64)phys + (tiles_y ? (u64)(tiles_y - 1u) * dest_stride : 0u) +
+                   (u64)tiles_x * block_bytes;
+
+        if (fmt > 12u || out_w <= 0 || out_h <= 0) {
+            TRAPF(efbtexfmt, "invalid EFB->texture format/dimensions "
+                  "(target=%u real=%u %dx%d)", target, fmt, out_w, out_h);
+        } else if (dest_stride == 0 || !s_cpu || !s_cpu->ram ||
+                   last > (u64)s_cpu->ram_size) {
+            TRAP(efbtexoob, "EFB->texture destination out of MEM1 / zero stride");
+        } else {
+            static u16 seen_formats;
+            if (!(seen_formats & (u16)(1u << fmt))) {
+                seen_formats |= (u16)(1u << fmt);
+                fprintf(stderr,
+                    "gx_raster: EFB->texture format %u handled "
+                    "(src=%d,%d %dx%d dst=%08X stride=%u half=%d depth=%d "
+                    "intensity=%d auto=%d)\n",
+                    fmt, left, top, src_w, src_h, dest_addr, dest_stride,
+                    half_scale, depth, intensity, auto_conv);
+            }
+            int wab = w0 + w1, wcde = w2 + w3 + w4, wfg = w5 + w6;
+            for (u32 by = 0; by < tiles_y; by++) {
+                for (u32 bx = 0; bx < tiles_x; bx++) {
+                    u8* dst = s_cpu->ram + phys + (u64)by * dest_stride +
+                              (u64)bx * block_bytes;
+                    efb_copy_texture_write_block(
+                        dst, fmt, (int)bx, (int)by, out_w, out_h,
+                        left, top, right, bottom, clamp_top, clamp_bottom,
+                        half_scale, depth, intensity && auto_conv,
+                        wab, wcde, wfg, copy_getpx);
+                }
+            }
+        }
     }
 
     if (clear) {

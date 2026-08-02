@@ -17,6 +17,7 @@
  */
 #include "cpu/cpu.h"
 #include "cpu/native_code.h"
+#include "cpu/timing.h"
 #include "debug/rings.h"   /* [gcn-watch] gcn_ring_watch_check */
 #include "memory/memory.h"
 #include "trace/trace.h"
@@ -24,6 +25,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* The runtime hosts exactly one guest CPU per process. Keeping the locked-L1
+ * backing in the memory subsystem avoids extending CPUState's generated-code
+ * ABI (and therefore avoids invalidating every AOT shard for a device-memory
+ * addition). */
+static CPUState* s_l1_owner;
+static u8* s_l1_cache;
 
 /* ---------------------------------------------------------------------------
  * Lifecycle
@@ -40,8 +48,28 @@ bool cpu_init(CPUState* cpu) {
                 cpu->ram_size);
         return false;
     }
+    if (s_l1_owner && s_l1_owner != cpu) {
+        fprintf(stderr,
+                "gcn memory: only one locked-L1 CPU instance is supported\n");
+        free(cpu->ram);
+        cpu->ram = NULL;
+        cpu->ram_size = 0;
+        return false;
+    }
+    s_l1_cache = (u8*)calloc(1, GCN_L1_CACHE_SIZE);
+    if (!s_l1_cache) {
+        fprintf(stderr,
+                "gcn memory: failed to allocate %u bytes for locked L1\n",
+                GCN_L1_CACHE_SIZE);
+        free(cpu->ram);
+        cpu->ram = NULL;
+        cpu->ram_size = 0;
+        return false;
+    }
+    s_l1_owner = cpu;
 
     /* PVR (SPR 287) reads as the Gekko id. Mirror of recompiler cpu.c. */
+    ppc_decrementer_reset(cpu);
     cpu->spr[287] = PPC_GEKKO_PVR;
     return true;
 }
@@ -74,6 +102,11 @@ void cpu_free(CPUState* cpu) {
         free(cpu->mem2);
         cpu->mem2 = NULL;
         cpu->mem2_size = 0;
+    }
+    if (s_l1_owner == cpu) {
+        free(s_l1_cache);
+        s_l1_cache = NULL;
+        s_l1_owner = NULL;
     }
 }
 
@@ -110,7 +143,10 @@ void cpu_reset(CPUState* cpu) {
         memset(cpu->ram, 0, cpu->ram_size);
     if (cpu->mem2)
         memset(cpu->mem2, 0, cpu->mem2_size);
+    if (s_l1_owner == cpu && s_l1_cache)
+        memset(s_l1_cache, 0, GCN_L1_CACHE_SIZE);
 
+    ppc_decrementer_reset(cpu);
     cpu->spr[287] = PPC_GEKKO_PVR;
 }
 
@@ -154,8 +190,26 @@ u8* gcn_mem_resolve(CPUState* cpu, u32 addr, u32* avail) {
             return cpu->mem2 + offset;
         }
     }
+    /* Locked L1 technically has programmable tags rather than a fixed
+     * address. Retail GameCube software conventionally uses 0xE0000000, and
+     * Dolphin models the hardware-visible storage as a 256 KiB flat window.
+     * This is ordinary big-endian CPU memory, not MMIO. */
+    if (s_l1_owner == cpu && s_l1_cache && addr >= GCN_L1_CACHE_BASE &&
+        addr - GCN_L1_CACHE_BASE < GCN_L1_CACHE_SIZE) {
+        u32 offset = addr - GCN_L1_CACHE_BASE;
+        *avail = GCN_L1_CACHE_SIZE - offset;
+        return s_l1_cache + offset;
+    }
     *avail = 0;
     return NULL;
+}
+
+u8* gcn_mem_locked_l1(CPUState* cpu, u32* size) {
+    if (size) *size = 0;
+    if (s_l1_owner != cpu || !s_l1_cache)
+        return NULL;
+    if (size) *size = GCN_L1_CACHE_SIZE;
+    return s_l1_cache;
 }
 
 bool gcn_mem_in_mem1(u32 addr, u32 need_bytes) {
@@ -202,8 +256,13 @@ void gcn_mem_set_rom_window(CPUState* cpu, const u8* rom, u32 size) {
 }
 
 static const u8* rom_window_resolve(CPUState* cpu, u32 addr, u32* avail) {
+    /* The 2 MiB reset ROM straddles the 32-bit wrap point:
+     * 0xFFF00000 + 0x00200000 wraps to 0x00100000. Compare the subtraction
+     * against the size instead of forming that overflowing end address. AOT
+     * BS1 did not expose this because it never fetched opcodes through the
+     * runtime bus; the co-sim interpreter does. */
     if (cpu->rom_window && addr >= GCN_ROM_WINDOW_BASE &&
-        addr < GCN_ROM_WINDOW_BASE + cpu->rom_window_size) {
+        addr - GCN_ROM_WINDOW_BASE < cpu->rom_window_size) {
         u32 offset = addr - GCN_ROM_WINDOW_BASE;
         *avail = cpu->rom_window_size - offset;
         return cpu->rom_window + offset;

@@ -158,6 +158,14 @@ void gx_render_flush(void) {
     }
 }
 
+void gx_render_sync_efb_to_software(void) {
+    if (s_mode == GX_RENDER_VULKAN_RESIDENT &&
+        !gx_vulkan_resident_sync_to_software()) {
+        fprintf(stderr, "gx_render: resident EFB CPU-access sync failed\n");
+        abort();
+    }
+}
+
 const char* gx_render_backend_name(void) {
     if (s_mode == GX_RENDER_VULKAN_SHADOW)
         return "vulkan-shadow/software-authority";

@@ -683,6 +683,8 @@ int main(int argc, char** argv) {
     gcn_pe_set_irq(&pe, pe_irq_to_pi, &pi);
     gcn_mmio_register(&bus, "PE", GCN_PE_BASE, GCN_PE_SIZE,
                       gcn_pe_read, gcn_pe_write, &pe);
+    gcn_mmio_register(&bus, "EFB-CPU", GCN_EFB_CPU_BASE, GCN_EFB_CPU_SIZE,
+                      gcn_pe_efb_read, gcn_pe_efb_write, &pe);
 
     /* CP: GX command-FIFO front-end. STATUS is computed from live pointer
      * state; the CPU-side watermark evaluation drives INT_CAUSE_CP (the line

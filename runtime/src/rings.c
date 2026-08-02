@@ -76,12 +76,29 @@ static u64 s_fifo_count;
 static u64 s_memcard_count;
 static u64 s_block_index;  /* monotonic retired-block counter (timeline stamp)  */
 
+/* One bit per aligned word. MEM1/MEM2 code is observed through the cached
+ * 0x80000000 alias in ordinary execution (24 MiB => 768 KiB); reset/BS1 code
+ * uses the 2 MiB high-ROM window (64 KiB). The rolling PC ring answers "when";
+ * this non-evicting bitmap answers "ever" without an arm-before-run race. */
+#define GCN_RAM_EXEC_BASE       0x80000000u
+#define GCN_RAM_EXEC_BYTES      0x01800000u
+#define GCN_RAM_EXEC_WORDS      (GCN_RAM_EXEC_BYTES / 4u)
+#define GCN_RAM_EXEC_COV_BYTES  (GCN_RAM_EXEC_WORDS / 8u)
+#define GCN_IPL_EXEC_BASE       0xFFE00000u
+#define GCN_IPL_EXEC_BYTES      0x00200000u
+#define GCN_IPL_EXEC_WORDS      (GCN_IPL_EXEC_BYTES / 4u)
+#define GCN_IPL_EXEC_COV_BYTES  (GCN_IPL_EXEC_WORDS / 8u)
+static u8 s_ram_pc_coverage[GCN_RAM_EXEC_COV_BYTES];
+static u8 s_ipl_pc_coverage[GCN_IPL_EXEC_COV_BYTES];
+
 void gcn_rings_init(void) {
     memset(s_mmio, 0, sizeof s_mmio);
     memset(s_block, 0, sizeof s_block);
     memset(s_event, 0, sizeof s_event);
     memset(s_fifo, 0, sizeof s_fifo);
     memset(s_memcard, 0, sizeof s_memcard);
+    memset(s_ram_pc_coverage, 0, sizeof s_ram_pc_coverage);
+    memset(s_ipl_pc_coverage, 0, sizeof s_ipl_pc_coverage);
     s_mmio_count = s_block_count = s_event_count = s_fifo_count = 0;
     s_memcard_count = 0;
     s_block_index = 0;
@@ -99,6 +116,15 @@ void gcn_ring_block(u32 pc) {
     BlockEntry* e = &s_block[s_block_count & (GCN_BLOCK_RING_CAP - 1)];
     e->seq = s_block_count++;
     e->pc = pc; e->_pad = 0;
+    if ((pc & 3u) == 0u) {
+        if (pc - GCN_RAM_EXEC_BASE < GCN_RAM_EXEC_BYTES) {
+            u32 word = (pc - GCN_RAM_EXEC_BASE) >> 2;
+            s_ram_pc_coverage[word >> 3] |= (u8)(1u << (word & 7u));
+        } else if (pc - GCN_IPL_EXEC_BASE < GCN_IPL_EXEC_BYTES) {
+            u32 word = (pc - GCN_IPL_EXEC_BASE) >> 2;
+            s_ipl_pc_coverage[word >> 3] |= (u8)(1u << (word & 7u));
+        }
+    }
     s_block_index++;
 }
 
@@ -128,6 +154,20 @@ void gcn_ring_memcard(u32 pc, u8 channel, u8 cs, u8 command, u8 rw, u8 dma,
 }
 
 u64 gcn_ring_block_index(void) { return s_block_index; }
+
+int gcn_ring_pc_seen(u32 pc) {
+    u32 word;
+    if ((pc & 3u) != 0u) return 0;
+    if (pc - GCN_RAM_EXEC_BASE < GCN_RAM_EXEC_BYTES) {
+        word = (pc - GCN_RAM_EXEC_BASE) >> 2;
+        return (s_ram_pc_coverage[word >> 3] >> (word & 7u)) & 1u;
+    }
+    if (pc - GCN_IPL_EXEC_BASE < GCN_IPL_EXEC_BYTES) {
+        word = (pc - GCN_IPL_EXEC_BASE) >> 2;
+        return (s_ipl_pc_coverage[word >> 3] >> (word & 7u)) & 1u;
+    }
+    return 0;
+}
 
 /* [gx-fifoprov] paired-single load/store value ring. The corrupt FIFO matrix
  * payloads are pushed by the IPL's psq_l(RAM)->psq_st(gather pipe) upload
