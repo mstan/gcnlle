@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 
-// Exact compute differential for the twenty-four fused IPL pixel programs
-// A--X.  Textured programs accept only the host-validated resident formats;
-// the host rejects every other format before dispatch.  Programs F/J/M/P/T
-// have no texture dependency; W samples a texture the combiner never
-// references, so it skips the fetch (identical output).
+// Exact compute differential for the thirty fused IPL/Wind-Waker pixel
+// programs A--AD.  Textured programs accept only the host-validated resident
+// formats; the host rejects every other format before dispatch.  Programs
+// F/J/M/P/T/Y/Z/AA/AB/AC/AD have no texture dependency at all (texgens==0);
+// W samples a texture the combiner never references, so it skips the fetch
+// (identical output).
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set = 0, binding = 0, r32ui) uniform uimage2D efb_color;
 layout(set = 0, binding = 1, r32ui) uniform uimage2D efb_depth;
@@ -228,6 +229,15 @@ void shade_pixel(int x, int y) {
         if (uint(z) > old_depth)
             return;
         imageStore(efb_depth, ivec2(x, y), uvec4(uint(z)));
+    } else if (program == 28u || program == 29u || program == 30u) {
+        // AB/AC/AD: zt_enable==1/zt_early==1/CMP_LEQUAL like K/L/X, but
+        // zupd==0 (see gpu_program_AB_match's derivation) -- test only,
+        // never write the depth plane.
+        int z = int(slope_value(100u, x, y));
+        z = clamp(z, 0, 16777215);
+        uint old_depth = imageLoad(efb_depth, ivec2(x, y)).r & 0x00ffffffu;
+        if (uint(z) > old_depth)
+            return;
     }
     uint ras_r = color_byte(22u, x, y);
     uint ras_g = color_byte(29u, x, y);
@@ -236,7 +246,9 @@ void shade_pixel(int x, int y) {
     uint out_r = ras_r, out_g = ras_g, out_b = ras_b, out_a = ras_a;
 
     if (program != 6u && program != 10u && program != 13u &&
-        program != 16u && program != 20u && program != 23u) {
+        program != 16u && program != 20u && program != 23u &&
+        program != 25u && program != 26u && program != 27u &&
+        program != 28u && program != 29u && program != 30u) {
         int bx = x & ~1;
         int by = y & ~1;
         precise vec2 uv = texture_uv(x, y);
@@ -339,17 +351,83 @@ void shade_pixel(int x, int y) {
         int cc = int(ras_a) + int(ras_a >> 7);
         out_a = clamp255_s16((si(97u) * cc + 128) >> 8);
     }
+    // Y/Z (25/26): color AND alpha are both the RasColor identity -- out_*
+    // already equal ras_r/g/b/a from the defaults above, no override needed.
+    if (program == 27u || program == 28u) {
+        // AA/AB: ac's every alpha arg is ZERO -> alpha is always 0.
+        out_a = 0u;
+    }
+    if (program == 28u || program == 29u) {
+        // AB/AC: color is StageKonst.rgb (clamp255 passthrough identity).
+        out_r = clamp255_s16(si(108u));
+        out_g = clamp255_s16(si(109u));
+        out_b = clamp255_s16(si(110u));
+    }
+    // AC (29): alpha is the RasColor.a identity -- out_a already equals
+    // ras_a from the defaults above, no override needed.
+    if (program == 30u) {
+        // AD: color is Reg[1].rgb (clamp255 passthrough identity, signed);
+        // alpha = StageKonst.a (signed) modulated by ras_a's cc -- same
+        // shape as T/W's alpha fold above, different operand slot.
+        out_r = clamp255_s16(si(91u));
+        out_g = clamp255_s16(si(92u));
+        out_b = clamp255_s16(si(93u));
+        int cc = int(ras_a) + int(ras_a >> 7);
+        out_a = clamp255_s16((si(97u) * cc + 128) >> 8);
+    }
 
     uvec4 src = uvec4(out_a, out_b, out_g, out_r);
     uint pf = jw(21u);
     uint old = imageLoad(efb_color, ivec2(x, y)).r;
     uvec4 dst = get_abgr(old, pf);
-    uint src_alpha = src.x;
-    uint sa = src_alpha + (src_alpha >> 7);
-    uint inverse = 255u - src_alpha;
-    uint da = inverse + (inverse >> 7);
-    uvec4 blended = (program == 16u || program == 17u) ? src :
-                    min((src * sa + dst * da) >> 8, uvec4(255u));
+
+    uvec4 blended;
+    if (program == 27u) {
+        // AA: sf=DstAlpha (dst's own current alpha before this blend) /
+        // df=One (0xff+(0xff>>7)==256, a compile-time constant). da_enable
+        // then unconditionally overwrites the alpha channel with da_alpha
+        // (0) regardless of what BlendColor computed there -- see
+        // gpu_program_AA_match's derivation -- so the fold never computes a
+        // blended alpha at all, it just stores 0 directly.
+        uint dst_alpha = dst.x;
+        uint sa2 = dst_alpha + (dst_alpha >> 7);
+        blended = min((src * sa2 + dst * 256u) >> 8, uvec4(255u));
+        blended.x = 0u;
+    } else if (program == 16u || program == 17u || program == 26u ||
+               program == 28u) {
+        // P/Q/Z/AB: blend_enable==0 && logic_enable==0 -> BlendTev's
+        // passthrough branch, dst := src unchanged. AB (gpu_program_AB_match:
+        // bm_blend_enable==0, same opaque shape as P/Q/Z) was missing from
+        // this list -- it fell into the general alpha-blend branch below,
+        // whose src_alpha comes from src.x (out_a). AB's ac word (0x08FFF0)
+        // makes ALPHA unconditionally 0 (see gpu_program_AB_match's
+        // derivation), so that branch's sa=0/da=256 makes
+        // blended=min(dst*256>>8,255)==dst: the draw silently no-op'd,
+        // leaving the destination (usually still the frame's clear value)
+        // instead of writing AB's real StageKonst.rgb color -- exactly the
+        // corun "gpu=00000000 sw=<real color>" divergence this fixes. AC/AD
+        // (29/30) are unaffected: both have bm_blend_enable==1 with a real,
+        // non-zero alpha feeding the same general branch on purpose.
+        blended = src;
+    } else {
+        uint src_alpha = src.x;
+        uint sa = src_alpha + (src_alpha >> 7);
+        uint inverse = 255u - src_alpha;
+        uint da = inverse + (inverse >> 7);
+        blended = min((src * sa + dst * da) >> 8, uvec4(255u));
+    }
+
+    // alpha_update (s_bm_au): every program pins au==1 except AB/AC/AD
+    // (au==0 fixed by their matchers) and Y/Z (au read live -- see
+    // GxRasterTriangleJob::bm_au's comment). au only matters for the
+    // RGBA6_Z24 packed format below; the "direct" formats never carry a
+    // real alpha plane at all (matches SetPixelColorOnly/SetPixelAlphaColor
+    // being identical for those formats on the CPU side).
+    bool write_alpha = true;
+    if (program == 28u || program == 29u || program == 30u)
+        write_alpha = false;
+    else if (program == 25u || program == 26u)
+        write_alpha = jw(111u) != 0u;
 
     if (pf == 1u) {
         const uint matrix[4] = uint[4](0u, 2u, 3u, 1u);
@@ -357,8 +435,9 @@ void shade_pixel(int x, int y) {
         blended.y = ((blended.y - (blended.y >> 6)) + dither) & 0xfcu;
         blended.z = ((blended.z - (blended.z >> 6)) + dither) & 0xfcu;
         blended.w = ((blended.w - (blended.w >> 6)) + dither) & 0xfcu;
+        uint alpha6 = write_alpha ? ((blended.x >> 2) & 0x3fu) : (old & 0x3fu);
         uint value = (old & 0xff000000u) |
-                ((blended.x >> 2) & 0x3fu) |
+                alpha6 |
                 ((blended.y << 4) & 0x00000fc0u) |
                 ((blended.z << 10) & 0x0003f000u) |
                 ((blended.w << 16) & 0x00fc0000u);

@@ -116,9 +116,17 @@ typedef struct {
     u32 num_color_chans;
     u32 num_texgens;
     u32 pixel_format;
-    u32 fused_program; /* 0=general, 1..19=the exact A..S programs */
+    u32 fused_program; /* 0=general, 1..30=the exact A..AD programs */
     s32 tev_reg[4][4];       /* [Prev/Color0/Color1/Color2][R,G,B,A] */
     s32 stage_konst[2][4];   /* first two stages are sufficient for A..F */
+    /* alpha_update (bp 0x41 bit 4, s_bm_au) -- ONLY read by programs Y/Z
+     * (25/26), whose matchers deliberately don't pin it (see the derivation
+     * comment above gpu_program_Y_match in gx_raster.c: the census found the
+     * same combiner+blend shape with au==0 and au==1, differing only in
+     * this write-mask bit, not in the pixel VALUE computation). Every other
+     * program's matcher pins au to an exact value, so this field is unused
+     * (left 0) for them. */
+    s32 bm_au;
 } GxRasterTriangleJob;
 
 /* Return nonzero from the pre-software callback only when the sink has taken

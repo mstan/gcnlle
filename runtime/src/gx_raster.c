@@ -225,10 +225,21 @@ static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
  * general tev_draw() — the coverage number the task's VERIFY step asks for,
  * gated on this same knob so it costs nothing when census is off. */
 #define GX_CENSUS_MAX 128
-typedef struct { int used; u32 hash; u64 draws, pixels, fused_pixels; } GxCensusEntry;
+typedef struct { int used; u32 hash, program_id; u64 draws, pixels, fused_pixels; } GxCensusEntry;
 static int s_tev_census = -1;
 static GxCensusEntry s_census[GX_CENSUS_MAX];
 static int s_census_cur = -1;   /* index of the current draw's config, else -1 */
+
+/* Table-full accounting: when a new shape shows up after all GX_CENSUS_MAX
+ * slots are taken, the draw has nowhere to be tallied. Rather than silently
+ * dropping it (the old behavior), count the draws and the distinct unseen
+ * shapes so gx_raster_print_census can flag an insufficient table instead of
+ * quietly under-reporting coverage. Table size stays GX_CENSUS_MAX; this is
+ * a separate, generously-sized dedup set for shapes that didn't fit. */
+#define GX_CENSUS_OVERFLOW_MAX 256
+static u32 s_census_overflow_hashes[GX_CENSUS_OVERFLOW_MAX];
+static int s_census_overflow_shapes = 0;  /* distinct unseen shapes (capped) */
+static u64 s_census_overflow_draws = 0;   /* draws whose shape didn't fit */
 static u64 s_ps_texel_cache_hits;   /* per-draw texel cache: decode_texel calls it satisfied */
 
 /* GCN_GX_NO_FUSED=1: force every draw's fused-pixel-path selection (see
@@ -2285,6 +2296,105 @@ static inline void fused_blend_stage(Tev* t, u8* output) {
     if (s_pixel_stats) s_ps_blend_writes++;   /* GCN_GX_PIXEL_STATS: blend_writes counter */
 }
 
+/* Same blend fold as fused_blend_stage (sf=4/df=5, da_enable==0), but for
+ * configs Y/AC whose matcher pins cu==1 WITHOUT pinning au (see the Y/Z/AA
+ * derivation comment above gpu_program_Y_match): the final write branches on
+ * the live s_bm_au flag exactly the way general BlendTev does, instead of
+ * assuming au==1. */
+static inline void fused_blend_stage_auto(Tev* t, u8* output) {
+    u32 off = (u32)(u16)t->Position[0] + (u32)(u16)t->Position[1] * EFB_WIDTH;
+    u32 dstClr = GetPixelColor(off);
+    u8* d = (u8*)&dstClr;
+    u32 srcA = output[ALP_C];
+    u32 sa = srcA + (srcA >> 7);
+    u32 invA = 255u - srcA;
+    u32 da = invA + (invA >> 7);
+    for (int i = 0; i < 4; i++) {
+        u32 c = (output[i] * sa + d[i] * da) >> 8;
+        d[i] = (c > 255u) ? 255u : (u8)c;
+    }
+    Dither((u16)t->Position[0], (u16)t->Position[1], d);
+    if (s_bm_au) SetPixelAlphaColor(off, d); else SetPixelColorOnly(off, d);
+    if (s_pixel_stats) s_ps_blend_writes++;
+}
+
+/* Config Z's finish: blend_enable==0 && logic_enable==0 && subtract==0, so
+ * BlendTev's three-way blend/logic/passthrough branch collapses to its
+ * `else { dstPtr = color; }` case -- output is written as-is, no read of the
+ * current dst pixel needed for the color math at all (still writes through
+ * GetPixelColor's offset math only to share SetPixel*'s dst-preserving byte
+ * for whichever channel this cu/au combo doesn't touch). da_enable==0 folded
+ * away (matcher pins it). au read live, same reasoning as fused_blend_stage_auto. */
+static inline void fused_write_stage_auto(Tev* t, u8* output) {
+    u32 off = (u32)(u16)t->Position[0] + (u32)(u16)t->Position[1] * EFB_WIDTH;
+    Dither((u16)t->Position[0], (u16)t->Position[1], output);
+    if (s_bm_au) SetPixelAlphaColor(off, output); else SetPixelColorOnly(off, output);
+    if (s_pixel_stats) s_ps_blend_writes++;
+}
+
+/* Config AA's finish: sf=6(DstAlpha)/df=1(One) reads the framebuffer's own
+ * current alpha for the source blend factor -- a genuinely per-pixel-varying
+ * value, not foldable to a hoisted scalar the way Y's sf=4/df=5 is -- so this
+ * does the real per-channel BlendColor math (dst_factor==One's rounded
+ * scalar, 0xff+(0xff>>7)==256, IS a compile-time constant, hoisted). The
+ * da_enable==1/da_alpha==0 override runs unconditionally afterward (proven
+ * in the derivation comment above gpu_program_AA_match), so the fold skips
+ * computing/writing a blended alpha entirely and stores 0 directly. cu==1 &&
+ * au==1 both pinned by the matcher (no live branch needed here). */
+static inline void fused_blend_stage_dstalpha_da0(Tev* t, u8* output) {
+    u32 off = (u32)(u16)t->Position[0] + (u32)(u16)t->Position[1] * EFB_WIDTH;
+    u32 dstClr = GetPixelColor(off);
+    u8* d = (u8*)&dstClr;
+    u32 da_before = d[ALP_C];
+    u32 sa = da_before + (da_before >> 7);
+    for (int i = 0; i < 4; i++) {
+        u32 c = (output[i] * sa + d[i] * 256u) >> 8;
+        d[i] = (c > 255u) ? 255u : (u8)c;
+    }
+    d[ALP_C] = s_cfg.da_alpha;   /* == 0; unconditional da_enable override */
+    Dither((u16)t->Position[0], (u16)t->Position[1], d);
+    SetPixelAlphaColor(off, d);   /* s_bm_cu==1 && s_bm_au==1, matcher-pinned */
+    if (s_pixel_stats) s_ps_blend_writes++;
+}
+
+/* Fused pixel functions Y/Z/AA (see the derivation comment above
+ * gpu_program_Y_match for the combiner decode). All three are texgens==0,
+ * en==0 -- no texture sample at all, so these are the cheapest fused
+ * functions in the file: no tev_sample_stat call, just a RasColor read. */
+static void fused_pixel_Y(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 output[4];
+    output[RED_C] = t->Color[0][0];
+    output[GRN_C] = t->Color[0][1];
+    output[BLU_C] = t->Color[0][2];
+    output[ALP_C] = t->Color[0][3];
+    /* alpha test always passes -- at word 0x3F0000 decodes to comp0==
+     * comp1==CMP_ALWAYS with AND, same always-pass proof as 0x7F0000
+     * (see fused_pixel_A's derivation and gpu_program_Y_match's comment). */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage_auto);
+}
+static void fused_pixel_Z(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 output[4];
+    output[RED_C] = t->Color[0][0];
+    output[GRN_C] = t->Color[0][1];
+    output[BLU_C] = t->Color[0][2];
+    output[ALP_C] = t->Color[0][3];
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_write_stage_auto);
+}
+static void fused_pixel_AA(Tev* t) {
+    tev_stats_enter(1);
+    u64 tex_before, comb_t0 = tev_comb_begin(&tex_before);
+    u8 output[4];
+    output[RED_C] = t->Color[0][0];
+    output[GRN_C] = t->Color[0][1];
+    output[BLU_C] = t->Color[0][2];
+    output[ALP_C] = 0;   /* ac=0x08FFF0: every alpha arg is ZERO -> result 0 */
+    tev_comb_finish(t, output, comb_t0, tex_before, fused_blend_stage_dstalpha_da0);
+}
+
 /* Shared preconditions for every fused config (see the file-header derivation
  * table above): everything EXCEPT numtexgens (checked by the two callers
  * below — the boot-animation D1 census's configs E/F needed a texgens==0
@@ -2479,6 +2589,168 @@ static int gpu_program_X_match(void) {
            s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
            s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
            fused_stage_match(0, 0x18FD82u, 0x08F770u, 1, 0);
+}
+
+/* GPU/fused programs Y--AD: the six dominant Wind Waker "general" (program-0)
+ * draw shapes named by a GCN_GX_TEV_CENSUS run over the title route
+ * (captures/perf-census-20260803/run1.err.log, 2026-08-03), covering ~71% of
+ * general pixels. Every fold below was brute-force verified bit-exact against
+ * a verbatim transcription of draw_color_regular/draw_alpha_regular (and,
+ * for AA, BlendColor) over the FULL signed-11-bit domain for every TEV
+ * Reg/Konst operand and the full 0..255 domain for every Ras/TexColor byte
+ * operand: 529,153 combiner cases (scratchpad verify_yz_aa_ab.c) + 16,777,216
+ * blend cases for AA (scratchpad verify_shape3_blend.c), 0 mismatches, 2026-08-03.
+ *
+ * The census dump omits two hashed-but-unprinted fields: s_bm_cu/s_bm_au
+ * (color_update/alpha_update, bp 0x41 bits 3/4). That's what distinguishes
+ * the two pairs the task investigation started from -- hash 31a3e87e/20faf539
+ * and c0e62b05/672366ca each print IDENTICAL dumps but differ in bm_au (cu=1
+ * in all four; au=1 for the first of each pair, au=0 for the second) --
+ * NOT cullmode (cullmode isn't hashed into the census key at all, same as
+ * every existing program here). Rather than splitting each pair into two
+ * near-duplicate programs the way T/W split on texgens, Y and Z generalize:
+ * their matchers pin cu==1 but deliberately do NOT pin au, and their finish
+ * helpers branch on the live s_bm_au flag exactly the way general BlendTev
+ * does (Dither, then SetPixelAlphaColor if au else SetPixelColorOnly) --
+ * this is the one config-hoisted branch in this whole fused family, added
+ * because it is the one place two real census configs differ only in a
+ * write-mask bit, not in any part of the pixel VALUE computation.
+ *
+ * zt_enable splits the six the same way the K--X family already established
+ * the write-up discipline: Y/Z/AA (zt_enable==0) are safe to fuse into the
+ * software raster too (no z semantics at stake); AB/AC/AD (zt_enable==1,
+ * early LEQUAL/func3, zupd==0 -- test only, never write) stay GPU-only so
+ * software's ordinary z slope/test remains the differential authority. */
+
+/* Y/Z shared combiner: cc=0x08FFFA (argA=argB=argC=ZERO, argD=RasColor.rgb,
+ * bias0 op0 clamp255 scale0) / ac=0x08FFD0 (aargA=aargB=aargC=ZERO(7),
+ * aargD=RasColor.a, bias0 op0 clamp255 scale0). Both reduce to the algebraic
+ * identity result==D exactly (A=B=0 makes the lerp term 0 regardless of C;
+ * the bias/scale/rshift chain is then a pure passthrough of D) -- COLOR is
+ * RasColor.rgb bit-for-bit, ALPHA is RasColor.a bit-for-bit, no Reg/Konst/Tex
+ * operand appears anywhere in this combiner. Verified for the full 0..255
+ * domain of every RasColor byte (each channel independent of the others). */
+static int fused_common_notex_at3F(void) {
+    for (u32 stage = 0; stage <= s_cfg.numtevstages; stage++)
+        if (s_cfg.stage[stage].tevind != 0) return 0;
+    return s_cfg.numtexgens == 0 && s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 0 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_logic_enable == 0 && s_cfg.bm_subtract == 0 &&
+           s_cfg.bm_dither == 1 &&
+           s_bm_cu == 1 &&   /* au deliberately NOT pinned -- see Y/Z's note */
+           s_bp[0xF3] == 0x3F0000u &&   /* comp0=comp1=ALWAYS regardless of AND/OR,
+                                          * same always-pass proof as 0x7F0000 (see
+                                          * fused_pixel_A's derivation) -- also
+                                          * already used unpinned-blend by P/Q. */
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3;
+}
+static int gpu_program_Y_match(void) {
+    return fused_common_notex_at3F() && s_cfg.numtevstages == 0 &&
+           s_cfg.bm_blend_enable == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           fused_stage_match(0, 0x08FFFAu, 0x08FFD0u, 0, 0);
+}
+static int gpu_program_Z_match(void) {
+    return fused_common_notex_at3F() && s_cfg.numtevstages == 0 &&
+           s_cfg.bm_blend_enable == 0 &&
+           fused_stage_match(0, 0x08FFFAu, 0x08FFD0u, 0, 0);
+}
+
+/* AA: same COLOR identity as Y/Z (cc=0x08FFFA) but ac=0x08FFF0 (aargA=aargB=
+ * aargC=ZERO(7), aargD=ZERO(15)->0): every alpha arg is 0, so ALPHA==0
+ * unconditionally (no operand dependence at all). Blend is sf=6(DstAlpha)
+ * df=1(One) -- a REAL per-pixel read of the framebuffer's own current alpha
+ * (not foldable to a hoisted scalar the way Y's sf=4/df=5 is), plus
+ * da_enable=1/da_alpha=0 which unconditionally overwrites dstPtr[ALP_C]
+ * after BlendColor regardless of what it computed there -- so the fold
+ * skips computing a blended alpha at all and just stores da_alpha (0)
+ * directly (an exact elision, not an approximation: da_enable's override in
+ * BlendTev runs unconditionally whenever da_enable==1, independent of any
+ * operand value). cu=1/au=1 both pinned exact (single observed config, no
+ * pairing ambiguity like Y/Z). */
+static int gpu_program_AA_match(void) {
+    for (u32 stage = 0; stage <= s_cfg.numtevstages; stage++)
+        if (s_cfg.stage[stage].tevind != 0) return 0;
+    return s_cfg.numtexgens == 0 && s_cfg.numcolchans == 1 &&
+           s_cfg.numtevstages == 0 &&
+           s_cfg.zt_enable == 0 &&
+           s_cfg.da_enable == 1 && s_cfg.da_alpha == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 6 && s_cfg.bm_dst_factor == 1 &&
+           s_bm_cu == 1 && s_bm_au == 1 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x08FFFAu, 0x08FFF0u, 0, 0);
+}
+
+/* AB/AC/AD: GPU-only, zt_enable==1 (early LEQUAL/func3, zupd==0) -- software
+ * deliberately stays on the general tev_draw() path as the differential
+ * authority, same convention as K--X. All three pin cu==1/au==0 exactly
+ * (each is a single observed census config, no pairing ambiguity). */
+
+/* AB: cc=0x08EFFF (argA=StageKonst.rgb, argB=argC=ZERO, argD=ZERO, bias0 op0
+ * clamp255 scale0) -> COLOR==clamp255(StageKonst.ch) (the lerp-to-B term is
+ * 0 since argC==ZERO, leaving a pure passthrough of A through the bias/scale
+ * chain); ac=0x08FFF0 -> ALPHA==0 (same all-zero shape as AA's alpha).
+ * blend disabled (opaque write). */
+static int gpu_program_AB_match(void) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == 0 &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 1 && s_cfg.zt_early == 1 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 0 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 0 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_bm_cu == 1 && s_bm_au == 0 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x08EFFFu, 0x08FFF0u, 0, 0);
+}
+
+/* AC: same cc=0x08EFFF COLOR==StageKonst.rgb as AB; ac=0x08BFF0 (aargA=
+ * RasColor.a, aargB=aargC=ZERO, aargD=ZERO) -> ALPHA==RasColor.a exactly
+ * (identity, same shape as Y/Z's alpha). blend=1 sf=4/df=5 -- the SAME
+ * hoistable fold as the A--J/Y family (both factors derive from the shaded
+ * pixel's own alpha). cu=1/au=0: the blended alpha is computed (blend math
+ * needs it for sf/df) but never written to the EFB. */
+static int gpu_program_AC_match(void) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == 0 &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 1 && s_cfg.zt_early == 1 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 0 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 0 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x08EFFFu, 0x08BFF0u, 0, 0);
+}
+
+/* AD: cc=0x082FFF (argA=Reg[1].rgb, argB=argC=ZERO, argD=ZERO, bias0 op0
+ * clamp255 scale0) -> COLOR==clamp255(Reg[1].ch) (same passthrough shape as
+ * AB's StageKonst color, for the Reg[1] operand instead); ac=0x08FAF0
+ * (aargA=ZERO, aargB=StageKonst.a, aargC=RasColor.a, aargD=ZERO) -> a REAL
+ * modulate: ALPHA==clamp255((StageKonst.a * cc(RasColor.a) + 128) >> 8),
+ * the same "constant times RasColor.a's cc" shape as fused_pixel_A's alpha
+ * fold. blend=1 sf=4/df=5 (the same hoistable fold). cu=1/au=0. */
+static int gpu_program_AD_match(void) {
+    return s_cfg.numtevstages == 0 && s_cfg.numtexgens == 0 &&
+           s_cfg.numcolchans == 1 &&
+           s_cfg.zt_enable == 1 && s_cfg.zt_early == 1 &&
+           s_cfg.zt_func == CMP_LEQUAL && s_zt_upd == 0 &&
+           s_cfg.da_enable == 0 &&
+           s_cfg.bm_blend_enable == 1 && s_cfg.bm_logic_enable == 0 &&
+           s_cfg.bm_subtract == 0 && s_cfg.bm_dither == 1 &&
+           s_cfg.bm_src_factor == 4 && s_cfg.bm_dst_factor == 5 &&
+           s_bm_cu == 1 && s_bm_au == 0 && s_bp[0xF3] == 0x7F0000u &&
+           s_cfg.swaptab[0][0] == 0 && s_cfg.swaptab[0][1] == 1 &&
+           s_cfg.swaptab[0][2] == 2 && s_cfg.swaptab[0][3] == 3 &&
+           fused_stage_match(0, 0x082FFFu, 0x08FAF0u, 0, 0);
 }
 
 /* ---- config A: stages=1, texgens=1, st0 cc=0x00F8CF ac=0x00F670 ----------
@@ -3609,6 +3881,12 @@ static u32 compute_program_id(void) {
     if (!s_cfg.fused && gpu_program_V_match()) return 22;
     if (!s_cfg.fused && gpu_program_W_match()) return 23;
     if (!s_cfg.fused && gpu_program_X_match()) return 24;
+    if (s_cfg.fused == fused_pixel_Y) return 25;
+    if (s_cfg.fused == fused_pixel_Z) return 26;
+    if (s_cfg.fused == fused_pixel_AA) return 27;
+    if (!s_cfg.fused && gpu_program_AB_match()) return 28;
+    if (!s_cfg.fused && gpu_program_AC_match()) return 29;
+    if (!s_cfg.fused && gpu_program_AD_match()) return 30;
     return 0;
 }
 
@@ -3774,11 +4052,20 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
     /* Programs U/V/X (21/22/24) never reference RasColor.rgb in any selector
      * (their pinned cc words name only Reg1/Tex/ONE/HALF inputs), so their
      * RGB color slopes are dead exactly like S's.  T/W (20/23) are the
-     * opposite: their color IS the RasColor.rgb identity — comp 0 stays. */
+     * opposite: their color IS the RasColor.rgb identity — comp 0 stays.
+     * AB/AC/AD (28/29/30, see their derivation above gpu_program_AB_match)
+     * are GPU-only like U/V/X and their pinned cc words name only
+     * StageKonst/Reg1 -- RasColor.rgb never appears in any of the three, so
+     * they join U/V/X's dead-RGB-slope list. (Y/Z/AA, 25-27, are FUSED and
+     * DO read RasColor.rgb -- s_cfg.fused_needs_ras_rgb is set for all three
+     * in build_draw_cfg, so the first clause below already keeps comp 0 for
+     * them; they do not need a triangle_program entry here.) */
     int first_color_comp =
         ((s_cfg.fused && !s_cfg.fused_needs_ras_rgb) ||
          triangle_program == 19u || triangle_program == 21u ||
-         triangle_program == 22u || triangle_program == 24u) ? 3 : 0;
+         triangle_program == 22u || triangle_program == 24u ||
+         triangle_program == 28u || triangle_program == 29u ||
+         triangle_program == 30u) ? 3 : 0;
     for (u32 i = 0; i < s_cfg.numcolchans; i++)
         for (int comp = first_color_comp; comp < 4; comp++)
             s_ColorSlopes[i][comp] = make_slope(v0->color[i][comp], v1->color[i][comp],
@@ -3819,6 +4106,7 @@ static void draw_triangle_impl(Tev* t, const OutVtx* v0, const OutVtx* v1, const
         job.num_texgens = s_cfg.numtexgens;
         job.pixel_format = s_pf;
         job.fused_program = triangle_program;
+        job.bm_au = s_bm_au;   /* only consumed by programs Y/Z (25/26) */
         for (u32 reg = 0; reg < 4; ++reg) {
             job.tev_reg[reg][0] = s_tev_w[0].Reg[reg].r;
             job.tev_reg[reg][1] = s_tev_w[0].Reg[reg].g;
@@ -5349,6 +5637,23 @@ static void build_draw_cfg(void) {
             s_cfg.fused = fused_pixel_J;
             s_cfg.fused_needs_ras_rgb = 1;
         }
+    } else if (!s_no_fused && gpu_program_Y_match()) {
+        /* Y/Z: at=0x3F0000, not 0x7F0000 -- neither fused_common_match() nor
+         * fused_common_match_notex() covers this word, so Y/Z self-check
+         * their own full precondition set (see the derivation comment above
+         * gpu_program_Y_match). Y is checked first since its extra
+         * blend_enable==1 test is a strict narrowing of Z's. */
+        s_cfg.fused = fused_pixel_Y;
+        s_cfg.fused_needs_ras_rgb = 1;   /* reads RasColor.rgb -- see gx_raster.c ~3774 */
+    } else if (!s_no_fused && gpu_program_Z_match()) {
+        s_cfg.fused = fused_pixel_Z;
+        s_cfg.fused_needs_ras_rgb = 1;
+    } else if (!s_no_fused && gpu_program_AA_match()) {
+        /* AA: da_enable==1 and sf=6(DstAlpha)/df=1(One), neither of which
+         * fused_common_match()/_notex() (da_enable==0, sf=4/df=5) permit --
+         * self-checks its own full precondition set. */
+        s_cfg.fused = fused_pixel_AA;
+        s_cfg.fused_needs_ras_rgb = 1;
     }
     s_cfg.program_id = compute_program_id();
 
@@ -5383,12 +5688,13 @@ static void build_draw_cfg(void) {
             s_census_cur = free_slot;
             s_census[free_slot].used = 1;
             s_census[free_slot].hash = h;
-            fprintf(stderr, "[gx-census] NEW config #%d hash=%08x stages=%u texgens=%u "
-                    "colchans=%u ztest=%u/%u/func%u zupd=%u blend=%u logic=%u/%u sub=%u "
+            s_census[free_slot].program_id = s_cfg.program_id;
+            fprintf(stderr, "[gx-census] NEW config #%d hash=%08x prog=%u stages=%u texgens=%u "
+                    "colchans=%u ztest=%u/%u/func%u zupd=%u cu=%u/%u blend=%u logic=%u/%u sub=%u "
                     "dither=%u sf=%u df=%u da=%u/%u at=0x%06X",
-                    free_slot, h, s_cfg.numtevstages + 1u, s_cfg.numtexgens,
+                    free_slot, h, s_cfg.program_id, s_cfg.numtevstages + 1u, s_cfg.numtexgens,
                     s_cfg.numcolchans, s_cfg.zt_enable, s_cfg.zt_early, s_cfg.zt_func,
-                    s_zt_upd, s_cfg.bm_blend_enable, s_cfg.bm_logic_enable,
+                    s_zt_upd, s_bm_cu, s_bm_au, s_cfg.bm_blend_enable, s_cfg.bm_logic_enable,
                     s_cfg.bm_logic_mode, s_cfg.bm_subtract, s_cfg.bm_dither,
                     s_cfg.bm_src_factor, s_cfg.bm_dst_factor,
                     s_cfg.da_enable, s_cfg.da_alpha, s_bp[0xF3]);
@@ -5398,6 +5704,16 @@ static void build_draw_cfg(void) {
                         s_cfg.stage[st].enable, s_cfg.stage[st].colorchan);
             fprintf(stderr, "\n");
             fflush(stderr);
+        }
+        if (s_census_cur < 0 && free_slot < 0) {
+            /* Table full and this shape has never been seen: it has no
+             * bucket to tally into. Count it instead of dropping it. */
+            s_census_overflow_draws++;
+            int seen = 0;
+            for (int i = 0; i < s_census_overflow_shapes; i++)
+                if (s_census_overflow_hashes[i] == h) { seen = 1; break; }
+            if (!seen && s_census_overflow_shapes < GX_CENSUS_OVERFLOW_MAX)
+                s_census_overflow_hashes[s_census_overflow_shapes++] = h;
         }
         if (s_census_cur >= 0) s_census[s_census_cur].draws++;
     }
@@ -6403,8 +6719,8 @@ void gx_raster_print_census(void) {
          * per-bucket coverage the task's VERIFY step asks to report: how
          * many of this bucket's shaded pixels took a fused_pixel_A/B/C
          * specialization instead of the general tev_draw(). */
-        fprintf(stderr, " #%d:%08x draws=%llu px=%llu(%.1f%%) fused=%llu(%.1f%%)",
-                i, s_census[i].hash,
+        fprintf(stderr, " #%d:%08x prog=%u draws=%llu px=%llu(%.1f%%) fused=%llu(%.1f%%)",
+                i, s_census[i].hash, s_census[i].program_id,
                 (unsigned long long)s_census[i].draws,
                 (unsigned long long)s_census[i].pixels,
                 100.0 * (double)s_census[i].pixels / (double)total_px,
@@ -6416,6 +6732,12 @@ void gx_raster_print_census(void) {
     fprintf(stderr, " | total_fused=%llu/%llu(%.1f%%)\n",
             (unsigned long long)total_fused, (unsigned long long)total_px,
             100.0 * (double)total_fused / (double)total_px);
+    if (s_census_overflow_draws)
+        fprintf(stderr, "[gx-census] census overflow: %llu draws in %d unseen shapes "
+                "(table has %d slots, all full)%s\n",
+                (unsigned long long)s_census_overflow_draws, s_census_overflow_shapes,
+                GX_CENSUS_MAX,
+                s_census_overflow_shapes >= GX_CENSUS_OVERFLOW_MAX ? " [shape count capped]" : "");
     fflush(stderr);
 }
 
@@ -7506,7 +7828,13 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                         efb_copy_pack(row, x, i, scanY, scanU, scanV);
                 }
             }
+            /* GCN_GX_XFB_HASH=1: feed exactly the bytes this copy just wrote
+             * (src_w*2 valid bytes per row; dest_stride may include padding
+             * the filter never touches) while still holding the writer
+             * guard, then count this copy as one publication. */
+            gcn_gx_xfb_hash_feed(s_cpu->ram + phys, dest_stride, (u32)src_w * 2u, (u32)dst_h);
             gcn_gx_xfb_write_end();
+            gcn_gx_xfb_hash_publish_done();
         }
     } else {
         int left = (int)bits(s_bp[0x49], 0, 10);

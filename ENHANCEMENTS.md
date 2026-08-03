@@ -249,6 +249,62 @@ zero overflow lines, clean TCP `quit`.
 
 Promoted: correctness gates plus a consistent (if small) whole-route win.
 
+## Exercised example: fused/GPU programs Y–AD for dominant WW general shapes (2026-08-03)
+
+`GCN_GX_TEV_CENSUS` (now printing `prog=` per bucket plus overflow
+accounting) attributed 73.3% of the route's shaded pixels to 60
+program-0 ("general") shapes; the top handful were single-stage
+untextured fills. Six programs were added following the T–X template:
+Y(25)/Z(26)/AA(27) as fused CPU+GPU folds (zt off), AB(28)/AC(29)/AD(30)
+GPU-only (zt on; software stays the differential authority). Y and Z
+deliberately do not pin `alpha_update` — the finish helper branches on
+the live flag, absorbing two census-duplicate shape pairs each. All folds
+brute-force verified against the general combiner/blend transcriptions
+(529,153 + 16,777,216 cases, 0 mismatches).
+
+New instrument: `GCN_GX_XFB_HASH=1` chains an FNV-1a-64 over every XFB
+publication (backend-agnostic boundary shared by the software copy and
+the resident materialize path) — the route-level byte-exactness gate this
+file previously lacked.
+
+Runtime fix that fell out of gating: `boot.c` silently discarded a
+nonzero `GCN_MAX_BLOCKS` whenever a debug port or window was active,
+making headed runs unbounded; an explicit budget is now honored
+everywhere (0 still means unbounded).
+
+Corun caught a real GPU bug the offline harness could not: program AB
+(blend disabled, combiner alpha unconditionally 0) was missing from the
+shader's blend-passthrough exception list, so the general alpha-blend
+branch computed `sa=0, da=256` → draw silently became a no-op
+(`gpu=0` vs software color; 34 divergences). Fixed by adding AB to the
+passthrough set. A second real defect fixed en route: corun tile blame
+was recorded before the resident path knew whether the draw actually
+stayed on the GPU. After both fixes: corun over the full bounded route =
+0 divergences in 1005 plane checks.
+
+Evidence (route = true-reset Wind Waker, `GCN_MAX_BLOCKS=110000000`,
+logs in `WindWakerRecomp/captures/perf-fused-20260803/`):
+
+- Census delta: general pixel share 73.3% → 18.3% (139.7M → 34.9M of
+  190.5M px); fused share 23.3% → 63.6%.
+- Byte-exactness: fused vs `GCN_GX_NO_FUSED` XFB chains identical
+  (`ed27f20acbdfe1d0`, 1338 publications), before and after the AB fix.
+- Headless timing (interleaved BASE,CAND,CAND,BASE, true baseline binary
+  rebuilt from HEAD): **neutral** — 80.21s vs 80.15s (0.07%, inside
+  noise). Recorded as a rejection of the headless-throughput claim: that
+  route is CPU-bound and the GX worker savings hide in overlap slack.
+- Headed timing (Vulkan resident active, same interleave, both arms
+  carrying the identical boot.c fix): BASE 94/98s vs CAND 85/88s —
+  **9.9% faster (10.57 → 11.73 fps)**, identical frames/pipe-stats/
+  poison=0 across arms. The win comes from the giant-area draws going
+  GPU-resident (117,273 → 119,550 queued triangles — few draws, ~100M
+  pixels) plus the fused CPU folds accelerating the remaining software
+  raster.
+
+Promoted on: full gate matrix (ctest 12/12, XFB chain equality, corun
+zero-divergence, headed route win) with the headless-neutral result
+retained as a negative datum.
+
 ## Wind Waker performance burndown after this exemplar
 
 The most recent headed title-screen log attributes the urgent work as follows:

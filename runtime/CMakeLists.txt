@@ -408,7 +408,7 @@ if(GCN_WITH_GENERATED)
               ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_draw_f.comp
       DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_draw_f.comp
       VERBATIM
-      COMMENT "Compiling exact GX fused-program A--S compute shader"
+      COMMENT "Compiling exact GX fused-program A--AD compute shader"
     )
     add_custom_target(gcn_gx_shaders DEPENDS ${GX_CLEAR_SPV_INC}
                                               ${GX_XFB_COPY_SPV_INC}
