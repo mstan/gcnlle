@@ -279,7 +279,14 @@ static int s_no_fused = -1;
  * behavior), for the same-binary A/B exactness proof this task's pass C
  * requires. Default (unset, or any other value) is ON. Own lazy -1-sentinel
  * getenv, same pattern as s_no_fused above. */
-static int s_general_tev_off = -1;
+/* GCN_GX_GENERAL_TEV levels (permanent observability/config lever, not
+ * scaffolding -- kept for same-binary A/B perf/exactness comparisons across
+ * phases): 0 = off (today's always-fallback behavior, byte-identical to the
+ * pre-general-TEV binary); 1 = full gate (every phase admitted; opt-in --
+ * measured net wall-time NEGATIVE 2026-08-03, see compute_program_id);
+ * 2 = phase-1a gate only (DEFAULT; fog/CMPR-eligible draws fall back to
+ * software). -1 = unparsed sentinel. */
+static int s_general_tev_level = -1;
 /* Pass D root-cause hunt (docs/GX_GENERAL_TEV.md): permanent, env-armed
  * per-pixel debug dump matching gx_vulkan.c's GENERAL_DEBUG_* / gpu-debug
  * prints (same env var, GCN_GX_GENERAL_DEBUG_XY="x,y"). s_gen_dbg_x/y default
@@ -375,6 +382,9 @@ static inline s32 sext(u32 v, u32 n) {          /* sign-extend n-bit field */
     return (s32)((v ^ m) - m);
 }
 static inline float xf_f(u32 addr) { float f; u32 v = s_xf[addr]; memcpy(&f, &v, 4); return f; }
+/* Phase 1b general TEV fog (docs/GX_GENERAL_TEV.md): exposes the raw XF word
+ * gx_vulkan.c needs to pack vp_wd()'s XF 0x101a for the GPU fog path. */
+u32 gx_raster_xf_word(u32 addr) { return s_xf ? s_xf[addr] : 0u; }
 
 /* big-endian guest-RAM readers */
 static inline float be_f32(const u8* p) {
@@ -4077,7 +4087,7 @@ static void gx_mt_resolve(void) {
     s_mt_threads = n;
 }
 
-/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md) eligibility gate.
+/* General TEV program (docs/GX_GENERAL_TEV.md) eligibility gate.
  * compute_program_id() falls through to program 31 IFF every condition here
  * holds; the shader (gx_draw_f.comp's shade_pixel_general) and the GPU-side
  * texture resolver (gx_vulkan.c's resolve_fused_texture/resolve_texture_unit)
@@ -4086,18 +4096,35 @@ static void gx_mt_resolve(void) {
  * from build_draw_cfg's tail, after s_cfg is fully populated (same call site
  * as every other program-id matcher), so every field read here is already
  * decoded/cached; only fog/ztex (not otherwise cached in DrawCfg) come from
- * a direct s_bp read. One comment per condition. */
-static int general_tev_eligible(void) {
+ * a direct s_bp read. One comment per condition.
+ *
+ * `level` (GCN_GX_GENERAL_TEV, see s_general_tev_level's comment): 1 admits
+ * everything below; 2 additionally requires fog disabled (fsel==0) and
+ * excludes CMPR, i.e. exactly the phase-1a gate -- a same-binary lever to
+ * isolate phase 1b's (fog+CMPR) wall-time/GEN-share contribution from phase
+ * 1a's, without needing a separate build. */
+static int general_tev_eligible(int level) {
     /* pixel format: same rule as programs 1..30 -- the shader's get_abgr
      * (gx_draw_f.comp) only decodes RGB8_Z24/RGBA6_Z24. */
     if (s_pf != PF_RGB8_Z24 && s_pf != PF_RGBA6_Z24)
         return 0;
 
-    /* no fog: BP 0xF1 bits 21-23 (fsel) must be the disabled value 0.
-     * tev_draw always runs apply_fog (gx_raster.c:1886-1935);
-     * shade_pixel_general never does. */
-    if (bits(s_bp[0xF1], 21, 3) != 0u)
-        return 0;
+    /* fog: BP 0xF1 bits 21-23 (fsel), a 3-bit field. apply_fog
+     * (gx_raster.c:1926-1996) traps (invalid fog type) ONLY for fsel 1/3 --
+     * `if (fsel != 2u && fsel < 4u) TRAP(...)` explicitly exempts fsel==2
+     * from that trap, and fsel>=4 never reaches it either. Every other
+     * value shades something real: 0=disabled (apply_fog returns
+     * immediately, a no-op we still admit since the gate only needs "won't
+     * trap"), 2=linear (falls through the switch's `default: break;`, no
+     * exp2 transform), 4-7=the exp2-family perspective/orthographic types.
+     * Porting fsel 1/3 would be porting a software TRAP, not a feature, so
+     * they stay ineligible. Level 2 (phase-1a-only) narrows this further to
+     * fsel==0 -- fog itself is phase 1b's addition. */
+    { u32 fsel = bits(s_bp[0xF1], 21, 3);
+      if (fsel == 1u || fsel == 3u)
+          return 0;
+      if (level >= 2 && fsel != 0u)
+          return 0; }
 
     /* no z-texture: BP 0xF5 bits 2-3 (ztex2 op) must be disabled (0) -- the
      * only case ztexture_depth (gx_raster.c:1857-1864) doesn't derive the
@@ -4156,7 +4183,9 @@ static int general_tev_eligible(void) {
         int fmt_ok = tc->fmt == TEXFMT_I4 || tc->fmt == TEXFMT_I8 ||
                      tc->fmt == TEXFMT_IA4 || tc->fmt == TEXFMT_IA8 ||
                      tc->fmt == TEXFMT_RGB5A3 || tc->fmt == TEXFMT_RGBA8 ||
-                     tc->fmt == TEXFMT_C4 || tc->fmt == TEXFMT_C8;
+                     tc->fmt == TEXFMT_C4 || tc->fmt == TEXFMT_C8 ||
+                     /* CMPR is phase 1b -- excluded at level 2 (phase-1a-only). */
+                     (level < 2 && tc->fmt == TEXFMT_CMPR);
         if (!fmt_ok || tc->mipmap_filter != 0u)
             return 0;
     }
@@ -4194,15 +4223,22 @@ static u32 compute_program_id(void) {
     if (!s_cfg.fused && gpu_program_AB_match()) return 28;
     if (!s_cfg.fused && gpu_program_AC_match()) return 29;
     if (!s_cfg.fused && gpu_program_AD_match()) return 30;
-    /* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): every draw that
-     * didn't match one of the exact per-shape signatures above falls
-     * through here. GCN_GX_GENERAL_TEV=0 forces the pre-existing
-     * always-fallback behavior (id 0) for the same-binary A/B exactness
-     * proof; default is ON. */
-    if (s_general_tev_off < 0)
-        s_general_tev_off = getenv("GCN_GX_GENERAL_TEV") &&
-                            !strcmp(getenv("GCN_GX_GENERAL_TEV"), "0");
-    if (!s_general_tev_off && general_tev_eligible())
+    /* General TEV program (docs/GX_GENERAL_TEV.md): every draw that didn't
+     * match one of the exact per-shape signatures above falls through here.
+     * GCN_GX_GENERAL_TEV selects the level (see s_general_tev_level's
+     * comment). Default (unset or unrecognized) is level 2, NOT 1: the
+     * 2026-08-03 interleaved A/B measured level 1 (fog/CMPR residency) at
+     * a consistent ~12-13% route wall REGRESSION (median 29.44s vs 25.69s,
+     * 3 pairs) -- the ~124K extra tiny GPU triangles cost more dispatch
+     * than the saved synchronizations recover until a draw-batching pass
+     * exists. Level 1 stays fully exactness-verified (chain golden, corun
+     * 0/route, differential 2000/2000) and available as an opt-in. */
+    if (s_general_tev_level < 0) {
+        const char* e = getenv("GCN_GX_GENERAL_TEV");
+        s_general_tev_level = (e && !strcmp(e, "0")) ? 0 :
+                              (e && !strcmp(e, "1")) ? 1 : 2;
+    }
+    if (s_general_tev_level != 0 && general_tev_eligible(s_general_tev_level))
         return 31;
     return 0;
 }
