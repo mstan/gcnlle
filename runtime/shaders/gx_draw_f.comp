@@ -467,7 +467,11 @@ void main() {
     uint count = job.words[draw_push.tile_header_base + tile * 2u + 1u];
     for (uint i = 0u; i < count; ++i) {
         uint packet = job.words[draw_push.tile_index_base + first + i];
-        current_word_base = draw_push.word_base + packet * 128u;
+        /* Phase 1a (docs/GX_GENERAL_TEV.md): packet stride grown 128->256
+         * words (DRAW_PACKET_BYTES 512->1024 in gx_vulkan.c). Words 0..111
+         * keep their exact prior meaning; 112..255 are the new general
+         * block, not yet read by any shader path (id 31 unclassified). */
+        current_word_base = draw_push.word_base + packet * 256u;
         shade_pixel(x, y);
     }
 }
