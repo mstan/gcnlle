@@ -14,6 +14,8 @@
  * suppress the duplicate inline helper definitions in this translation unit. */
 #define DOLRECOMP_TYPES_H
 #include "backend/ppc_cycles.h"
+#include "cpu/native_code.h"
+#include "cpu/title_module.h"
 #include "debug/rings.h"
 #include "frontend/decoder.h"
 #include "memory/memory.h"
@@ -915,6 +917,142 @@ static u32 integer_record_value(const CPUState* cpu, const PPCInst* in) {
     }
 }
 
+/* --- interpreter-side batching of counted cache-maintenance loops ---
+ *
+ * BS1's post-DMA I/D-cache flush is the classic 3-instruction PowerPC idiom:
+ *     loop:  <cache-op> 0,rX     ; icbi/dcbi/dcbf/dcbst/dcbtst/dcbt
+ *            addi       rX,rX,32 ; advance one cache line
+ *            bdnz       loop     ; BO=0x10 (ignore CR), branch back -8
+ * Content validation correctly routes this to the interpreter (the AOT
+ * snapshot has stale bytes at a DYNAMICALLY-WRITTEN address), but that means
+ * paying dispatch.c's full per-block round trip (device ticks, ring log,
+ * debug-server pump gate, ...) three times per iteration -- 622,592 times
+ * for BS1's icbi cluster alone (ctr=0x8000, 19 invocations), and 121,487
+ * times for its dcbi cluster. This recognizer closes the whole loop (or as
+ * much of it as the cycle quantum allows) in one interpreter call: identical
+ * final GPR/CTR, identical cycle charge (per-iteration cost taken straight
+ * from dr_ppc_num_cycles(), summed exactly -- never re-derived or estimated),
+ * and identical cache-invalidation side effects. gcn_native_code_invalidate
+ * and gcn_title_module_icbi already expose a RANGE api that is a monotonic
+ * set-union over pages/chunks (native_code.c's bitmap only counts a page
+ * once no matter how many overlapping calls set it; aot_module.c's
+ * gcn_aot_module_invalidate unions overlapping chunks the same way) -- so
+ * one call over [start, start+32*K) invalidates exactly the set N per-line
+ * calls would have.
+ *
+ * Recognized ONLY on the DECODED INSTRUCTION SHAPE (cache-op class + a
+ * self-incrementing addi-by-32 on the cache-op's index register + a
+ * bdnz-always branch back to the cache-op), never on PC -- any future title
+ * that hits the same idiom at a different address is covered automatically.
+ *
+ * Exactness / safety gates (fall through to the ordinary one-instruction
+ * path -- byte-identical to before this existed -- the instant any of these
+ * doesn't hold):
+ *   - gcn_interpreter_set_cache_loop_batch_enabled(false): dispatch.c calls
+ *     this with GCN_COSIM's enabled state each block (cosim grants exactly
+ *     one retired instruction per budget and would desync if a whole loop
+ *     retired at once). interpreter.c has no debug_server.c dependency of
+ *     its own -- gcn_runtime_core stays link-complete without the TCP/device
+ *     sources gcn_boot adds -- so the caller pushes the decision down instead
+ *     of this file pulling debug_server.c in;
+ *   - never while MSR[EE] is set: both external (pi.c) and decrementer
+ *     (cpu_glue.c) delivery gate on MSR[EE], so with EE clear neither check
+ *     could have fired at ANY of the per-block boundaries this batch skips,
+ *     batched or not -- there is nothing to miss;
+ *   - never past cpu->cycle_deadline: the same quantum discipline as the
+ *     generated-code taken-backward-branch peephole (dispatch.c's deadline
+ *     yield). A real deadline expiry still yields back to dispatch.c's
+ *     per-block device tick / interrupt check exactly where the unbatched
+ *     path would have -- we just don't pay 3*(iterations before the
+ *     deadline) separate round trips to discover that.
+ */
+static bool s_cache_loop_batch_enabled = true;
+
+/* dispatch.c calls this once per block with !gcn_debug_server_cosim_enabled()
+ * (production); tests call it directly to run the same synthetic loop both
+ * batched and unbatched and diff the resulting GPR/CTR/cycles/invalidation
+ * state for exactness. Defaults to enabled. */
+void gcn_interpreter_set_cache_loop_batch_enabled(bool enabled) {
+    s_cache_loop_batch_enabled = enabled;
+}
+
+static bool try_batch_cache_loop(CPUState* cpu, const PPCInst* in, u32 cia) {
+    if (!s_cache_loop_batch_enabled)
+        return false;
+    switch (in->op) {
+    case PPC_OP_ICBI: case PPC_OP_DCBI: case PPC_OP_DCBF:
+    case PPC_OP_DCBST: case PPC_OP_DCBTST: case PPC_OP_DCBT:
+        break;
+    default:
+        return false;
+    }
+    if (cpu->exception)
+        return false;
+    if (cpu->msr & 0x00008000u)          /* MSR[EE] (PPC bit 16) */
+        return false;
+
+    const u32 raw2 = mem_read32(cpu, cia + 4u, cia + 4u);
+    PPCInst in2 = ppc_decode(raw2, cia + 4u);
+    if (in2.op != PPC_OP_ADDI)
+        return false;
+    if (in2.rD != in2.rA || in2.rD != in->rB)   /* addi rX,rX,32; rX == cache-op's index reg */
+        return false;
+    if ((s32)in2.simm != 32)
+        return false;
+    if (in->rA != 0u && in->rA == in->rB)       /* base register must stay constant */
+        return false;
+
+    const u32 raw3 = mem_read32(cpu, cia + 8u, cia + 8u);
+    PPCInst in3 = ppc_decode(raw3, cia + 8u);
+    if (in3.op != PPC_OP_BC)
+        return false;
+    if (in3.bo != 0x10u || in3.lk)              /* bdnz, ignore CR, always, no link */
+        return false;
+    if (in3.branch_target != cia)               /* must close back onto the cache-op */
+        return false;
+
+    const u32 idx_reg = in->rB;
+    const u32 ctr = cpu->ctr;
+    const u64 iters_to_exit = ctr == 0u ? 0x100000000ULL : (u64)ctr;
+
+    const u64 per_iter = (u64)dr_ppc_num_cycles(in->op) +
+                          (u64)dr_ppc_num_cycles(PPC_OP_ADDI) +
+                          (u64)dr_ppc_num_cycles(PPC_OP_BC);
+    const u64 budget_cycles = cpu->cycle_deadline > cpu->cycles ?
+                               cpu->cycle_deadline - cpu->cycles : 0u;
+    const u64 budget_iters = budget_cycles / per_iter;
+    const u64 k = iters_to_exit < budget_iters ? iters_to_exit : budget_iters;
+    if (k == 0u)
+        return false;   /* not even one full iteration fits the remaining
+                          * quantum -- let the ordinary single-instruction
+                          * path run this one, identical to unbatched. */
+
+    if (in->op == PPC_OP_ICBI) {
+        const u32 base_ea = in->rA ? cpu->gpr[in->rA] : 0u;
+        const u32 start_addr = base_ea + cpu->gpr[idx_reg];
+        const u32 range = (u32)(k * 32ull);
+        gcn_native_code_invalidate(start_addr & ~31u, range);
+        gcn_title_module_icbi(start_addr & ~31u, range);
+    }
+    /* dcbi/dcbf/dcbst/dcbtst/dcbt are architectural hints with no modeled
+     * side effect in this interpreter (see the no-op case in
+     * execute_integer's ICBI/DCB* switch) -- nothing else to replay. */
+
+    cpu->gpr[idx_reg] += (u32)(k * 32ull);
+    cpu->ctr = (u32)(ctr - (u32)k);
+    cpu->cycles += per_iter * k;
+    cpu->pc = (k == iters_to_exit) ? cia + 12u /* branch falls through */
+                                    : cia;      /* deadline hit mid-loop */
+
+    /* One retired *step*, not 3*k instructions: the batched iterations never
+     * call gcn_interpreter_step, so this total legitimately reads lower than
+     * an unbatched run over the same guest execution -- expected, not a bug
+     * (see the M2 census comparison in the task notes). */
+    s_instruction_count++;
+    note_edge(cia, cpu->pc, cpu->cycles);
+    return true;
+}
+
 int gcn_interpreter_step(CPUState* cpu) {
     const u32 cia = cpu->pc;
     const u32 raw = mem_read32(cpu, cia, cia);
@@ -926,6 +1064,8 @@ int gcn_interpreter_step(CPUState* cpu) {
         cpu->halt_reason = GCN_HALT_INTERPRETER_UNSUPPORTED;
         return 0;
     }
+    if (try_batch_cache_loop(cpu, &in, cia))
+        return 1;
     if (is_fp_op(in.op) && !(cpu->msr & MSR_FP)) {
         ppc_fp_unavailable(cpu, cia);
         cpu->cycles += dr_ppc_num_cycles(in.op);
