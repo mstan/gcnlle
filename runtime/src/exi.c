@@ -8,6 +8,7 @@
  */
 #include "exi/exi.h"
 #include "memory/memory.h"
+#include "cpu/native_code.h"
 #include "debug/rings.h"
 #include "descramble_core.h"   /* tools/ipl_descramble — vendored segher descrambler,
                                   transcribed verbatim (see gcn_exi_set_rom_scrambled) */
@@ -392,6 +393,9 @@ static int memcard_transfer(GcnExi* exi, CPUState* cpu, u32 ch, u32 rw, bool dma
             } else {
                 gcn_ring_watch_check_span(guest, n, 0xEC1EC100u); /* [gcn-watch] */
                 gcn_memcard_dma_read(mc, p, n);
+                /* Device write to RAM: dirty the miss-CRC identity only
+                 * (icbi convention -- see gcn_native_code_content_dirty). */
+                gcn_native_code_content_dirty(guest, n);
             }
         }
     } else if (rw == 1u) {                 /* immediate WRITE: CPU -> card */

@@ -180,6 +180,13 @@ add_executable(test_cache_loop_batch tests/test_cache_loop_batch.c)
 target_link_libraries(test_cache_loop_batch PRIVATE gcn_runtime_core)
 add_test(NAME cache_loop_batch_exactness COMMAND test_cache_loop_batch)
 
+# Native-miss page-CRC memo: duplicate misses on an unchanged page reuse the
+# cached identity; any writer through the gcn_native_code_invalidate funnel
+# (store/DMA/icbi) forces a rehash with unchanged identity semantics.
+add_executable(test_page_crc_memo tests/test_page_crc_memo.c)
+target_link_libraries(test_page_crc_memo PRIVATE gcn_runtime_core)
+add_test(NAME page_crc_memo_identity COMMAND test_page_crc_memo)
+
 add_executable(gcn_memcard_inspect tools/memcard_inspect.c src/memcard_image.c)
 target_include_directories(gcn_memcard_inspect PRIVATE include)
 

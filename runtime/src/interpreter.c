@@ -119,6 +119,81 @@ static const u8* executable_page(CPUState* cpu, u32 pc, u32* page_out) {
     return NULL;
 }
 
+/* --- native-miss page-CRC memo --------------------------------------
+ *
+ * The miss identity key is (pc, page CRC): the CRC distinguishes different
+ * dynamically-written code that lands at the same pc. Recomputing a 4 KiB
+ * CRC32 on EVERY miss made duplicate misses in interpreted hot loops cost
+ * ~35K host cycles each (the 2026-08-03 WW route census attributed 27.2% of
+ * all pc-attributed cycles to the three blocks of one dynamically-written
+ * icbi loop at 0x812FFF80, almost all of it this hash). A page's content can
+ * only change through the gcn_native_code_invalidate funnel (guest stores
+ * via memory.c, device DMA, icbi via cpu_glue.c and the batch fast path), so
+ * native_code.c keeps a read-and-clear per-page staleness bit set in that
+ * same funnel and the CRC is recomputed exactly when a recompute could
+ * return a different value -- identical identity semantics, no per-duplicate
+ * hashing. ROM-window pages are immutable once loaded: seen-only memo.
+ *
+ * DELIBERATE identity refinement: plain loads/stores emitted by the
+ * recompiler are inlined (generated_abi.h dolrecomp_mem_write*_fast) and do
+ * NOT pass the funnel -- exactly as they do not touch the native-code fence.
+ * A page identity therefore refreshes at icache-relevant boundaries (icbi,
+ * dcbz, string/multiple/atomic stores, interpreted stores, DMA and device
+ * RAM writes), not on every data store into a mixed code/data page. On the
+ * WW route this drops ~3,900 junk (pc, crc) identities minted purely by
+ * low-mem/heap data churn between misses, while the distinct missed-pc set
+ * and every icbi-delimited code state stay bit-identical (verified
+ * 2026-08-03: golden XFB chain unchanged, missed-pc sets equal). Guest code
+ * written by plain stores and executed WITHOUT icbi keeps its old identity
+ * here for the same reason it keeps executing stale native code: the
+ * runtime models the un-invalidated icache, consistently. */
+#define CRC_RAM_PAGE_CAP (GC_MAIN_RAM_SIZE / PAGE_SIZE)
+#define CRC_ROM_PAGE_CAP 1024u
+static u32 s_page_crc[CRC_RAM_PAGE_CAP];
+static u8 s_page_crc_seen[(CRC_RAM_PAGE_CAP + 7u) / 8u];
+static u32 s_rom_page_crc[CRC_ROM_PAGE_CAP];
+static u8 s_rom_page_crc_seen[(CRC_ROM_PAGE_CAP + 7u) / 8u];
+static u64 s_page_crc_recomputes;
+
+u64 gcn_interpreter_page_crc_recomputes(void) {
+    return s_page_crc_recomputes;
+}
+
+static u32 miss_page_crc(CPUState* cpu, u32 pc, const u8* bytes) {
+    if (!bytes)
+        return 0u;
+    u32 phys = pc & 0x1FFFFFFFu;
+    if (phys < cpu->ram_size) {          /* executable_page's RAM branch */
+        u32 pidx = phys / PAGE_SIZE;
+        u8 mask = (u8)(1u << (pidx & 7u));
+        /* take FIRST: the read-and-clear must happen even when the page has
+         * never been seen, so a pre-set stale bit doesn't linger. */
+        bool stale = gcn_native_code_page_content_stale_take(pc);
+        if (!stale && pidx < CRC_RAM_PAGE_CAP &&
+            (s_page_crc_seen[pidx >> 3] & mask))
+            return s_page_crc[pidx];
+        u32 crc = gcn_crc32(bytes, PAGE_SIZE);
+        s_page_crc_recomputes++;
+        if (pidx < CRC_RAM_PAGE_CAP) {
+            s_page_crc[pidx] = crc;
+            s_page_crc_seen[pidx >> 3] |= mask;
+        }
+        return crc;
+    }
+    /* executable_page's ROM-window branch */
+    u32 pidx = (pc - GCN_ROM_WINDOW_BASE) / PAGE_SIZE;
+    u8 mask = (u8)(1u << (pidx & 7u));
+    if (pidx < CRC_ROM_PAGE_CAP && (s_rom_page_crc_seen[pidx >> 3] & mask))
+        return s_rom_page_crc[pidx];
+    u32 crc = gcn_crc32(bytes, PAGE_SIZE);
+    s_page_crc_recomputes++;
+    if (pidx < CRC_ROM_PAGE_CAP) {
+        s_rom_page_crc[pidx] = crc;
+        s_rom_page_crc_seen[pidx >> 3] |= mask;
+    }
+    return crc;
+}
+
 static void write_page_blob(u32 page, u32 crc, const u8* bytes) {
     if (!bytes || !s_blob_dir[0])
         return;
@@ -146,7 +221,7 @@ int gcn_interpreter_note_native_miss(CPUState* cpu) {
     capture_init();
     u32 page = 0;
     const u8* bytes = executable_page(cpu, cpu->pc, &page);
-    u32 crc = bytes ? gcn_crc32(bytes, PAGE_SIZE) : 0u;
+    u32 crc = miss_page_crc(cpu, cpu->pc, bytes);
     u32 slot = hash_pair(cpu->pc, crc) & (MISS_CAP - 1u);
     for (u32 probe = 0; probe < MISS_CAP; probe++) {
         MissKey* key = &s_misses[(slot + probe) & (MISS_CAP - 1u)];

@@ -10,6 +10,16 @@
 static u8 s_invalid[(GCN_MEM1_PAGE_COUNT + 7u) / 8u];
 static u32 s_invalid_count;
 
+/* Content-staleness companion to s_invalid, consumed by interpreter.c's
+ * native-miss page-CRC memo. A page's CRC identity can only change through
+ * the same funnel that invalidates native code (guest stores via memory.c,
+ * device DMA, icbi via cpu_glue.c / the interpreter batch path), so setting
+ * a bit here in the same loop lets the miss path reuse its cached CRC until
+ * the page could actually have changed -- identical identity semantics to
+ * recomputing the CRC on every miss, without hashing 4 KiB per duplicate.
+ * Unlike s_invalid (monotonic until reset), these bits are read-and-clear. */
+static u8 s_content_stale[(GCN_MEM1_PAGE_COUNT + 7u) / 8u];
+
 static bool mem1_offset(u32 address, u32* offset) {
     if (address < GC_MAIN_RAM_SIZE) {
         *offset = address;
@@ -31,6 +41,10 @@ static bool mem1_offset(u32 address, u32* offset) {
 void gcn_native_code_reset(void) {
     memset(s_invalid, 0, sizeof s_invalid);
     s_invalid_count = 0;
+    /* All-stale, not all-clean: interpreter.c may hold CRCs cached from
+     * before the reset, and reset means the backing bytes are about to be
+     * repopulated. */
+    memset(s_content_stale, 0xFF, sizeof s_content_stale);
 }
 
 void gcn_native_code_invalidate(u32 address, u32 size) {
@@ -50,7 +64,35 @@ void gcn_native_code_invalidate(u32 address, u32 size) {
             *byte |= mask;
             s_invalid_count++;
         }
+        s_content_stale[page >> 3] |= mask;
     }
+}
+
+void gcn_native_code_content_dirty(u32 address, u32 size) {
+    u32 offset;
+    if (!size || !mem1_offset(address, &offset))
+        return;
+    u64 end = (u64)offset + size;
+    if (end > GC_MAIN_RAM_SIZE)
+        end = GC_MAIN_RAM_SIZE;
+    u32 first = offset >> GCN_CODE_PAGE_SHIFT;
+    u32 last = (u32)(end - 1u) >> GCN_CODE_PAGE_SHIFT;
+    for (u32 page = first; page <= last; page++)
+        s_content_stale[page >> 3] |= (u8)(1u << (page & 7u));
+}
+
+bool gcn_native_code_page_content_stale_take(u32 pc) {
+    u32 offset;
+    if (!mem1_offset(pc, &offset))
+        return true;   /* outside MEM1: no staleness tracking, always stale */
+    u32 page = offset >> GCN_CODE_PAGE_SHIFT;
+    u8 mask = (u8)(1u << (page & 7u));
+    u8* byte = &s_content_stale[page >> 3];
+    if (*byte & mask) {
+        *byte &= (u8)~mask;
+        return true;
+    }
+    return false;
 }
 
 bool gcn_native_code_is_invalid(u32 pc) {

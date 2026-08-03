@@ -15,6 +15,7 @@
  */
 #include "dsp/dsp.h"
 #include "dsp_lle_c.h"
+#include "cpu/native_code.h"
 #include "debug/rings.h"
 
 #include <stdlib.h>
@@ -439,6 +440,11 @@ static void aram_dma_kick(GcnDsp* dsp, CPUState* cpu) {
             memcpy(aram + araddr, cpu->ram + mmaddr, len);
         } else {
             gcn_ring_watch_check_span(mmaddr, len, 0xD5BD5B00u); /* [gcn-watch] */
+            /* ARAM->MEM1 DMA rewrites guest RAM outside the memory.c store
+             * helpers. Content-dirty only (miss-CRC identity): architecturally
+             * the icache still holds the old lines until the guest icbi's the
+             * range, same convention as dcbz / gather-pipe / GX RAM writes. */
+            gcn_native_code_content_dirty(mmaddr, len);
             memcpy(cpu->ram + mmaddr, aram + araddr, len);
         }
     }

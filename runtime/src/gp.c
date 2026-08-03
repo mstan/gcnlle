@@ -7,6 +7,7 @@
  */
 #include "gp/gp.h"
 #include "gx/gx.h"         /* gcn_gx_pipeline_drain — fifo-reset join (G3) */
+#include "cpu/native_code.h"
 #include "debug/rings.h"
 
 #include <stdio.h>
@@ -53,6 +54,9 @@ static void gp_flush_burst(GcnGp* gp, CPUState* cpu) {
     if (cpu && cpu->ram && (u64)phys + GCN_GP_GATHER_SIZE <= (u64)cpu->ram_size) {
         gcn_ring_watch_check_span(phys, GCN_GP_GATHER_SIZE, 0x6A6A6A00u); /* [gcn-watch] */
         memcpy(cpu->ram + phys, gp->stage, GCN_GP_GATHER_SIZE);
+        /* Device write to RAM: dirty the miss-CRC identity only (the guest
+         * must icbi before executing gather-written bytes). */
+        gcn_native_code_content_dirty(phys, GCN_GP_GATHER_SIZE);
     } else {
         static int warned = 0;
         if (!warned) {
