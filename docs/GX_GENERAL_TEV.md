@@ -97,11 +97,33 @@ gx_raster.c:1176-1329) in the same phase; same for RGB565/RGB5A3/IA8 if
 they appear. CI/palette formats need a TLUT upload path — defer unless
 the census says otherwise.
 
-### Out of scope, phase 1 (keep falling back)
+### Measured verdict (census extension, 2026-08-03, route @3b58247)
 
-Indirect stages, fog, z-textures, mipmapped textures, >2 texgens,
-CI/palette textures (pending census), EFB pixel formats the GPU model
-lacks. Each remains a loud per-draw fallback with its census bucket.
+The eligibility census reshaped the phasing:
+
+- Phase-1 gate (no indirect/fog/ztex/mip, ≤2 texgens) covers **78.00% of
+  prog=0 pixels but only 4,362 of ~565K prog=0 draws (0.77%)** — the
+  eligible draws are the giant fills. The per-draw sync burden lives
+  almost entirely in **fog draws (560,658 draws, 21.12% of pixels)**.
+- **All CMPR pixel weight is fog-gated** (19.07% of prog=0 px, 0% of it
+  phase-1-eligible): a CMPR decoder buys nothing until fog ships.
+- Palette format C8 is the 4th-largest eligible format (6.63%) — TLUT
+  upload is IN phase 1a, not deferred.
+- Formats in eligible buckets: {RGBA8, IA8, I4, C8, IA4, RGB5A3, C4, I8}
+  = the full 78% (RGBA8+IA8+I4+C8 alone = 75.13%).
+- ztex: 0.88% (one draw); indirect: 0 px; texgens>2: ~0%; mip: 2.41%.
+
+### Phasing (revised on the measurement)
+
+- **Phase 1a** (pixels): general combiner/alpha-test/blend/logic/dither/
+  ztest, ≤2 texgens, formats {RGBA8, IA8, I4, C8, IA4, RGB5A3, C4, I8}
+  with a TLUT upload path for C4/C8. Target: 78% of software pixels.
+- **Phase 1b** (syncs): fog — a bit-exact port of `apply_fog`
+  (gx_raster.c:1866-1935) incl. range-adjust table — plus a CMPR
+  decoder. Target: the ~560K fog-draw syncs + remaining ~21% of pixels.
+- **Phase 2+**: mip sampling, z-texture, indirect stages + bump-alpha
+  ras channels, >2 texgens. Each remains a loud per-draw fallback with
+  its census bucket until moved.
 
 ## Verification (all mandatory before promotion)
 
