@@ -341,6 +341,40 @@ Evidence (same env both arms, uniform route, stats+toppc+journal on):
   reuse, store/dcbz/icbi/reset staleness, neighbor-page isolation, and
   that dcbz dirties identity without touching the native fence).
 
+## Exercised example: general TEV program phases 1a/1b (2026-08-03)
+
+Five audited passes (docs/GX_GENERAL_TEV.md is the spec; 0f20e67,
+ecd1e10, 11ae141, c6af812): draw packet 128→272 words packing raw BP
+windows; a full general TEV pixel pipeline in gx_draw_f.comp (program
+31) transcribed function-for-function from gx_raster.c and brute-force
+verified (~1.05B combiner/blend cases + 199M fog cases, 0 mismatches);
+eligibility gate + 3-level GCN_GX_GENERAL_TEV lever; two texture slots,
+8 formats + TLUT arena + CMPR.
+
+Hard-won exactness facts (now standing rules):
+- **Vulkan FDiv is ~2.5 ULP; x86 divss is correctly rounded.** A 1-ULP
+  reciprocal difference flipped an s17.7 texel index and moved the XFB
+  chain. exact_rcp/exact_div (Newton+Markstein on `precise fma()`,
+  correctly rounded by construction) back EVERY GPU divide that mirrors
+  a CPU divide, including long-shipped programs' texture_uv(). Use them
+  for any future GPU float path.
+- Permanent GCN_GX_GENERAL_DEBUG_XY="x,y" instrumentation dumps matched
+  CPU/GPU per-pixel intermediates (bit patterns) — this is how the ULP
+  bug was pinned in one pass instead of guessed at.
+- The differential/validate knobs are a no-op in resident mode without
+  GCN_GX_BACKEND=vulkan-shadow.
+
+Measured outcomes (fixed 110M-block headed route):
+- Phase 1a (default): fallbacks 538,901 → 535,166, wall 30.5s → 25.9s,
+  chain golden at every knob level, corun 1118 plane checks / 0.
+- Phase 1b (fog+CMPR): exact (all gates green) but a consistent
+  ~12-13% wall REGRESSION when resident (interleaved 6-run A/B, median
+  29.44s vs 25.69s): ~124K extra tiny GPU triangles cost more dispatch
+  than their saved synchronizations recover. Shipped opt-in (level 1),
+  default stays at the phase-1a gate (level 2). Recorded as the
+  motivating datum for a resident tiny-draw batching pass — the next
+  designed lever; revisit the default when it lands.
+
 ## Wind Waker performance burndown after this exemplar
 
 The most recent headed title-screen log attributes the urgent work as follows:
