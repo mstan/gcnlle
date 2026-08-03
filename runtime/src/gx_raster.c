@@ -9,6 +9,7 @@
  */
 #include "gx/gx_raster.h"
 #include "gx/gx.h"       /* gcn_gx_tmem() — TLUT reads for paletted textures */
+#include "cpu/native_code.h"   /* content_dirty — XFB/EFB->RAM copy writes */
 
 #include <math.h>
 #include <stdarg.h>
@@ -8210,6 +8211,9 @@ void gx_raster_efb_copy(const GxCpState* cp) {
              * the filter never touches) while still holding the writer
              * guard, then count this copy as one publication. */
             gcn_gx_xfb_hash_feed(s_cpu->ram + phys, dest_stride, (u32)src_w * 2u, (u32)dst_h);
+            /* Device write to RAM: dirty the miss-CRC identity over the
+             * whole copied span (conservatively including stride padding). */
+            gcn_native_code_content_dirty(phys, (u32)((u64)dst_h * dest_stride));
             gcn_gx_xfb_write_end();
             gcn_gx_xfb_hash_publish_done();
         }
@@ -8266,6 +8270,8 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                         wab, wcde, wfg, copy_getpx);
                 }
             }
+            /* Device write to RAM (see the XFB copy above). */
+            gcn_native_code_content_dirty(phys, (u32)(last - phys));
         }
     }
 

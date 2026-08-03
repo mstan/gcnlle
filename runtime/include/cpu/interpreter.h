@@ -21,6 +21,11 @@ void gcn_interpreter_shutdown(void);
 u64  gcn_interpreter_instruction_count(void);
 u64  gcn_interpreter_unique_miss_count(void);
 
+/* Observability: how many times the native-miss page-CRC memo actually
+ * hashed a page (vs. served a cached identity). See miss_page_crc
+ * (interpreter.c) for the memo's exactness contract. */
+u64  gcn_interpreter_page_crc_recomputes(void);
+
 /* Test-only: force the counted-cache-loop batching fast path (interpreter.c)
  * on or off so a test can diff batched vs. unbatched execution of the same
  * synthetic loop. Defaults to enabled; production code never calls this. */

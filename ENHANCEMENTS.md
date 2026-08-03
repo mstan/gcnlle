@@ -305,6 +305,42 @@ Promoted on: full gate matrix (ctest 12/12, XFB chain equality, corun
 zero-divergence, headed route win) with the headless-neutral result
 retained as a negative datum.
 
+## Exercised example: native-miss page-CRC memo (2026-08-03)
+
+`GCN_DISPATCH_TOPPC` on the uniform 110M-block WW route attributed 27.2%
+of all pc-attributed cycles to the three blocks of one dynamically-written
+icbi flush loop at `0x812FFF80` (~35K host cycles per block entry, 622,592
+entries per PC). The interpreter batching shipped at fa9c162 never fires in
+uniform mode (the pre-expired `cycle_deadline` zeroes its budget), but the
+cost wasn't the loop at all: `gcn_interpreter_note_native_miss` recomputed
+a full 4 KiB page CRC32 on EVERY native miss — the dedup key is (pc, crc) —
+so every interpreted-fallback block on the route paid ~33K cycles of
+hashing before executing one instruction.
+
+Fix: `native_code.c` keeps a read-and-clear per-page content-staleness
+bitmap fed by the existing invalidation funnel plus a new
+`gcn_native_code_content_dirty` entry point for writers that change bytes
+without touching the icache fence (dcbz's zeroing store, gather-pipe
+redirect bursts, GX XFB/EFB→RAM copies, ARAM→MEM1 and EXI memcard DMA).
+`interpreter.c` memoizes the page CRC and rehashes only on staleness;
+ROM-window pages are seen-once. Identity semantics are deliberately
+icache-coherent: plain inlined guest stores refresh neither the native
+fence nor the identity (see the `miss_page_crc` comment for the full
+contract).
+
+Evidence (same env both arms, uniform route, stats+toppc+journal on):
+
+- Wall: **94.66s → 33.39s (−64.7%)**; block-exec dispatch share
+  73.5% → 27.4%; the icbi cluster 27.2% → 5.0% of pc-attributed cycles.
+- Byte-exactness: golden XFB chain `ed27f20acbdfe1d0`, 1338 publications,
+  1015 frames, poison=0 — identical before/after.
+- Identity: distinct missed-pc sets bit-identical; ~3,900 baseline-only
+  (pc, crc) variants were pure low-mem/heap data churn between misses
+  (junk identities the memo intentionally stops minting).
+- Tests: runtime ctest 14/14 (new `page_crc_memo_identity` covers memo
+  reuse, store/dcbz/icbi/reset staleness, neighbor-page isolation, and
+  that dcbz dirties identity without touching the native fence).
+
 ## Wind Waker performance burndown after this exemplar
 
 The most recent headed title-screen log attributes the urgent work as follows:

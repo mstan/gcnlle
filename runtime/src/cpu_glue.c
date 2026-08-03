@@ -435,6 +435,9 @@ void ppc_dcbz(CPUState* cpu, u32 ea, u32 cia) {
             ((cpu->reserve_addr ^ block) & ~31u) == 0u)
             cpu->reserve_valid = false;
         memset(host, 0, 32u);
+        /* Content changed, icache untouched (see above) -- dirty only the
+         * miss-CRC identity, never the native-dispatch fence. */
+        gcn_native_code_content_dirty(block, 32u);
         return;
     }
     /* Preserve the existing exception/MMIO behavior for a non-RAM effective
