@@ -113,6 +113,17 @@ void gcn_gx_xfb_read_end(void);
 void gcn_gx_xfb_write_begin(void);
 void gcn_gx_xfb_write_end(void);
 
+/* GCN_GX_XFB_HASH=1: route-level content hash chain over every XFB
+ * publication (default off, zero overhead: one branch per publication).
+ * Call gcn_gx_xfb_hash_feed() with the exact destination region an EFB->XFB
+ * copy just wrote (same bytes VI/scanout will read), then
+ * gcn_gx_xfb_hash_publish_done() once per completed copy. Two runs of the
+ * same route that print the same shutdown chain wrote byte-identical XFB
+ * content, regardless of which internal path (software raster vs Vulkan
+ * resident, fused vs unfused shaders, SIMD vs scalar) produced it. */
+void gcn_gx_xfb_hash_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows);
+void gcn_gx_xfb_hash_publish_done(void);
+
 /* Completed-frame counter (accepted GXSetDrawDone writes). Provenance stamp
  * for diagnostics that need to name "which frame" (e.g. gx_raster's
  * big-triangle census). */

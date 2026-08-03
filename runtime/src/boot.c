@@ -762,11 +762,23 @@ int main(int argc, char** argv) {
      * GCN_WINDOW is unset. */
     gcn_host_window_start(&cpu);
 
-    /* With the debug server or the host window on, run unbounded and stop
-     * only on an explicit quit signal (TCP "quit" / window closed), so the
-     * process (and its always-on rings) stay inspectable/interactive rather
-     * than racing to the block budget. */
-    u32 run_blocks = (dbg_port > 0 || gcn_host_window_enabled()) ? 0u : max_blocks;
+    /* A caller-requested block budget is authoritative in every mode,
+     * headed/debug included: an explicit nonzero max_blocks is explicit
+     * intent (e.g. a bounded corun/timing gate driven through a headed
+     * window), and silently discarding it made headed runs unbounded no
+     * matter what the caller asked for, which in turn made them
+     * unboundable-by-construction for any measured/gated run.
+     *
+     * max_blocks == 0 still means "run unbounded and stop only on an
+     * explicit quit signal" (TCP "quit" / window closed) exactly as
+     * before — that's how an interactive session run through
+     * tools/run.sh (which always passes ${GCN_MAX_BLOCKS:-0}, i.e. 0
+     * unless the caller opts into a budget) stays unbounded and
+     * inspectable rather than racing to a hardcoded budget. dbg_port/
+     * window state no longer need to be consulted here: they only ever
+     * mattered as a proxy for "did the caller mean to leave this
+     * unbounded", and max_blocks itself now says that directly. */
+    u32 run_blocks = max_blocks;
 
     /* M1: arm the handoff-instant snapshot the integrity check compares (see
      * dispatch.h — end-of-run memory is useless once BS2 has executed). */
@@ -780,7 +792,7 @@ int main(int argc, char** argv) {
         "gcn boot: seeded; entering recompiled %s at 0x%08X (budget %u blocks)\n"
         "--- execution (unmapped-MMIO warnings below are the M0 signal) ---\n",
         bs1_mode ? "BS1 (true reset)" : "BS2",
-        cpu.pc, dbg_port > 0 ? 0u : max_blocks);
+        cpu.pc, run_blocks);
     fflush(stdout);
 
     int still_live = gcn_dispatch_run(&cpu, run_blocks);

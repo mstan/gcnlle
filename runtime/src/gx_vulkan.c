@@ -30,7 +30,7 @@
 #define READBACK_BYTES (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
 #define DRAW_JOB_OFFSET (XFB_SHADOW_OFFSET + XFB_SHADOW_TOTAL)
 #define DRAW_PACKET_BYTES 512u
-#define GX_VK_DRAW_PROGRAM_COUNT 24u
+#define GX_VK_DRAW_PROGRAM_COUNT 30u
 #define DRAW_JOB_BYTES  (8u * 1024u * 1024u)
 #define DRAW_PACKET_ARENA_BYTES (6u * 1024u * 1024u)
 #define EFB_TILE_WIDTH 40u
@@ -586,6 +586,27 @@ static void corun_census_add(u32 mask, u32 plane, u32 px) {
     }
 }
 
+/* Program id (1-based) -> letter label, A..Z then AA/AB/... (spreadsheet-
+ * column style) -- the single-char ('A'+id-1) scheme used through program X
+ * (24) runs out at Z (26); GX_VK_DRAW_PROGRAM_COUNT is now 30 (Y/Z/AA/AB/
+ * AC/AD), so labels 27-30 need two letters. Returns a pointer into a small
+ * static table; callers never hold more than one label at a time (both call
+ * sites format-and-print immediately), so reuse across calls is safe. */
+static const char* gx_vk_program_label(u32 program) {
+    static char buf[4];
+    if (program == 0 || program > 26u * 27u) return "?";
+    if (program <= 26u) {
+        buf[0] = (char)('A' + program - 1u);
+        buf[1] = '\0';
+    } else {
+        u32 rest = program - 27u;   /* AA=27 -> rest 0 */
+        buf[0] = (char)('A' + rest / 26u);
+        buf[1] = (char)('A' + rest % 26u);
+        buf[2] = '\0';
+    }
+    return buf;
+}
+
 void gx_vulkan_shadow_shutdown(void) {
     if (s_vk.resident_mode &&
         (s_vk.resident_recording || s_vk.resident_inflight) &&
@@ -597,12 +618,17 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.comparisons,
                 (unsigned long long)s_vk.xfb_comparisons);
     if (s_vk.draws) {
+        /* Program-letter labels A..Z then AA.. (see gx_vk_program_label
+         * below) -- the fixed A..X arity predates this Y-AD extension; the
+         * six new ones are appended rather than folded into the format
+         * string so every existing count keeps its position. */
         fprintf(stderr,
                 "gx_vulkan: captured %llu draws / %llu post-clip triangles "
                 "(A=%llu B=%llu C=%llu D=%llu E=%llu F=%llu G=%llu "
                 "H=%llu I=%llu J=%llu K=%llu L=%llu M=%llu N=%llu "
                 "O=%llu P=%llu Q=%llu R=%llu S=%llu T=%llu U=%llu "
-                "V=%llu W=%llu X=%llu general=%llu)\n",
+                "V=%llu W=%llu X=%llu Y=%llu Z=%llu AA=%llu AB=%llu "
+                "AC=%llu AD=%llu general=%llu)\n",
                 (unsigned long long)s_vk.draws,
                 (unsigned long long)s_vk.triangles,
                 (unsigned long long)s_vk.fused_triangles[1],
@@ -629,14 +655,20 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.fused_triangles[22],
                 (unsigned long long)s_vk.fused_triangles[23],
                 (unsigned long long)s_vk.fused_triangles[24],
+                (unsigned long long)s_vk.fused_triangles[25],
+                (unsigned long long)s_vk.fused_triangles[26],
+                (unsigned long long)s_vk.fused_triangles[27],
+                (unsigned long long)s_vk.fused_triangles[28],
+                (unsigned long long)s_vk.fused_triangles[29],
+                (unsigned long long)s_vk.fused_triangles[30],
                 (unsigned long long)s_vk.fused_triangles[0]);
     }
     for (u32 program = 1; program <= GX_VK_DRAW_PROGRAM_COUNT; ++program) {
         if (s_vk.draw_validations[program])
             fprintf(stderr,
-                    "gx_vulkan: %llu fused-program-%c GPU triangle comparisons passed\n",
+                    "gx_vulkan: %llu fused-program-%s GPU triangle comparisons passed\n",
                     (unsigned long long)s_vk.draw_validations[program],
-                    (int)('A' + program - 1u));
+                    gx_vk_program_label(program));
     }
     if (s_vk.texture_hits || s_vk.texture_misses)
         fprintf(stderr,
@@ -965,9 +997,16 @@ static GxVkTextureEntry* find_texture_binding(const u32* bp, u32 unit) {
 static int resolve_fused_texture(const GxRasterTriangleJob* job,
                                  GxVkTextureEntry** texture_out) {
     *texture_out = NULL;
+    /* Y/Z/AA/AB/AC/AD (25-30, see gx_raster.c's gpu_program_Y_match
+     * derivation) are all texgens==0/en==0 like F/J/M/P/T -- none of the six
+     * new census shapes samples a texture at all, so they join this
+     * no-texture-required list. */
     if (job->fused_program != 6u && job->fused_program != 10u &&
         job->fused_program != 13u && job->fused_program != 16u &&
-        job->fused_program != 20u && job->fused_program != 23u) {
+        job->fused_program != 20u && job->fused_program != 23u &&
+        job->fused_program != 25u && job->fused_program != 26u &&
+        job->fused_program != 27u && job->fused_program != 28u &&
+        job->fused_program != 29u && job->fused_program != 30u) {
         u32 order = s_vk.draw_bp[0x28];
         u32 unit = order & 7u;
         u32 mode0 = s_vk.draw_bp[0x80 + unit];
@@ -981,11 +1020,11 @@ static int resolve_fused_texture(const GxRasterTriangleJob* job,
             if (!s_vk.texture_reject_logged[job->fused_program]) {
                 s_vk.texture_reject_logged[job->fused_program] = 1;
                 fprintf(stderr,
-                        "gx_vulkan: fused-program-%c exact GPU path supports "
+                        "gx_vulkan: fused-program-%s exact GPU path supports "
                         "only a resident stage-0 I4/I8/RGBA8 non-mipmapped texture "
                         "with supported wrap (unit=%u fmt=%u size=%ux%u "
                         "mode0=%06X)\n",
-                        (int)('A' + job->fused_program - 1u), unit,
+                        gx_vk_program_label(job->fused_program), unit,
                         texture ? texture->format : 0xffffffffu,
                         texture ? texture->width : 0u,
                         texture ? texture->height : 0u, mode0);
@@ -1043,7 +1082,18 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
     words[99] = 0u;
     memcpy(words + 100u, &job->z, sizeof job->z);
     words[107] = (u32)job->tev_reg[1][3];
-    /* Words 108..127 are alignment-only stride padding.  The shader never
+    /* AB/AC (28/29, see gx_raster.c's gpu_program_AB_match derivation) need
+     * StageKonst.rgb (stage 0's konst r/g/b) -- the only three fields this
+     * whole fused family reads that were never packed before (every prior
+     * program only ever needed stage_konst[*].a, packed above at 97/98).
+     * Reuses three of the previously-untouched stride-padding words. */
+    words[108] = (u32)job->stage_konst[0][0];
+    words[109] = (u32)job->stage_konst[0][1];
+    words[110] = (u32)job->stage_konst[0][2];
+    /* Y/Z (25/26) read this live instead of a matcher-pinned constant -- see
+     * GxRasterTriangleJob::bm_au's comment. */
+    words[111] = (u32)job->bm_au;
+    /* Words 112..127 are alignment-only stride padding.  The shader never
      * indexes them, and resident packets are written directly into their
      * mapped final slot, so touching that padding is pure bandwidth. */
 }
@@ -1081,6 +1131,13 @@ static int resident_materialize_pending(void) {
         for (u32 y = 0; y < p->height; ++y)
             memcpy(p->ram + p->address + (u64)y * p->stride,
                    gpu + (u64)y * p->gpu_stride, (size_t)p->width * 2u);
+        /* GCN_GX_XFB_HASH=1: same chain the software-raster path feeds
+         * (gx_raster.c) -- one publication per completed EFB->XFB copy,
+         * hashing the final guest-RAM bytes so the resident (GPU) and
+         * software paths, and fused vs unfused programs, are compared by
+         * output rather than code path. */
+        gcn_gx_xfb_hash_feed(p->ram + p->address, p->stride, (u32)p->width * 2u, p->height);
+        gcn_gx_xfb_hash_publish_done();
     }
     gcn_gx_xfb_write_end();
     s_vk.resident_copy_memcpy_tsc += __rdtsc() - t0;
@@ -1664,16 +1721,16 @@ int gx_vulkan_shadow_triangle(const GxRasterTriangleJob* job,
         s_vk.draw_validation_pending = 0;
         const u32* gpu = (const u32*)(s_vk.readback_map +
                                       READBACK_COLOR_OFFSET);
-        char label[] = "draw-A color";
+        char label[24];
         u32 program = s_vk.draw_validation_program;
-        label[5] = (char)('A' + program - 1u);
+        snprintf(label, sizeof label, "draw-%s color", gx_vk_program_label(program));
         if (!compare_plane(label, color, gpu))
             return 0;
         if (program == 11u || program == 12u || program == 24u) {
             const u32* gpu_depth = (const u32*)(s_vk.readback_map +
                                                 READBACK_DEPTH_OFFSET);
-            char depth_label[] = "draw-K depth";
-            depth_label[5] = (char)('A' + program - 1u);
+            char depth_label[24];
+            snprintf(depth_label, sizeof depth_label, "draw-%s depth", gx_vk_program_label(program));
             if (!compare_plane(depth_label, depth, gpu_depth))
                 return 0;
         }
@@ -1699,8 +1756,8 @@ int gx_vulkan_shadow_triangle(const GxRasterTriangleJob* job,
     if (s_vk.draw_validate_remaining[job->fused_program] &&
         !submit_fused_draw(job)) {
         fprintf(stderr,
-                "gx_vulkan: fused-program-%c validation submit failed\n",
-                (int)('A' + job->fused_program - 1u));
+                "gx_vulkan: fused-program-%s validation submit failed\n",
+                gx_vk_program_label(job->fused_program));
         return 0;
     }
     return 1;
@@ -1852,10 +1909,37 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
     s_vk.triangles++;
     if (job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT)
         s_vk.fused_triangles[job->fused_program]++;
+
+    int supported = job->fused_program >= 1u &&
+                    job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT;
+    if (supported && job->num_texgens && !s_vk.draw_textures_validated) {
+        supported = validate_draw_textures(s_vk.draw_bp, s_vk.draw_ram,
+                                           s_vk.draw_ram_size);
+        s_vk.draw_textures_validated = supported;
+    }
+    if (supported)
+        supported = resident_record_draw(job);
+
+    /* Co-run tile census: record which program actually ends up responsible
+     * for this tile's GPU-side pixels, not which program the triangle
+     * nominally is. A GPU-eligible program (1..30) whose resident_record_draw
+     * call above FAILED (tile/arena capacity, texture rejection, ...) falls
+     * all the way through to the software-fallback path below exactly like
+     * program 0 (general/unmatched) always does -- the GPU never queues, let
+     * alone draws, this triangle anywhere. Marking the tile with that
+     * program's bit regardless (the previous behavior, done unconditionally
+     * before `supported` was even known) let a corun compare blame a
+     * still-queued program's shader for a mismatch that was actually just an
+     * expected, synchronized software-only draw: the tile's real story that
+     * frame was "nothing GPU-side touched this pixel", which bit 0 already
+     * means for every plain software triangle. Gating on the final
+     * `supported` value makes the two cases (drew on GPU vs. fell back)
+     * report identically instead of the fallback case impersonating the GPU
+     * program it failed to become. */
     if (s_corun == 1 && job->scan.maxx > job->scan.minx &&
         job->scan.maxy > job->scan.miny &&
         job->scan.minx >= 0 && job->scan.miny >= 0) {
-        u32 bit = 1u << (job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT ?
+        u32 bit = 1u << (supported && job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT ?
                          job->fused_program : 0u);
         u32 tx0 = (u32)job->scan.minx / 16u;
         u32 ty0 = (u32)job->scan.miny / 16u;
@@ -1868,15 +1952,6 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
                 s_vk.corun_tile_programs[ty * EFB_TILE_WIDTH + tx] |= bit;
     }
 
-    int supported = job->fused_program >= 1u &&
-                    job->fused_program <= GX_VK_DRAW_PROGRAM_COUNT;
-    if (supported && job->num_texgens && !s_vk.draw_textures_validated) {
-        supported = validate_draw_textures(s_vk.draw_bp, s_vk.draw_ram,
-                                           s_vk.draw_ram_size);
-        s_vk.draw_textures_validated = supported;
-    }
-    if (supported)
-        supported = resident_record_draw(job);
     if (supported)
         /* Co-run: the GPU batch keeps the triangle, but report it unhandled
          * so the software scan rasterizes it too — that reference is what

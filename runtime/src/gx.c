@@ -425,6 +425,64 @@ void gcn_gx_xfb_read_begin(void)  { AcquireSRWLockShared(&s_xfb_lock); }
 void gcn_gx_xfb_read_end(void)    { ReleaseSRWLockShared(&s_xfb_lock); }
 void gcn_gx_xfb_write_begin(void) { AcquireSRWLockExclusive(&s_xfb_lock); }
 void gcn_gx_xfb_write_end(void)   { ReleaseSRWLockExclusive(&s_xfb_lock); }
+
+/* GCN_GX_XFB_HASH=1: chained FNV-1a-64 over every byte ever written to the
+ * guest XFB by an EFB->XFB copy, in publication order. This boundary (the
+ * same s_xfb_lock-guarded region gcn_gx_xfb_write_begin/end already protect)
+ * is the natural choice because:
+ *   - it's the single point both the software-raster path (gx_raster.c) and
+ *     the Vulkan resident-readback path (gx_vulkan.c) funnel through, so the
+ *     hash is identical no matter which backend produced the pixels;
+ *   - it hashes the FINAL bytes landing in guest RAM, so fused vs unfused
+ *     shader programs and SIMD vs scalar filtering are transparent to it —
+ *     they're compared by their output, not their code path;
+ *   - it runs once per completed copy (not per draw call or per BP write),
+ *     so it's deterministic across runs regardless of internal batching,
+ *     thread scheduling, or timing;
+ *   - it covers 100% of pixel output: every byte scanout/VI can ever read
+ *     back out of the XFB passed through here first.
+ * A running (chained) hash rather than a per-publication list because the
+ * FNV-1a state itself already folds in every prior publication's bytes --
+ * "chain = hash(prev_chain || these_bytes)" is exactly what continuing to
+ * feed the same accumulator does. */
+static int s_xfb_hash_on = -1;
+static u64 s_xfb_hash_chain = 0xcbf29ce484222325ULL; /* FNV-1a-64 offset basis */
+static u64 s_xfb_hash_pubs = 0;
+
+static int gx_xfb_hash_on(void) {
+    if (s_xfb_hash_on < 0) {
+        const char* e = getenv("GCN_GX_XFB_HASH");
+        s_xfb_hash_on = (e && e[0] == '1') ? 1 : 0;
+    }
+    return s_xfb_hash_on;
+}
+
+void gcn_gx_xfb_hash_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows) {
+    if (!gx_xfb_hash_on())
+        return;
+    u64 h = s_xfb_hash_chain;
+    for (u32 y = 0; y < rows; y++) {
+        const u8* row = base + (u64)y * stride;
+        for (u32 x = 0; x < row_bytes; x++) {
+            h ^= row[x];
+            h *= 0x100000001b3ULL; /* FNV-1a-64 prime */
+        }
+    }
+    s_xfb_hash_chain = h;
+}
+
+void gcn_gx_xfb_hash_publish_done(void) {
+    if (!gx_xfb_hash_on())
+        return;
+    s_xfb_hash_pubs++;
+    /* First publication plus every 256th thereafter: enough breadcrumbs to
+     * bisect a divergence to a <=256-publication window without printing a
+     * line per frame. */
+    if (s_xfb_hash_pubs == 1 || (s_xfb_hash_pubs % 256) == 0)
+        fprintf(stderr, "[gx-xfb-hash] publication=%llu chain=%016llx\n",
+                (unsigned long long)s_xfb_hash_pubs,
+                (unsigned long long)s_xfb_hash_chain);
+}
 u64 gcn_gx_xfb_generation(void) {
     return __atomic_load_n(&s_xfb_generation, __ATOMIC_ACQUIRE);
 }
@@ -588,6 +646,10 @@ void gcn_gx_pipeline_shutdown(void) {
                     "executions (max DL %u bytes)\n",
             (unsigned long long)s_dl_tears, (unsigned long long)s_dl_execs,
             s_dl_max_bytes);
+    if (gx_xfb_hash_on())
+        fprintf(stderr, "[gx-xfb-hash] publications=%llu chain=%016llx\n",
+                (unsigned long long)s_xfb_hash_pubs,
+                (unsigned long long)s_xfb_hash_chain);
     gx_render_shutdown();
 }
 
