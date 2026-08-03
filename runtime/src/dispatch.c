@@ -217,6 +217,13 @@ typedef struct {
     int valid;
     u64 count;
     u64 cycles;
+    u64 first_block;   /* gcn_ring_block_index() at this entry-PC's FIRST
+                         * invocation -- answers "WHEN" (which route phase:
+                         * IPL menu boot / BS2 / post-handoff title) without
+                         * a separate arm-then-run probe, same census pass. */
+    u64 last_block;    /* ...and its most recent invocation, so a cluster that
+                         * fires once early vs. one that recurs throughout the
+                         * whole run are distinguishable from the same table. */
 } ToppcSlot;
 static ToppcSlot s_toppc_table[GCN_TOPPC_WAYS];
 static u64 s_toppc_overflow_hits;   /* note() calls that found the table completely
@@ -226,6 +233,7 @@ static int s_toppc_registered;
 
 static inline void gcn_dispatch_toppc_note(u32 pc, u64 cycles) {
     u32 h = (pc * 2654435761u) % GCN_TOPPC_WAYS;
+    u64 block = gcn_ring_block_index();
     for (u32 i = 0; i < GCN_TOPPC_WAYS; i++) {
         u32 idx = (h + i) % GCN_TOPPC_WAYS;
         ToppcSlot* s = &s_toppc_table[idx];
@@ -234,11 +242,14 @@ static inline void gcn_dispatch_toppc_note(u32 pc, u64 cycles) {
             s->pc = pc;
             s->count = 1;
             s->cycles = cycles;
+            s->first_block = block;
+            s->last_block = block;
             return;
         }
         if (s->pc == pc) {
             s->count++;
             s->cycles += cycles;
+            s->last_block = block;
             return;
         }
     }
@@ -281,11 +292,13 @@ static void gcn_dispatch_toppc_shutdown(void) {
         const ToppcSlot* s = &s_toppc_table[best];
         fprintf(stderr,
                 "[dispatch-toppc]   #%2d pc=0x%08X invocations=%llu (%.2f%%) "
-                "cycles=%llu (%.2f%% of measured pc-attributed cycles)\n",
+                "cycles=%llu (%.2f%% of measured pc-attributed cycles) "
+                "first_block=%llu last_block=%llu\n",
                 rank + 1, s->pc, (unsigned long long)s->count,
                 100.0 * (double)s->count / (double)total_count,
                 (unsigned long long)s->cycles,
-                total_cycles ? 100.0 * (double)s->cycles / (double)total_cycles : 0.0);
+                total_cycles ? 100.0 * (double)s->cycles / (double)total_cycles : 0.0,
+                (unsigned long long)s->first_block, (unsigned long long)s->last_block);
     }
 
     /* Top-64 by cumulative cycles (only meaningful when GCN_DISPATCH_STATS or
@@ -304,10 +317,12 @@ static void gcn_dispatch_toppc_shutdown(void) {
         used[best] = 1;
         const ToppcSlot* s = &s_toppc_table[best];
         fprintf(stderr,
-                "[dispatch-toppc]   #%2d pc=0x%08X cycles=%llu (%.2f%%) invocations=%llu\n",
+                "[dispatch-toppc]   #%2d pc=0x%08X cycles=%llu (%.2f%%) invocations=%llu "
+                "first_block=%llu last_block=%llu\n",
                 rank + 1, s->pc, (unsigned long long)s->cycles,
                 total_cycles ? 100.0 * (double)s->cycles / (double)total_cycles : 0.0,
-                (unsigned long long)s->count);
+                (unsigned long long)s->count,
+                (unsigned long long)s->first_block, (unsigned long long)s->last_block);
     }
     fflush(stderr);
 }
@@ -405,6 +420,64 @@ static inline int gcn_dispatch_charge(CPUState* ctx, u64* prev_cycles,
      * true 10125/15187.5 cycles/sample rate (ai.h derivation comment). */
     *ai_cycles_out = (u32)delta;
     return 1;
+}
+
+/* ===========================================================================
+ * GCN_TRIGGER_PCS=<hex,hex,...> (default unset, own cached-getenv sentinel):
+ * a conditional ring-DUMP trigger, not a trace arm — the block ring (rings.c)
+ * already records every block's pc/lr/ctr/srr0/srr1/msr/exception, always,
+ * from process start; this only decides WHEN to print a window of it. Fires
+ * the FIRST GCN_TRIGGER_MAX (default 8) times ctx->pc equals ANY listed
+ * address, each time dumping full CPU state plus the last GCN_TRIGGER_RING
+ * (default 32) resident block-ring entries to stderr — the entry-chain
+ * evidence for "how did ctx->pc come to equal X" (dispatch fallthrough bug?
+ * rfi to a stale srr0? bctr off a corrupt ctr?) without re-running anything:
+ * read the dump backward from the trigger block. Per-pc hit counters are
+ * independent so a multi-address watch (e.g. the 3-adjacent-PC clusters this
+ * was built for) does not let one address's frequency starve the others'
+ * dumps. Off by default: unset costs one cached int compare per block. */
+#define GCN_TRIGGER_MAX_PCS 16
+static u32 s_trigger_pcs[GCN_TRIGGER_MAX_PCS];
+static u32 s_trigger_pc_count;
+static u64 s_trigger_hits[GCN_TRIGGER_MAX_PCS];
+static int s_trigger_cap = 8;      /* GCN_TRIGGER_MAX */
+static int s_trigger_ring = 32;    /* GCN_TRIGGER_RING */
+static int s_trigger_inited;
+
+static void gcn_dispatch_pc_trigger_init(void) {
+    s_trigger_inited = 1;
+    const char* list = getenv("GCN_TRIGGER_PCS");
+    if (!list || !*list) return;
+    const char* p = list;
+    while (*p && s_trigger_pc_count < GCN_TRIGGER_MAX_PCS) {
+        s_trigger_pcs[s_trigger_pc_count++] = (u32)strtoul(p, NULL, 16);
+        const char* comma = strchr(p, ',');
+        if (!comma) break;
+        p = comma + 1;
+    }
+    const char* m = getenv("GCN_TRIGGER_MAX");
+    if (m && *m) s_trigger_cap = (int)strtol(m, NULL, 0);
+    const char* r = getenv("GCN_TRIGGER_RING");
+    if (r && *r) s_trigger_ring = (int)strtol(r, NULL, 0);
+}
+
+static inline void gcn_dispatch_pc_trigger_check(CPUState* ctx) {
+    if (!s_trigger_inited) gcn_dispatch_pc_trigger_init();
+    if (!s_trigger_pc_count) return;
+    for (u32 i = 0; i < s_trigger_pc_count; i++) {
+        if (ctx->pc != s_trigger_pcs[i]) continue;
+        if ((s64)++s_trigger_hits[i] > (s64)s_trigger_cap) return;
+        fprintf(stderr,
+            "\n[trigger] pc=0x%08X hit #%llu (block-index=%llu)\n"
+            "  lr=0x%08X ctr=0x%08X cr=0x%08X xer=0x%08X\n"
+            "  msr=0x%08X srr0=0x%08X srr1=0x%08X exception-pending=0x%08X\n",
+            ctx->pc, (unsigned long long)s_trigger_hits[i],
+            (unsigned long long)gcn_ring_block_index(),
+            ctx->lr, ctx->ctr, ctx->cr, ctx->xer,
+            ctx->msr, ctx->srr0, ctx->srr1, ctx->exception);
+        gcn_ring_block_dump_stderr(s_trigger_ring);
+        return;
+    }
 }
 
 /* IPL native code remains the first candidate. Title code is a separate,
@@ -517,7 +590,13 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         ppc_deliver_decrementer(ctx);
         if (!gcn_debug_server_checkpoint_before_block())
             return 1;
-        gcn_ring_block(ctx->pc);   /* always-on retired-block/PC timeline */
+        gcn_ring_block_ex(ctx->pc, ctx->lr, ctx->ctr, ctx->srr0, ctx->srr1,
+                          ctx->msr, ctx->exception);  /* always-on retired-
+                          * block/PC timeline, now with the CPU state that
+                          * explains HOW we got here (indirect-branch or
+                          * exception-vector entry chain) */
+        gcn_dispatch_pc_trigger_check(ctx);   /* env-gated conditional dump,
+                          * see GCN_TRIGGER_PCS doc comment above its impl */
 
         /* M1 (opt-in, GCN_LOG_BS1_HANDOFF=1): one-shot dump of the FULL CPU
          * state the instant execution reaches BS2's entry (0x81300000),
@@ -609,12 +688,17 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
             u32 entry_pc = ctx->pc;
             u64 t0 = __rdtsc();
             int ok = 0;
-            if (!gcn_debug_server_cosim_enabled()) {
+            bool cosim = gcn_debug_server_cosim_enabled();
+            if (!cosim) {
                 ok = gcn_dispatch_native(ctx);
                 if (!ok)
                     gcn_interpreter_note_native_miss(ctx);
             }
             if (!ok) {
+                /* Cosim grants exactly one retired instruction per budget --
+                 * the counted-cache-loop batch fast path (interpreter.c)
+                 * must never retire more than that under cosim. */
+                gcn_interpreter_set_cache_loop_batch_enabled(!cosim);
                 ok = gcn_interpreter_step(ctx);
             }
             u64 t1 = __rdtsc(); s_tsc[0] += t1 - t0;
@@ -651,12 +735,16 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         u32 entry_pc = ctx->pc;
         u64 tpc0 = s_toppc ? __rdtsc() : 0;
         int dispatch_ok = 0;
-        if (!gcn_debug_server_cosim_enabled()) {
+        bool cosim = gcn_debug_server_cosim_enabled();
+        if (!cosim) {
             dispatch_ok = gcn_dispatch_native(ctx);
             if (!dispatch_ok)
                 gcn_interpreter_note_native_miss(ctx);
         }
         if (!dispatch_ok) {
+            /* See the s_dstats branch above: cosim must never let the batch
+             * fast path retire more than the one granted instruction. */
+            gcn_interpreter_set_cache_loop_batch_enabled(!cosim);
             dispatch_ok = gcn_interpreter_step(ctx);
         }
         if (s_toppc) gcn_dispatch_toppc_note(entry_pc, __rdtsc() - tpc0);

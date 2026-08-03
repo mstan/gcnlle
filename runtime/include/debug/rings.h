@@ -75,8 +75,17 @@ void gcn_rings_init(void);
  * 0 if it hit the unmapped fallback. Stamped with the current block index. */
 void gcn_ring_mmio(u32 pc, u32 addr, u32 value, u8 size, u8 rw, u8 mapped);
 
-/* One retired recompiled block (its entry PC). Advances the global block index. */
-void gcn_ring_block(u32 pc);
+/* One retired recompiled block: entry PC plus the CPU-state fields needed to
+ * reconstruct HOW control arrived there (an indirect branch via a corrupt
+ * ctr/lr, or an exception vector via a corrupt srr0/msr) without re-running
+ * anything — lr/ctr/srr0/srr1/msr are cheap register reads already resident
+ * in CPUState, so recording them every block costs one extra cache line, not
+ * a re-arm-and-hope trace. `exception` is ctx->exception AS SEEN ON ENTRY
+ * (the pending flag the dispatcher clears right before this call) — non-zero
+ * exactly when this block is the first block of an exception handler.
+ * Advances the global block index. */
+void gcn_ring_block_ex(u32 pc, u32 lr, u32 ctr, u32 srr0, u32 srr1, u32 msr,
+                       u32 exception);
 
 /* One device/timeline edge (see GcnEventKind). Stamped with the block index. */
 void gcn_ring_event(u16 kind, u32 detail, u32 aux, u32 pc);
@@ -103,6 +112,13 @@ void gcn_ring_memcard(u32 pc, u8 channel, u8 cs, u8 command, u8 rw, u8 dma,
 
 /* Current monotonic block index (number of blocks retired so far). */
 u64  gcn_ring_block_index(void);
+
+/* stderr dump of the newest `max_entries` resident block-ring entries
+ * (oldest->newest), each with its full lr/ctr/srr0/srr1/msr/exception —
+ * the entry-chain evidence for "how did ctx->pc come to equal X": read
+ * backward from the trigger block to see what block ran immediately before
+ * it and what its lr/ctr/srr0 were. */
+void gcn_ring_block_dump_stderr(int max_entries);
 
 /* Exact, always-on dispatch-entry coverage. Unlike the rolling block ring,
  * these bits do not evict: MEM1/MEM2 executable aliases and the 2 MiB IPL

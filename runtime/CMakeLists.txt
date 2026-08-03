@@ -173,6 +173,13 @@ add_executable(test_gx_pipeline tests/test_gx_pipeline.c)
 target_include_directories(test_gx_pipeline PRIVATE include)
 add_test(NAME gx_pipeline_carry_boundary COMMAND test_gx_pipeline)
 
+# Interpreter counted-cache-loop batching fast path: exactness of batched vs.
+# unbatched icbi/dcbi loop execution (GPR/CTR/cycles/native-invalidation),
+# including a cycle-deadline crossing mid-loop.
+add_executable(test_cache_loop_batch tests/test_cache_loop_batch.c)
+target_link_libraries(test_cache_loop_batch PRIVATE gcn_runtime_core)
+add_test(NAME cache_loop_batch_exactness COMMAND test_cache_loop_batch)
+
 add_executable(gcn_memcard_inspect tools/memcard_inspect.c src/memcard_image.c)
 target_include_directories(gcn_memcard_inspect PRIVATE include)
 

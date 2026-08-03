@@ -21,6 +21,11 @@ void gcn_interpreter_shutdown(void);
 u64  gcn_interpreter_instruction_count(void);
 u64  gcn_interpreter_unique_miss_count(void);
 
+/* Test-only: force the counted-cache-loop batching fast path (interpreter.c)
+ * on or off so a test can diff batched vs. unbatched execution of the same
+ * synthetic loop. Defaults to enabled; production code never calls this. */
+void gcn_interpreter_set_cache_loop_batch_enabled(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif

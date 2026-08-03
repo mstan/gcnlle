@@ -27,7 +27,17 @@ typedef struct {
 typedef struct {
     u64 seq;
     u32 pc;
-    u32 _pad;
+    u32 lr;
+    u32 ctr;
+    u32 srr0;
+    u32 srr1;
+    u32 msr;
+    u32 exception;   /* ctx->exception AS SEEN ON ENTRY to this block, i.e. the
+                       * pending flag the dispatcher just cleared (dispatch.c
+                       * `pending = ctx->exception; ctx->exception = 0;`) — 0
+                       * for an ordinary block, non-zero exactly on the FIRST
+                       * block of a handler (the one whose pc == the vector
+                       * address the previous block's exception computed). */
 } BlockEntry;
 
 typedef struct {
@@ -112,10 +122,12 @@ void gcn_ring_mmio(u32 pc, u32 addr, u32 value, u8 size, u8 rw, u8 mapped) {
     e->size = size; e->rw = rw; e->mapped = mapped; e->_pad = 0;
 }
 
-void gcn_ring_block(u32 pc) {
+void gcn_ring_block_ex(u32 pc, u32 lr, u32 ctr, u32 srr0, u32 srr1, u32 msr,
+                       u32 exception) {
     BlockEntry* e = &s_block[s_block_count & (GCN_BLOCK_RING_CAP - 1)];
     e->seq = s_block_count++;
-    e->pc = pc; e->_pad = 0;
+    e->pc = pc; e->lr = lr; e->ctr = ctr; e->srr0 = srr0; e->srr1 = srr1;
+    e->msr = msr; e->exception = exception;
     if ((pc & 3u) == 0u) {
         if (pc - GCN_RAM_EXEC_BASE < GCN_RAM_EXEC_BYTES) {
             u32 word = (pc - GCN_RAM_EXEC_BASE) >> 2;
@@ -126,6 +138,23 @@ void gcn_ring_block(u32 pc) {
         }
     }
     s_block_index++;
+}
+
+void gcn_ring_block_dump_stderr(int max_entries) {
+    u64 avail = s_block_count < GCN_BLOCK_RING_CAP ? s_block_count : GCN_BLOCK_RING_CAP;
+    if ((u64)max_entries < avail) avail = (u64)max_entries;
+    u64 start = s_block_count - avail;
+    fprintf(stderr, "[block-ring] (%llu total, showing #%llu..#%llu):\n",
+            (unsigned long long)s_block_count, (unsigned long long)start,
+            (unsigned long long)(s_block_count ? s_block_count - 1u : 0u));
+    for (u64 i = start; i < s_block_count; i++) {
+        const BlockEntry* e = &s_block[i & (GCN_BLOCK_RING_CAP - 1)];
+        fprintf(stderr,
+            "  #%llu pc=%08X lr=%08X ctr=%08X srr0=%08X srr1=%08X msr=%08X%s\n",
+            (unsigned long long)e->seq, e->pc, e->lr, e->ctr, e->srr0, e->srr1,
+            e->msr, e->exception ? " <-- exception-pending-on-entry" : "");
+    }
+    fflush(stderr);
 }
 
 void gcn_ring_event(u16 kind, u32 detail, u32 aux, u32 pc) {
@@ -470,8 +499,10 @@ int gcn_ring_block_json(char* out, int cap, int max_entries) {
     for (u64 s = start; s < s_block_count; s++) {
         BlockEntry* e = &s_block[s & (GCN_BLOCK_RING_CAP - 1)];
         int w = snprintf(out + n, (size_t)(cap - n),
-            "%s{\"seq\":%llu,\"pc\":%u}", first ? "" : ",",
-            (unsigned long long)e->seq, e->pc);
+            "%s{\"seq\":%llu,\"pc\":%u,\"lr\":%u,\"ctr\":%u,\"srr0\":%u,"
+            "\"srr1\":%u,\"msr\":%u,\"exception\":%u}", first ? "" : ",",
+            (unsigned long long)e->seq, e->pc, e->lr, e->ctr, e->srr0,
+            e->srr1, e->msr, e->exception);
         if (w < 0 || n + w >= cap - 4) break;
         n += w; first = 0; emitted++;
     }
