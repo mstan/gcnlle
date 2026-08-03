@@ -1,0 +1,293 @@
+# GCN Performance Enhancement Routine
+
+This is the handoff playbook for performance work in `gcnrecomp`. It applies
+the shared recompilation rules in
+[`OPTIMIZATION.md`](https://github.com/mstan/recomp-ai-rules/blob/main/OPTIMIZATION.md)
+to the GameCube runtime and Wind Waker bring-up.
+
+Here, “enhancement” means a faster implementation of the same guest-visible
+machine unless a change is explicitly classified and approved as an
+approximation. Performance work does not weaken the LLE floor.
+
+## Non-negotiable floor
+
+- The real reset, IPL, DI, apploader, and title path remains runnable.
+- The recompiled Gekko executes the same instructions, cycles, exceptions, and
+  hardware accesses as the retained interpreter/LLE implementation.
+- Accelerated GX, DSP, device, or title paths enter and leave through a named
+  LLE contract.
+- The reference implementation remains forceable.
+- Unsupported optimized states synchronize and fall back loudly.
+- Content-derived HLE candidates are keyed by executable identity plus entry
+  point, never by PC alone.
+- Approximation requires an explicit user-visible policy and a separately
+  retained exact mode. A screenshot that “looks close” is not an exactness
+  proof.
+
+Useful policy shape for a replaceable subsystem:
+
+| Mode | Meaning |
+|---|---|
+| `off` | Force the faithful implementation |
+| `on` | Use validated fast paths and fall back on every miss |
+| `force` | Require the fast path; fail loudly if it cannot run |
+| `verify` | Run/compare the fast path against the faithful path and publish the faithful result |
+| `auto` | Select only previously promoted fast paths for the current host/content identity |
+
+## The optimization loop
+
+### 1. Establish a representative route
+
+Name the exact scenario and acceptance boundary before editing:
+
+- true-reset IPL menu;
+- Wind Waker title screen;
+- a deterministic gameplay scene;
+- a bounded co-simulation interval.
+
+Record the framework commit, title commit, executable hash, environment knobs,
+host GPU/CPU, block or frame boundary, and output hashes. Preserve the baseline
+executable before rebuilding.
+
+### 2. Gate on host load
+
+Builds use BelowNormal priority, at most two jobs, and no short wall timeout.
+Game runs use normal priority.
+
+Before a performance run, sample
+`\Processor Information(_Total)\% Processor Utility` for at least eight
+seconds. At 40% or more sustained background utility, pause performance
+measurement. Correctness runs may continue if they do not interfere with the
+foreground workload, but their wall time is not evidence.
+
+### 3. Measure attribution before choosing a change
+
+Use opt-in counters that answer a specific question without taxing normal
+play. Keep source attribution where multiple callers share a dispatcher.
+Current instruments include:
+
+- `GCN_DISPATCH_STATS=1` for CPU/device attribution;
+- `GCN_GX_STATS=1` and `GCN_GX_PIXEL_STATS=1` for software GX cost;
+- `GCN_GX_GPU_STATS=1` for resident Vulkan submission/wait/copy timing;
+- resident Vulkan triangle/program/fallback summaries;
+- AOT/interpreter instruction and identity summaries;
+- `GCN_GX_PIPE_STATS=1` for GX pipeline sync/resume/poison transitions.
+
+Prefer whole-route counters first, then a narrower microbenchmark. A locally
+faster helper is rejected when its route-level dynamic coverage is too small.
+
+### 4. Classify the candidate
+
+1. **Exact host-cost removal:** caching, inlining, sharding, eliminating dead
+   diagnostics, or removing artificial dispatch boundaries.
+2. **Exact replacement behind an LLE API:** resident Vulkan, compiled DSP
+   blocks, or a content-validated routine shim with exact state/timing
+   publication.
+3. **Approved approximation:** a disclosed enhancement which may differ from
+   hardware and can be disabled.
+
+Classes 1 and 2 are zero-diff candidates. Class 3 is never silently promoted
+as an optimization.
+
+### 5. Make the smallest reversible increment
+
+- Add a same-binary disable/verification knob when practical.
+- Preserve a slow path with the old semantics.
+- Put invalidation at the exact guest event which makes cached state stale.
+- Keep unsupported cases loud.
+- Avoid title PCs in the generic runtime when decoded shape, device state, or
+  content identity can describe the condition.
+
+### 6. Prove correctness before timing
+
+Run the narrow unit test first, then the project matrix appropriate to the
+changed boundary:
+
+- all runtime/recompiler tests;
+- pinned uniform and derived XFB hashes;
+- ordered MMIO/PE token/finish counts;
+- interpreter-versus-native state parity;
+- GPU/software co-run at EFB/XFB publication boundaries;
+- deterministic TCP co-simulation for registers and RAM;
+- headed screenshots and audio when user-visible output is affected.
+
+Headless success is necessary but not sufficient. A renderer or presentation
+change is not complete until headed execution reaches the same acceptance
+boundary without new visible defects.
+
+### 7. Measure fairly
+
+Use a preserved baseline executable and the same title inputs. Run interleaved
+`BASE,CAND,CAND,BASE` rounds, discard warm-up explicitly, and report medians
+plus the individual samples. Do not compare unrelated rebuilds, different PGO
+profiles, different background load, or different scene coverage.
+
+Report both:
+
+- route throughput (frames, `GXSetDrawDone` completions, blocks, or guest time
+  per wall second);
+- remaining headroom attribution and fallback coverage.
+
+### 8. Promote or reject
+
+An exact candidate is promoted only when:
+
+- every required correctness gate passes;
+- the headed path passes when applicable;
+- it improves the representative route, not only a microbenchmark;
+- the LLE/reference path remains forceable;
+- the measurement and rejected alternatives are documented.
+
+Keep negative results. They prevent the next agent from repeating plausible
+but unproductive work.
+
+## Exercised example: GX scanner resume boundary
+
+### Baseline observation
+
+The archived headed Wind Waker run in
+`captures/checkin-headed/runtime.err.log` reported:
+
+```text
+gx-pipe: scanner carry overflow (97+32) — BUG; permanent synchronous fallback
+```
+
+The scanner owns a 128-byte carry and receives 32-byte gather-pipe chunks.
+After an unsizable top-level primitive moves decode temporarily to the
+synchronous path, the old resume test accepted any staging remainder at or
+below 128 bytes. A 97-byte remainder therefore resumed even though the next
+gather required 129 bytes. The following push poisoned the pipeline for the
+rest of the run, removing CPU/GX overlap.
+
+### Exact change
+
+Resume is now allowed only when:
+
+```text
+carry_len <= carry_capacity - next_gather_size
+```
+
+With the current sizes, 96 bytes resumes and 97 bytes remains synchronous for
+another tick. The same FIFO decoder consumes the same bytes in the same order;
+the change only avoids selecting asynchronous hosting before its buffer
+precondition is true.
+
+`gcn_gx_pipeline_carry_can_resume()` centralizes that precondition.
+`test_gx_pipeline` proves the 96/97 boundary and undersized-capacity case.
+
+`GCN_GX_PIPE_STATS=1` emits:
+
+```text
+[gx-pipe-stats] first resume deferral carry=... next-gather=... capacity=...
+[gx-pipe-stats] sync=... defer=... resume=... poison=... max-deferred-carry=...
+```
+
+Acceptance for the title route is:
+
+- the historical 97-byte case is observed as a deferral;
+- execution later resumes;
+- `poison=0`;
+- no `scanner carry overflow` appears;
+- the same title boundary is reached;
+- a quiet-host interleaved timing run shows whether restored overlap produces
+  a measurable route gain.
+
+### Baseline-reproduction instrument
+
+`GCN_GX_PIPE_UNSAFE_RESUME=1` reproduces the old, known-buggy resume policy
+(`carry_len <= carry_capacity`, no headroom reserved for the next gather)
+from the same binary, so the two policies can be A/B measured without a
+separate build. It defaults off. Enabling it can poison the pipeline exactly
+as the archived baseline did — that is its purpose, not a defect; it exists
+solely for comparison, never for normal use.
+
+The unit-level build and all 12 runtime tests pass.
+
+### Route evidence and timing (2026-08-02/03)
+
+Same-binary interleaved A/B (`A` = `GCN_GX_PIPE_UNSAFE_RESUME=1` old gate,
+`B` = corrected gate), headless true-reset Wind Waker, `GCN_WINDOW=0`,
+`GCN_THROTTLE=0`, fixed `GCN_MAX_BLOCKS=110000000`, `GCN_GX_PIPE_STATS=1`,
+order `A,B,B,A`, host-load gate sampled >=8 s below 40% before every arm
+(observed 27.6-35.3%). Binary
+`runtime/build-windwaker/gcn_boot.exe` SHA256
+`68dceda9acd691df18fe8b26a33bd40b3c54f039587a570309829b92e35229e7`.
+Raw logs: `WindWakerRecomp/captures/perf-pipe-ab-20260802/`.
+
+| run | arm | wall (s) | frames | poison | overflow lines |
+|---|---|---|---|---|---|
+| 1 | A | 87.85 | 1015 | 1 | 1 |
+| 2 | B | 84.72 | 1015 | 0 | 0 |
+| 3 | B | 85.62 | 1015 | 0 | 0 |
+| 4 | A | 87.23 | 1015 | 1 | 1 |
+
+- A reproduced the archived failure both times: one `scanner carry overflow
+  (97+32)`, `poison=1`, pipeline permanently synchronous
+  (`sync=15175 defer=0 resume=15174`).
+- B held `poison=0`, zero overflow, and identical deterministic stats both
+  times (`sync=31906 defer=76667 resume=31906 max-deferred-carry=1302`).
+- Behavioral equivalence across all four runs: identical frame count (1015
+  `GXSetDrawDone`), DL tear census (0/70468), AOT summary
+  (`native=69217855 verifications=539 verified=539 failed=0`), and
+  interpreter summary (`instructions=5892966 unique-misses=22790`).
+- Wall time: A mean 87.54 s, B mean 85.17 s — **B improves the whole route
+  by ~2.7%**, with non-overlapping samples (both B runs faster than both A
+  runs). The gain is modest because on this headless route the poisoned
+  synchronous pipeline still keeps the GX worker fed most of the time; the
+  fix's primary value is correctness of the overlap mechanism plus the
+  measured ~2.7%, not a large throughput jump.
+
+Headed confirmation (candidate gate, knob off, `GCN_WINDOW=1`,
+`GCN_THROTTLE=1`): launched on the interactive desktop
+(`winsta0\default`), reached and rendered the Wind Waker title sailing
+sequence (debug-surface screenshot and a `CopyFromScreen` desktop capture
+both show the scene), observed the historical event exactly once as
+`first resume deferral carry=97 next-gather=32 capacity=128`, completed
+1353 `GXSetDrawDone` frames with
+`sync=150164 defer=749420 resume=150164 poison=0 max-deferred-carry=1302`,
+zero overflow lines, clean TCP `quit`.
+
+Promoted: correctness gates plus a consistent (if small) whole-route win.
+
+## Wind Waker performance burndown after this exemplar
+
+The most recent headed title-screen log attributes the urgent work as follows:
+
+1. **Restore GX overlap.** Eliminate the `97+32` permanent pipeline poison and
+   verify that recoverable top-level primitives continue to re-seed safely.
+2. **Expand exact resident GX coverage.** Roughly 5.4 million draws fell back
+   synchronously, dominated by general/program-0 triangle state. Implement the
+   observed state behind `gx_render`, co-run against software, and retain loud
+   fallback.
+3. **Implement observed EFB-copy states.** The title repeatedly uses copy
+   states `0x01023B` and `0x010263`; synchronize/corun before promotion.
+4. **Reduce GPU publication joins.** Keep EFB/XFB data resident until a real
+   guest observation boundary; never delay PE/token/CPU-read visibility.
+5. **Close interpreter coverage.** The headed checkpoint still executed about
+   27.0 million interpreter instructions with 24,600 unique misses versus
+   about 298.6 million native title dispatches.
+6. **Re-profile CPU/dispatch only after GX fallback collapses.** Then apply the
+   proven `ndsrecomp` sequence: exact RAM fast paths, generation-aware dispatch
+   caches, source-aware fallthrough attribution, validated superblocks, and
+   scoped PGO.
+7. **Consider title HLE last.** Use content identity, declared live state,
+   `verify` mode, and exact LLE fallback. Prefer platform-wide exact work while
+   it dominates.
+
+## Clean handoff checklist
+
+Before another agent takes over:
+
+- stop any `gcn_boot` process cleanly with the TCP `quit` command;
+- record current system load and whether timing is admissible;
+- include the exact build/test/run commands and log paths;
+- commit framework changes to `master` and push `origin/master`;
+- update `WindWakerRecomp/gcnrecomp.lock`, its handoff note, and push its
+  `master`;
+- leave generated code, ISO/firmware, captures, Ghidra databases, and build
+  products untracked;
+- state which checks are complete and which remain pending.
+
+Do not erase a failed experiment or silently substitute a narrower route. The
+next agent should be able to reproduce the evidence, reject the candidate, or
+continue from the exact stopping point.

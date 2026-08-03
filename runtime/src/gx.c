@@ -391,6 +391,9 @@ static volatile s32 s_pipe_quit     = 0;
 static volatile s32 s_pipe_failed   = 0;   /* worker cannot preserve command stream  */
 static HANDLE       s_pipe_h        = NULL;
 static int          s_pipe_on       = -1;  /* default on; GCN_GX_PIPELINE=0 disables */
+static int          s_pipe_stats    = -1;  /* GCN_GX_PIPE_STATS=1 transition census */
+static int          s_pipe_unsafe_resume = -1; /* GCN_GX_PIPE_UNSAFE_RESUME=1: baseline-
+                                            * reproduction instrument only, see gx_pipe_on() */
 static int          s_pipe_poisoned = 0;   /* scanner overflow (bug guard): permanent sync */
 static int          s_pipe_syncmode = 0;   /* unsizable top-level cmd (e.g. a top-level
                                             * PRIM — the IPL draws one 4-vertex quad
@@ -406,6 +409,11 @@ static int          s_pipe_syncmode = 0;   /* unsizable top-level cmd (e.g. a to
 static u8  s_scan_carry[128];
 static u32 s_scan_carry_len = 0;
 static s64 s_scan_pos = 0;        /* cumulative stream offset of carry[0] */
+static u64 s_pipe_sync_entries = 0;
+static u64 s_pipe_resume_deferrals = 0;
+static u64 s_pipe_resumes = 0;
+static u64 s_pipe_poison_events = 0;
+static u32 s_pipe_max_deferred_carry = 0;
 
 /* The IPL normally renders successive fields into the same guest XFB. The GX
  * worker materializes that buffer row-by-row while VI runs on the CPU thread;
@@ -443,6 +451,18 @@ static void gx_pipe_abort_if_failed(void) {
 
 static int gx_pipe_on(void) {
     if (s_pipe_on < 0) {
+        const char* stats = getenv("GCN_GX_PIPE_STATS");
+        s_pipe_stats = (stats && stats[0] == '1') ? 1 : 0;
+        /* GCN_GX_PIPE_UNSAFE_RESUME=1: baseline-reproduction instrument for A/B
+         * measurement against the known-buggy pre-fix resume gate (carry_len <=
+         * capacity, no gather-size headroom). Never for normal use — it can
+         * poison the pipeline, which is the whole point of reproducing it. */
+        const char* unsafe = getenv("GCN_GX_PIPE_UNSAFE_RESUME");
+        s_pipe_unsafe_resume = (unsafe && unsafe[0] == '1') ? 1 : 0;
+        if (s_pipe_unsafe_resume)
+            fprintf(stderr, "[gx-pipe] GCN_GX_PIPE_UNSAFE_RESUME=1: "
+                            "baseline-reproduction mode, resume gate is the "
+                            "known-buggy policy (carry overflow possible)\n");
         /* Default ON after the finalized implementation held all four golden
          * XFB hashes, both oracle counts, repeated-run determinism, and showed
          * a 15.5% average whole-boot win in an interleaved derived A/B. Keep a
@@ -553,6 +573,15 @@ void gcn_gx_pipeline_shutdown(void) {
                     100.0 * (double)cfg_hits / (double)(cfg_hits + cfg_misses) : 0.0);
         gx_raster_print_draw_shape_stats();
     }
+    if (s_pipe_stats == 1)
+        fprintf(stderr,
+                "[gx-pipe-stats] sync=%llu defer=%llu resume=%llu poison=%llu "
+                "max-deferred-carry=%u\n",
+                (unsigned long long)s_pipe_sync_entries,
+                (unsigned long long)s_pipe_resume_deferrals,
+                (unsigned long long)s_pipe_resumes,
+                (unsigned long long)s_pipe_poison_events,
+                s_pipe_max_deferred_carry);
     fprintf(stderr, "gx: completed %llu IPL frames (GXSetDrawDone)\n",
             (unsigned long long)s_gx_frames);
     fprintf(stderr, "gx: DL tear census: %llu tears / %llu hashed CALL_DL "
@@ -652,6 +681,7 @@ static s64 gx_scan_chunk(const u8* chunk, s64 chunk_start_off, int* poison) {
                         "permanent synchronous fallback\n",
                 s_scan_carry_len, take);
         s_pipe_poisoned = 1;
+        s_pipe_poison_events++;
         *poison = 1;
         return 0;
     }
@@ -786,6 +816,7 @@ static void gx_pipe_enter_syncmode(void) {
         announced = 1;
     }
     gx_pipe_drain_worker();
+    s_pipe_sync_entries++;
     s_pipe_syncmode = 1;
 }
 
@@ -798,11 +829,30 @@ static void gx_pipe_enter_syncmode(void) {
  * budget ended mid-PRIM) just stays in sync mode another tick. */
 static void gx_pipe_try_resume(void) {
     GcnGx* gx = &s_gx;
-    if (gx->buf_len > sizeof s_scan_carry)
+    /* GCN_GX_PIPE_UNSAFE_RESUME=1 substitutes the old, known-buggy gate
+     * (resume whenever the carry merely fits the buffer, with no headroom
+     * reserved for the next gather) for baseline A/B reproduction only. */
+    int can_resume = s_pipe_unsafe_resume
+        ? (gx->buf_len <= sizeof s_scan_carry)
+        : gcn_gx_pipeline_carry_can_resume(
+              gx->buf_len, (u32)sizeof s_scan_carry,
+              GCN_CP_GATHER_PIPE_SIZE);
+    if (!can_resume) {
+        s_pipe_resume_deferrals++;
+        if (gx->buf_len > s_pipe_max_deferred_carry)
+            s_pipe_max_deferred_carry = gx->buf_len;
+        if (s_pipe_stats == 1 && s_pipe_resume_deferrals == 1u)
+            fprintf(stderr,
+                    "[gx-pipe-stats] first resume deferral carry=%u "
+                    "next-gather=%u capacity=%u\n",
+                    gx->buf_len, GCN_CP_GATHER_PIPE_SIZE,
+                    (u32)sizeof s_scan_carry);
         return;
+    }
     memcpy(s_scan_carry, gx->buf, gx->buf_len);
     s_scan_carry_len = gx->buf_len;
     s_scan_pos = __atomic_load_n(&s_pipe_produced, __ATOMIC_RELAXED) - (s64)gx->buf_len;
+    s_pipe_resumes++;
     s_pipe_syncmode = 0;
 }
 

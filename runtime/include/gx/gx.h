@@ -66,6 +66,17 @@
  * rationale as the VI beam rate in vi.h). 1024 = 32 gather-pipe chunks. */
 #define GCN_GX_DRAIN_BYTES_PER_TICK  1024u
 
+/* A scanner carry may re-enter the asynchronous producer only when the next
+ * complete 32-byte gather can be appended without overflowing its fixed
+ * buffer. Checking only carry_len <= capacity is insufficient: a 97-byte
+ * Wind Waker primitive tail plus the next 32-byte gather poisoned the
+ * pipeline permanently. */
+static inline int gcn_gx_pipeline_carry_can_resume(u32 carry_len,
+                                                   u32 capacity,
+                                                   u32 gather_size) {
+    return gather_size <= capacity && carry_len <= capacity - gather_size;
+}
+
 /* Bring the GX consumer up. Needs the guest CPU (for FIFO/DL/XFB guest-RAM
  * access), the CP register file (read pointer / distance / enables), and the PE
  * (token/finish latches raised by SETDRAWDONE / PE_TOKEN commands). */
