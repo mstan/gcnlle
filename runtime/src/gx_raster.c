@@ -227,7 +227,28 @@ static u64 s_ps_blend_writes;    /* blend_stage reached BlendTev */
  * general tev_draw() — the coverage number the task's VERIFY step asks for,
  * gated on this same knob so it costs nothing when census is off. */
 #define GX_CENSUS_MAX 128
-typedef struct { int used; u32 hash, program_id; u64 draws, pixels, fused_pixels; } GxCensusEntry;
+typedef struct {
+    int used; u32 hash, program_id; u64 draws, pixels, fused_pixels;
+    /* GX_GENERAL_TEV.md phase-1 eligibility fields (measure-first step).
+     * Mixed into `hash` above (see build_draw_cfg's census tail) so a bucket
+     * is a fixed point in every dimension that changes the general program's
+     * eligibility -- without that, two draws sharing a combiner shape but
+     * differing in fog/ztex/indirect/texture-format state would fold into
+     * one bucket and silently corrupt the per-eligibility-class pixel
+     * attribution this extension exists to produce. */
+    u32 fog_fsel;            /* BP 0xF1 bits 21-23; 0 = fog disabled */
+    int ztex_enable;         /* BP 0xF5 op (bits 2-2) != 0 */
+    int indirect_active;     /* any stage's tevind takes the non-identity path
+                               * (tev_indirect_coord, tevind != 0) or any stage
+                               * reads ras colorchan 5/6 (bump alpha) */
+    u32 numtexgens;          /* GenMode numtexgens, duplicated here for a
+                               * standalone print (already part of `hash`) */
+    u32 sampled_mask;        /* bit i: texmap unit i is sampled by a stage
+                               * (enable && numtexgens>0) this draw */
+    u32 sampled_fmt[8];      /* TX_SETIMAGE0 format (bits 20-23), unit-indexed;
+                               * only meaningful where sampled_mask's bit is set */
+    int sampled_mip[8];      /* tex[unit].mipmap_filter != 0, same validity rule */
+} GxCensusEntry;
 static int s_tev_census = -1;
 static GxCensusEntry s_census[GX_CENSUS_MAX];
 static int s_census_cur = -1;   /* index of the current draw's config, else -1 */
@@ -5837,11 +5858,49 @@ static void build_draw_cfg(void) {
         CEN_MIX(s_cfg.bm_logic_mode);
         CEN_MIX(s_cfg.da_enable); CEN_MIX(s_cfg.da_alpha);
         CEN_MIX(s_bp[0xF3]);                     /* alpha-test word */
+
+        /* GX_GENERAL_TEV.md phase-1 eligibility fields (see the GxCensusEntry
+         * comment). fsel/ztex/indirect are read straight off the same BP
+         * registers apply_fog/ztexture_depth/tev_indirect_coord read; sampled
+         * texmap format/mip mirror what tex_sample_mip actually consults for
+         * every unit an enabled stage samples (numtexgens>0 gate matches
+         * tev_draw's own "no texgens -> memset(texel,0,4), no sample" path). */
+        u32 cen_fsel = bits(s_bp[0xF1], 21, 3);
+        int cen_ztex = bits(s_bp[0xF5], 2, 2) != 0u;
+        int cen_indirect = 0;
+        u32 cen_sampled_mask = 0;
+        u32 cen_sampled_fmt[8] = {0};
+        int cen_sampled_mip[8] = {0};
         for (u32 st = 0; st <= s_cfg.numtevstages; st++) {
             const TevStageCfg* sc = &s_cfg.stage[st];
             CEN_MIX(sc->cc); CEN_MIX(sc->ac);    /* full combiner words */
             CEN_MIX(sc->enable); CEN_MIX(sc->colorchan);
+
+            /* tev_indirect_coord/RasColor both run for EVERY stage regardless
+             * of `enable` (tev_draw calls tev_indirect_coord before checking
+             * enable, and the RasColor block right after is unconditional
+             * too) -- so a disabled stage's non-identity tevind or bump-alpha
+             * colorchan still has downstream effect (AlphaBump feeds a later
+             * stage's indirect matrix, RasColor feeds that stage's own
+             * combiner args) and must count toward indirect-active here. */
+            if (sc->tevind != 0) cen_indirect = 1;
+            if (sc->colorchan == 5 || sc->colorchan == 6) cen_indirect = 1;
+
+            if (sc->enable && s_cfg.numtexgens > 0) {
+                u32 u = sc->texmap & 7u;
+                if (!(cen_sampled_mask & (1u << u))) {
+                    cen_sampled_mask |= (1u << u);
+                    cen_sampled_fmt[u] = s_cfg.tex[u].fmt;
+                    cen_sampled_mip[u] = s_cfg.tex[u].mipmap_filter != 0u;
+                }
+            }
         }
+        CEN_MIX(cen_fsel); CEN_MIX(cen_ztex); CEN_MIX(cen_indirect);
+        CEN_MIX(cen_sampled_mask);
+        for (u32 u = 0; u < 8; u++)
+            if (cen_sampled_mask & (1u << u)) {
+                CEN_MIX(cen_sampled_fmt[u]); CEN_MIX(cen_sampled_mip[u]);
+            }
         #undef CEN_MIX
         int free_slot = -1;
         for (int i = 0; i < GX_CENSUS_MAX; i++) {
@@ -5853,15 +5912,26 @@ static void build_draw_cfg(void) {
             s_census[free_slot].used = 1;
             s_census[free_slot].hash = h;
             s_census[free_slot].program_id = s_cfg.program_id;
+            s_census[free_slot].fog_fsel = cen_fsel;
+            s_census[free_slot].ztex_enable = cen_ztex;
+            s_census[free_slot].indirect_active = cen_indirect;
+            s_census[free_slot].numtexgens = s_cfg.numtexgens;
+            s_census[free_slot].sampled_mask = cen_sampled_mask;
+            memcpy(s_census[free_slot].sampled_fmt, cen_sampled_fmt, sizeof cen_sampled_fmt);
+            memcpy(s_census[free_slot].sampled_mip, cen_sampled_mip, sizeof cen_sampled_mip);
             fprintf(stderr, "[gx-census] NEW config #%d hash=%08x prog=%u stages=%u texgens=%u "
                     "colchans=%u ztest=%u/%u/func%u zupd=%u cu=%u/%u blend=%u logic=%u/%u sub=%u "
-                    "dither=%u sf=%u df=%u da=%u/%u at=0x%06X",
+                    "dither=%u sf=%u df=%u da=%u/%u at=0x%06X fog=%u ztex=%d ind=%d",
                     free_slot, h, s_cfg.program_id, s_cfg.numtevstages + 1u, s_cfg.numtexgens,
                     s_cfg.numcolchans, s_cfg.zt_enable, s_cfg.zt_early, s_cfg.zt_func,
                     s_zt_upd, s_bm_cu, s_bm_au, s_cfg.bm_blend_enable, s_cfg.bm_logic_enable,
                     s_cfg.bm_logic_mode, s_cfg.bm_subtract, s_cfg.bm_dither,
                     s_cfg.bm_src_factor, s_cfg.bm_dst_factor,
-                    s_cfg.da_enable, s_cfg.da_alpha, s_bp[0xF3]);
+                    s_cfg.da_enable, s_cfg.da_alpha, s_bp[0xF3],
+                    cen_fsel, cen_ztex, cen_indirect);
+            for (u32 u = 0; u < 8; u++)
+                if (cen_sampled_mask & (1u << u))
+                    fprintf(stderr, " tex%u=fmt%u/mip%d", u, cen_sampled_fmt[u], cen_sampled_mip[u]);
             for (u32 st = 0; st <= s_cfg.numtevstages; st++)
                 fprintf(stderr, " | st%u cc=%06X ac=%06X en=%u chan=%u",
                         st, s_cfg.stage[st].cc, s_cfg.stage[st].ac,
@@ -7097,7 +7167,8 @@ void gx_raster_print_census(void) {
          * per-bucket coverage the task's VERIFY step asks to report: how
          * many of this bucket's shaded pixels took a fused_pixel_A/B/C
          * specialization instead of the general tev_draw(). */
-        fprintf(stderr, " #%d:%08x prog=%u draws=%llu px=%llu(%.1f%%) fused=%llu(%.1f%%)",
+        fprintf(stderr, " #%d:%08x prog=%u draws=%llu px=%llu(%.1f%%) fused=%llu(%.1f%%) "
+                "texgens=%u fog=%u ztex=%d ind=%d",
                 i, s_census[i].hash, s_census[i].program_id,
                 (unsigned long long)s_census[i].draws,
                 (unsigned long long)s_census[i].pixels,
@@ -7105,7 +7176,13 @@ void gx_raster_print_census(void) {
                 (unsigned long long)s_census[i].fused_pixels,
                 s_census[i].pixels
                     ? 100.0 * (double)s_census[i].fused_pixels / (double)s_census[i].pixels
-                    : 0.0);
+                    : 0.0,
+                s_census[i].numtexgens, s_census[i].fog_fsel,
+                s_census[i].ztex_enable, s_census[i].indirect_active);
+        for (u32 u = 0; u < 8; u++)
+            if (s_census[i].sampled_mask & (1u << u))
+                fprintf(stderr, " tex%u=fmt%u/mip%d", u,
+                        s_census[i].sampled_fmt[u], s_census[i].sampled_mip[u]);
     }
     fprintf(stderr, " | total_fused=%llu/%llu(%.1f%%)\n",
             (unsigned long long)total_fused, (unsigned long long)total_px,
