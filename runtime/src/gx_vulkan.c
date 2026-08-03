@@ -33,7 +33,14 @@
 #define READBACK_EFB_TEX_OFFSET (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
 #define READBACK_BYTES (READBACK_EFB_TEX_OFFSET + EFB_TEX_SHADOW_BYTES)
 #define DRAW_JOB_OFFSET (XFB_SHADOW_OFFSET + XFB_SHADOW_TOTAL)
-#define DRAW_PACKET_BYTES 512u
+/* Phase 1a (general TEV program, docs/GX_GENERAL_TEV.md): grown from 128 to
+ * 256 u32 words. Words 0..111 keep their EXACT pre-existing layout (every
+ * program 1..30 reads only those); words 112..255 are the new "general
+ * block", packed for every draw regardless of fused_program so the stride
+ * change is exercised (and load-bearing) under the existing 30 programs
+ * before anything ever classifies to the still-unused id 31. See the layout
+ * table in snapshot_fused_draw's comment. */
+#define DRAW_PACKET_BYTES 1024u
 #define GX_VK_DRAW_PROGRAM_COUNT 30u
 #define DRAW_JOB_BYTES  (8u * 1024u * 1024u)
 #define DRAW_PACKET_ARENA_BYTES (6u * 1024u * 1024u)
@@ -1130,6 +1137,8 @@ static int resolve_fused_texture(const GxRasterTriangleJob* job,
 
 static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
                                 const GxVkTextureEntry* texture) {
+    _Static_assert(DRAW_PACKET_BYTES == 256u * sizeof(u32),
+                   "general block (words 112..255) layout assumes a 256-word packet");
     _Static_assert(sizeof(GxRasterTriScan) == 21u * sizeof(u32),
                    "GPU triangle scan packet layout changed");
     _Static_assert(sizeof(GxRasterSlope) == 7u * sizeof(u32),
@@ -1185,9 +1194,66 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
     /* Y/Z (25/26) read this live instead of a matcher-pinned constant -- see
      * GxRasterTriangleJob::bm_au's comment. */
     words[111] = (u32)job->bm_au;
-    /* Words 112..127 are alignment-only stride padding.  The shader never
-     * indexes them, and resident packets are written directly into their
-     * mapped final slot, so touching that padding is pure bandwidth. */
+
+    /* Phase 1a general block (docs/GX_GENERAL_TEV.md), words 112..255.
+     * NOT YET consumed by the shader (id 31 is not classified to by
+     * compute_program_id yet -- this pass only lands the packer+stride so
+     * the 128->256-word stride change is exercised, and provably inert,
+     * under every existing program 1..30). Layout (144 words total):
+     *
+     *   112        raw GenMode            BP 0x00 (numtexgens/numtevstages/
+     *                                     numcolchans bitfields, undecoded)
+     *   113..144   raw TevStageCombiner cc/ac, 16 stages x 2   BP 0xC0-0xDF
+     *   145..152   raw TRef (order/texmap/texcoord/enable/colorchan),
+     *              stage-pairs 0-7                             BP 0x28-0x2F
+     *   153..160   raw TevKSel (konst + swap-table selectors),
+     *              stage-pairs 0-7                             BP 0xF6-0xFD
+     *   161..176   tev_reg[4][4]: decoded Prev/Color0/Color1/Color2 RGBA
+     *              (job->tev_reg -- CPU already sign-extends these once;
+     *              only tev_reg[1]/[2] rgb + tev_reg[1].a were packed
+     *              before, at 91-96/107, for the matched A..AD programs)
+     *   177..184   raw TEV/konst registers (tev_load_registers input)
+     *                                                          BP 0xE0-0xE7
+     *   185        raw AlphaTest word                          BP 0xF3
+     *   186        raw ZMode                                   BP 0x40
+     *   187        raw BlendMode                                BP 0x41
+     *   188        raw dest-alpha/ConstantAlpha                BP 0x42
+     *   189        raw PEControl                                BP 0x43
+     *   190..217   color[1] slopes: 4x GxRasterSlope (7 words each) --
+     *              second Gouraud color channel (job->color[1])
+     *   218..238   tex[1] slopes: 3x GxRasterSlope (7 words each) --
+     *              second texgen (job->tex[1])
+     *   239..250   second texture metadata block, mirrors the words-79..90
+     *              schema (format/width/height/wrap-s/wrap-t/mipmap/
+     *              edge-lod/lod-bias/min-linear/mag-linear/length) for the
+     *              stage(s) sampling texmap!=0 -- zeroed until a second
+     *              resident-texture unit is resolved (pass B/C)
+     *   251..255   reserved (zeroed; free for Phase 1b/2 fields)
+     *
+     * Raw BP windows (not pre-decoded fields) per the spec's auditability
+     * rule: the eventual shader re-derives bitfields with a line-for-line
+     * port of the CPU extraction, so every GLSL helper can cite the exact
+     * C function it transcribes. */
+    memcpy(words + 113u, s_vk.draw_bp + 0xC0, 32u * sizeof(*words));
+    memcpy(words + 145u, s_vk.draw_bp + 0x28, 8u * sizeof(*words));
+    memcpy(words + 153u, s_vk.draw_bp + 0xF6, 8u * sizeof(*words));
+    for (u32 reg = 0; reg < 4u; ++reg)
+        for (u32 comp = 0; comp < 4u; ++comp)
+            words[161u + reg * 4u + comp] = (u32)job->tev_reg[reg][comp];
+    memcpy(words + 177u, s_vk.draw_bp + 0xE0, 8u * sizeof(*words));
+    words[185] = s_vk.draw_bp[0xF3];
+    words[186] = s_vk.draw_bp[0x40];
+    words[187] = s_vk.draw_bp[0x41];
+    words[188] = s_vk.draw_bp[0x42];
+    words[189] = s_vk.draw_bp[0x43];
+    words[112] = s_vk.draw_bp[0x00];
+    for (u32 comp = 0; comp < 4u; ++comp)
+        memcpy(words + 190u + comp * 7u, &job->color[1][comp],
+               sizeof(GxRasterSlope));
+    for (u32 comp = 0; comp < 3u; ++comp)
+        memcpy(words + 218u + comp * 7u, &job->tex[1][comp],
+               sizeof(GxRasterSlope));
+    memset(words + 239u, 0, 17u * sizeof(*words)); /* 239..255: see table */
 }
 
 static int flush_staging(void) {
