@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Exact bit-for-bit transcription of gx_raster.c's EFB->texture branch
+// (efb_copy_texture_sample + efb_copy_texture_write_block), restricted to the
+// two GPU-resident configurations gx_vulkan.c's decode_efb_tex_copy() gates
+// on before ever dispatching this shader: fmt 11 (RG8) and fmt 6 (RGBA8),
+// both 4x4-block tiled. The C side only reaches this shader for exactly the
+// two bit-verified copy words (0x01023B / 0x010263); every other EFB->texture
+// state keeps the synchronized software fallback (gx_vulkan.c,
+// gx_vulkan_resident_efb_copy).
+#version 450
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D efb_color;
+layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D efb_depth;
+layout(set = 0, binding = 5, std430) buffer TexCopyOutput {
+    uint words[];
+} out_buf;
+
+layout(push_constant) uniform TexCopyPush {
+    uvec4 rect;     // left, top, right, bottom (right/bottom exclusive)
+    uvec4 dims;     // out_w, out_h, tiles_x, tiles_y
+    uvec4 mode;     // clamp_top, clamp_bottom, half_scale, is_depth
+    uvec4 mode2;    // is_rgba6, fmt, reserved0, block_bytes
+    uvec4 weights0; // w0..w3
+    uvec4 weights1; // w4..w6, output_word_base
+} p;
+
+int clampi(int value, int low, int high) {
+    return min(max(value, low), high);
+}
+
+uint expand6(uint value) {
+    return (value << 2) | (value >> 4);
+}
+
+struct Texel { uint r, g, b, a; };
+
+// efb_copy_texture_sample's per-row pixel extraction (SWEfbInterface.cpp's
+// GetPixelColor / GetPixelDepth families), transcribed for exactly the
+// pixel_format values gx_vulkan.c's decode gates on: RGB8_Z24/RGB565_Z16
+// (direct), RGBA6_Z24, and Z24 (depth substitutes for color entirely).
+Texel extract(int x, int y) {
+    Texel t;
+    x = clampi(x, 0, 639);
+    y = clampi(y, 0, 527);
+    if (p.mode.w != 0u) {                        // is_depth (PF_Z24)
+        uint z = imageLoad(efb_depth, ivec2(x, y)).r & 0xFFFFFFu;
+        t.r = (z >> 16) & 0xFFu;
+        t.g = (z >> 8) & 0xFFu;
+        t.b = z & 0xFFu;
+        t.a = 0xFFu;
+        return t;
+    }
+    uint raw = imageLoad(efb_color, ivec2(x, y)).r;
+    if (p.mode2.x != 0u) {                        // is_rgba6 (PF_RGBA6_Z24)
+        t.a = expand6(raw & 0x3Fu);
+        t.b = expand6((raw >> 6) & 0x3Fu);
+        t.g = expand6((raw >> 12) & 0x3Fu);
+        t.r = expand6((raw >> 18) & 0x3Fu);
+    } else {                                      // direct (RGB8_Z24/RGB565_Z16)
+        t.r = (raw >> 16) & 0xFFu;
+        t.g = (raw >> 8) & 0xFFu;
+        t.b = raw & 0xFFu;
+        t.a = 0xFFu;
+    }
+    return t;
+}
+
+// efb_copy_texture_sample's half_scale remap + clamp_top/bottom neighbor
+// selection + 3-tap vertical filter (>>6, no rounding -- matches the C cast
+// truncation exactly). Alpha is the middle row's, unfiltered.
+Texel filtered(int sx, int sy) {
+    int x = sx, y = sy;
+    if (p.mode.z != 0u) {                         // half_scale
+        x = int(p.rect.x) + (x - int(p.rect.x)) * 2;
+        y = int(p.rect.y) + (y - int(p.rect.y)) * 2;
+    }
+    x = clampi(x, 0, 639);
+    y = clampi(y, 0, 527);
+    int yprev = y - 1;
+    int ynext = y + 1;
+    if (p.mode.x != 0u && yprev < int(p.rect.y)) yprev = int(p.rect.y);
+    if (p.mode.y != 0u && ynext >= int(p.rect.w)) ynext = int(p.rect.w) - 1;
+    yprev = clampi(yprev, 0, 527);
+    ynext = clampi(ynext, 0, 527);
+
+    Texel r0 = extract(x, yprev);
+    Texel r1 = extract(x, y);
+    Texel r2 = extract(x, ynext);
+    int wab = int(p.weights0.x + p.weights0.y);
+    int wcde = int(p.weights0.z + p.weights0.w + p.weights1.x);
+    int wfg = int(p.weights1.y + p.weights1.z);
+    Texel o;
+    o.r = uint(clampi((int(r0.r) * wab + int(r1.r) * wcde + int(r2.r) * wfg) >> 6, 0, 255));
+    o.g = uint(clampi((int(r0.g) * wab + int(r1.g) * wcde + int(r2.g) * wfg) >> 6, 0, 255));
+    o.b = uint(clampi((int(r0.b) * wab + int(r1.b) * wcde + int(r2.b) * wfg) >> 6, 0, 255));
+    o.a = r1.a;
+    return o;
+}
+
+// efb_copy_texture_write_block's per-block source addressing: ox/oy clamp to
+// the last valid output column/row (out_w-1 / out_h-1), then offset by
+// left/top. `i` is the block-local linear texel index (y*4+x), exactly the
+// px[] index the software write-back loops use.
+Texel block_texel(uint bx, uint by, uint i) {
+    uint ox = bx * 4u + (i & 3u);
+    uint oy = by * 4u + (i >> 2u);
+    int sx = int(p.rect.x) + int(ox < p.dims.x ? ox : p.dims.x - 1u);
+    int sy = int(p.rect.y) + int(oy < p.dims.y ? oy : p.dims.y - 1u);
+    return filtered(sx, sy);
+}
+
+void main() {
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    if (bx >= p.dims.z || by >= p.dims.w)
+        return;
+
+    uint words_per_block = p.mode2.w / 4u;        // block_bytes / 4
+    uint j = gl_LocalInvocationID.x;
+    if (j >= words_per_block)
+        return;
+
+    // Shadow buffer layout: tiles_y rows of (tiles_x * words_per_block)
+    // contiguous words, exactly mirroring the guest RAM tiled-block walk
+    // (dest_stride = tiles_x*block_bytes, no shadow-side padding) -- the C
+    // side memcpy's row_bytes = tiles_x*block_bytes bytes per output row.
+    uint out_index = p.weights1.w +
+        by * (p.dims.z * words_per_block) + bx * words_per_block + j;
+
+    uint fmt = p.mode2.y;
+    if (fmt == 11u) {
+        // RG8: 8 words/block, 2 texels/word -- dst[2i]=g, dst[2i+1]=r.
+        uint i0 = j * 2u, i1 = i0 + 1u;
+        Texel t0 = block_texel(bx, by, i0);
+        Texel t1 = block_texel(bx, by, i1);
+        out_buf.words[out_index] = t0.g | (t0.r << 8) | (t1.g << 16) | (t1.r << 24);
+    } else {
+        // RGBA8: 16 words/block -- 8 AR-plane words (dst[2i]=a,dst[2i+1]=r),
+        // then 8 GB-plane words (dst[32+2i]=g, dst[33+2i]=b).
+        if (j < 8u) {
+            uint i0 = j * 2u, i1 = i0 + 1u;
+            Texel t0 = block_texel(bx, by, i0);
+            Texel t1 = block_texel(bx, by, i1);
+            out_buf.words[out_index] = t0.a | (t0.r << 8) | (t1.a << 16) | (t1.r << 24);
+        } else {
+            uint jj = j - 8u;
+            uint i0 = jj * 2u, i1 = i0 + 1u;
+            Texel t0 = block_texel(bx, by, i0);
+            Texel t1 = block_texel(bx, by, i1);
+            out_buf.words[out_index] = t0.g | (t0.b << 8) | (t1.g << 16) | (t1.b << 24);
+        }
+    }
+}
