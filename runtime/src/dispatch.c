@@ -188,6 +188,130 @@ const u8* gcn_dispatch_bs1_snapshot(u32* len_out) {
     return s_bs1_snap;
 }
 
+/* ===========================================================================
+ * GCN_DISPATCH_TOPPC=1 (default off, own cached-getenv sentinel, same idiom
+ * as GCN_DISPATCH_STATS/s_dstats above): a per-entry-PC invocation counter +
+ * cumulative rdtsc, dumped as a top-64 table at shutdown. This is the
+ * durable version of the throwaway "second temporary dispatcher counter"
+ * PERF_CAMPAIGN_2.md describes finding one PC (0x813388DC) responsible for
+ * 82.29% of derived-mode invocations, then removing the counter — extending
+ * it into the always-on-capable instrument family instead of re-writing a
+ * one-shot probe every time this question comes up again.
+ *
+ * Table is open-addressed (linear probe), keyed by entry PC. Sized to match
+ * GCN_BLOCK_RING_CAP (debug/rings.h) -- Wind Waker's route measured a
+ * distinct-entry-PC working set far above a first-cut 16384-way guess (that
+ * size hit 13M overflow-counted invocations out of ~110M -- a stale, too-
+ * small table masquerading as a complete census, exactly what the overflow
+ * counter below exists to catch), so headroom is taken from the same-order
+ * constant the rest of this codebase already uses for "big enough for a
+ * real title route" rather than re-guessing a smaller one. If the table
+ * ever fills anyway (every slot occupied by a DIFFERENT pc than the one
+ * being recorded), the miss is counted in s_toppc_overflow_hits rather than
+ * silently dropped or overwriting a live slot -- the shutdown print reports
+ * a non-zero overflow loudly so a too-small table is never mistaken for a
+ * complete census. */
+#define GCN_TOPPC_WAYS 262144u
+typedef struct {
+    u32 pc;
+    int valid;
+    u64 count;
+    u64 cycles;
+} ToppcSlot;
+static ToppcSlot s_toppc_table[GCN_TOPPC_WAYS];
+static u64 s_toppc_overflow_hits;   /* note() calls that found the table completely
+                                      * full with no matching/empty slot -- counted,
+                                      * never dropped silently */
+static int s_toppc_registered;
+
+static inline void gcn_dispatch_toppc_note(u32 pc, u64 cycles) {
+    u32 h = (pc * 2654435761u) % GCN_TOPPC_WAYS;
+    for (u32 i = 0; i < GCN_TOPPC_WAYS; i++) {
+        u32 idx = (h + i) % GCN_TOPPC_WAYS;
+        ToppcSlot* s = &s_toppc_table[idx];
+        if (!s->valid) {
+            s->valid = 1;
+            s->pc = pc;
+            s->count = 1;
+            s->cycles = cycles;
+            return;
+        }
+        if (s->pc == pc) {
+            s->count++;
+            s->cycles += cycles;
+            return;
+        }
+    }
+    /* Table is completely full and pc is not already resident. Loud, counted
+     * fallback -- never drop silently (PRINCIPLES: make misses loud). */
+    s_toppc_overflow_hits++;
+}
+
+static void gcn_dispatch_toppc_shutdown(void) {
+    u64 total_count = 0, total_cycles = 0;
+    u32 distinct = 0;
+    for (u32 i = 0; i < GCN_TOPPC_WAYS; i++) {
+        if (!s_toppc_table[i].valid) continue;
+        distinct++;
+        total_count += s_toppc_table[i].count;
+        total_cycles += s_toppc_table[i].cycles;
+    }
+    fprintf(stderr,
+            "[dispatch-toppc] distinct-entry-pcs=%u invocations=%llu "
+            "table-overflow-hits=%llu\n",
+            distinct, (unsigned long long)total_count,
+            (unsigned long long)s_toppc_overflow_hits);
+    if (total_count == 0) return;
+
+    /* Top-64 by invocation count: selection sort over a local copy so the
+     * live table (and a concurrent -- there is none, single-threaded
+     * dispatch -- but keep this side-effect-free on principle) is untouched.
+     * GCN_TOPPC_WAYS * 64 comparisons is trivial next to a multi-block run. */
+    static int used[GCN_TOPPC_WAYS];
+    memset(used, 0, sizeof used);
+    fprintf(stderr, "[dispatch-toppc] top-64 by invocation count:\n");
+    for (int rank = 0; rank < 64; rank++) {
+        u32 best = GCN_TOPPC_WAYS; u64 best_n = 0;
+        for (u32 i = 0; i < GCN_TOPPC_WAYS; i++) {
+            if (!s_toppc_table[i].valid || used[i]) continue;
+            if (s_toppc_table[i].count > best_n) { best_n = s_toppc_table[i].count; best = i; }
+        }
+        if (best == GCN_TOPPC_WAYS || best_n == 0) break;
+        used[best] = 1;
+        const ToppcSlot* s = &s_toppc_table[best];
+        fprintf(stderr,
+                "[dispatch-toppc]   #%2d pc=0x%08X invocations=%llu (%.2f%%) "
+                "cycles=%llu (%.2f%% of measured pc-attributed cycles)\n",
+                rank + 1, s->pc, (unsigned long long)s->count,
+                100.0 * (double)s->count / (double)total_count,
+                (unsigned long long)s->cycles,
+                total_cycles ? 100.0 * (double)s->cycles / (double)total_cycles : 0.0);
+    }
+
+    /* Top-64 by cumulative cycles (only meaningful when GCN_DISPATCH_STATS or
+     * the toppc knob's own timing was actually exercised -- both branches in
+     * gcn_dispatch_run time every call regardless of GCN_DISPATCH_STATS, see
+     * below, so this is always populated once GCN_DISPATCH_TOPPC=1). */
+    memset(used, 0, sizeof used);
+    fprintf(stderr, "[dispatch-toppc] top-64 by cumulative cycles:\n");
+    for (int rank = 0; rank < 64; rank++) {
+        u32 best = GCN_TOPPC_WAYS; u64 best_c = 0;
+        for (u32 i = 0; i < GCN_TOPPC_WAYS; i++) {
+            if (!s_toppc_table[i].valid || used[i]) continue;
+            if (s_toppc_table[i].cycles > best_c) { best_c = s_toppc_table[i].cycles; best = i; }
+        }
+        if (best == GCN_TOPPC_WAYS || best_c == 0) break;
+        used[best] = 1;
+        const ToppcSlot* s = &s_toppc_table[best];
+        fprintf(stderr,
+                "[dispatch-toppc]   #%2d pc=0x%08X cycles=%llu (%.2f%%) invocations=%llu\n",
+                rank + 1, s->pc, (unsigned long long)s->cycles,
+                total_cycles ? 100.0 * (double)s->cycles / (double)total_cycles : 0.0,
+                (unsigned long long)s->count);
+    }
+    fflush(stderr);
+}
+
 /* Resolve one executed block's device-cycle charges from ctx->cycles (the
  * recompiler's per-instruction `ctx->cycles += N` accumulation, cpu.h) and
  * fold ctx->timebase / *device_cycles directly. Returns the cycle count the
@@ -355,6 +479,19 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     static u64 s_tsc[6];
     if (s_dstats < 0) s_dstats = getenv("GCN_DISPATCH_STATS") ? 1 : 0;
 
+    /* GCN_DISPATCH_TOPPC=1: per-entry-PC invocation+cycle census (see the
+     * big comment above gcn_dispatch_toppc_note). Own sentinel, resolved
+     * once; registers its shutdown print via atexit exactly once, same
+     * pattern interpreter.c uses for gcn_interpreter_shutdown. */
+    static int s_toppc = -1;
+    if (s_toppc < 0) {
+        s_toppc = getenv("GCN_DISPATCH_TOPPC") ? 1 : 0;
+        if (s_toppc && !s_toppc_registered) {
+            s_toppc_registered = 1;
+            atexit(gcn_dispatch_toppc_shutdown);
+        }
+    }
+
     while (max_blocks == 0u || blocks < max_blocks) {
         /* GCN_COSIM=1 is the deterministic diagnostic path from
          * recomp-template/DIFFERENTIAL-COSIMULATION.md. Park before the very
@@ -469,6 +606,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
          * blocks. Shares (not absolute ns) are the product — the tsc frequency
          * never needs calibrating. Off by default; ~zero cost when off. */
         if (s_dstats) {
+            u32 entry_pc = ctx->pc;
             u64 t0 = __rdtsc();
             int ok = 0;
             if (!gcn_debug_server_cosim_enabled()) {
@@ -480,6 +618,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                 ok = gcn_interpreter_step(ctx);
             }
             u64 t1 = __rdtsc(); s_tsc[0] += t1 - t0;
+            if (s_toppc) gcn_dispatch_toppc_note(entry_pc, t1 - t0);
             if (!ok) { ctx->exception = pending; return 0; }
             u32 dsp_cycles, ai_cycles, tb_ticks;
             int derived = gcn_dispatch_charge(ctx, &prev_cycles, &tb_remainder,
@@ -509,6 +648,8 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                 fflush(stderr);
             }
         } else {
+        u32 entry_pc = ctx->pc;
+        u64 tpc0 = s_toppc ? __rdtsc() : 0;
         int dispatch_ok = 0;
         if (!gcn_debug_server_cosim_enabled()) {
             dispatch_ok = gcn_dispatch_native(ctx);
@@ -518,6 +659,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         if (!dispatch_ok) {
             dispatch_ok = gcn_interpreter_step(ctx);
         }
+        if (s_toppc) gcn_dispatch_toppc_note(entry_pc, __rdtsc() - tpc0);
         if (!dispatch_ok) {   /* off-image PC and interpreter cannot continue */
             ctx->exception = pending;
             return 0;

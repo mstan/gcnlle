@@ -629,6 +629,7 @@ void gcn_gx_pipeline_shutdown(void) {
                 (unsigned long long)cfg_misses,
                 cfg_hits + cfg_misses ?
                     100.0 * (double)cfg_hits / (double)(cfg_hits + cfg_misses) : 0.0);
+        gx_raster_print_config_cache_detail();
         gx_raster_print_draw_shape_stats();
     }
     if (s_pipe_stats == 1)
@@ -640,6 +641,7 @@ void gcn_gx_pipeline_shutdown(void) {
                 (unsigned long long)s_pipe_resumes,
                 (unsigned long long)s_pipe_poison_events,
                 s_pipe_max_deferred_carry);
+    gx_raster_print_cfg_verify_summary();
     fprintf(stderr, "gx: completed %llu IPL frames (GXSetDrawDone)\n",
             (unsigned long long)s_gx_frames);
     fprintf(stderr, "gx: DL tear census: %llu tears / %llu hashed CALL_DL "
@@ -1296,7 +1298,7 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     }
 
     if (gx->bp[cmd] != value)
-        gx_raster_notify_bp_write();
+        gx_raster_notify_bp_write(cmd);
     gx->bp[cmd] = value;
 
     switch (cmd) {

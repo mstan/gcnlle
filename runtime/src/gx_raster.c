@@ -13,7 +13,8 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below */
+#include <stdint.h>      /* uintptr_t — GCN_GX_CFG_CACHE_VERIFY pointer-field compares */
+#include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below; abort() — cfg-cache-verify mismatch */
 #include <string.h>
 #include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
 #include <emmintrin.h>   /* SSE2 — EFB-copy scanline encode (GCN_GX_NO_SIMD knob) */
@@ -508,6 +509,130 @@ static u64 s_cfg_cache_hits;
 static u64 s_cfg_cache_misses;
 static u64 s_draw_shapes[8][17]; /* nverts 0..15, 16=16+ */
 
+/* ============================================================================
+ * DrawCfg cache: register-relevance + generation + N-way content cache
+ * ----------------------------------------------------------------------------
+ * gx_raster_notify_bp_write() used to bump s_bp_generation (and force a
+ * build_draw_cfg() rebuild on the next draw) for ANY value-changing BP write,
+ * regardless of whether that register feeds build_draw_cfg() at all. On IPL
+ * menus this was nearly free because the same handful of BP writes repeat
+ * for thousands of draws, so hit rates were high anyway. Wind Waker's title
+ * route measured hit=0 miss=970367 (0.0%) — see
+ * F:\Projects\WindWakerRecomp\captures\perf-census-20260803\run1.err.log —
+ * because its material system rewrites BP registers build_draw_cfg() never
+ * reads (texture-unrelated indirect-matrix/scale regs 0x06-0x27 sans 0x10-
+ * 0x1F/0x28-0x2F, fog regs 0xE8-0xF2, ztex 0xF4-0xF5, scissor/viewport-copy
+ * regs) on effectively every draw, which used to force a full rebuild even
+ * when the pixel-relevant subset was unchanged or repeating.
+ *
+ * s_cfg_relevant_bp[] is the exact, enumerated set of BP command IDs
+ * build_draw_cfg() reads, directly or through a helper it calls (pixel_format,
+ * the zm_/bm_/da_/gm_ accessor families, tx_mode0/tx_mode1/tx_image0/
+ * tx_image3, swap_table, tev_load_registers, konst_lookup), plus the
+ * s_bp[0xF3] alpha-test-word reads inside the fused-match family that
+ * build_draw_cfg's tail calls to select s_cfg.fused. Every one of those call
+ * sites was audited line-by-line (2026-08-03 cfg-cache task) against this
+ * table; registers that tev_indirect_coord / the fog function / ztex read
+ * directly from s_bp EVERY PIXEL (never cached into s_cfg) are deliberately
+ * excluded — they can never be stale because nothing caches them.
+ *
+ * s_relevant_bp_generation only advances when a write changes a register in
+ * this set, so consecutive draws whose BP churn lives entirely outside it
+ * keep reusing s_cfg for free (tier 1, same cost as the old scheme's best
+ * case). When it DOES advance, s_cfg_cache[] (tier 2) hashes exactly this
+ * register set and remembers the last CFG_CACHE_WAYS distinct builds, so a
+ * title that alternates among a small number of materials still hits even
+ * though the relevant generation changes on every draw. */
+static u8 s_cfg_relevant_bp[256];
+
+static void init_cfg_relevant_bp(void) {
+    memset(s_cfg_relevant_bp, 0, sizeof s_cfg_relevant_bp);
+    #define CFG_REL_MARK(a, b) \
+        do { for (u32 _i = (u32)(a); _i <= (u32)(b); _i++) s_cfg_relevant_bp[_i] = 1; } while (0)
+    CFG_REL_MARK(0x00, 0x00);   /* GenMode: numtexgens/numcolchans/numtevstages/cull/numindstages (the
+                                 * last only selects LIVE per-pixel indirect reads, but it shares this
+                                 * register with fields build_draw_cfg DOES cache) */
+    CFG_REL_MARK(0x10, 0x1F);   /* TEV indirect-stage words (sc->tevind), stages 0-15 */
+    CFG_REL_MARK(0x28, 0x2F);   /* TRef: order/texmap/texcoord/enable/colorchan, stage-pairs 0-7 */
+    CFG_REL_MARK(0x40, 0x43);   /* ZMode, BlendMode, DstAlpha/ConstantAlpha, PEControl (pixel_format/
+                                 * early_ztest) */
+    CFG_REL_MARK(0x80, 0x97);   /* TX_SETMODE0/1 + TX_SETIMAGE0, texture units 0-3 and 4-7
+                                 * (tx_unit_base packs unit 4-7 at +8) */
+    CFG_REL_MARK(0x98, 0x9B);   /* TX_SETTLUT, units 0-3 */
+    CFG_REL_MARK(0x9C, 0x9F);   /* TX_SETIMAGE3, units 4-7 */
+    CFG_REL_MARK(0xB8, 0xBB);   /* TX_SETTLUT, units 4-7 */
+    CFG_REL_MARK(0xC0, 0xDF);   /* TevStageCombiner cc/ac words, 16 stages */
+    CFG_REL_MARK(0xE0, 0xE7);   /* TEV registers (konst colors), tev_load_registers */
+    CFG_REL_MARK(0xF3, 0xF3);   /* AlphaCompare word. Read LIVE by alpha_test() every pixel (so THAT
+                                 * read can never be stale), but build_draw_cfg()'s tail also reads it
+                                 * directly to select s_cfg.fused (fused_blend_common_match and every
+                                 * gpu_program_*_match). A stale cached fused-path choice here would
+                                 * apply an always-pass/always-fail alpha-test assumption baked at the
+                                 * WRONG alpha-test word, so this register is cache-relevant even though
+                                 * its live reader is not. */
+    CFG_REL_MARK(0xF6, 0xFD);   /* TevKSel: konst selectors + swap-table selectors, stage-pairs 0-7 */
+    #undef CFG_REL_MARK
+}
+
+static u64 s_relevant_bp_generation = 1;
+static u64 s_cfg_relevant_generation = 0;
+
+/* Small content-addressed cache of recently built DrawCfgs, keyed by an
+ * FNV-1a hash over exactly s_cfg_relevant_bp[]'s registers. Looked up only
+ * when s_relevant_bp_generation has advanced (tier 1 already handles the
+ * "nothing relevant changed" case for free). sizeof(DrawCfg) is a few KB;
+ * copying it on a tier-2 hit is far cheaper than build_draw_cfg's full
+ * per-stage/per-texunit decode + fused-path pattern match it replaces. */
+/* Wind Waker's own census (see the task evidence log) found 73 distinct
+ * shading configs in one route, several with hundreds of thousands of draws
+ * each, interleaved with the others across the frame (ocean/sky/UI/actors
+ * alternate, not batched by material) — so this needs real headroom, not
+ * just enough for two alternating states. 16 ways * a few KB/DrawCfg is a
+ * trivial amount of static memory next to the decode work it avoids. */
+#define CFG_CACHE_WAYS 16
+typedef struct {
+    u64 key;
+    int valid;
+    DrawCfg cfg;
+} CfgCacheSlot;
+static CfgCacheSlot s_cfg_cache[CFG_CACHE_WAYS];
+static u32 s_cfg_cache_next_way;
+static u64 s_cfg_cache_tier2_hits;
+static u64 s_cfg_cache_tier2_misses;
+static u64 s_cfg_cache_tier1_advances;   /* times s_relevant_bp_generation != s_cfg_relevant_generation */
+
+/* GCN_GX_CFG_CACHE_VERIFY=1 (default off, same getenv-cache pattern as
+ * s_draw_stats/GCN_GX_STATS above — one resolved `if` at the single call
+ * site below, zero cost when unset beyond that untaken branch). On EVERY
+ * cache hit, tier 1 or tier 2, re-runs the full build_draw_cfg() decode into
+ * a scratch DrawCfg and compares it field-by-field against the cached s_cfg
+ * that the hit just reused. A hit that reused a stale/wrong DrawCfg is a
+ * correctness bug in the relevance table or the FNV key, not something to
+ * paper over — see the abort() in draw_cfg_verify_hit() below. This doubles
+ * the work on every hit (a full rebuild is exactly what the cache exists to
+ * avoid), so it is strictly a correctness-audit knob, never left on for a
+ * measured perf run. */
+static int s_cfg_cache_verify = -1;
+static u64 s_cfg_cache_verify_count;
+static u64 s_cfg_cache_verify_mismatches;
+
+/* Always-on (cheap: one array increment per real value-changing BP write)
+ * per-register census of writes that changed value but were NOT relevant to
+ * DrawCfg — i.e. exactly the over-invalidation the old flat-generation
+ * scheme paid for. Printed by gx_raster_print_config_cache_detail(). */
+static u64 s_bp_irrelevant_change_count[256];
+static u64 s_bp_relevant_change_count[256];
+
+static u64 cfg_relevant_hash(void) {
+    u64 h = 1469598103934665603ULL;   /* FNV-1a 64 offset basis */
+    for (u32 i = 0; i < 256; i++) {
+        if (!s_cfg_relevant_bp[i]) continue;
+        h ^= (u64)s_bp[i];
+        h *= 1099511628211ULL;         /* FNV-1a 64 prime */
+    }
+    return h;
+}
+
 /* Last observed draw for every shading-census bucket. This is deliberately a
  * fixed, append-only-by-bucket diagnostic surface: a late TCP query can still
  * inspect the full-screen movie draw even after later menu draws have replaced
@@ -597,10 +722,19 @@ static GxDebugRecent s_debug_large[GX_DEBUG_LARGE_MAX];
 static u32 s_debug_large_head, s_debug_large_count;
 static u64 s_debug_large_latest_frame;
 
-void gx_raster_notify_bp_write(void) {
+void gx_raster_notify_bp_write(u32 cmd) {
     if (++s_bp_generation == 0) {
         s_bp_generation = 1;
         s_cfg_bp_generation = 0;
+    }
+    if (cmd < 256u && s_cfg_relevant_bp[cmd]) {
+        s_bp_relevant_change_count[cmd]++;
+        if (++s_relevant_bp_generation == 0) {
+            s_relevant_bp_generation = 1;
+            s_cfg_relevant_generation = 0;
+        }
+    } else if (cmd < 256u) {
+        s_bp_irrelevant_change_count[cmd]++;
     }
 }
 
@@ -5342,6 +5476,35 @@ static void recompute_scissor(void) {
     }
 }
 
+/* recompute_scissor()'s inputs are bp 0x20/0x21/0x59 (ScissorPos/Dims/Offset)
+ * PLUS the viewport (vp_wd/vp_ht/vp_xo/vp_yo), which live in XF memory, not
+ * BP — gx_on_bp/gx_raster_notify_bp_write() never sees an XF write at all, so
+ * gating this purely on the BP generation (as the old shared s_bp_generation
+ * check did) can leave the scissor rect stale after a viewport-only change
+ * with no intervening BP write. Give it its own tiny key instead: recompute
+ * only when one of these 7 words actually changed since the last check (a
+ * handful of compares every draw, versus recompute_scissor's O(81) rect
+ * search), and let it run every draw regardless of the DrawCfg cache's own
+ * tier1/tier2 state so it never rides on a bigger cache's staleness. */
+static u32 s_scissor_key_bp[3];
+static float s_scissor_key_vp[4];
+static int s_scissor_key_valid;
+
+static void recompute_scissor_if_needed(void) {
+    u32 tl = s_bp[0x20], br = s_bp[0x21], soff = s_bp[0x59];
+    float vw = vp_wd(), vh = vp_ht(), vx = vp_xo(), vy = vp_yo();
+    if (s_scissor_key_valid &&
+        tl == s_scissor_key_bp[0] && br == s_scissor_key_bp[1] && soff == s_scissor_key_bp[2] &&
+        vw == s_scissor_key_vp[0] && vh == s_scissor_key_vp[1] &&
+        vx == s_scissor_key_vp[2] && vy == s_scissor_key_vp[3])
+        return;
+    recompute_scissor();
+    s_scissor_key_bp[0] = tl; s_scissor_key_bp[1] = br; s_scissor_key_bp[2] = soff;
+    s_scissor_key_vp[0] = vw; s_scissor_key_vp[1] = vh;
+    s_scissor_key_vp[2] = vx; s_scissor_key_vp[3] = vy;
+    s_scissor_key_valid = 1;
+}
+
 /* Populate s_cfg (+ the shared s_pf/s_zt_upd/s_bm_cu/s_bm_au quad) once for the
  * whole draw call — see the big "Per-draw config cache" comment above
  * GetPixelColor for why this is exact rather than approximate. Must run AFTER
@@ -5717,6 +5880,131 @@ static void build_draw_cfg(void) {
         }
         if (s_census_cur >= 0) s_census[s_census_cur].draws++;
     }
+}
+
+/* ============================================================================
+ * GCN_GX_CFG_CACHE_VERIFY: field-by-field DrawCfg comparator + cache-hit audit
+ * ----------------------------------------------------------------------------
+ * (see s_cfg_cache_verify's statics comment and gx_raster.h). Walks every
+ * register-derived field build_draw_cfg() sets. A raw memcmp() of the whole
+ * struct is deliberately NOT used: DrawCfg has compiler padding between some
+ * fields that build_draw_cfg() never touches, so memcmp can report a false
+ * mismatch on garbage padding bytes even when every real field is equal.
+ * Safe to walk the whole struct field-by-field because every `s_cfg.<field> =`
+ * site in this file lives inside build_draw_cfg() itself (audited 2026-08-03,
+ * cfg-cache-verify task) -- nothing mutates s_cfg between builds, so there is
+ * no field build_draw_cfg() sets that this comparator must skip.
+ *
+ * tex[].src/tlut are host pointers, but each is a pure deterministic function
+ * of s_cpu->ram (a fixed base for the process lifetime) and phys / the fixed
+ * TMEM base -- comparing the pointer VALUE is exactly as meaningful as
+ * comparing phys/tlut_reg, and additionally catches a moved-ram-base class of
+ * bug that comparing phys alone would miss. s_cfg.fused is a function pointer
+ * into a small fixed table (fused_pixel_A..AA or NULL); comparing it directly
+ * is correct and is exactly what fused_program_id()'s own lookup already
+ * does, so no special-casing is needed for either pointer family. */
+static int draw_cfg_field_mismatch(const char* name, u64 cached_v, u64 fresh_v) {
+    if (cached_v == fresh_v) return 0;
+    fprintf(stderr,
+            "[gx-cfg-verify] MISMATCH field=%s cached=0x%llx rebuilt=0x%llx\n",
+            name, (unsigned long long)cached_v, (unsigned long long)fresh_v);
+    return 1;
+}
+
+static int draw_cfg_diff(const DrawCfg* c, const DrawCfg* f) {
+    int n = 0;
+    #define F(field) n += draw_cfg_field_mismatch(#field, (u64)(uintptr_t)c->field, (u64)(uintptr_t)f->field)
+    F(numtexgens); F(numcolchans); F(numtevstages); F(cullmode);
+    F(zt_enable); F(zt_early); F(zt_func);
+    F(bm_blend_enable); F(bm_logic_enable); F(bm_dither); F(bm_subtract);
+    F(bm_dst_factor); F(bm_src_factor); F(bm_logic_mode);
+    F(da_enable); F(da_alpha);
+    F(fused); F(fused_needs_ras_rgb); F(program_id); F(parallel_ok);
+    #undef F
+
+    for (u32 id = 0; id < 4; id++)
+        for (u32 i = 0; i < 4; i++) {
+            char nm[40];
+            snprintf(nm, sizeof nm, "swaptab[%u][%u]", id, i);
+            n += draw_cfg_field_mismatch(nm, c->swaptab[id][i], f->swaptab[id][i]);
+        }
+
+    /* Only stages 0..numtevstages are populated by build_draw_cfg() (its own
+     * loop bound); numtevstages itself was already compared above, and if it
+     * mismatched that's already reported -- walk the smaller of the two so an
+     * out-of-range read never happens even mid-mismatch. */
+    u32 nstages = c->numtevstages < f->numtevstages ? c->numtevstages : f->numtevstages;
+    if (nstages > 15) nstages = 15;
+    for (u32 st = 0; st <= nstages; st++) {
+        const TevStageCfg* cs = &c->stage[st];
+        const TevStageCfg* fs = &f->stage[st];
+        char nm[48];
+        #define SF(field) do { snprintf(nm, sizeof nm, "stage[%u]." #field, st); \
+            n += draw_cfg_field_mismatch(nm, (u64)cs->field, (u64)fs->field); } while (0)
+        SF(texcoordSel); SF(texmap); SF(enable); SF(colorchan); SF(tevind);
+        SF(cc); SF(ac);
+        SF(argA); SF(argB); SF(argC); SF(argD);
+        SF(aargA); SF(aargB); SF(aargC); SF(aargD);
+        SF(c16); SF(c18); SF(c19); SF(c20); SF(c22);
+        SF(a16); SF(a18); SF(a19); SF(a20); SF(a22);
+        SF(tswap_id); SF(rswap_id);
+        #undef SF
+        snprintf(nm, sizeof nm, "stage[%u].stage_konst.r", st);
+        n += draw_cfg_field_mismatch(nm, (u16)cs->stage_konst.r, (u16)fs->stage_konst.r);
+        snprintf(nm, sizeof nm, "stage[%u].stage_konst.g", st);
+        n += draw_cfg_field_mismatch(nm, (u16)cs->stage_konst.g, (u16)fs->stage_konst.g);
+        snprintf(nm, sizeof nm, "stage[%u].stage_konst.b", st);
+        n += draw_cfg_field_mismatch(nm, (u16)cs->stage_konst.b, (u16)fs->stage_konst.b);
+        snprintf(nm, sizeof nm, "stage[%u].stage_konst.a", st);
+        n += draw_cfg_field_mismatch(nm, (u16)cs->stage_konst.a, (u16)fs->stage_konst.a);
+    }
+
+    for (u32 u = 0; u < 8; u++) {
+        const TexUnitCfg* cu = &c->tex[u];
+        const TexUnitCfg* fu = &f->tex[u];
+        char nm[40];
+        #define TF(field) do { snprintf(nm, sizeof nm, "tex[%u]." #field, u); \
+            n += draw_cfg_field_mismatch(nm, (u64)(uintptr_t)cu->field, (u64)(uintptr_t)fu->field); } while (0)
+        TF(fmt); TF(w1); TF(h1); TF(wrap_s); TF(wrap_t); TF(magf); TF(minf);
+        TF(mipmap_filter); TF(lod_edge); TF(lod_bias_half); TF(minlod); TF(maxlod);
+        TF(image0_raw); TF(image3_raw); TF(tlutfmt); TF(img_base); TF(phys);
+        TF(valid); TF(src); TF(src_len); TF(tlut);
+        #undef TF
+    }
+    return n;
+}
+
+/* Called from gx_raster_draw_impl on EVERY cache hit (tier 1 or tier 2) when
+ * GCN_GX_CFG_CACHE_VERIFY=1. `cached` is the DrawCfg the hit is about to
+ * reuse; on return s_cfg is restored to `cached` (build_draw_cfg() below
+ * overwrites the live s_cfg to perform the audit rebuild, so this must put
+ * it back before the caller proceeds to draw with it). NOTE: this calls
+ * build_draw_cfg() a second time per hit, including its GCN_GX_TEV_CENSUS
+ * tail (double-counts s_census[].draws if that knob is ALSO set) -- verify
+ * is a correctness audit, never combine it with TEV_CENSUS or a measured
+ * perf run. */
+static void draw_cfg_verify_hit(const char* tier, u64 key) {
+    DrawCfg cached = s_cfg;
+    build_draw_cfg();
+    int mismatches = draw_cfg_diff(&cached, &s_cfg);
+    if (mismatches) {
+        fprintf(stderr,
+                "[gx-cfg-verify] ABORT: %d field mismatch(es) on a %s cache hit "
+                "(key=0x%016llx, s_relevant_bp_generation=%llu, "
+                "s_cfg_relevant_generation=%llu) -- stale cache hit, not continuing\n",
+                mismatches, tier, (unsigned long long)key,
+                (unsigned long long)s_relevant_bp_generation,
+                (unsigned long long)s_cfg_relevant_generation);
+        fprintf(stderr, "[gx-cfg-verify] relevant BP register set at the time of the hit:\n");
+        for (u32 i = 0; i < 256; i++) {
+            if (!s_cfg_relevant_bp[i]) continue;
+            fprintf(stderr, "[gx-cfg-verify]   bp[0x%02X] = 0x%08X\n", i, s_bp[i]);
+        }
+        fflush(stderr);
+        abort();
+    }
+    s_cfg = cached;
+    s_cfg_cache_verify_count++;
 }
 
 static u64 debug_hash_bytes(const u8* p, u32 len) {
@@ -6376,20 +6664,55 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
     if (nverts < ((is_line || is_line_strip) ? 2u : 3u)) return;
 
     /* BP register loads are separate FIFO commands, so no BP-derived state
-     * can change between two draws unless gx_on_bp() advanced the generation.
-     * The late IPL menus issue thousands of tiny draws under one unchanged
-     * state; decoding all stages, textures, swaps, scissor and carry analysis
-     * for each was pure repetition. TEV census mode deliberately rebuilds so
-     * its per-config draw counters retain their diagnostic meaning. */
+     * can change between two draws unless gx_on_bp() advanced the relevant
+     * generation. The late IPL menus issue thousands of tiny draws under one
+     * unchanged state, hitting this for free (tier 1, below). Titles like
+     * Wind Waker rewrite build_draw_cfg-relevant registers on nearly every
+     * draw but frequently repeat one of a small number of distinct configs
+     * (same material, different draw), so a relevant-generation miss falls
+     * through to a small content-addressed cache (tier 2) before paying for
+     * a full rebuild — see the big comment above s_cfg_relevant_bp[].
+     * TEV census mode deliberately rebuilds unconditionally, bypassing BOTH
+     * tiers, so its per-config draw counters retain their diagnostic
+     * meaning. recompute_scissor_if_needed() runs unconditionally every draw
+     * regardless of either tier — its own inputs include the XF viewport,
+     * which no BP generation here ever tracks (see its comment). */
     advance_texel_cache_generation();
     tev_load_registers(&s_tev_w[0]);
-    if (s_cfg_bp_generation != s_bp_generation || s_tev_census == 1) {
+    recompute_scissor_if_needed();
+    if (s_cfg_cache_verify < 0)
+        s_cfg_cache_verify = getenv("GCN_GX_CFG_CACHE_VERIFY") ? 1 : 0;
+    if (s_tev_census == 1) {
         ++s_cfg_cache_misses;
-        recompute_scissor();
         build_draw_cfg();
         s_cfg_bp_generation = s_bp_generation;
+        s_cfg_relevant_generation = s_relevant_bp_generation;
+    } else if (s_cfg_relevant_generation != s_relevant_bp_generation) {
+        ++s_cfg_cache_tier1_advances;
+        u64 key = cfg_relevant_hash();
+        int way = -1;
+        for (u32 w = 0; w < CFG_CACHE_WAYS; w++) {
+            if (s_cfg_cache[w].valid && s_cfg_cache[w].key == key) { way = (int)w; break; }
+        }
+        if (way >= 0) {
+            s_cfg = s_cfg_cache[way].cfg;
+            ++s_cfg_cache_tier2_hits;
+            ++s_cfg_cache_hits;
+            if (s_cfg_cache_verify) draw_cfg_verify_hit("tier2", key);
+        } else {
+            build_draw_cfg();
+            ++s_cfg_cache_tier2_misses;
+            ++s_cfg_cache_misses;
+            u32 w = s_cfg_cache_next_way++ % CFG_CACHE_WAYS;
+            s_cfg_cache[w].key = key;
+            s_cfg_cache[w].cfg = s_cfg;
+            s_cfg_cache[w].valid = 1;
+        }
+        s_cfg_bp_generation = s_bp_generation;
+        s_cfg_relevant_generation = s_relevant_bp_generation;
     } else {
         ++s_cfg_cache_hits;
+        if (s_cfg_cache_verify) draw_cfg_verify_hit("tier1", 0);
     }
     debug_capture_draw(prim, vat, verts, nverts, vstride);
 
@@ -6588,6 +6911,60 @@ void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u6
 void gx_raster_get_config_cache_stats(u64* hits, u64* misses) {
     if (hits) *hits = s_cfg_cache_hits;
     if (misses) *misses = s_cfg_cache_misses;
+}
+
+void gx_raster_print_config_cache_detail(void) {
+    u64 tier1_hits = s_cfg_cache_hits - s_cfg_cache_tier2_hits;
+    fprintf(stderr,
+            "[gx-config-cache-detail] tier1_hit=%llu tier2_hit=%llu rebuild=%llu "
+            "tier1_advances=%llu\n",
+            (unsigned long long)tier1_hits,
+            (unsigned long long)s_cfg_cache_tier2_hits,
+            (unsigned long long)s_cfg_cache_tier2_misses,
+            (unsigned long long)s_cfg_cache_tier1_advances);
+
+    u64 rel_total = 0, irrel_total = 0;
+    u32 irrel_regs = 0;
+    for (u32 i = 0; i < 256; i++) {
+        rel_total += s_bp_relevant_change_count[i];
+        if (s_bp_irrelevant_change_count[i]) {
+            irrel_total += s_bp_irrelevant_change_count[i];
+            irrel_regs++;
+        }
+    }
+    fprintf(stderr,
+            "[gx-config-cache-detail] relevant-reg-writes=%llu irrelevant-reg-writes=%llu "
+            "(%u distinct irrelevant regs written)\n",
+            (unsigned long long)rel_total, (unsigned long long)irrel_total,
+            (unsigned)irrel_regs);
+    /* Top-8 relevant registers by change count -- which parts of the material
+     * state Wind Waker actually churns every draw (informational only). Works
+     * off a local copy so this print stays side-effect-free and repeatable. */
+    u64 scratch[256];
+    memcpy(scratch, s_bp_relevant_change_count, sizeof scratch);
+    for (int top = 0; top < 8; top++) {
+        u32 best = 256; u64 best_n = 0;
+        for (u32 i = 0; i < 256; i++) {
+            if (scratch[i] > best_n) { best_n = scratch[i]; best = i; }
+        }
+        if (best == 256 || best_n == 0) break;
+        fprintf(stderr, "[gx-config-cache-detail]   bp[0x%02X] changed %llu times\n",
+                best, (unsigned long long)best_n);
+        scratch[best] = 0;
+    }
+}
+
+/* GCN_GX_CFG_CACHE_VERIFY summary. s_cfg_cache_verify_mismatches stays 0 in
+ * practice: a real mismatch aborts() immediately from draw_cfg_verify_hit()
+ * (see its comment -- a stale cache hit is never something to count and
+ * continue past), so reaching this print at all already means every hit
+ * audited so far agreed with a fresh rebuild. No-op if the knob was never
+ * read as on (s_cfg_cache_verify <= 0). */
+void gx_raster_print_cfg_verify_summary(void) {
+    if (s_cfg_cache_verify != 1) return;
+    fprintf(stderr, "[gx-cfg-verify] verified=%llu mismatches=%llu\n",
+            (unsigned long long)s_cfg_cache_verify_count,
+            (unsigned long long)s_cfg_cache_verify_mismatches);
 }
 
 void gx_raster_print_draw_shape_stats(void) {
@@ -7913,6 +8290,17 @@ void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
     s_cfg_bp_generation = 0;
     s_cfg_cache_hits = 0;
     s_cfg_cache_misses = 0;
+    init_cfg_relevant_bp();
+    s_relevant_bp_generation = 1;
+    s_cfg_relevant_generation = 0;
+    memset(s_cfg_cache, 0, sizeof s_cfg_cache);
+    s_cfg_cache_next_way = 0;
+    s_cfg_cache_tier2_hits = 0;
+    s_cfg_cache_tier2_misses = 0;
+    s_cfg_cache_tier1_advances = 0;
+    memset(s_bp_irrelevant_change_count, 0, sizeof s_bp_irrelevant_change_count);
+    memset(s_bp_relevant_change_count, 0, sizeof s_bp_relevant_change_count);
+    s_scissor_key_valid = 0;
     memset(s_draw_shapes, 0, sizeof s_draw_shapes);
     memset(s_efb_color, 0, sizeof s_efb_color);
     memset(s_efb_depth, 0, sizeof s_efb_depth);
