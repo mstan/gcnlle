@@ -388,6 +388,7 @@ if(GCN_WITH_GENERATED)
     set(GX_XFB_COPY_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_xfb_copy.comp.inc)
     set(GX_XFB_SUBGROUP_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_xfb_subgroup.comp.inc)
     set(GX_DRAW_F_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_draw_f.comp.inc)
+    set(GX_EFB_TEX_COPY_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_efb_tex_copy.comp.inc)
     add_custom_command(
       OUTPUT ${GX_CLEAR_SPV_INC}
       COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.1 -O
@@ -424,13 +425,23 @@ if(GCN_WITH_GENERATED)
       VERBATIM
       COMMENT "Compiling exact GX fused-program A--AD compute shader"
     )
+    add_custom_command(
+      OUTPUT ${GX_EFB_TEX_COPY_SPV_INC}
+      COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.1 -O
+              -mfmt=c -o ${GX_EFB_TEX_COPY_SPV_INC}
+              ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_efb_tex_copy.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gx_efb_tex_copy.comp
+      VERBATIM
+      COMMENT "Compiling exact GX EFB-to-texture (RG8/RGBA8) compute shader"
+    )
     add_custom_target(gcn_gx_shaders DEPENDS ${GX_CLEAR_SPV_INC}
                                               ${GX_XFB_COPY_SPV_INC}
                                               ${GX_XFB_SUBGROUP_SPV_INC}
-                                              ${GX_DRAW_F_SPV_INC})
+                                              ${GX_DRAW_F_SPV_INC}
+                                              ${GX_EFB_TEX_COPY_SPV_INC})
     add_dependencies(gcn_boot gcn_gx_shaders)
     set_source_files_properties(src/gx_vulkan.c PROPERTIES
-      OBJECT_DEPENDS "${GX_CLEAR_SPV_INC};${GX_XFB_COPY_SPV_INC};${GX_XFB_SUBGROUP_SPV_INC};${GX_DRAW_F_SPV_INC}")
+      OBJECT_DEPENDS "${GX_CLEAR_SPV_INC};${GX_XFB_COPY_SPV_INC};${GX_XFB_SUBGROUP_SPV_INC};${GX_DRAW_F_SPV_INC};${GX_EFB_TEX_COPY_SPV_INC}")
     target_include_directories(gcn_boot PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_compile_definitions(gcn_boot PRIVATE GCN_HAVE_VULKAN=1)
     target_link_libraries(gcn_boot PRIVATE Vulkan::Vulkan)

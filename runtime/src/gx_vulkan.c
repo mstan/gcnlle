@@ -28,7 +28,10 @@
 #define READBACK_XFB_OFFSET 0u
 #define READBACK_COLOR_OFFSET XFB_SHADOW_TOTAL
 #define READBACK_DEPTH_OFFSET (READBACK_COLOR_OFFSET + EFB_PLANE_BYTES)
-#define READBACK_BYTES (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
+/* EFB_TEX_SHADOW_BYTES is defined below (after TEXTURE_SHADOW_BYTES); the
+ * readback buffer needs an equally-sized region to receive it back. */
+#define READBACK_EFB_TEX_OFFSET (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
+#define READBACK_BYTES (READBACK_EFB_TEX_OFFSET + EFB_TEX_SHADOW_BYTES)
 #define DRAW_JOB_OFFSET (XFB_SHADOW_OFFSET + XFB_SHADOW_TOTAL)
 #define DRAW_PACKET_BYTES 512u
 #define GX_VK_DRAW_PROGRAM_COUNT 30u
@@ -44,7 +47,15 @@
 #define TILE_JOBS_PER_TILE 1024u
 #define TEXTURE_SHADOW_OFFSET (DRAW_JOB_OFFSET + DRAW_JOB_BYTES)
 #define TEXTURE_SHADOW_BYTES  (4u * 1024u * 1024u)
-#define STAGING_BYTES   (TEXTURE_SHADOW_OFFSET + TEXTURE_SHADOW_BYTES)
+/* EFB->texture resident copy shadow (RG8/RGBA8, half_scale): worst case is
+ * half_scale RGBA8 across the whole EFB (320x264 out, 64-byte 4x4 blocks) --
+ * 80*66*64 = 337,920 bytes; round up and give it a small ring so a handful of
+ * copies can be in flight before the frame fence, same shape as XFB_RING_SIZE. */
+#define EFB_TEX_RING_SIZE 4u
+#define EFB_TEX_SHADOW_SLOT_BYTES (384u * 1024u)
+#define EFB_TEX_SHADOW_BYTES (EFB_TEX_SHADOW_SLOT_BYTES * EFB_TEX_RING_SIZE)
+#define EFB_TEX_SHADOW_OFFSET (TEXTURE_SHADOW_OFFSET + TEXTURE_SHADOW_BYTES)
+#define STAGING_BYTES   (EFB_TEX_SHADOW_OFFSET + EFB_TEX_SHADOW_BYTES)
 #define GPU_QUERY_MAX 16u
 
 enum { GPU_TIME_DRAW = 0, GPU_TIME_XFB, GPU_TIME_CLEAR, GPU_TIME_COUNT };
@@ -60,6 +71,9 @@ static const u32 s_xfb_subgroup_spv[] =
 ;
 static const u32 s_draw_f_spv[] =
 #include "gx_draw_f.comp.inc"
+;
+static const u32 s_efb_tex_copy_spv[] =
+#include "gx_efb_tex_copy.comp.inc"
 ;
 
 typedef struct {
@@ -89,6 +103,31 @@ typedef struct {
     u32 address, stride, width, height, gpu_stride;
     VkDeviceSize slot_offset;
 } GxVkPendingXfb;
+
+/* Six uvec4s, matching gx_efb_tex_copy.comp's push layout exactly. Reachable
+ * only for the two exact bit-verified copy words (see decode_efb_tex_copy /
+ * gx_vulkan_resident_efb_tex_copy) -- fmt is always 11 (RG8) or 6 (RGBA8),
+ * half_scale is always 1, clamp_top/clamp_bottom are always 1. is_rgba6 and
+ * is_depth come from the separate, runtime pixel_format BP state (bp[0x43]),
+ * not from the copy word, so they are decoded fresh every call. */
+typedef struct {
+    u32 left, top, right, bottom;
+    u32 out_w, out_h, tiles_x, tiles_y;
+    u32 clamp_top, clamp_bottom, half_scale, is_depth;
+    u32 is_rgba6, fmt, reserved0, block_bytes;
+    u32 w0, w1, w2, w3;
+    u32 w4, w5, w6, output_word_base;
+} GxVkTexCopyPush;
+
+typedef struct {
+    u8* ram;
+    u32 ram_size;
+    u32 dest_addr, dest_stride;
+    u32 tiles_x, tiles_y, block_bytes;
+    u32 row_bytes;      /* tiles_x * block_bytes: valid bytes per output row,
+                          * which may be less than dest_stride (padding). */
+    VkDeviceSize slot_offset;
+} GxVkPendingTexCopy;
 
 typedef struct {
     u32 word_base;
@@ -142,6 +181,8 @@ typedef struct {
     VkPipeline copy_pipeline;
     VkPipelineLayout draw_f_pipeline_layout;
     VkPipeline draw_f_pipeline;
+    VkPipelineLayout efb_tex_copy_pipeline_layout;
+    VkPipeline efb_tex_copy_pipeline;
     int images_general;
     int prepared;
     int xfb_present;
@@ -182,6 +223,10 @@ typedef struct {
     u32 resident_draw_arena_used;
     GxVkPendingXfb resident_pending[XFB_RING_SIZE];
     u32 resident_pending_count;
+    GxVkPendingTexCopy resident_pending_tex[EFB_TEX_RING_SIZE];
+    u32 resident_pending_tex_count;
+    int efb_copy_verify;         /* GCN_GX_EFB_COPY_VERIFY=1 */
+    u64 efb_copy_verify_compares;
     u32 texture_arena_used;
     u64 resident_batches;
     u64 resident_triangles;
@@ -380,7 +425,7 @@ static int create_readback(void) {
 }
 
 static int create_compute_state(void) {
-    VkDescriptorSetLayoutBinding bindings[5] = {0};
+    VkDescriptorSetLayoutBinding bindings[6] = {0};
     for (u32 i = 0; i < 2; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -399,9 +444,13 @@ static int create_compute_state(void) {
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[4].descriptorCount = 1;
     bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[5].binding = 5;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dl = {0};
     dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dl.bindingCount = 5;
+    dl.bindingCount = 6;
     dl.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(s_vk.device, &dl, NULL,
                                     &s_vk.descriptor_layout) != VK_SUCCESS)
@@ -477,9 +526,26 @@ static int create_compute_state(void) {
     if (pipeline_result != VK_SUCCESS)
         return 0;
 
+    range.size = sizeof(GxVkTexCopyPush);
+    if (vkCreatePipelineLayout(s_vk.device, &pl, NULL,
+                               &s_vk.efb_tex_copy_pipeline_layout) != VK_SUCCESS)
+        return 0;
+    sm.codeSize = sizeof s_efb_tex_copy_spv;
+    sm.pCode = s_efb_tex_copy_spv;
+    module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(s_vk.device, &sm, NULL, &module) != VK_SUCCESS)
+        return 0;
+    pi.stage.module = module;
+    pi.layout = s_vk.efb_tex_copy_pipeline_layout;
+    pipeline_result = vkCreateComputePipelines(
+        s_vk.device, VK_NULL_HANDLE, 1, &pi, NULL, &s_vk.efb_tex_copy_pipeline);
+    vkDestroyShaderModule(s_vk.device, module, NULL);
+    if (pipeline_result != VK_SUCCESS)
+        return 0;
+
     VkDescriptorPoolSize pool_sizes[2] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}
     };
     VkDescriptorPoolCreateInfo dp = {0};
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -497,7 +563,7 @@ static int create_compute_state(void) {
     if (vkAllocateDescriptorSets(s_vk.device, &da, &s_vk.descriptor_set) != VK_SUCCESS)
         return 0;
     VkDescriptorImageInfo images[2] = {0};
-    VkWriteDescriptorSet writes[5] = {0};
+    VkWriteDescriptorSet writes[6] = {0};
     for (u32 i = 0; i < 2; ++i) {
         images[i].imageView = s_vk.view[i];
         images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -535,7 +601,16 @@ static int create_compute_state(void) {
     writes[4].descriptorCount = 1;
     writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[4].pBufferInfo = &texture_shadow;
-    vkUpdateDescriptorSets(s_vk.device, 5, writes, 0, NULL);
+    VkDescriptorBufferInfo efb_tex_output = {
+        s_vk.staging, EFB_TEX_SHADOW_OFFSET, EFB_TEX_SHADOW_BYTES
+    };
+    writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[5].dstSet = s_vk.descriptor_set;
+    writes[5].dstBinding = 5;
+    writes[5].descriptorCount = 1;
+    writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[5].pBufferInfo = &efb_tex_output;
+    vkUpdateDescriptorSets(s_vk.device, 6, writes, 0, NULL);
 
     VkCommandBufferAllocateInfo ca = {0};
     ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -711,6 +786,11 @@ void gx_vulkan_shadow_shutdown(void) {
                     (double)s_vk.resident_copy_total_tsc,
                 100.0 * (double)s_vk.resident_copy_memcpy_tsc /
                     (double)s_vk.resident_copy_total_tsc);
+    if (s_vk.efb_copy_verify)
+        fprintf(stderr,
+                "gx_vulkan: EFB->texture copy verify: %llu compare(s), 0 "
+                "mismatches (any mismatch aborts immediately, see above)\n",
+                (unsigned long long)s_vk.efb_copy_verify_compares);
     if (s_vk.gpu_stats) {
         static const char* names[GPU_TIME_COUNT] = {"draw", "xfb", "clear"};
         for (u32 i = 0; i < GPU_TIME_COUNT; ++i) {
@@ -738,12 +818,16 @@ void gx_vulkan_shadow_shutdown(void) {
         vkUnmapMemory(s_vk.device, s_vk.staging_memory);
     if (s_vk.device && s_vk.readback_map)
         vkUnmapMemory(s_vk.device, s_vk.readback_memory);
+    if (s_vk.device && s_vk.efb_tex_copy_pipeline)
+        vkDestroyPipeline(s_vk.device, s_vk.efb_tex_copy_pipeline, NULL);
     if (s_vk.device && s_vk.draw_f_pipeline)
         vkDestroyPipeline(s_vk.device, s_vk.draw_f_pipeline, NULL);
     if (s_vk.device && s_vk.copy_pipeline)
         vkDestroyPipeline(s_vk.device, s_vk.copy_pipeline, NULL);
     if (s_vk.device && s_vk.clear_pipeline)
         vkDestroyPipeline(s_vk.device, s_vk.clear_pipeline, NULL);
+    if (s_vk.device && s_vk.efb_tex_copy_pipeline_layout)
+        vkDestroyPipelineLayout(s_vk.device, s_vk.efb_tex_copy_pipeline_layout, NULL);
     if (s_vk.device && s_vk.draw_f_pipeline_layout)
         vkDestroyPipelineLayout(s_vk.device, s_vk.draw_f_pipeline_layout, NULL);
     if (s_vk.device && s_vk.copy_pipeline_layout)
@@ -948,6 +1032,13 @@ int gx_vulkan_resident_init(void) {
         fprintf(stderr,
                 "gx_vulkan: CO-RUN differential active — software rasterizes "
                 "everything; GPU planes byte-checked at every fallback sync\n");
+    s_vk.efb_copy_verify = getenv("GCN_GX_EFB_COPY_VERIFY") ? 1 : 0;
+    if (s_vk.efb_copy_verify)
+        fprintf(stderr,
+                "gx_vulkan: EFB->texture copy verify active — every resident "
+                "RG8/RGBA8 copy is also encoded on the CPU from a downloaded "
+                "EFB snapshot and memcmp'd against the GPU result (forces a "
+                "synchronous submit per copy; not for perf runs)\n");
     return 1;
 }
 
@@ -1120,33 +1211,53 @@ static int invalidate_readback(void) {
 }
 
 static int resident_materialize_pending(void) {
-    if (!s_vk.resident_pending_count)
+    if (!s_vk.resident_pending_count && !s_vk.resident_pending_tex_count)
         return 1;
     if (!invalidate_readback())
         return 0;
     u64 t0 = __rdtsc();
-    gcn_gx_xfb_write_begin();
-    for (u32 i = 0; i < s_vk.resident_pending_count; ++i) {
-        const GxVkPendingXfb* p = &s_vk.resident_pending[i];
-        const u8* gpu = s_vk.readback_map + READBACK_XFB_OFFSET + p->slot_offset;
-        for (u32 y = 0; y < p->height; ++y)
-            memcpy(p->ram + p->address + (u64)y * p->stride,
-                   gpu + (u64)y * p->gpu_stride, (size_t)p->width * 2u);
-        /* GCN_GX_XFB_HASH=1: same chain the software-raster path feeds
-         * (gx_raster.c) -- one publication per completed EFB->XFB copy,
-         * hashing the final guest-RAM bytes so the resident (GPU) and
-         * software paths, and fused vs unfused programs, are compared by
-         * output rather than code path. */
-        gcn_gx_xfb_hash_feed(p->ram + p->address, p->stride, (u32)p->width * 2u, p->height);
-        /* Device write to RAM: dirty the miss-CRC identity over the copied
-         * span (see gx_raster.c's XFB copy). */
-        gcn_native_code_content_dirty(p->address,
-                                      (u32)((u64)p->height * p->stride));
-        gcn_gx_xfb_hash_publish_done();
+    if (s_vk.resident_pending_count) {
+        gcn_gx_xfb_write_begin();
+        for (u32 i = 0; i < s_vk.resident_pending_count; ++i) {
+            const GxVkPendingXfb* p = &s_vk.resident_pending[i];
+            const u8* gpu = s_vk.readback_map + READBACK_XFB_OFFSET + p->slot_offset;
+            for (u32 y = 0; y < p->height; ++y)
+                memcpy(p->ram + p->address + (u64)y * p->stride,
+                       gpu + (u64)y * p->gpu_stride, (size_t)p->width * 2u);
+            /* GCN_GX_XFB_HASH=1: same chain the software-raster path feeds
+             * (gx_raster.c) -- one publication per completed EFB->XFB copy,
+             * hashing the final guest-RAM bytes so the resident (GPU) and
+             * software paths, and fused vs unfused programs, are compared by
+             * output rather than code path. */
+            gcn_gx_xfb_hash_feed(p->ram + p->address, p->stride, (u32)p->width * 2u, p->height);
+            /* Device write to RAM: dirty the miss-CRC identity over the copied
+             * span (see gx_raster.c's XFB copy). */
+            gcn_native_code_content_dirty(p->address,
+                                          (u32)((u64)p->height * p->stride));
+            gcn_gx_xfb_hash_publish_done();
+        }
+        gcn_gx_xfb_write_end();
+        s_vk.resident_pending_count = 0;
     }
-    gcn_gx_xfb_write_end();
+    if (s_vk.resident_pending_tex_count) {
+        /* EFB->texture resident copies (gx_vulkan_resident_efb_tex_copy):
+         * same "device write to RAM" contract as the XFB copy above, but
+         * these never feed the XFB hash chain -- the software EFB->texture
+         * branch (gx_raster.c's gx_raster_efb_copy, copy_to_xfb==0 side)
+         * doesn't either, only gcn_native_code_content_dirty. */
+        for (u32 i = 0; i < s_vk.resident_pending_tex_count; ++i) {
+            const GxVkPendingTexCopy* p = &s_vk.resident_pending_tex[i];
+            const u8* gpu = s_vk.readback_map + READBACK_EFB_TEX_OFFSET +
+                            p->slot_offset;
+            for (u32 row = 0; row < p->tiles_y; ++row)
+                memcpy(p->ram + p->dest_addr + (u64)row * p->dest_stride,
+                       gpu + (u64)row * p->row_bytes, (size_t)p->row_bytes);
+            gcn_native_code_content_dirty(
+                p->dest_addr, (u32)((u64)p->tiles_y * p->dest_stride));
+        }
+        s_vk.resident_pending_tex_count = 0;
+    }
     s_vk.resident_copy_memcpy_tsc += __rdtsc() - t0;
-    s_vk.resident_pending_count = 0;
     return 1;
 }
 
@@ -1620,6 +1731,29 @@ static u32 texture_encoded_size(u32 format, u32 width, u32 height) {
     return total <= UINT32_MAX ? (u32)total : 0u;
 }
 
+/* True if [address, address+length) overlaps the guest-RAM destination of
+ * any not-yet-materialized pending copy (XFB ring or EFB->texture ring).
+ * Texture snapshots read guest RAM at record time; a draw sampling a
+ * pending copy's destination must materialize first or it uploads the
+ * pre-copy bytes. EFB->texture copies exist precisely to be sampled by a
+ * later draw, so this is a live ordering hazard, not a theoretical one. */
+static int resident_pending_ram_overlap(u32 address, u32 length) {
+    u64 lo = address, hi = (u64)address + length;
+    for (u32 i = 0; i < s_vk.resident_pending_count; ++i) {
+        const GxVkPendingXfb* p = &s_vk.resident_pending[i];
+        u64 dlo = p->address, dhi = dlo + (u64)p->height * p->stride;
+        if (lo < dhi && dlo < hi)
+            return 1;
+    }
+    for (u32 i = 0; i < s_vk.resident_pending_tex_count; ++i) {
+        const GxVkPendingTexCopy* p = &s_vk.resident_pending_tex[i];
+        u64 dlo = p->dest_addr, dhi = dlo + (u64)p->tiles_y * p->dest_stride;
+        if (lo < dhi && dlo < hi)
+            return 1;
+    }
+    return 0;
+}
+
 static int validate_texture_binding(const u32* bp, const u8* ram, u32 ram_size,
                                     u32 unit) {
     u32 image0 = bp[0x88 + unit];
@@ -1634,6 +1768,18 @@ static int validate_texture_binding(const u32* bp, const u8* ram, u32 ram_size,
                 "gx_vulkan: texture snapshot outside exact cache scope "
                 "(unit=%u fmt=%u %ux%u addr=%08X len=%u ram=%u)\n",
                 unit, format, width, height, address, length, ram_size);
+        return 0;
+    }
+
+    /* Materialize pending copies whose destination this snapshot would
+     * read -- both the identity memcmp below and the upload memcpy consume
+     * guest RAM, and a pending copy's bytes only land there at batch
+     * completion (resident_materialize_pending). */
+    if (resident_pending_ram_overlap(address, length) &&
+        !resident_submit_batch()) {
+        fprintf(stderr,
+                "gx_vulkan: pending-copy flush before texture snapshot "
+                "failed (unit=%u addr=%08X len=%u)\n", unit, address, length);
         return 0;
     }
 
@@ -2026,6 +2172,366 @@ static int decode_copy(const u32* bp, GxVkCopyPush* p) {
     return 1;
 }
 
+/* ============================================================================
+ * EFB->texture resident copy (RG8/RGBA8, half_scale, 3-tap vertical filter).
+ *
+ * Reachable ONLY for the two exact, individually bit-verified copy words
+ * gx_vulkan_resident_efb_copy() gates on before ever calling into this code:
+ *   0x01023B -> target=7  -> fmt=11 (RG8),   half_scale=1, clamp_top/bottom=1
+ *   0x010263 -> target=12 -> fmt=6  (RGBA8), half_scale=1, clamp_top/bottom=1
+ * Every other EFB->texture copy word keeps the synchronized software
+ * fallback below, unchanged (see gx_vulkan_resident_efb_copy).
+ *
+ * pixel_format (bp[0x43]&7, is_rgba6/is_depth below) is separate runtime BP
+ * state, NOT part of the copy word, so it is decoded fresh every call and
+ * fully supported (RGB8_Z24/RGB565_Z16 direct, RGBA6_Z24, and Z24 depth-as-
+ * color) -- exactly gx_raster.c's efb_copy_texture_sample/write_block, only
+ * restricted to the two fmt values above. Any other pixel_format (4..7,
+ * never legitimately reached -- see GetPixelColor's own TRAPF) is rejected
+ * here so it falls into the loud software fallback instead of silently
+ * mishandling an unverified state on the GPU path.
+ * ========================================================================= */
+
+typedef struct {
+    GxVkTexCopyPush push;
+    u32 dest_addr, dest_stride, tiles_x, tiles_y, block_bytes, row_bytes;
+    u32 pixel_format;
+} EfbTexCopyDecoded;
+
+static int decode_efb_tex_copy(const u32* bp, u32 copy_word, u32 ram_size,
+                               EfbTexCopyDecoded* d) {
+    memset(d, 0, sizeof *d);
+    u32 left = bp[0x49] & 0x3ffu;
+    u32 top = (bp[0x49] >> 10) & 0x3ffu;
+    u32 src_w = (bp[0x4a] & 0x3ffu) + 1u;
+    u32 src_h = ((bp[0x4a] >> 10) & 0x3ffu) + 1u;
+    u32 right = left + src_w, bottom = top + src_h;
+    u32 clamp_top = copy_word & 1u;
+    u32 clamp_bottom = (copy_word >> 1) & 1u;
+    u32 half_scale = (copy_word >> 9) & 1u;
+    u32 intensity = (copy_word >> 15) & 1u;
+    u32 target = (copy_word >> 3) & 0xFu;
+    u32 fmt = target / 2u + (target & 1u) * 8u;
+    u32 out_w = half_scale ? (src_w + 1u) >> 1 : src_w;
+    u32 out_h = half_scale ? (src_h + 1u) >> 1 : src_h;
+    u32 pixel_format = bp[0x43] & 7u;
+    u32 flow = bp[0x53], fhigh = bp[0x54];
+    u32 w0 = flow & 0x3fu, w1 = (flow >> 6) & 0x3fu;
+    u32 w2 = (flow >> 12) & 0x3fu, w3 = (flow >> 18) & 0x3fu;
+    u32 w4 = fhigh & 0x3fu, w5 = (fhigh >> 6) & 0x3fu, w6 = (fhigh >> 12) & 0x3fu;
+
+    /* Exactly the two bit-verified configurations. The copy_word ==
+     * 0x01023B/0x010263 gate at the call site already forces fmt to 11 or 6
+     * and half_scale/clamp_top/clamp_bottom to 1 and intensity to 0 -- these
+     * checks are a defensive second source of truth, never loosened
+     * independently of that gate. */
+    if ((fmt != 11u && fmt != 6u) || !half_scale || !clamp_top ||
+        !clamp_bottom || intensity || pixel_format > 3u ||
+        out_w == 0u || out_h == 0u || out_w > EFB_WIDTH || out_h > EFB_HEIGHT)
+        return 0;
+
+    u32 block_bytes = fmt == 6u ? 64u : 32u;
+    u32 tiles_x = (out_w + 3u) / 4u;
+    u32 tiles_y = (out_h + 3u) / 4u;
+    u32 row_bytes = tiles_x * block_bytes;
+    if ((u64)row_bytes * tiles_y > EFB_TEX_SHADOW_SLOT_BYTES)
+        return 0; /* would overrun the shadow arena -- never observed, but
+                   * never silently truncate a copy either. */
+    u32 dest_addr_raw = bp[0x4b] << 5;
+    u32 dest_stride = bp[0x4d] << 5;
+    u32 phys = dest_addr_raw & 0x1FFFFFFFu;
+    u64 last = (u64)phys + (tiles_y ? (u64)(tiles_y - 1u) * dest_stride : 0u) +
+               (u64)row_bytes;
+    if (!dest_stride || last > (u64)ram_size)
+        return 0;
+
+    d->push.left = left; d->push.top = top;
+    d->push.right = right; d->push.bottom = bottom;
+    d->push.out_w = out_w; d->push.out_h = out_h;
+    d->push.tiles_x = tiles_x; d->push.tiles_y = tiles_y;
+    d->push.clamp_top = clamp_top; d->push.clamp_bottom = clamp_bottom;
+    d->push.half_scale = half_scale;
+    d->push.is_depth = (pixel_format == 3u);
+    d->push.is_rgba6 = (pixel_format == 1u);
+    d->push.fmt = fmt;
+    d->push.reserved0 = 0;
+    d->push.block_bytes = block_bytes;
+    d->push.w0 = w0; d->push.w1 = w1; d->push.w2 = w2; d->push.w3 = w3;
+    d->push.w4 = w4; d->push.w5 = w5; d->push.w6 = w6;
+    d->push.output_word_base = 0; /* filled in by the caller, per ring slot */
+    d->dest_addr = phys;
+    d->dest_stride = dest_stride;
+    d->tiles_x = tiles_x;
+    d->tiles_y = tiles_y;
+    d->block_bytes = block_bytes;
+    d->row_bytes = row_bytes;
+    d->pixel_format = pixel_format;
+    return 1;
+}
+
+static void record_efb_tex_copy(const GxVkTexCopyPush* push) {
+    vkCmdBindPipeline(s_vk.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      s_vk.efb_tex_copy_pipeline);
+    vkCmdBindDescriptorSets(s_vk.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            s_vk.efb_tex_copy_pipeline_layout, 0, 1,
+                            &s_vk.descriptor_set, 0, NULL);
+    vkCmdPushConstants(s_vk.command_buffer, s_vk.efb_tex_copy_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof *push, push);
+    vkCmdDispatch(s_vk.command_buffer, push->tiles_x, push->tiles_y, 1);
+}
+
+/* ---- GCN_GX_EFB_COPY_VERIFY=1 CPU reference (mirrors GCN_GX_CFG_CACHE_VERIFY
+ * in gx_raster.c: default off, own getenv-cached knob, abort loudly on any
+ * mismatch). Operates on a freshly-downloaded EFB color/depth snapshot (NOT
+ * gx_raster.c's own s_efb_color/s_efb_depth, which go stale for any pixel a
+ * resident triangle drew without a corun/fallback sync) so the reference is
+ * checked against exactly what the GPU shader read. Transcribed bit-for-bit
+ * from gx_raster.c's efb_copy_texture_sample/efb_copy_texture_write_block,
+ * restricted to fmt 11 (RG8) and fmt 6 (RGBA8). ---- */
+
+typedef struct { u8 r, g, b, a; } RefTexel;
+
+static int ref_clampi(int value, int low, int high) {
+    return value < low ? low : (value > high ? high : value);
+}
+
+static void ref_extract(const u32* color, const u32* depth, int x, int y,
+                        u32 pixel_format, u8* r, u8* g, u8* b, u8* a) {
+    u32 off = (u32)y * EFB_WIDTH + (u32)x;
+    if (pixel_format == 3u) { /* PF_Z24: depth substitutes for color */
+        u32 z = depth[off] & 0xFFFFFFu;
+        *r = (u8)(z >> 16); *g = (u8)(z >> 8); *b = (u8)z; *a = 0xFFu;
+        return;
+    }
+    u32 raw = color[off];
+    if (pixel_format == 1u) { /* PF_RGBA6_Z24 */
+        *a = (u8)(((raw & 0x3Fu) << 2) | ((raw & 0x3Fu) >> 4));
+        *b = (u8)((((raw >> 6) & 0x3Fu) << 2) | (((raw >> 6) & 0x3Fu) >> 4));
+        *g = (u8)((((raw >> 12) & 0x3Fu) << 2) | (((raw >> 12) & 0x3Fu) >> 4));
+        *r = (u8)((((raw >> 18) & 0x3Fu) << 2) | (((raw >> 18) & 0x3Fu) >> 4));
+    } else { /* PF_RGB8_Z24 / PF_RGB565_Z16 direct */
+        *r = (u8)(raw >> 16); *g = (u8)(raw >> 8); *b = (u8)raw; *a = 0xFFu;
+    }
+}
+
+static RefTexel ref_sample(const u32* color, const u32* depth, int x, int y,
+                           int left, int top, int bottom, int clamp_top,
+                           int clamp_bottom, int half_scale, u32 pixel_format,
+                           int wab, int wcde, int wfg) {
+    if (half_scale) {
+        x = left + (x - left) * 2;
+        y = top + (y - top) * 2;
+    }
+    x = ref_clampi(x, 0, (int)EFB_WIDTH - 1);
+    y = ref_clampi(y, 0, (int)EFB_HEIGHT - 1);
+    int yprev = y - 1, ynext = y + 1;
+    if (clamp_top && yprev < top) yprev = top;
+    if (clamp_bottom && ynext >= bottom) ynext = bottom - 1;
+    yprev = ref_clampi(yprev, 0, (int)EFB_HEIGHT - 1);
+    ynext = ref_clampi(ynext, 0, (int)EFB_HEIGHT - 1);
+
+    u8 rr[3], gg[3], bb[3], aa[3];
+    int ys[3] = { yprev, y, ynext };
+    for (int i = 0; i < 3; i++)
+        ref_extract(color, depth, x, ys[i], pixel_format,
+                   &rr[i], &gg[i], &bb[i], &aa[i]);
+    RefTexel out;
+    out.r = (u8)ref_clampi(((int)rr[0] * wab + (int)rr[1] * wcde + (int)rr[2] * wfg) >> 6, 0, 255);
+    out.g = (u8)ref_clampi(((int)gg[0] * wab + (int)gg[1] * wcde + (int)gg[2] * wfg) >> 6, 0, 255);
+    out.b = (u8)ref_clampi(((int)bb[0] * wab + (int)bb[1] * wcde + (int)bb[2] * wfg) >> 6, 0, 255);
+    out.a = aa[1];
+    return out;
+}
+
+static void ref_write_block(u8* dst, u32 fmt, int bx, int by, int out_w,
+                            int out_h, int left, int top, int bottom,
+                            int clamp_top, int clamp_bottom, int half_scale,
+                            u32 pixel_format, int wab, int wcde, int wfg,
+                            const u32* color, const u32* depth) {
+    RefTexel px[16];
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            int ox = bx * 4 + x, oy = by * 4 + y;
+            int sx = left + (ox < out_w ? ox : out_w - 1);
+            int sy = top + (oy < out_h ? oy : out_h - 1);
+            px[y * 4 + x] = ref_sample(color, depth, sx, sy, left, top, bottom,
+                                       clamp_top, clamp_bottom, half_scale,
+                                       pixel_format, wab, wcde, wfg);
+        }
+    }
+    if (fmt == 11u) { /* RG8 */
+        for (int i = 0; i < 16; i++) { dst[i * 2] = px[i].g; dst[i * 2 + 1] = px[i].r; }
+    } else { /* RGBA8: AR plane, then GB plane */
+        for (int i = 0; i < 16; i++) {
+            dst[i * 2] = px[i].a; dst[i * 2 + 1] = px[i].r;
+            dst[32 + i * 2] = px[i].g; dst[33 + i * 2] = px[i].b;
+        }
+    }
+}
+
+static int resident_efb_copy_verify_one(const EfbTexCopyDecoded* d, u8* ram) {
+    if (!invalidate_readback())
+        return 0;
+    const u32* color = (const u32*)(s_vk.readback_map + READBACK_COLOR_OFFSET);
+    const u32* depth = (const u32*)(s_vk.readback_map + READBACK_DEPTH_OFFSET);
+    static u8 scratch[EFB_TEX_SHADOW_SLOT_BYTES];
+    u64 total = (u64)d->tiles_y * d->row_bytes;
+    if (total > sizeof scratch)
+        return 0;
+    int wab = (int)(d->push.w0 + d->push.w1);
+    int wcde = (int)(d->push.w2 + d->push.w3 + d->push.w4);
+    int wfg = (int)(d->push.w5 + d->push.w6);
+    for (u32 by = 0; by < d->tiles_y; ++by)
+        for (u32 bx = 0; bx < d->tiles_x; ++bx)
+            ref_write_block(scratch + (u64)by * d->row_bytes + (u64)bx * d->block_bytes,
+                            d->push.fmt, (int)bx, (int)by,
+                            (int)d->push.out_w, (int)d->push.out_h,
+                            (int)d->push.left, (int)d->push.top, (int)d->push.bottom,
+                            (int)d->push.clamp_top, (int)d->push.clamp_bottom,
+                            (int)d->push.half_scale, d->pixel_format,
+                            wab, wcde, wfg, color, depth);
+    for (u32 row = 0; row < d->tiles_y; ++row) {
+        const u8* got = ram + d->dest_addr + (u64)row * d->dest_stride;
+        const u8* want = scratch + (u64)row * d->row_bytes;
+        if (memcmp(got, want, d->row_bytes) != 0) {
+            u32 first = 0;
+            for (; first < d->row_bytes; ++first)
+                if (got[first] != want[first]) break;
+            fprintf(stderr,
+                    "gx_vulkan: EFB->TEXTURE COPY VERIFY MISMATCH row=%u "
+                    "byte=%u got=%02X want=%02X dest=%08X fmt=%u %ux%u "
+                    "(compare #%llu)\n",
+                    row, first, got[first], want[first], d->dest_addr,
+                    d->push.fmt, d->push.out_w, d->push.out_h,
+                    (unsigned long long)s_vk.efb_copy_verify_compares);
+            fflush(stderr);
+            abort();
+        }
+    }
+    s_vk.efb_copy_verify_compares++;
+    return 1;
+}
+
+/* Records the color/depth EFB image download into the readback buffer's
+ * color/depth region (same offsets resident_sync_to_software uses), so
+ * resident_efb_copy_verify_one() can read back exactly what this copy's
+ * shader invocation saw. Only recorded under GCN_GX_EFB_COPY_VERIFY=1 --
+ * correctness instrumentation, not part of the default resident path. */
+static void record_efb_verify_download(void) {
+    VkImageMemoryBarrier download[2] = {0};
+    VkBufferImageCopy copies[2] = {0};
+    for (u32 i = 0; i < 2; ++i) {
+        download[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        download[i].srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                    VK_ACCESS_SHADER_WRITE_BIT;
+        download[i].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        download[i].oldLayout = download[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        download[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        download[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        download[i].image = s_vk.image[i];
+        download[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        download[i].subresourceRange.levelCount = 1;
+        download[i].subresourceRange.layerCount = 1;
+        copies[i].bufferOffset = i ? READBACK_DEPTH_OFFSET : READBACK_COLOR_OFFSET;
+        copies[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copies[i].imageSubresource.layerCount = 1;
+        copies[i].imageExtent = (VkExtent3D){EFB_WIDTH, EFB_HEIGHT, 1};
+    }
+    vkCmdPipelineBarrier(s_vk.command_buffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, NULL, 0, NULL, 2, download);
+    for (u32 i = 0; i < 2; ++i)
+        vkCmdCopyImageToBuffer(s_vk.command_buffer, s_vk.image[i],
+                               VK_IMAGE_LAYOUT_GENERAL, s_vk.readback,
+                               1, &copies[i]);
+    VkBufferMemoryBarrier to_host = {0};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = s_vk.readback;
+    to_host.offset = READBACK_COLOR_OFFSET;
+    to_host.size = 2u * EFB_PLANE_BYTES;
+    vkCmdPipelineBarrier(s_vk.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         0, NULL, 1, &to_host, 0, NULL);
+}
+
+/* 1=handled on GPU (materialized, and verified if GCN_GX_EFB_COPY_VERIFY=1),
+ * 0=this exact state was rejected by decode_efb_tex_copy (should not happen
+ * given the copy_word gate at the call site, but never silently continue a
+ * stale co-run/resident state -- fall into the ordinary synchronized
+ * fallback), -1=fatal. */
+static int gx_vulkan_resident_efb_tex_copy(const u32* bp, u32 copy_word,
+                                           u8* ram, u32 ram_size) {
+    EfbTexCopyDecoded d;
+    if (!decode_efb_tex_copy(bp, copy_word, ram_size, &d))
+        return 0;
+
+    if (s_vk.resident_pending_tex_count == EFB_TEX_RING_SIZE &&
+        !resident_submit_batch())
+        return -1;
+    if (!resident_begin_commands())
+        return -1;
+    if (!resident_emit_draw_batch())
+        return -1;
+
+    u32 slot = s_vk.resident_pending_tex_count;
+    VkDeviceSize slot_offset = (VkDeviceSize)slot * EFB_TEX_SHADOW_SLOT_BYTES;
+    d.push.output_word_base = (u32)(slot_offset / sizeof(u32));
+
+    record_efb_tex_copy(&d.push);
+
+    VkDeviceSize copy_bytes = (VkDeviceSize)d.tiles_y * d.row_bytes;
+    VkBufferMemoryBarrier tex_to_transfer = {0};
+    tex_to_transfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    tex_to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    tex_to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    tex_to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    tex_to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    tex_to_transfer.buffer = s_vk.staging;
+    tex_to_transfer.offset = EFB_TEX_SHADOW_OFFSET + slot_offset;
+    tex_to_transfer.size = copy_bytes;
+    vkCmdPipelineBarrier(s_vk.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, NULL, 1, &tex_to_transfer, 0, NULL);
+    VkBufferCopy tex_copy = {
+        EFB_TEX_SHADOW_OFFSET + slot_offset,
+        READBACK_EFB_TEX_OFFSET + slot_offset, copy_bytes
+    };
+    vkCmdCopyBuffer(s_vk.command_buffer, s_vk.staging, s_vk.readback,
+                    1, &tex_copy);
+    VkBufferMemoryBarrier tex_to_host = tex_to_transfer;
+    tex_to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    tex_to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    tex_to_host.buffer = s_vk.readback;
+    tex_to_host.offset = READBACK_EFB_TEX_OFFSET + slot_offset;
+    vkCmdPipelineBarrier(s_vk.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         0, NULL, 1, &tex_to_host, 0, NULL);
+
+    if (s_vk.efb_copy_verify)
+        record_efb_verify_download();
+
+    GxVkPendingTexCopy* pending = &s_vk.resident_pending_tex[slot];
+    pending->ram = ram; pending->ram_size = ram_size;
+    pending->dest_addr = d.dest_addr; pending->dest_stride = d.dest_stride;
+    pending->tiles_x = d.tiles_x; pending->tiles_y = d.tiles_y;
+    pending->block_bytes = d.block_bytes; pending->row_bytes = d.row_bytes;
+    pending->slot_offset = slot_offset;
+    s_vk.resident_pending_tex_count++;
+
+    if ((s_vk.gpu_stats || s_vk.efb_copy_verify) && !resident_submit_batch())
+        return -1;
+
+    if (s_vk.efb_copy_verify && !resident_efb_copy_verify_one(&d, ram))
+        return -1;
+
+    return 1;
+}
+
 static void record_xfb_copy(const GxVkCopyPush* push) {
     vkCmdBindPipeline(s_vk.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                       s_vk.copy_pipeline);
@@ -2061,8 +2567,24 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
         }
         return 0;
     }
-    GxVkCopyPush copy_push;
     u32 copy_word = bp[0x52];
+    /* Two exact, individually bit-verified EFB->texture copy configurations
+     * (RG8 and RGBA8, both half_scale + 3-tap vertical filter -- see
+     * gx_efb_tex_copy.comp / decode_efb_tex_copy). Every other copy_word,
+     * including every other EFB->texture variant, falls through unchanged to
+     * the ordinary synchronized-fallback check below. */
+    if (((copy_word >> 7) & 3u) == 0u &&
+        (copy_word == 0x01023Bu || copy_word == 0x010263u)) {
+        int tex_result = gx_vulkan_resident_efb_tex_copy(bp, copy_word, ram,
+                                                         ram_size);
+        if (tex_result != 0)
+            return tex_result; /* 1 = handled, -1 = fatal */
+        /* tex_result==0: decode_efb_tex_copy rejected the exact state it was
+         * given (should not happen given the copy_word gate above, but never
+         * silently fall through to a stale co-run/resident state) -- drop
+         * into the ordinary synchronized fallback below. */
+    }
+    GxVkCopyPush copy_push;
     if (((copy_word >> 7) & 3u) != 0u ||
         ((copy_word >> 14) & 1u) == 0u ||
         !decode_copy(bp, &copy_push) || !copy_push.copy_enable) {
