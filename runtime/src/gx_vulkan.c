@@ -31,7 +31,15 @@
 /* EFB_TEX_SHADOW_BYTES is defined below (after TEXTURE_SHADOW_BYTES); the
  * readback buffer needs an equally-sized region to receive it back. */
 #define READBACK_EFB_TEX_OFFSET (READBACK_DEPTH_OFFSET + EFB_PLANE_BYTES)
-#define READBACK_BYTES (READBACK_EFB_TEX_OFFSET + EFB_TEX_SHADOW_BYTES)
+/* Pass D (docs/GX_GENERAL_TEV.md root-cause hunt): permanent, always-cheap
+ * per-pixel debug dump for shade_pixel_general -- gated on a push-constant
+ * (x,y) that defaults to (-1,-1) (never matches, so the shader's one `if`
+ * compare is the only cost when off). GCN_GX_GENERAL_DEBUG_XY="x,y" arms it;
+ * matching CPU-side dumps live in gx_raster.c under the same env knob. */
+#define GENERAL_DEBUG_WORDS 64u
+#define GENERAL_DEBUG_BYTES (GENERAL_DEBUG_WORDS * sizeof(u32))
+#define READBACK_GENERAL_DEBUG_OFFSET (READBACK_EFB_TEX_OFFSET + EFB_TEX_SHADOW_BYTES)
+#define READBACK_BYTES (READBACK_GENERAL_DEBUG_OFFSET + GENERAL_DEBUG_BYTES)
 #define DRAW_JOB_OFFSET (XFB_SHADOW_OFFSET + XFB_SHADOW_TOTAL)
 /* Phase 1a (general TEV program, docs/GX_GENERAL_TEV.md): grown from 128 to
  * 256 u32 words. Words 0..111 keep their EXACT pre-existing layout (every
@@ -41,7 +49,10 @@
  * before anything ever classifies to the still-unused id 31. See the layout
  * table in snapshot_fused_draw's comment. */
 #define DRAW_PACKET_BYTES 1024u
-#define GX_VK_DRAW_PROGRAM_COUNT 30u
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): id 31, the first
+ * program compute_program_id (gx_raster.c) derives from an eligibility gate
+ * rather than an exact per-shape signature match. */
+#define GX_VK_DRAW_PROGRAM_COUNT 31u
 #define DRAW_JOB_BYTES  (8u * 1024u * 1024u)
 #define DRAW_PACKET_ARENA_BYTES (6u * 1024u * 1024u)
 #define EFB_TILE_WIDTH 40u
@@ -62,7 +73,16 @@
 #define EFB_TEX_SHADOW_SLOT_BYTES (384u * 1024u)
 #define EFB_TEX_SHADOW_BYTES (EFB_TEX_SHADOW_SLOT_BYTES * EFB_TEX_RING_SIZE)
 #define EFB_TEX_SHADOW_OFFSET (TEXTURE_SHADOW_OFFSET + TEXTURE_SHADOW_BYTES)
-#define STAGING_BYTES   (EFB_TEX_SHADOW_OFFSET + EFB_TEX_SHADOW_BYTES)
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md), pass C: TLUT bytes
+ * for C4/C8 palette decode (gx_draw_f.comp's TlutData SSBO, binding=6 --
+ * binding=5 is already EFB_TEX_SHADOW, so pass B's dead-code binding=5
+ * declaration was wrong and is corrected alongside this). GX TLUTs are at
+ * most 16384 entries * 2 bytes = 32KiB (C14X2, out of phase-1a scope); C4
+ * needs <=32 bytes, C8 <=512 -- 64KiB total budget covers many distinct
+ * small TLUTs with room to spare. */
+#define TLUT_SHADOW_BYTES (64u * 1024u)
+#define TLUT_SHADOW_OFFSET (EFB_TEX_SHADOW_OFFSET + EFB_TEX_SHADOW_BYTES)
+#define STAGING_BYTES   (TLUT_SHADOW_OFFSET + TLUT_SHADOW_BYTES)
 #define GPU_QUERY_MAX 16u
 
 enum { GPU_TIME_DRAW = 0, GPU_TIME_XFB, GPU_TIME_CLEAR, GPU_TIME_COUNT };
@@ -141,6 +161,11 @@ typedef struct {
     u32 batch_mode;
     u32 tile_header_base;
     u32 tile_index_base;
+    /* Pass D debug hook (docs/GX_GENERAL_TEV.md): -1,-1 (default) never
+     * matches any real pixel, so this is a single dead compare per
+     * invocation when unarmed. See GENERAL_DEBUG_* above. */
+    int32_t dbg_x;
+    int32_t dbg_y;
 } GxVkDrawPush;
 
 typedef struct {
@@ -153,6 +178,38 @@ typedef struct {
 } GxVkTextureEntry;
 
 #define GX_VK_TEXTURE_CACHE_ENTRIES 32u
+
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): TLUT bytes for
+ * C4/C8, mirroring GxVkTextureEntry's content-compare/upload shape but keyed
+ * by TMEM byte offset (from TX_SETTLUT, gx_raster.c:5741-5743) instead of
+ * guest-RAM address, and read from gcn_gx_tmem() instead of guest RAM. */
+typedef struct {
+    int used;
+    u32 tmem_offset, length;
+    u8* bytes;
+    u32 gpu_offset, gpu_capacity;
+    int gpu_dirty;
+    u64 stamp;
+} GxVkTlutEntry;
+
+#define GX_VK_TLUT_CACHE_ENTRIES 8u
+
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): the two texture
+ * "slots" the general shader supports (shade_pixel_general's texmap==0 ->
+ * slot 0 / words 79-90, texmap!=0 -> slot 1 / words 239-250 convention).
+ * Every program 1..30 only ever needs slot 0 (tex[0] aliases the single
+ * `texture_out` those programs' callers already use); program 31 can use
+ * both. */
+typedef struct {
+    GxVkTextureEntry* tex[2];
+    GxVkTlutEntry* tlut[2];
+    u32 unit[2];   /* the actual texmap/unit index each slot resolved, in
+                    * first-enabled-stage order (see resolve_fused_texture's
+                    * program-31 branch) -- snapshot_fused_draw needs this to
+                    * read the right unit's wrap/mip/lod-bias BP fields,
+                    * since general draws are not guaranteed to sample
+                    * texmap 0 at all, let alone at stage 0. */
+} GxVkGeneralTex;
 
 typedef struct {
     VkInstance instance;
@@ -202,6 +259,9 @@ typedef struct {
     const u8* draw_ram;
     u32 draw_ram_size;
     int draw_textures_validated;
+    /* Pass D general-TEV debug hook (docs/GX_GENERAL_TEV.md), GCN_GX_GENERAL_DEBUG_XY. */
+    int32_t general_debug_x, general_debug_y;
+    int general_debug_armed;
     int draw_active;
     u64 draws;
     u64 triangles;
@@ -219,6 +279,9 @@ typedef struct {
     u64 texture_misses;
     u64 texture_bytes_compared;
     u64 texture_bytes_changed;
+    GxVkTlutEntry tlut_cache[GX_VK_TLUT_CACHE_ENTRIES];
+    u64 tlut_stamp;
+    u32 tlut_arena_used;   /* bytes consumed so far in TLUT_SHADOW_BYTES */
     int resident_mode;
     int resident_recording;
     u32 resident_inflight;
@@ -432,7 +495,7 @@ static int create_readback(void) {
 }
 
 static int create_compute_state(void) {
-    VkDescriptorSetLayoutBinding bindings[6] = {0};
+    VkDescriptorSetLayoutBinding bindings[8] = {0};
     for (u32 i = 0; i < 2; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -455,9 +518,21 @@ static int create_compute_state(void) {
     bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[5].descriptorCount = 1;
     bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    /* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): TLUT bytes for
+     * C4/C8, gx_draw_f.comp's TlutData SSBO. */
+    bindings[6].binding = 6;
+    bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[6].descriptorCount = 1;
+    bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    /* Pass D root-cause hunt (docs/GX_GENERAL_TEV.md): permanent, always-on
+     * (env-armed) per-pixel debug dump SSBO, gx_draw_f.comp's DebugData. */
+    bindings[7].binding = 7;
+    bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[7].descriptorCount = 1;
+    bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dl = {0};
     dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dl.bindingCount = 6;
+    dl.bindingCount = 8;
     dl.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(s_vk.device, &dl, NULL,
                                     &s_vk.descriptor_layout) != VK_SUCCESS)
@@ -552,7 +627,7 @@ static int create_compute_state(void) {
 
     VkDescriptorPoolSize pool_sizes[2] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}
     };
     VkDescriptorPoolCreateInfo dp = {0};
     dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -570,7 +645,7 @@ static int create_compute_state(void) {
     if (vkAllocateDescriptorSets(s_vk.device, &da, &s_vk.descriptor_set) != VK_SUCCESS)
         return 0;
     VkDescriptorImageInfo images[2] = {0};
-    VkWriteDescriptorSet writes[6] = {0};
+    VkWriteDescriptorSet writes[8] = {0};
     for (u32 i = 0; i < 2; ++i) {
         images[i].imageView = s_vk.view[i];
         images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -617,7 +692,25 @@ static int create_compute_state(void) {
     writes[5].descriptorCount = 1;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[5].pBufferInfo = &efb_tex_output;
-    vkUpdateDescriptorSets(s_vk.device, 6, writes, 0, NULL);
+    VkDescriptorBufferInfo tlut_shadow = {
+        s_vk.staging, TLUT_SHADOW_OFFSET, TLUT_SHADOW_BYTES
+    };
+    writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[6].dstSet = s_vk.descriptor_set;
+    writes[6].dstBinding = 6;
+    writes[6].descriptorCount = 1;
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[6].pBufferInfo = &tlut_shadow;
+    VkDescriptorBufferInfo general_debug = {
+        s_vk.readback, READBACK_GENERAL_DEBUG_OFFSET, GENERAL_DEBUG_BYTES
+    };
+    writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[7].dstSet = s_vk.descriptor_set;
+    writes[7].dstBinding = 7;
+    writes[7].descriptorCount = 1;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[7].pBufferInfo = &general_debug;
+    vkUpdateDescriptorSets(s_vk.device, 8, writes, 0, NULL);
 
     VkCommandBufferAllocateInfo ca = {0};
     ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -711,7 +804,7 @@ void gx_vulkan_shadow_shutdown(void) {
                 "H=%llu I=%llu J=%llu K=%llu L=%llu M=%llu N=%llu "
                 "O=%llu P=%llu Q=%llu R=%llu S=%llu T=%llu U=%llu "
                 "V=%llu W=%llu X=%llu Y=%llu Z=%llu AA=%llu AB=%llu "
-                "AC=%llu AD=%llu general=%llu)\n",
+                "AC=%llu AD=%llu GEN=%llu general=%llu)\n",
                 (unsigned long long)s_vk.draws,
                 (unsigned long long)s_vk.triangles,
                 (unsigned long long)s_vk.fused_triangles[1],
@@ -744,6 +837,7 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.fused_triangles[28],
                 (unsigned long long)s_vk.fused_triangles[29],
                 (unsigned long long)s_vk.fused_triangles[30],
+                (unsigned long long)s_vk.fused_triangles[31],
                 (unsigned long long)s_vk.fused_triangles[0]);
     }
     for (u32 program = 1; program <= GX_VK_DRAW_PROGRAM_COUNT; ++program) {
@@ -878,6 +972,20 @@ void gx_vulkan_shadow_shutdown(void) {
 
 int gx_vulkan_shadow_init(void) {
     gx_vulkan_shadow_shutdown();
+    /* Pass D general-TEV debug hook (docs/GX_GENERAL_TEV.md): parse once,
+     * defaults to -1,-1 (armed nowhere, so shade_pixel_general's guard
+     * compare never matches and the dump path costs nothing). */
+    s_vk.general_debug_x = -1;
+    s_vk.general_debug_y = -1;
+    s_vk.general_debug_armed = 0;
+    { const char* e = getenv("GCN_GX_GENERAL_DEBUG_XY");
+      int gx = -1, gy = -1;
+      if (e && sscanf(e, "%d,%d", &gx, &gy) == 2 && gx >= 0 && gy >= 0) {
+          s_vk.general_debug_x = gx;
+          s_vk.general_debug_y = gy;
+          s_vk.general_debug_armed = 1;
+          fprintf(stderr, "gx_vulkan: general-TEV debug armed at (%d,%d)\n", gx, gy);
+      } }
     VkApplicationInfo app = {0};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "gcnrecomp GX shadow";
@@ -1007,10 +1115,19 @@ int gx_vulkan_shadow_init(void) {
           s_vk.draw_validate_program = (u32)(e[0] - 'A') + 1u;
       else if (e && strcmp(e, "ALL") == 0)
           s_vk.draw_validate_program = 0u;
-      else if (e && *e)
-          fprintf(stderr,
-                  "gx_vulkan: invalid GCN_GX_VK_DRAW_PROGRAM='%s'; using F\n",
-                  e); }
+      else if (e && *e) {
+          /* Numeric fallback: the single-letter scheme predates Y-AD
+           * (25-30) and general (31, docs/GX_GENERAL_TEV.md), neither of
+           * which fits the "one letter" A-X convention. */
+          char* end = NULL;
+          unsigned long v = strtoul(e, &end, 10);
+          if (end && *end == '\0' && v >= 1 && v <= GX_VK_DRAW_PROGRAM_COUNT)
+              s_vk.draw_validate_program = (u32)v;
+          else
+              fprintf(stderr,
+                      "gx_vulkan: invalid GCN_GX_VK_DRAW_PROGRAM='%s'; using F\n",
+                      e);
+      } }
     if (s_vk.draw_validate_program) {
         s_vk.draw_validate_remaining[s_vk.draw_validate_program] =
             draw_validate_count;
@@ -1093,9 +1210,120 @@ static GxVkTextureEntry* find_texture_binding(const u32* bp, u32 unit) {
     return NULL;
 }
 
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): TLUT lookup for
+ * C4/C8, mirroring find_texture_binding but keyed by TMEM byte offset. */
+static GxVkTlutEntry* find_tlut_binding(u32 tmem_offset, u32 length) {
+    for (u32 i = 0; i < GX_VK_TLUT_CACHE_ENTRIES; ++i) {
+        GxVkTlutEntry* entry = &s_vk.tlut_cache[i];
+        if (entry->used && entry->tmem_offset == tmem_offset && entry->length == length)
+            return entry;
+    }
+    return NULL;
+}
+
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): the 8 eligible
+ * texture formats (I4/I8/IA4/IA8/RGB5A3/RGBA8/C4/C8), same set the shader's
+ * decode_texture_g supports. */
+static int general_texture_format_ok(u32 format) {
+    return format == 0u || format == 1u || format == 2u || format == 3u ||
+           format == 5u || format == 6u || format == 8u || format == 9u;
+}
+
+/* One texture unit's resident-eligibility check, shared by programs 1..30
+ * (formats {I4=0,I8=1,RGBA8=6} only, unchanged) and program 31 (the 8-format
+ * general set, docs/GX_GENERAL_TEV.md). Returns the resolved texture (NULL
+ * on any rejection) and, via *tlut_out, the TLUT entry for C4/C8 (NULL for
+ * every other format, including a successful non-paletted resolve). */
+static GxVkTextureEntry* resolve_texture_unit(u32 unit, int general,
+                                              GxVkTlutEntry** tlut_out) {
+    *tlut_out = NULL;
+    u32 mode0 = s_vk.draw_bp[0x80 + unit];
+    GxVkTextureEntry* texture = find_texture_binding(s_vk.draw_bp, unit);
+    if (!texture)
+        return NULL;
+    int fmt_ok = general ? general_texture_format_ok(texture->format)
+                         : (texture->format == 0u || texture->format == 1u ||
+                            texture->format == 6u);
+    if (!fmt_ok || texture->length > TEXTURE_SHADOW_BYTES ||
+        (mode0 & 3u) == 3u || ((mode0 >> 2) & 3u) == 3u ||
+        ((mode0 >> 5) & 3u) != 0u)   /* mipmap_filter != none (no mip, either family) */
+        return NULL;
+    if (texture->format == 8u || texture->format == 9u) {
+        u32 tlut_reg = (unit < 4u) ? s_vk.draw_bp[0x98 + unit]
+                                   : s_vk.draw_bp[0xB8 + (unit - 4u)];
+        u32 tmem_offset = (tlut_reg & 0x3FFu) << 9;
+        u32 tlut_len = (texture->format == 8u) ? 32u : 512u;
+        GxVkTlutEntry* tlut = find_tlut_binding(tmem_offset, tlut_len);
+        if (!tlut)
+            return NULL;
+        *tlut_out = tlut;
+    }
+    return texture;
+}
+
 static int resolve_fused_texture(const GxRasterTriangleJob* job,
-                                 GxVkTextureEntry** texture_out) {
+                                 GxVkTextureEntry** texture_out,
+                                 GxVkGeneralTex* general_out) {
     *texture_out = NULL;
+    if (general_out) memset(general_out, 0, sizeof *general_out);
+
+    if (job->fused_program == 31u) {
+        /* General TEV (docs/GX_GENERAL_TEV.md): the shader supports at most
+         * two texture "slots". Slot assignment is first-enabled-stage order
+         * (slot 0 = the first distinct texmap an enabled stage references,
+         * slot 1 = the next distinct one, if any) -- NOT "texmap==0", since
+         * a general draw is not guaranteed to sample texmap 0 at all, let
+         * alone at stage 0; this also matches what the shared words-79..90
+         * packer below needs (see snapshot_fused_draw's gen->unit[] use).
+         * gx_raster.c's eligibility gate already enforces <=2 distinct
+         * texmaps, but re-derive defensively here rather than trust the job
+         * to have gotten it right -- a gate/resolver disagreement must fail
+         * closed. */
+        u32 numtexgens = s_vk.draw_bp[0x00] & 0xfu;
+        if (numtexgens == 0u)
+            return 1;   /* no sampling needed at all */
+        u32 last_stage = (s_vk.draw_bp[0x00] >> 10) & 0xfu;
+        u32 distinct[2];
+        u32 distinct_count = 0;
+        for (u32 stage = 0; stage <= last_stage; ++stage) {
+            u32 order = s_vk.draw_bp[0x28 + (stage >> 1)];
+            u32 odd = stage & 1u;
+            u32 enabled = odd ? ((order >> 18) & 1u) : ((order >> 6) & 1u);
+            u32 unit = odd ? ((order >> 12) & 7u) : (order & 7u);
+            if (!enabled)
+                continue;
+            u32 k;
+            for (k = 0; k < distinct_count; ++k)
+                if (distinct[k] == unit)
+                    break;
+            if (k == distinct_count) {
+                if (distinct_count >= 2)
+                    return 0;   /* >2 distinct texmaps: gate/resolver disagreement */
+                distinct[distinct_count++] = unit;
+            }
+        }
+        for (u32 slot = 0; slot < distinct_count; ++slot) {
+            u32 unit = distinct[slot];
+            GxVkTlutEntry* tlut = NULL;
+            GxVkTextureEntry* texture = resolve_texture_unit(unit, 1, &tlut);
+            if (!texture) {
+                if (!s_vk.texture_reject_logged[31u]) {
+                    s_vk.texture_reject_logged[31u] = 1;
+                    fprintf(stderr,
+                            "gx_vulkan: fused-program-general exact GPU path "
+                            "rejected unit=%u (fmt/mip/wrap/TLUT outside the "
+                            "8-format phase-1a set)\n", unit);
+                }
+                return 0;
+            }
+            general_out->tex[slot] = texture;
+            general_out->tlut[slot] = tlut;
+            general_out->unit[slot] = unit;
+        }
+        *texture_out = general_out->tex[0];
+        return 1;
+    }
+
     /* Y/Z/AA/AB/AC/AD (25-30, see gx_raster.c's gpu_program_Y_match
      * derivation) are all texgens==0/en==0 like F/J/M/P/T -- none of the six
      * new census shapes samples a texture at all, so they join this
@@ -1108,35 +1336,44 @@ static int resolve_fused_texture(const GxRasterTriangleJob* job,
         job->fused_program != 29u && job->fused_program != 30u) {
         u32 order = s_vk.draw_bp[0x28];
         u32 unit = order & 7u;
-        u32 mode0 = s_vk.draw_bp[0x80 + unit];
-        GxVkTextureEntry* texture = find_texture_binding(s_vk.draw_bp, unit);
-        if (!(order & (1u << 6)) || !texture ||
-            (texture->format != 0u && texture->format != 1u &&
-             texture->format != 6u) ||
-            texture->length > TEXTURE_SHADOW_BYTES ||
-            (mode0 & 3u) == 3u || ((mode0 >> 2) & 3u) == 3u ||
-            ((mode0 >> 5) & 3u) != 0u) {
+        GxVkTlutEntry* tlut_unused = NULL;
+        GxVkTextureEntry* texture = (order & (1u << 6)) ?
+            resolve_texture_unit(unit, 0, &tlut_unused) : NULL;
+        if (!texture) {
             if (!s_vk.texture_reject_logged[job->fused_program]) {
                 s_vk.texture_reject_logged[job->fused_program] = 1;
+                GxVkTextureEntry* logged = find_texture_binding(s_vk.draw_bp, unit);
+                u32 mode0 = s_vk.draw_bp[0x80 + unit];
                 fprintf(stderr,
                         "gx_vulkan: fused-program-%s exact GPU path supports "
                         "only a resident stage-0 I4/I8/RGBA8 non-mipmapped texture "
                         "with supported wrap (unit=%u fmt=%u size=%ux%u "
                         "mode0=%06X)\n",
                         gx_vk_program_label(job->fused_program), unit,
-                        texture ? texture->format : 0xffffffffu,
-                        texture ? texture->width : 0u,
-                        texture ? texture->height : 0u, mode0);
+                        logged ? logged->format : 0xffffffffu,
+                        logged ? logged->width : 0u,
+                        logged ? logged->height : 0u, mode0);
             }
             return 0;
         }
         *texture_out = texture;
+        /* Regression fix: callers (resident_record_draw) now call
+         * ensure_resident_texture(gen.tex[0]/[1]) uniformly instead of
+         * ensure_resident_texture(texture) directly, so gen.tex[0] must
+         * mirror *texture_out here too -- otherwise programs 1..30's
+         * texture never gets uploaded/refreshed to the resident arena
+         * (gen stays all-NULL from the memset above, since only the
+         * program==31 branch used to fill it), and the GPU silently
+         * samples stale/garbage bytes. Caught by corun: gpu stuck at an
+         * old value while software correctly re-drew every frame. */
+        if (general_out) general_out->tex[0] = texture;
     }
     return 1;
 }
 
 static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
-                                const GxVkTextureEntry* texture) {
+                                const GxVkTextureEntry* texture,
+                                const GxVkGeneralTex* gen) {
     _Static_assert(DRAW_PACKET_BYTES == 256u * sizeof(u32),
                    "general block (words 112..255) layout assumes a 256-word packet");
     _Static_assert(sizeof(GxRasterTriScan) == 21u * sizeof(u32),
@@ -1155,8 +1392,13 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
                sizeof(GxRasterSlope));
 
     if (texture) {
-        u32 order = s_vk.draw_bp[0x28];
-        u32 unit = order & 7u;
+        /* Slot 0's unit: for the general program (id 31) this is
+         * gen->unit[0] (first-enabled-stage order, see resolve_fused_texture's
+         * program-31 branch -- a general draw is not guaranteed to sample
+         * texmap 0, let alone at stage 0). Every other program keeps the
+         * original stage-pair-0 order-register derivation unchanged. */
+        u32 unit = (gen && job->fused_program == 31u) ? gen->unit[0]
+                                                       : (s_vk.draw_bp[0x28] & 7u);
         u32 mode0 = s_vk.draw_bp[0x80 + unit];
         u32 mode1 = s_vk.draw_bp[0x84 + unit];
         words[79] = texture->format;
@@ -1225,10 +1467,22 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
      *              second texgen (job->tex[1])
      *   239..250   second texture metadata block, mirrors the words-79..90
      *              schema (format/width/height/wrap-s/wrap-t/mipmap/
-     *              edge-lod/lod-bias/min-linear/mag-linear/length) for the
-     *              stage(s) sampling texmap!=0 -- zeroed until a second
-     *              resident-texture unit is resolved (pass B/C)
-     *   251..255   reserved (zeroed; free for Phase 1b/2 fields)
+     *              edge-lod/lod-bias/min-linear/mag-linear/length) for
+     *              gen->tex[1] (the second distinct texmap an enabled stage
+     *              references, first-enabled-stage-order slot 1 -- see
+     *              resolve_fused_texture's program-31 branch); zeroed when
+     *              there is no second unit.
+     *   251        primary slot's TLUT format (0=IA8,1=RGB565,2=RGB5A3),
+     *              only meaningful for slot 0 formats C4(8)/C8(9)
+     *   252        primary slot's TLUT byte offset into the TlutData SSBO
+     *              (gx_vulkan.c's TLUT_SHADOW_OFFSET arena)
+     *   253        secondary slot's TLUT format
+     *   254        secondary slot's TLUT byte offset into the TlutData SSBO
+     *   255        secondary slot's texture-bytes arena base word, mirrors
+     *              word 99's role for slot 0 (both are patched by the
+     *              caller after ensure_resident_texture/_tlut assign the
+     *              real gpu_offset -- see resident_record_draw/
+     *              submit_fused_draw)
      *
      * Raw BP windows (not pre-decoded fields) per the spec's auditability
      * rule: the eventual shader re-derives bitfields with a line-for-line
@@ -1253,7 +1507,41 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
     for (u32 comp = 0; comp < 3u; ++comp)
         memcpy(words + 218u + comp * 7u, &job->tex[1][comp],
                sizeof(GxRasterSlope));
-    memset(words + 239u, 0, 17u * sizeof(*words)); /* 239..255: see table */
+    memset(words + 239u, 0, 17u * sizeof(*words)); /* 239..255: zero, then fill below */
+
+    if (gen && gen->tex[0] && (gen->tex[0]->format == 8u || gen->tex[0]->format == 9u)) {
+        u32 unit0 = gen->unit[0];
+        u32 tlut_reg0 = (unit0 < 4u) ? s_vk.draw_bp[0x98 + unit0]
+                                     : s_vk.draw_bp[0xB8 + (unit0 - 4u)];
+        words[251] = (tlut_reg0 >> 10) & 3u;
+        /* word 252 (TLUT arena byte offset) is patched by the caller once
+         * ensure_resident_tlut assigns gen->tlut[0]->gpu_offset, same
+         * two-step pattern word 99 already uses for the texture arena. */
+    }
+    if (gen && gen->tex[1]) {
+        const GxVkTextureEntry* t2 = gen->tex[1];
+        u32 unit1 = gen->unit[1];
+        u32 mode0 = s_vk.draw_bp[0x80 + unit1];
+        u32 mode1 = s_vk.draw_bp[0x84 + unit1];
+        words[239] = t2->format;
+        words[240] = t2->width;
+        words[241] = t2->height;
+        words[242] = mode0 & 3u;
+        words[243] = (mode0 >> 2) & 3u;
+        words[244] = (mode0 >> 4) & 1u;
+        words[245] = (mode0 >> 7) & 1u;
+        words[246] = (mode0 >> 8) & 1u;
+        words[247] = (u32)((s32)(s8)((mode0 >> 9) & 0xffu) >> 1);
+        words[248] = mode1 & 0xffu;
+        words[249] = (mode1 >> 8) & 0xffu;
+        words[250] = t2->length;
+        if (t2->format == 8u || t2->format == 9u) {
+            u32 tlut_reg1 = (unit1 < 4u) ? s_vk.draw_bp[0x98 + unit1]
+                                         : s_vk.draw_bp[0xB8 + (unit1 - 4u)];
+            words[253] = (tlut_reg1 >> 10) & 3u;
+            /* word 254 patched by the caller, same as word 252/99/255. */
+        }
+    }
 }
 
 static int flush_staging(void) {
@@ -1456,7 +1744,8 @@ static int resident_emit_draw_batch(void) {
                             &s_vk.descriptor_set, 0, NULL);
     GxVkDrawPush push = {
         s_vk.resident_draw_arena_used / sizeof(u32), 1u,
-        header_offset / sizeof(u32), index_offset / sizeof(u32)
+        header_offset / sizeof(u32), index_offset / sizeof(u32),
+        s_vk.general_debug_x, s_vk.general_debug_y
     };
     vkCmdPushConstants(s_vk.command_buffer, s_vk.draw_f_pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
@@ -1521,6 +1810,36 @@ static int resident_submit_async(void) {
     return resident_submit_current(0);
 }
 
+/* Pass D root-cause hunt (docs/GX_GENERAL_TEV.md): print + clear the
+ * general-TEV debug SSBO if the armed pixel was touched by the batch just
+ * completed. Word layout matches gx_draw_f.comp's shade_pixel_general dbg
+ * writes exactly (see the comments there); pack_abgr's x|y<<8|z<<16|w<<24
+ * applied to (r,g,b,a) unpacks the same way here. */
+static void gx_vk_dump_general_debug(void) {
+    if (!invalidate_readback())
+        return;
+    u32* d = (u32*)(s_vk.readback_map + READBACK_GENERAL_DEBUG_OFFSET);
+    if (d[0] != 0xDEADBEEFu)
+        return;
+    u32 program = d[1];
+    fprintf(stderr,
+        "gx_vulkan: [gpu-debug] program=%u xy=(%u,%u) wraw=%08X uv=(%08X,%08X) invw=%08X q=%08X "
+        "fixed=(%08X,%08X) int=(%d,%d) linear=%u is/it=(%d,%d) is1/it1=(%d,%d) fs/ft=(%d,%d)\n",
+        program, d[2], d[3], d[36], d[4], d[5], d[6], d[7], d[8], d[9],
+        (int32_t)d[10], (int32_t)d[11], d[12],
+        (int32_t)d[13], (int32_t)d[14], (int32_t)d[15], (int32_t)d[16],
+        (int32_t)d[17], (int32_t)d[18]);
+    fprintf(stderr,
+        "gx_vulkan: [gpu-debug] v00=%08X v10=%08X v01=%08X v11=%08X texel=%08X "
+        "tex_color=%08X ras_color=%08X\n",
+        d[19], d[20], d[21], d[22], d[23], d[24], d[25]);
+    fprintf(stderr,
+        "gx_vulkan: [gpu-debug] combiner_out(r,g,b,a packed)=%08X pf=%u old_efb=%08X "
+        "dstv=%08X pre_dither=%08X post_dither=%08X stored=%08X\n",
+        d[28], d[29], d[30], d[32], d[33], d[34], d[35]);
+    memset(d, 0, GENERAL_DEBUG_BYTES);
+}
+
 static int resident_submit_batch(void) {
     int had_pending = s_vk.resident_pending_count != 0u;
     u64 t0 = __rdtsc();
@@ -1538,6 +1857,8 @@ static int resident_submit_batch(void) {
     }
     if (signaled && !resident_wait_fence())
         return 0;
+    if (s_vk.general_debug_armed && signaled)
+        gx_vk_dump_general_debug();
     u64 t2 = __rdtsc();
     if (s_vk.gpu_stats && s_vk.gpu_query_count) {
         u64 timestamps[GPU_QUERY_MAX] = {0};
@@ -1593,6 +1914,31 @@ static int ensure_resident_texture(GxVkTextureEntry* texture) {
     return 1;
 }
 
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): mirrors
+ * ensure_resident_texture for TLUT bytes. */
+static int ensure_resident_tlut(GxVkTlutEntry* entry) {
+    if (!entry)
+        return 1;
+    if (!entry->gpu_dirty && entry->gpu_capacity >= entry->length)
+        return 1;
+    if ((s_vk.resident_recording || s_vk.resident_inflight) &&
+        !resident_submit_batch())
+        return 0;
+    if (entry->gpu_capacity < entry->length) {
+        u32 offset = (s_vk.tlut_arena_used + 255u) & ~255u;
+        u32 capacity = (entry->length + 255u) & ~255u;
+        if ((u64)offset + capacity > TLUT_SHADOW_BYTES)
+            return 0;
+        entry->gpu_offset = offset;
+        entry->gpu_capacity = capacity;
+        s_vk.tlut_arena_used = offset + capacity;
+    }
+    memcpy(s_vk.staging_map + TLUT_SHADOW_OFFSET + entry->gpu_offset,
+           entry->bytes, entry->length);
+    entry->gpu_dirty = 0;
+    return 1;
+}
+
 static int resident_record_draw(const GxRasterTriangleJob* job) {
     if (job->fused_program < 1u ||
         job->fused_program > GX_VK_DRAW_PROGRAM_COUNT)
@@ -1604,8 +1950,12 @@ static int resident_record_draw(const GxRasterTriangleJob* job) {
         job->scan.maxy > (int)EFB_HEIGHT)
         return 0;
     GxVkTextureEntry* texture = NULL;
-    if (!resolve_fused_texture(job, &texture) ||
-        !ensure_resident_texture(texture))
+    GxVkGeneralTex gen = {0};
+    if (!resolve_fused_texture(job, &texture, &gen) ||
+        !ensure_resident_texture(gen.tex[0]) ||
+        !ensure_resident_texture(gen.tex[1]) ||
+        !ensure_resident_tlut(gen.tlut[0]) ||
+        !ensure_resident_tlut(gen.tlut[1]))
         return 0;
 
     u32 tx0 = (u32)job->scan.minx / 16u;
@@ -1639,9 +1989,15 @@ static int resident_record_draw(const GxRasterTriangleJob* job) {
     u32* packet = (u32*)(s_vk.staging_map + DRAW_JOB_OFFSET +
                          s_vk.resident_draw_arena_used +
                          (u64)packet_index * DRAW_PACKET_BYTES);
-    snapshot_fused_draw(job, packet, texture);
+    snapshot_fused_draw(job, packet, texture, &gen);
     if (texture)
         packet[99] = texture->gpu_offset;
+    if (gen.tlut[0])
+        packet[252] = gen.tlut[0]->gpu_offset;
+    if (gen.tex[1])
+        packet[255] = gen.tex[1]->gpu_offset;
+    if (gen.tlut[1])
+        packet[254] = gen.tlut[1]->gpu_offset;
     ++s_vk.resident_job_count;
     for (u32 ty = ty0; ty <= ty1; ++ty) {
         for (u32 tx = tx0; tx <= tx1; ++tx) {
@@ -1668,13 +2024,44 @@ static int submit_fused_draw(const GxRasterTriangleJob* job) {
            (size_t)EFB_PLANE_BYTES);
     u32* words = (u32*)(s_vk.staging_map + DRAW_JOB_OFFSET);
     GxVkTextureEntry* texture = NULL;
-    if (!resolve_fused_texture(job, &texture))
+    GxVkGeneralTex gen = {0};
+    if (!resolve_fused_texture(job, &texture, &gen))
         return 0;
-    snapshot_fused_draw(job, words, texture);
+    snapshot_fused_draw(job, words, texture, &gen);
+    /* This single-draw validate path has no arena/cache (unlike the resident
+     * batched path) -- it always re-uploads at a fixed spot for exactly this
+     * one triangle. General TEV (program 31, docs/GX_GENERAL_TEV.md) can
+     * need a second texture + up to two TLUTs, so slot 1 / the TLUTs are
+     * placed after slot 0 in the same arena rather than at offset 0. */
+    u32 tex_arena_used = 0;
     if (texture) {
         memcpy(s_vk.staging_map + TEXTURE_SHADOW_OFFSET,
                texture->bytes, texture->length);
         words[99] = 0u;
+        tex_arena_used = (texture->length + 255u) & ~255u;
+    }
+    if (gen.tex[1]) {
+        u32 off = tex_arena_used;
+        if ((u64)off + gen.tex[1]->length > TEXTURE_SHADOW_BYTES)
+            return 0;
+        memcpy(s_vk.staging_map + TEXTURE_SHADOW_OFFSET + off,
+               gen.tex[1]->bytes, gen.tex[1]->length);
+        words[255] = off;
+    }
+    u32 tlut_arena_used = 0;
+    if (gen.tlut[0]) {
+        memcpy(s_vk.staging_map + TLUT_SHADOW_OFFSET,
+               gen.tlut[0]->bytes, gen.tlut[0]->length);
+        words[252] = 0u;
+        tlut_arena_used = (gen.tlut[0]->length + 255u) & ~255u;
+    }
+    if (gen.tlut[1]) {
+        u32 off = tlut_arena_used;
+        if ((u64)off + gen.tlut[1]->length > TLUT_SHADOW_BYTES)
+            return 0;
+        memcpy(s_vk.staging_map + TLUT_SHADOW_OFFSET + off,
+               gen.tlut[1]->bytes, gen.tlut[1]->length);
+        words[254] = off;
     }
     if (!s_vk.staging_coherent) {
         VkMappedMemoryRange range = {0};
@@ -1736,6 +2123,8 @@ static int submit_fused_draw(const GxRasterTriangleJob* job) {
                             s_vk.draw_f_pipeline_layout, 0, 1,
                             &s_vk.descriptor_set, 0, NULL);
     GxVkDrawPush draw_push = {0};
+    draw_push.dbg_x = s_vk.general_debug_x;
+    draw_push.dbg_y = s_vk.general_debug_y;
     vkCmdPushConstants(s_vk.command_buffer, s_vk.draw_f_pipeline_layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof draw_push,
                        &draw_push);
@@ -1769,6 +2158,8 @@ static int submit_fused_draw(const GxRasterTriangleJob* job) {
         return 0;
     if (!invalidate_readback())
         return 0;
+    if (s_vk.general_debug_armed)
+        gx_vk_dump_general_debug();
     s_vk.images_general = 1;
     s_vk.draw_validation_program = job->fused_program;
     s_vk.draw_validation_pending = 1;
@@ -1893,6 +2284,50 @@ static int validate_texture_binding(const u32* bp, const u8* ram, u32 ram_size,
     return 1;
 }
 
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): TLUT bytes for
+ * C4/C8, content-compared every draw exactly like validate_texture_binding
+ * does for texture bytes -- a stale TLUT is just as wrong as a stale
+ * texture. Source is modeled TMEM (gcn_gx_tmem(), gx_raster.c:5736-5743),
+ * not guest RAM: TX_SETTLUT's tmem_offset<<9 is always within the 1MB TMEM
+ * array (same bound gx_raster.c's decode_texel comment cites), so no OOB
+ * check is needed here either. */
+static int validate_tlut_binding(u32 tmem_offset, u32 length) {
+    const u8* tmem = gcn_gx_tmem();
+    GxVkTlutEntry* entry = NULL;
+    GxVkTlutEntry* victim = &s_vk.tlut_cache[0];
+    for (u32 i = 0; i < GX_VK_TLUT_CACHE_ENTRIES; ++i) {
+        GxVkTlutEntry* candidate = &s_vk.tlut_cache[i];
+        if (candidate->used && candidate->tmem_offset == tmem_offset &&
+            candidate->length == length) {
+            entry = candidate;
+            break;
+        }
+        if (!candidate->used ||
+            (victim->used && candidate->stamp < victim->stamp))
+            victim = candidate;
+    }
+    s_vk.tlut_stamp++;
+    if (entry) {
+        if (memcmp(entry->bytes, tmem + tmem_offset, length) == 0) {
+            entry->stamp = s_vk.tlut_stamp;
+            return 1;
+        }
+    } else {
+        entry = victim;
+    }
+    u8* resized = (u8*)realloc(entry->bytes, length);
+    if (!resized)
+        return 0;
+    entry->bytes = resized;
+    memcpy(entry->bytes, tmem + tmem_offset, length);
+    entry->used = 1;
+    entry->tmem_offset = tmem_offset;
+    entry->length = length;
+    entry->stamp = s_vk.tlut_stamp;
+    entry->gpu_dirty = 1;
+    return 1;
+}
+
 static int validate_draw_textures(const u32* bp, const u8* ram, u32 ram_size) {
     u32 num_texgens = bp[0x00] & 0xfu;
     u32 last_stage = (bp[0x00] >> 10) & 0xfu;
@@ -1907,6 +2342,17 @@ static int validate_draw_textures(const u32* bp, const u8* ram, u32 ram_size) {
         if (enabled && !(seen & (1u << unit))) {
             if (!validate_texture_binding(bp, ram, ram_size, unit))
                 return 0;
+            /* C4/C8 units also need their TLUT bytes content-compared every
+             * draw (docs/GX_GENERAL_TEV.md phase 1a). */
+            u32 image0 = bp[0x88 + unit];
+            u32 format = (image0 >> 20) & 0xfu;
+            if (format == 8u || format == 9u) {
+                u32 tlut_reg = (unit < 4u) ? bp[0x98 + unit] : bp[0xB8 + (unit - 4u)];
+                u32 tmem_offset = (tlut_reg & 0x3FFu) << 9;
+                u32 tlut_len = (format == 8u) ? 32u : 512u;
+                if (!validate_tlut_binding(tmem_offset, tlut_len))
+                    return 0;
+            }
             seen |= 1u << unit;
         }
     }
@@ -1941,9 +2387,33 @@ int gx_vulkan_shadow_triangle(const GxRasterTriangleJob* job,
         char label[24];
         u32 program = s_vk.draw_validation_program;
         snprintf(label, sizeof label, "draw-%s color", gx_vk_program_label(program));
-        if (!compare_plane(label, color, gpu))
+        if (!compare_plane(label, color, gpu)) {
+            if (program == 31u) {
+                fprintf(stderr,
+                        "gx_vulkan: [general-debug] genmode=%06X TRef0=%06X "
+                        "cc0=%06X ac0=%06X ksel0=%06X at=%06X bm=%06X\n",
+                        s_vk.draw_bp[0x00], s_vk.draw_bp[0x28],
+                        s_vk.draw_bp[0xC0], s_vk.draw_bp[0xC1],
+                        s_vk.draw_bp[0xF6], s_vk.draw_bp[0xF3], s_vk.draw_bp[0x41]);
+                for (u32 u = 0; u < 8; ++u) {
+                    u32 image0 = s_vk.draw_bp[0x88 + u];
+                    u32 fmt = (image0 >> 20) & 0xfu;
+                    if (fmt || image0)
+                        fprintf(stderr,
+                                "gx_vulkan: [general-debug] unit=%u fmt=%u "
+                                "w=%u h=%u mode0=%06X\n",
+                                u, fmt, (image0 & 0x3ffu) + 1u,
+                                ((image0 >> 10) & 0x3ffu) + 1u,
+                                s_vk.draw_bp[0x80 + u]);
+                }
+            }
             return 0;
-        if (program == 11u || program == 12u || program == 24u) {
+        }
+        /* General (31, docs/GX_GENERAL_TEV.md) can also early-Z test/write
+         * depth (shade_pixel_general derives zt_early from raw PEControl
+         * itself, unlike the matched programs' pinned constants), so its
+         * depth plane needs the same comparison K/L/X already get. */
+        if (program == 11u || program == 12u || program == 24u || program == 31u) {
             const u32* gpu_depth = (const u32*)(s_vk.readback_map +
                                                 READBACK_DEPTH_OFFSET);
             char depth_label[24];

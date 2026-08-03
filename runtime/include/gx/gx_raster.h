@@ -125,7 +125,9 @@ typedef struct {
     u32 num_color_chans;
     u32 num_texgens;
     u32 pixel_format;
-    u32 fused_program; /* 0=general, 1..30=the exact A..AD programs */
+    u32 fused_program; /* 0=general (software), 1..30=the exact A..AD
+                        * programs, 31=general TEV (eligibility-gated,
+                        * docs/GX_GENERAL_TEV.md) */
     s32 tev_reg[4][4];       /* [Prev/Color0/Color1/Color2][R,G,B,A] */
     s32 stage_konst[2][4];   /* first two stages are sufficient for A..F */
     /* alpha_update (bp 0x41 bit 4, s_bm_au) -- ONLY read by programs Y/Z

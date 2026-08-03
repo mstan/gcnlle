@@ -274,6 +274,28 @@ static u64 s_ps_texel_cache_hits;   /* per-draw texel cache: decode_texel calls 
  * GCN_GX_TEV_CENSUS: fused selection runs on every draw regardless of whether
  * the census is being collected. */
 static int s_no_fused = -1;
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): GCN_GX_GENERAL_TEV=0
+ * forces compute_program_id() to never return 31 (today's always-fallback
+ * behavior), for the same-binary A/B exactness proof this task's pass C
+ * requires. Default (unset, or any other value) is ON. Own lazy -1-sentinel
+ * getenv, same pattern as s_no_fused above. */
+static int s_general_tev_off = -1;
+/* Pass D root-cause hunt (docs/GX_GENERAL_TEV.md): permanent, env-armed
+ * per-pixel debug dump matching gx_vulkan.c's GENERAL_DEBUG_* / gpu-debug
+ * prints (same env var, GCN_GX_GENERAL_DEBUG_XY="x,y"). s_gen_dbg_x/y default
+ * -1 (never matches); s_gen_dbg_active is set per-pixel by raster_pixel_prep
+ * and read by tex_sample_mip/tev_draw, which don't otherwise carry (x,y). */
+static int s_gen_dbg_x = -2, s_gen_dbg_y = -2;
+static int s_gen_dbg_active;
+static void gen_dbg_parse_once(void) {
+    if (s_gen_dbg_x != -2) return;
+    s_gen_dbg_x = -1; s_gen_dbg_y = -1;
+    const char* e = getenv("GCN_GX_GENERAL_DEBUG_XY");
+    int gx = -1, gy = -1;
+    if (e && sscanf(e, "%d,%d", &gx, &gy) == 2 && gx >= 0 && gy >= 0) {
+        s_gen_dbg_x = gx; s_gen_dbg_y = gy;
+    }
+}
 static u64 s_ps_texel_cache_misses; /* ...calls that had to fall through to a real decode */
 
 /* ---- one-time trap logging ------------------------------------------------ */
@@ -1085,6 +1107,11 @@ static void BlendTev(u16 x, u16 y, u8* color) {
 
     if (s_cfg.da_enable) dstPtr[ALP_C] = s_cfg.da_alpha;
 
+    if (s_gen_dbg_active && (s32)x == s_gen_dbg_x && (s32)y == s_gen_dbg_y)
+        fprintf(stderr, "[cpu-debug] pre_dither r=%u g=%u b=%u a=%u old_efb=%08X\n",
+                dstPtr[RED_C], dstPtr[GRN_C], dstPtr[BLU_C], dstPtr[ALP_C],
+                *(u32*)&s_efb_color[off]);
+
     if (s_bm_cu) {
         Dither(x, y, dstPtr);
         if (s_bm_au) SetPixelAlphaColor(off, dstPtr);
@@ -1092,6 +1119,10 @@ static void BlendTev(u16 x, u16 y, u8* color) {
     } else if (s_bm_au) {
         SetPixelAlphaOnly(off, dstPtr[ALP_C]);
     }
+    if (s_gen_dbg_active && (s32)x == s_gen_dbg_x && (s32)y == s_gen_dbg_y)
+        fprintf(stderr, "[cpu-debug] post_dither r=%u g=%u b=%u a=%u stored=%08X\n",
+                dstPtr[RED_C], dstPtr[GRN_C], dstPtr[BLU_C], dstPtr[ALP_C],
+                *(u32*)&s_efb_color[off]);
 }
 
 /* ============================================================================
@@ -1573,6 +1604,15 @@ static void tex_sample_mip(int wid, u32 texmap, s32 s, s32 t, u32 mip,
                       v11[c] * (u32)((fS)       * (fT));
             out[c] = (u8)(acc >> 14);
         }
+        if (s_gen_dbg_active)
+            fprintf(stderr,
+                "[cpu-debug] tex_sample_mip linear texmap=%u is/it=(%d,%d) is1/it1=(%d,%d) "
+                "fs/ft=(%d,%d) v00=%02X%02X%02X%02X v10=%02X%02X%02X%02X "
+                "v01=%02X%02X%02X%02X v11=%02X%02X%02X%02X out=%02X%02X%02X%02X\n",
+                texmap, iS, iT, iS1, iT1, fS, fT,
+                v00[0], v00[1], v00[2], v00[3], v10[0], v10[1], v10[2], v10[3],
+                v01[0], v01[1], v01[2], v01[3], v11[0], v11[1], v11[2], v11[3],
+                out[0], out[1], out[2], out[3]);
     } else {
         int iS = wrap_coord(s >> 7, wrap_s, w1 + 1);
         int iT = wrap_coord(t >> 7, wrap_t, h1 + 1);
@@ -2259,6 +2299,11 @@ static void tev_draw(Tev* t) {
                 t->RasColor.r = t->RasColor.g = t->RasColor.b = t->RasColor.a = 0;
             }
         }
+        if (s_gen_dbg_active)
+            fprintf(stderr,
+                "[cpu-debug] stage=%u tex_color=(%d,%d,%d,%d) ras_color=(%d,%d,%d,%d)\n",
+                stage, t->TexColor.r, t->TexColor.g, t->TexColor.b, t->TexColor.a,
+                t->RasColor.r, t->RasColor.g, t->RasColor.b, t->RasColor.a);
 
         /* combine inputs */
         s32 inA[4], inB[4], inC[4], inD[4];
@@ -2286,6 +2331,9 @@ static void tev_draw(Tev* t) {
     output[BLU_C] = (u8)t->Reg[color_dest].b;
     output[GRN_C] = (u8)t->Reg[color_dest].g;
     output[RED_C] = (u8)t->Reg[color_dest].r;
+    if (s_gen_dbg_active)
+        fprintf(stderr, "[cpu-debug] combiner_out r=%u g=%u b=%u a=%u\n",
+                output[RED_C], output[GRN_C], output[BLU_C], output[ALP_C]);
 
     if (s_debug_pending_index >= 0) {
         u32 alpha = output[ALP_C];
@@ -3615,6 +3663,23 @@ static int raster_pixel_prep(Tev* t, s32 x, s32 y, s32 xi, s32 yi) {
         t->UvS[i] = (s32)(p->Uv[i][0] * 128.0f);
         t->UvT[i] = (s32)(p->Uv[i][1] * 128.0f);
     }
+    gen_dbg_parse_once();
+    s_gen_dbg_active = (x == s_gen_dbg_x && y == s_gen_dbg_y);
+    if (s_gen_dbg_active) {
+        u32 uvbits[8][2], invwbits, wbits;
+        float wraw = slope_value(&s_WSlope, x, y);
+        float invW = 1.0f / wraw;
+        memcpy(&wbits, &wraw, 4);
+        memcpy(&invwbits, &invW, 4);
+        for (u32 i = 0; i < s_cfg.numtexgens && i < 8; i++) {
+            memcpy(&uvbits[i][0], &p->Uv[i][0], 4);
+            memcpy(&uvbits[i][1], &p->Uv[i][1], 4);
+        }
+        fprintf(stderr, "[cpu-debug] xy=(%d,%d) wraw=%08X invw=%08X uv0=(%08X,%08X) UvS0=%d UvT0=%d\n",
+                x, y, wbits, invwbits,
+                s_cfg.numtexgens ? uvbits[0][0] : 0u, s_cfg.numtexgens ? uvbits[0][1] : 0u,
+                s_cfg.numtexgens ? t->UvS[0] : 0, s_cfg.numtexgens ? t->UvT[0] : 0);
+    }
     return 1;
 }
 
@@ -4012,6 +4077,92 @@ static void gx_mt_resolve(void) {
     s_mt_threads = n;
 }
 
+/* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md) eligibility gate.
+ * compute_program_id() falls through to program 31 IFF every condition here
+ * holds; the shader (gx_draw_f.comp's shade_pixel_general) and the GPU-side
+ * texture resolver (gx_vulkan.c's resolve_fused_texture/resolve_texture_unit)
+ * must support EXACTLY what this gate admits -- a gate admitting what the
+ * shader can't do bit-exactly is a correctness bug, not a perf bug. Called
+ * from build_draw_cfg's tail, after s_cfg is fully populated (same call site
+ * as every other program-id matcher), so every field read here is already
+ * decoded/cached; only fog/ztex (not otherwise cached in DrawCfg) come from
+ * a direct s_bp read. One comment per condition. */
+static int general_tev_eligible(void) {
+    /* pixel format: same rule as programs 1..30 -- the shader's get_abgr
+     * (gx_draw_f.comp) only decodes RGB8_Z24/RGBA6_Z24. */
+    if (s_pf != PF_RGB8_Z24 && s_pf != PF_RGBA6_Z24)
+        return 0;
+
+    /* no fog: BP 0xF1 bits 21-23 (fsel) must be the disabled value 0.
+     * tev_draw always runs apply_fog (gx_raster.c:1886-1935);
+     * shade_pixel_general never does. */
+    if (bits(s_bp[0xF1], 21, 3) != 0u)
+        return 0;
+
+    /* no z-texture: BP 0xF5 bits 2-3 (ztex2 op) must be disabled (0) -- the
+     * only case ztexture_depth (gx_raster.c:1857-1864) doesn't derive the
+     * depth from RawTexColor, which shade_pixel_general never samples (it
+     * always feeds ZCompare the plain interpolated depth). */
+    if (bits(s_bp[0xF5], 2, 2) != 0u)
+        return 0;
+
+    /* <=2 texgens: shade_pixel_general only carries two texgen slopes
+     * (job->tex[0]/tex[1], words 58-79/218-238 of the draw packet). */
+    if (s_cfg.numtexgens > 2u)
+        return 0;
+
+    u32 distinct[2];
+    u32 distinct_count = 0;
+    for (u32 stage = 0; stage <= s_cfg.numtevstages; stage++) {
+        const TevStageCfg* sc = &s_cfg.stage[stage];
+
+        /* no indirect texturing: every stage's raw tevind (BP 0x10+stage)
+         * must take tev_indirect_coord's identity/no-op path (tevind==0) --
+         * shade_pixel_general never runs the active-indirect branch. */
+        if (sc->tevind != 0u)
+            return 0;
+
+        /* no bump-alpha ras channels: colorchan 5/6 read AlphaBump (only
+         * ever written by an active indirect stage, already excluded above,
+         * but colorchan is an independent BP selector so the gate checks it
+         * directly too rather than relying on the tevind==0 check alone). */
+        if (sc->colorchan == 5u || sc->colorchan == 6u)
+            return 0;
+
+        if (!sc->enable || s_cfg.numtexgens == 0u)
+            continue;
+
+        u32 k;
+        for (k = 0; k < distinct_count; k++)
+            if (distinct[k] == sc->texmap)
+                break;
+        if (k == distinct_count) {
+            /* >2 distinct texmaps: the shader only has two texture "slots"
+             * (words 79-90 and 239-250) -- see gx_vulkan.c's
+             * resolve_fused_texture for the matching GPU-side derivation,
+             * which must fail closed the same way if this ever disagrees. */
+            if (distinct_count >= 2)
+                return 0;
+            distinct[distinct_count++] = sc->texmap;
+        }
+    }
+
+    /* every SAMPLED texmap resolves through the resident texture gate:
+     * format in the phase-1a 8-format set, no mip -- gx_vulkan.c's
+     * resolve_texture_unit mirrors this exact pair of conditions on the GPU
+     * side (general_texture_format_ok + the mipmap_filter check). */
+    for (u32 k = 0; k < distinct_count; k++) {
+        const TexUnitCfg* tc = &s_cfg.tex[distinct[k]];
+        int fmt_ok = tc->fmt == TEXFMT_I4 || tc->fmt == TEXFMT_I8 ||
+                     tc->fmt == TEXFMT_IA4 || tc->fmt == TEXFMT_IA8 ||
+                     tc->fmt == TEXFMT_RGB5A3 || tc->fmt == TEXFMT_RGBA8 ||
+                     tc->fmt == TEXFMT_C4 || tc->fmt == TEXFMT_C8;
+        if (!fmt_ok || tc->mipmap_filter != 0u)
+            return 0;
+    }
+    return 1;
+}
+
 static u32 compute_program_id(void) {
     if (s_cfg.fused == fused_pixel_A) return 1;
     if (s_cfg.fused == fused_pixel_B) return 2;
@@ -4043,6 +4194,16 @@ static u32 compute_program_id(void) {
     if (!s_cfg.fused && gpu_program_AB_match()) return 28;
     if (!s_cfg.fused && gpu_program_AC_match()) return 29;
     if (!s_cfg.fused && gpu_program_AD_match()) return 30;
+    /* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): every draw that
+     * didn't match one of the exact per-shape signatures above falls
+     * through here. GCN_GX_GENERAL_TEV=0 forces the pre-existing
+     * always-fallback behavior (id 0) for the same-binary A/B exactness
+     * proof; default is ON. */
+    if (s_general_tev_off < 0)
+        s_general_tev_off = getenv("GCN_GX_GENERAL_TEV") &&
+                            !strcmp(getenv("GCN_GX_GENERAL_TEV"), "0");
+    if (!s_general_tev_off && general_tev_eligible())
+        return 31;
     return 0;
 }
 
