@@ -59,9 +59,18 @@ typedef struct {
  * EFB model. */
 void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf);
 
-/* Conservatively invalidate BP-derived draw configuration after any BP load.
- * Consecutive draws without a BP write reuse the exact decoded state. */
-void gx_raster_notify_bp_write(void);
+/* Notify that BP register `cmd` was just written a NEW value (gx_on_bp only
+ * calls this from its `gx->bp[cmd] != value` branch, i.e. genuine value
+ * changes only — same-value rewrites are already free). Bumps the flat
+ * "something changed" generation always, and the DrawCfg-relevant generation
+ * only when `cmd` is one of the registers build_draw_cfg() actually reads
+ * (see gx_raster.c's s_cfg_relevant_bp[] enumeration) — consecutive draws
+ * whose only BP churn lives outside that set keep reusing the exact decoded
+ * DrawCfg, and even draws that DO touch a relevant register may still hit a
+ * small content-addressed cache of recently built configs (see
+ * gx_raster_get_config_cache_stats and the cfg-cache block above
+ * gx_raster_draw's cache lookup). */
+void gx_raster_notify_bp_write(u32 cmd);
 
 /* Execute one primitive draw (OpcodeDecoder RunCommand -> SWVertexLoader ->
  * TransformUnit -> Clipper -> Rasterizer -> Tev). `prim` is the GX primitive
@@ -147,7 +156,29 @@ void gx_raster_set_triangle_sink(GxRasterTriangleSink sink, void* user);
  * pointer may be NULL. */
 void gx_raster_get_draw_stats(u64* tsc_vtx, u64* tsc_tri, u64* pixels_shaded, u64* draw_calls);
 void gx_raster_get_config_cache_stats(u64* hits, u64* misses);
+
+/* [gx-config-cache-detail]: breaks the hit total above into "generation
+ * unchanged" hits (cheapest — nothing DrawCfg-relevant was written since the
+ * last build) vs "content-cache" hits (a relevant register changed value,
+ * but the resulting register set was byte-identical to one of the last
+ * CFG_CACHE_WAYS distinct builds — see gx_raster.c). Also prints, per BP
+ * command, how many value-changing writes were NOT in the relevant set
+ * (over-invalidation candidates under the OLD flat-generation scheme; kept
+ * for visibility even though the new scheme no longer pays for them). No-op
+ * unless GCN_GX_STATS (or GCN_GX_CFGCACHE_CENSUS) was ever read as on. */
+void gx_raster_print_config_cache_detail(void);
 void gx_raster_print_draw_shape_stats(void);
+
+/* GCN_GX_CFG_CACHE_VERIFY=1 (default off, own getenv-cached knob, same
+ * pattern as GCN_GX_STATS): on every DrawCfg cache hit (tier 1 or tier 2),
+ * also rebuilds the config from scratch and compares it field-by-field
+ * against the cached copy that was about to be reused. A mismatch means a
+ * hit reused a stale/wrong DrawCfg -- a correctness bug in the relevance
+ * table (s_cfg_relevant_bp[]) or the tier-2 FNV key, never something to
+ * continue past -- so gx_raster.c aborts() with the differing field and the
+ * relevant BP register set logged. Call at shutdown; no-op (prints nothing)
+ * if the knob was never read as on. */
+void gx_raster_print_cfg_verify_summary(void);
 
 /* GCN_GX_STATS=1 (same knob): further split of gx.c's own GX_STAT_EFB bucket
  * (gx_raster_efb_copy's whole call, copy-encode + clear) into the clear-only
