@@ -16,20 +16,32 @@ layout(set = 0, binding = 3, std430) readonly buffer DrawJob {
 layout(set = 0, binding = 4, std430) readonly buffer TextureData {
     uint words[];
 } texture_data;
-// Phase 1a general TEV program (docs/GX_GENERAL_TEV.md), pass B: binding for
-// the TLUT bytes C4/C8 palette decode needs. Layout mirrors TextureData (a
-// flat packed-byte word arena); pass C's upload side still needs to fill it
-// and wire the real per-draw arena offsets (words 251..255, see
-// shade_pixel_general's derivation comment) -- until then this binding is
-// declared but unreachable (program id 31 is never classified to).
-layout(set = 0, binding = 5, std430) readonly buffer TlutData {
+// Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): binding for the
+// TLUT bytes C4/C8 palette decode needs. Layout mirrors TextureData (a flat
+// packed-byte word arena). binding=6, NOT 5 -- binding=5 in this shared
+// descriptor set is already EFB_TEX_SHADOW (gx_vulkan.c's efb_tex_output);
+// pass B's first draft wrongly declared this at binding=5, which would have
+// silently aliased that buffer instead of real TLUT bytes. Fixed in pass C
+// alongside wiring the real upload (gx_vulkan.c's TLUT_SHADOW_OFFSET/BYTES,
+// words 251..255).
+layout(set = 0, binding = 6, std430) readonly buffer TlutData {
     uint words[];
 } tlut_data;
+// Pass D root-cause hunt (docs/GX_GENERAL_TEV.md): permanent, always-armable
+// per-pixel debug dump for shade_pixel_general. Written only when (x,y)
+// equals draw_push.dbg_x/dbg_y (default -1,-1, matching no real pixel), so
+// the cost when unarmed is one integer compare per invocation. See
+// gx_vk_dump_general_debug (gx_vulkan.c) for the word layout and printer.
+layout(set = 0, binding = 7, std430) buffer DebugData {
+    uint words[];
+} gen_debug;
 layout(push_constant) uniform DrawPush {
     uint word_base;
     uint batch_mode;
     uint tile_header_base;
     uint tile_index_base;
+    int dbg_x;
+    int dbg_y;
 } draw_push;
 
 uint current_word_base;
@@ -52,12 +64,52 @@ uint color_byte(uint slope_base, int x, int y) {
     return uint(int(value < 0.0 ? 0.0 : value > 255.0 ? 255.0 : value));
 }
 
+// Pass E (docs/GX_GENERAL_TEV.md, root-caused in pass D): Vulkan/SPIR-V FDiv
+// is only guaranteed accurate to ~2.5 ULP, while gx_raster.c's CPU reference
+// executes a single x86 DIVSS/DIVSD, which IS correctly rounded (IEEE 754
+// mandates correctly-rounded basic division on x86). Pass D's instrumented
+// per-pixel dump proved this gap is real, not theoretical: for BIT-IDENTICAL
+// input wraw=0x36F61463, CPU's `1.0f/wraw` gave 0x480528FF while GPU's plain
+// `1.0/wraw` (even `precise`-qualified -- precise controls evaluation order,
+// not a single division instruction's rounding) gave 0x48052900, a 1-ULP
+// difference that flipped an int() truncation boundary (3656 vs 3655) and
+// ultimately a stored pixel byte after dithering (corun pixel (142,90),
+// sync 1020, frame 969).
+//
+// `precise fma()`, unlike `/`, IS specified as a true, single-rounding fused
+// multiply-add (no intermediate rounding of a*b before adding c) -- so a
+// Newton-Raphson + Markstein refinement built entirely from fma() calls can
+// reconstruct the correctly-rounded fp32 reciprocal/quotient from a merely
+// ~2.5-ULP seed, matching x86 DIVSS bit-for-bit. This is a standard
+// technique (see e.g. Markstein, "IA-64 and Elementary Functions"); it is
+// NOT a fudge factor -- it recomputes the same well-defined mathematical
+// result to full IEEE precision, it does not special-case any input.
+precise float exact_rcp(float b) {
+    precise float y = 1.0 / b;           // seed: hardware divide, ~2.5 ULP
+    precise float e = fma(-b, y, 1.0);    // residual of b*y-1, exact (fma)
+    y = fma(y, e, y);                     // Newton step
+    e = fma(-b, y, 1.0);
+    y = fma(y, e, y);                     // Markstein step -> correctly rounded
+    return y;
+}
+// exact_div(a,b): CPU's `invW / q` (gx_raster.c build_block) is a genuine
+// one-shot DIVSS(a,b), not a reciprocal-then-multiply -- so this mirrors
+// that shape (a true quotient), built from exact_rcp(b) rather than a raw
+// GPU '/' seed, then one more fma-based Newton correction on the quotient.
+precise float exact_div(float a, float b) {
+    precise float rb = exact_rcp(b);
+    precise float y = a * rb;             // seed quotient
+    precise float e = fma(-b, y, a);       // exact remainder a-b*y (fma)
+    y = fma(e, rb, y);                     // correction -> correctly rounded
+    return y;
+}
+
 precise vec2 texture_uv(int x, int y) {
-    precise float inv_w = 1.0 / slope_value(51u, x, y);
+    precise float inv_w = exact_rcp(slope_value(51u, x, y));
     precise float q = slope_value(72u, x, y) * inv_w;
     precise float projection = inv_w;
     if (q != 0.0)
-        projection = inv_w / q;
+        projection = exact_div(inv_w, q);
     precise float u = slope_value(58u, x, y) * projection;
     precise float v = slope_value(65u, x, y) * projection;
     return vec2(u, v);
@@ -552,7 +604,18 @@ uvec4 decode_texture_g(uint fb, uint arena_word, uint tlut_fmt_word, uint tlut_a
     }
     if (format == 6u) {                                  // RGBA8 (decode_texel:1295-1305)
         uint width_blocks = (w + 3u) >> 2;
-        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 5;
+        /* <<6, NOT <<5: the C reference does base=(...)<<5 then a SEPARATE
+         * offset=(base+blkOff)<<1 step (2 bytes/texel); folding both steps
+         * into one shift (as the existing decode_texture()'s format==6 case
+         * above already does, and this generalized copy must match) needs
+         * <<6 total. Bug caught by pass C's per-triangle GPU differential
+         * (GCN_GX_VK_DRAW_VALIDATE=1 GCN_GX_VK_DRAW_PROGRAM=31): an earlier
+         * draft used <<5 here directly, which only happened to read the
+         * right bytes for the block containing (0,0) and silently corrupted
+         * every other block -- the brute-force harnesses never exercise
+         * texture decode, only the combiner/blend arithmetic, so this class
+         * of bug needed the real GPU-vs-software pixel compare to surface. */
+        uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 6;
         uint index = ((tt & 3u) << 2) + (ss & 3u);
         uint a = load_texture_u8_g(arena_word, len_word, base + index * 2u);
         uint r = load_texture_u8_g(arena_word, len_word, base + index * 2u + 1u);
@@ -583,27 +646,34 @@ uvec4 decode_texture_g(uint fb, uint arena_word, uint tlut_fmt_word, uint tlut_a
 // generalized: gen_base is 58 (texgen 0, tex[0]) or 218 (texgen 1, tex[1]),
 // each 3 slopes (s,t,q) 7 words apart; w (base 51) is per-vertex, shared by
 // every texgen.
-vec2 texture_uv_g(uint gen_base, int x, int y) {
-    float inv_w = 1.0 / slope_value(51u, x, y);
-    float q = slope_value(gen_base + 14u, x, y) * inv_w;
-    float projection = inv_w;
-    if (q != 0.0) projection = inv_w / q;
-    float u = slope_value(gen_base, x, y) * projection;
-    float v = slope_value(gen_base + 7u, x, y) * projection;
+// precise throughout, matching texture_uv() above exactly: without it the
+// compiler is free to reassociate/fuse this chain differently than the
+// software reference's float math, which can flip the low bit of the
+// eventual 8-bit sample after the perspective divide + *128.0 fixed-point
+// conversion -- caught by pass C's per-triangle GPU differential as a
+// single-bit color mismatch (dithering, gated on bm_dither, turns any such
+// 1-ULP difference into a visible stored-pixel bit flip).
+precise vec2 texture_uv_g(uint gen_base, int x, int y) {
+    precise float inv_w = exact_rcp(slope_value(51u, x, y));
+    precise float q = slope_value(gen_base + 14u, x, y) * inv_w;
+    precise float projection = inv_w;
+    if (q != 0.0) projection = exact_div(inv_w, q);
+    precise float u = slope_value(gen_base, x, y) * projection;
+    precise float v = slope_value(gen_base + 7u, x, y) * projection;
     return vec2(u, v);
 }
 
 // texture_linear (calc_lod / Rasterizer.cpp, same derivation as the existing
 // texture_linear() above), slot+texgen generalized.
 bool texture_linear_g(uint fb, uint gen_base, int bx, int by) {
-    vec2 uv00 = texture_uv_g(gen_base, bx, by);
-    vec2 uv10 = texture_uv_g(gen_base, bx + 1, by);
-    vec2 uv01 = texture_uv_g(gen_base, bx, by + 1);
-    float dudx = abs(uv00.x - uv10.x);
-    float dvdx = abs(uv00.y - uv10.y);
-    float dudy = abs(uv00.x - uv01.x);
-    float dvdy = abs(uv00.y - uv01.y);
-    float s_delta, t_delta;
+    precise vec2 uv00 = texture_uv_g(gen_base, bx, by);
+    precise vec2 uv10 = texture_uv_g(gen_base, bx + 1, by);
+    precise vec2 uv01 = texture_uv_g(gen_base, bx, by + 1);
+    precise float dudx = abs(uv00.x - uv10.x);
+    precise float dvdx = abs(uv00.y - uv10.y);
+    precise float dudy = abs(uv00.x - uv01.x);
+    precise float dvdy = abs(uv00.y - uv01.y);
+    precise float s_delta, t_delta;
     if (jw(fb + 7u) != 0u) { s_delta = dudx + dudy; t_delta = dvdx + dvdy; }
     else { s_delta = max(dudx, dudy); t_delta = max(dvdx, dvdy); }
     int lod = fixed_log2(max(s_delta, t_delta));
@@ -713,6 +783,9 @@ uint gen_logic_blend_u32(uint s, uint d, uint op) {
 // block. DEAD CODE (see file-header comment above): unreachable until
 // compute_program_id classifies a draw to program id 31 (pass C).
 void shade_pixel_general(int x, int y) {
+    // Pass D debug hook (docs/GX_GENERAL_TEV.md): armed only when this pixel
+    // matches the push-constant (x,y); one bool compare when unarmed.
+    bool dbg = (x == draw_push.dbg_x && y == draw_push.dbg_y);
     if (x >= si(3u) || y >= si(5u)) return;
     int x16 = x << 4;
     int y16 = y << 4;
@@ -815,14 +888,66 @@ void shade_pixel_general(int x, int y) {
                 uint tlut_fmt_w = (texmap == 0u) ? 251u : 253u;
                 uint tlut_arena_w = (texmap == 0u) ? 252u : 254u;
                 int bx = x & ~1, by = y & ~1;
-                vec2 uv = texture_uv_g(gen_base, x, y);
-                float sfixed = uv.x * 128.0;
-                float tfixed = uv.y * 128.0;
+                precise vec2 uv = texture_uv_g(gen_base, x, y);
+                precise float sfixed = uv.x * 128.0;
+                precise float tfixed = uv.y * 128.0;
                 bool linear = texture_linear_g(fb, gen_base, bx, by);
                 uvec4 texel = sample_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w,
                                                int(sfixed), int(tfixed), linear);
                 tex_chan[0] = texel.r; tex_chan[1] = texel.g;
                 tex_chan[2] = texel.b; tex_chan[3] = texel.a;
+                if (dbg) {
+                    // Recompute the perspective-divide + bilinear intermediates
+                    // for the dump only (sample_texture_g doesn't expose them);
+                    // same expressions, no behavior change to the real path.
+                    precise float wraw = slope_value(51u, x, y);
+                    precise float inv_w = exact_rcp(wraw);
+                    precise float q = slope_value(gen_base + 14u, x, y) * inv_w;
+                    gen_debug.words[0] = 0xDEADBEEFu;
+                    gen_debug.words[1] = jw(50u);
+                    gen_debug.words[2] = uint(x); gen_debug.words[3] = uint(y);
+                    gen_debug.words[4] = floatBitsToUint(uv.x);
+                    gen_debug.words[5] = floatBitsToUint(uv.y);
+                    gen_debug.words[6] = floatBitsToUint(inv_w);
+                    gen_debug.words[7] = floatBitsToUint(q);
+                    gen_debug.words[36] = floatBitsToUint(wraw);
+                    gen_debug.words[8] = floatBitsToUint(sfixed);
+                    gen_debug.words[9] = floatBitsToUint(tfixed);
+                    gen_debug.words[10] = uint(int(sfixed));
+                    gen_debug.words[11] = uint(int(tfixed));
+                    gen_debug.words[12] = linear ? 1u : 0u;
+                    int width = int(jw(fb + 1u));
+                    int height = int(jw(fb + 2u));
+                    int ds = int(sfixed), dt = int(tfixed);
+                    if (linear) {
+                        ds -= 64; dt -= 64;
+                        int is0 = ds >> 7, it0 = dt >> 7, is1 = is0 + 1, it1 = it0 + 1;
+                        int fs = ds & 0x7f, ft = dt & 0x7f;
+                        is0 = wrap_coord(is0, jw(fb + 3u), width);
+                        it0 = wrap_coord(it0, jw(fb + 4u), height);
+                        is1 = wrap_coord(is1, jw(fb + 3u), width);
+                        it1 = wrap_coord(it1, jw(fb + 4u), height);
+                        gen_debug.words[13] = uint(is0); gen_debug.words[14] = uint(it0);
+                        gen_debug.words[15] = uint(is1); gen_debug.words[16] = uint(it1);
+                        gen_debug.words[17] = uint(fs); gen_debug.words[18] = uint(ft);
+                        uvec4 v00 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is0, it0);
+                        uvec4 v10 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is1, it0);
+                        uvec4 v01 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is0, it1);
+                        uvec4 v11 = decode_texture_g(fb, arena, tlut_fmt_w, tlut_arena_w, is1, it1);
+                        // pack_abgr's x|y<<8|z<<16|w<<24 applied to an (r,g,b,a)
+                        // vector packs as r|g<<8|b<<16|a<<24 -- the CPU printer
+                        // unpacks with that same (R,G,B,A) convention.
+                        gen_debug.words[19] = pack_abgr(v00);
+                        gen_debug.words[20] = pack_abgr(v10);
+                        gen_debug.words[21] = pack_abgr(v01);
+                        gen_debug.words[22] = pack_abgr(v11);
+                    } else {
+                        int is0 = wrap_coord(ds >> 7, jw(fb + 3u), width);
+                        int it0 = wrap_coord(dt >> 7, jw(fb + 4u), height);
+                        gen_debug.words[13] = uint(is0); gen_debug.words[14] = uint(it0);
+                    }
+                    gen_debug.words[23] = pack_abgr(texel);   // (r,g,b,a) packing
+                }
             } else {
                 tex_chan[0] = 0u; tex_chan[1] = 0u; tex_chan[2] = 0u; tex_chan[3] = 0u;
             }
@@ -832,6 +957,8 @@ void shade_pixel_general(int x, int y) {
             tex_color.g = int(tex_chan[sw[1]]);
             tex_color.b = int(tex_chan[sw[2]]);
             tex_color.a = int(tex_chan[sw[3]]);
+            if (dbg) gen_debug.words[24] = pack_abgr(uvec4(uint(tex_color.r) & 0xffu,
+                uint(tex_color.g) & 0xffu, uint(tex_color.b) & 0xffu, uint(tex_color.a) & 0xffu));
         }
 
         // ras color (SetRasColor, tev_draw:2245-2261). colorchan 5/6 (bump
@@ -852,6 +979,8 @@ void shade_pixel_general(int x, int y) {
             } else {
                 ras_color = GenColor(0, 0, 0, 0);
             }
+            if (dbg) gen_debug.words[25] = pack_abgr(uvec4(uint(ras_color.r) & 0xffu,
+                uint(ras_color.g) & 0xffu, uint(ras_color.b) & 0xffu, uint(ras_color.a) & 0xffu));
         }
 
         int inA[4], inB[4], inC[4], inD[4];
@@ -875,6 +1004,7 @@ void shade_pixel_general(int x, int y) {
     int out_g = int(uint(reg[lastC22].g) & 0xffu);
     int out_b = int(uint(reg[lastC22].b) & 0xffu);
     int out_a = int(uint(reg[lastA22].a) & 0xffu);
+    if (dbg) gen_debug.words[28] = pack_abgr(uvec4(uint(out_r), uint(out_g), uint(out_b), uint(out_a)));
 
     if (!gen_alpha_test(out_a)) return;
 
@@ -887,6 +1017,7 @@ void shade_pixel_general(int x, int y) {
     uint pf = jw(21u);
     uint old = imageLoad(efb_color, ivec2(x, y)).r;
     uvec4 dstv = get_abgr(old, pf);
+    if (dbg) { gen_debug.words[29] = pf; gen_debug.words[30] = old; gen_debug.words[32] = pack_abgr(dstv); }
 
     uint bm = jw(187u);
     bool blend_enable = ubits(bm, 0u, 1u) != 0u;
@@ -911,6 +1042,7 @@ void shade_pixel_general(int x, int y) {
 
     uint destalpha_word = jw(188u);
     if (ubits(destalpha_word, 8u, 1u) != 0u) result.x = ubits(destalpha_word, 0u, 8u);
+    if (dbg) gen_debug.words[33] = pack_abgr(result);   // pre-dither blended value
 
     if (color_update) {
         if (dither_on && pf == 1u) {
@@ -920,6 +1052,7 @@ void shade_pixel_general(int x, int y) {
             result.z = ((result.z - (result.z >> 6)) + dth) & 0xfcu;
             result.w = ((result.w - (result.w >> 6)) + dth) & 0xfcu;
         }
+        if (dbg) gen_debug.words[34] = pack_abgr(result);   // post-dither
         if (pf == 1u) {
             uint alpha6 = alpha_update ? ((result.x >> 2) & 0x3fu) : (old & 0x3fu);
             uint value = (old & 0xff000000u) | alpha6 |
@@ -927,9 +1060,11 @@ void shade_pixel_general(int x, int y) {
                     ((result.z << 10) & 0x0003f000u) |
                     ((result.w << 16) & 0x00fc0000u);
             imageStore(efb_color, ivec2(x, y), uvec4(value));
+            if (dbg) gen_debug.words[35] = value;
         } else {
             uint value = (old & 0xff000000u) | result.y | (result.z << 8) | (result.w << 16);
             imageStore(efb_color, ivec2(x, y), uvec4(value));
+            if (dbg) gen_debug.words[35] = value;
         }
     } else if (alpha_update) {
         // SetPixelAlphaOnly (gx_raster.c:883-888): pf!=1 has no alpha plane,
