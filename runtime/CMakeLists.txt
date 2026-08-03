@@ -169,6 +169,10 @@ if(WIN32)
 endif()
 add_test(NAME host_audio_pcm COMMAND test_host_audio)
 
+add_executable(test_gx_pipeline tests/test_gx_pipeline.c)
+target_include_directories(test_gx_pipeline PRIVATE include)
+add_test(NAME gx_pipeline_carry_boundary COMMAND test_gx_pipeline)
+
 add_executable(gcn_memcard_inspect tools/memcard_inspect.c src/memcard_image.c)
 target_include_directories(gcn_memcard_inspect PRIVATE include)
 
