@@ -500,6 +500,101 @@ bool gen_alpha_test(int alpha) {
     return !(c0 != c1);
 }
 
+// fog_float (gx_raster.c:1888-1895): GX's 11e8m custom float encoding ->
+// IEEE754 fp32 bit reconstruction. Pure integer bit manipulation, no
+// rounding hazard.
+float fog_float_g(uint word) {
+    uint raw = (((word >> 19u) & 1u) << 31) | (((word >> 11u) & 0xffu) << 23) |
+               ((word & 0x7ffu) << 12);
+    return uintBitsToFloat(raw);
+}
+
+// apply_fog (gx_raster.c:1926-1996), phase 1b (docs/GX_GENERAL_TEV.md).
+// Blends B/G/R only, never alpha (matches the C reference exactly -- there
+// is no fourth output[ALP_C] write in apply_fog). `zval` is always the plain
+// interpolated depth: the eligibility gate excludes z-texture, so
+// ztexture_depth's op==0 passthrough (gx_raster.c:1897-1900) is the only
+// reachable case -- this never re-derives depth from RawTexColor. fsel 1/3
+// are excluded by the eligibility gate (gx_raster.c's TRAPF path, a
+// software bug we don't port); every other 3-bit fsel value is handled
+// exactly as apply_fog's own control flow reaches it (0=no-op, 2=linear via
+// the switch's default no-transform case, 4-7=exp2 family).
+void gen_apply_fog(inout int out_r, inout int out_g, inout int out_b,
+                    int x, int y, uint zval) {
+    uint f3 = jw(265u);              // raw BP 0xF1 (word 256+9)
+    uint fsel = ubits(f3, 21u, 3u);
+    if (fsel == 0u) return;
+
+    uint a_word = jw(262u);           // raw BP 0xEE (word 256+6)
+    uint c_word = f3;
+    float a = fog_float_g(a_word);
+    float c = fog_float_g(c_word);
+    if (((a_word >> 11u) & 0xffu) == 0xffu && ((c_word >> 11u) & 0xffu) == 0xffu) {
+        a = 0.0;
+        bool neg = ((a_word & (1u << 19)) == 0u) && ((c_word & (1u << 19)) == 0u);
+        c = neg ? uintBitsToFloat(0xff800000u) : uintBitsToFloat(0x7f800000u);
+    }
+
+    precise float ze;
+    if (ubits(f3, 20u, 1u) == 0u) {
+        uint shift = jw(264u) & 31u;                    // raw BP 0xF0
+        int denom = int(jw(263u) & 0x00ffffffu) - int(zval >> shift);  // raw BP 0xEF
+        if (denom != 0)
+            ze = exact_div(a * 16777216.0, float(denom));
+        else
+            ze = (a < 0.0) ? uintBitsToFloat(0xff800000u) : uintBitsToFloat(0x7f800000u);
+    } else {
+        ze = a * float(zval) * (1.0 / 16777216.0);   // exact power-of-2 scale, no ULP risk
+    }
+
+    uint range_base = jw(256u);       // raw BP 0xE8
+    if (ubits(range_base, 10u, 1u) != 0u) {
+        float vp_width = abs(sf(267u) * 2.0);   // word 267: raw XF 0x101a (vp_wd())
+        if (vp_width > 0.0) {
+            precise float center = float(int(ubits(range_base, 0u, 10u)) - 342);
+            precise float screen_center = exact_div(center, vp_width) * 2.0 - 1.0;
+            precise float off = 2.0 * exact_div(float(x), vp_width) - 1.0 - screen_center;
+            float findex = 9.0 - abs(off) * 9.0;
+            findex = clamp(findex, 0.0, 9.0);
+            uint lo = uint(findex);
+            uint hi = (lo < 9u) ? lo + 1u : 9u;
+            uint lo_word = jw(257u + lo / 2u);   // raw BP 0xE9 + lo/2 (word 257+..)
+            uint hi_word = jw(257u + hi / 2u);
+            float klo = float(ubits(lo_word, (lo & 1u) != 0u ? 0u : 12u, 12u)) / 64.0;
+            float khi = float(ubits(hi_word, (hi & 1u) != 0u ? 0u : 12u, 12u)) / 64.0;
+            float frac = findex - float(lo);
+            float k = klo + (khi - klo) * frac;
+            if (k != 0.0)
+                ze *= exact_div(sqrt(off * off + k * k), k);
+        }
+    }
+
+    float fog = ze - c;
+    fog = clamp(fog, 0.0, 1.0);
+    if (fsel == 4u) fog = 1.0 - exp2(-8.0 * fog);
+    else if (fsel == 5u) fog = 1.0 - exp2(-8.0 * fog * fog);
+    else if (fsel == 6u) fog = exp2(-8.0 * (1.0 - fog));
+    else if (fsel == 7u) { fog = 1.0 - fog; fog = exp2(-8.0 * fog * fog); }
+
+    // iround (gx_raster.c:3522): round-half-up, NOT round-to-nearest-even --
+    // int() truncates toward zero, so replicate the C `(x-t)>=0.5f` bump
+    // exactly rather than using GLSL round()/roundEven().
+    float fx = fog * 256.0;
+    int ifog = int(fx);
+    if (fx - float(ifog) >= 0.5) ifog += 1;
+
+    uint fog_color = jw(266u);        // raw BP 0xF2
+    int fb = int(ubits(fog_color, 0u, 8u));
+    int fg = int(ubits(fog_color, 8u, 8u));
+    int fr = int(ubits(fog_color, 16u, 8u));
+    // (u8) truncation, matching the C reference's implicit narrowing cast
+    // exactly (mod-256, including any wraparound if ifog ever strays
+    // outside its normal ~0..256 range).
+    out_b = int(uint((out_b * (256 - ifog) + fb * ifog) >> 8) & 0xffu);
+    out_g = int(uint((out_g * (256 - ifog) + fg * ifog) >> 8) & 0xffu);
+    out_r = int(uint((out_r * (256 - ifog) + fr * ifog) >> 8) & 0xffu);
+}
+
 // decode_tlut_pixel (gx_raster.c:1148-1179). tlutfmt 0=IA8,1=RGB565,2=RGB5A3.
 // TLUT bytes come from the tlut_data SSBO (binding=5); arena_word names the
 // per-slot word holding this draw's byte offset into it (words 252/254, see
@@ -542,6 +637,17 @@ uint load_texture_u8_g(uint arena_word, uint len_word, uint offset) {
     if (offset >= jw(len_word)) return 0u;
     uint packed = texture_data.words[(jw(arena_word) + offset) >> 2u];
     return (packed >> ((offset & 3u) * 8u)) & 0xffu;
+}
+// be_u16 with decode_texel's joint OOB check (gx_raster.c's safe_u8-gated
+// `(offset+1 < src_len) ? be_u16(&src[offset]) : 0` shape -- the WHOLE
+// 16-bit read is zero if either byte would be out of bounds, not just the
+// individual out-of-bounds byte; phase 1b (RGB5A3/CMPR) needs this exact
+// joint semantics, not two independent load_texture_u8_g calls.
+uint load_texture_be16_g(uint arena_word, uint len_word, uint offset) {
+    if (offset + 1u >= jw(len_word)) return 0u;
+    uint b0 = load_texture_u8_g(arena_word, len_word, offset);
+    uint b1 = load_texture_u8_g(arena_word, len_word, offset + 1u);
+    return (b0 << 8) | b1;
 }
 
 // decode_texel (gx_raster.c:1197-1339), the 8 phase-1a eligible formats
@@ -593,9 +699,7 @@ uvec4 decode_texture_g(uint fb, uint arena_word, uint tlut_fmt_word, uint tlut_a
         uint base = ((tt >> 2) * width_blocks + (ss >> 2)) << 4;
         uint blkOff = ((tt & 3u) << 2) + (ss & 3u);
         uint offset = (base + blkOff) << 1;
-        uint b0 = load_texture_u8_g(arena_word, len_word, offset);
-        uint b1 = load_texture_u8_g(arena_word, len_word, offset + 1u);
-        uint val = (b0 << 8) | b1;
+        uint val = load_texture_be16_g(arena_word, len_word, offset);
         if ((val & 0x8000u) != 0u)
             return uvec4(expand5((val >> 10) & 0x1fu), expand5((val >> 5) & 0x1fu),
                          expand5(val & 0x1fu), 255u);
@@ -638,6 +742,39 @@ uvec4 decode_texture_g(uint fb, uint arena_word, uint tlut_fmt_word, uint tlut_a
         uint blkOff = ((tt & 3u) << 3) + (ss & 7u);
         uint idx = load_texture_u8_g(arena_word, len_word, base + blkOff);
         return decode_tlut_pixel_g(tlut_arena_word, idx * 2u, jw(tlut_fmt_word));
+    }
+    if (format == 0xEu) {                                // CMPR (decode_texel:1337-1379), phase 1b
+        // 8x8 outer block, four 4x4 DXT1-style sub-blocks (2x2 arrangement).
+        uint sDxt = ss >> 2, tDxt = tt >> 2;
+        uint sBlk = sDxt >> 1, tBlk = tDxt >> 1;
+        uint width_blocks8 = (w + 7u) >> 3;   // ceil(width/8), outer 8x8 blocks
+        uint base = (tBlk * width_blocks8 + sBlk) << 2;
+        uint blkOff = ((tDxt & 1u) << 1) + (sDxt & 1u);
+        uint offset = (base + blkOff) << 3;   // 8 bytes/DXTBlock: c1(2) c2(2) lines(4)
+        uint c1 = load_texture_be16_g(arena_word, len_word, offset);
+        uint c2 = load_texture_be16_g(arena_word, len_word, offset + 2u);
+        uint line = load_texture_u8_g(arena_word, len_word, offset + 4u + (tt & 3u));
+        uint blue1 = expand5(c1 & 0x1fu), blue2 = expand5(c2 & 0x1fu);
+        uint green1 = expand6((c1 >> 5) & 0x3fu), green2 = expand6((c2 >> 5) & 0x3fu);
+        uint red1 = expand5((c1 >> 11) & 0x1fu), red2 = expand5((c2 >> 11) & 0x1fu);
+        int rs = 6 - int((ss & 3u) << 1);
+        uint colorSel = (line >> uint(rs)) & 3u;
+        colorSel |= (c1 > c2) ? 0u : 4u;
+        if (colorSel == 0u || colorSel == 4u)
+            return uvec4(red1, green1, blue1, 255u);
+        if (colorSel == 1u || colorSel == 5u)
+            return uvec4(red2, green2, blue2, 255u);
+        if (colorSel == 2u)
+            return uvec4((red2 * 3u + red1 * 5u) >> 3, (green2 * 3u + green1 * 5u) >> 3,
+                         (blue2 * 3u + blue1 * 5u) >> 3, 255u);
+        if (colorSel == 3u)
+            return uvec4((red1 * 3u + red2 * 5u) >> 3, (green1 * 3u + green2 * 5u) >> 3,
+                         (blue1 * 3u + blue2 * 5u) >> 3, 255u);
+        if (colorSel == 6u)
+            return uvec4((red1 + red2) >> 1, (green1 + green2) >> 1, (blue1 + blue2) >> 1, 255u);
+        if (colorSel == 7u)
+            return uvec4((red1 + red2) >> 1, (green1 + green2) >> 1, (blue1 + blue2) >> 1, 0u);
+        return uvec4(0u);
     }
     return uvec4(0u);
 }
@@ -840,6 +977,17 @@ void shade_pixel_general(int x, int y) {
 
     GenColor tex_color = GenColor(0, 0, 0, 0);
     uint lastC22 = 0u, lastA22 = 0u;
+    // Slot assignment mirrors gx_vulkan.c's resolve_fused_texture EXACTLY:
+    // first-enabled-stage-order (slot 0 = the first distinct texmap an
+    // enabled stage references, slot 1 = the next distinct one), NOT
+    // "texmap==0" -- a draw is not guaranteed to sample texmap 0 at all,
+    // let alone at the first enabled stage. Mismatching this against the
+    // CPU/packer's assignment reads the WRONG unit's width/wrap/format
+    // metadata (caught by the differential: a CMPR unit's fetch clamped to
+    // a co-resident unit's smaller width because the shader assumed
+    // texmap==0 was always slot 0).
+    bool slot0_valid = false;
+    uint slot0_texmap = 0u;
 
     for (uint stage = 0u; stage <= numstages; ++stage) {
         uint s2 = stage >> 1u;
@@ -883,10 +1031,15 @@ void shade_pixel_general(int x, int y) {
             uint tex_chan[4];
             if (numtexgens > 0u) {
                 uint gen_base = (texcoordSel == 0u) ? 58u : 218u;
-                uint fb = (texmap == 0u) ? 79u : 239u;
-                uint arena = (texmap == 0u) ? 99u : 255u;
-                uint tlut_fmt_w = (texmap == 0u) ? 251u : 253u;
-                uint tlut_arena_w = (texmap == 0u) ? 252u : 254u;
+                // First-enabled-stage-order slot assignment (see the
+                // slot0_valid/slot0_texmap comment above) -- NOT texmap==0.
+                bool is_slot0;
+                if (!slot0_valid) { slot0_valid = true; slot0_texmap = texmap; is_slot0 = true; }
+                else is_slot0 = (texmap == slot0_texmap);
+                uint fb = is_slot0 ? 79u : 239u;
+                uint arena = is_slot0 ? 99u : 255u;
+                uint tlut_fmt_w = is_slot0 ? 251u : 253u;
+                uint tlut_arena_w = is_slot0 ? 252u : 254u;
                 int bx = x & ~1, by = y & ~1;
                 precise vec2 uv = texture_uv_g(gen_base, x, y);
                 precise float sfixed = uv.x * 128.0;
@@ -1007,6 +1160,11 @@ void shade_pixel_general(int x, int y) {
     if (dbg) gen_debug.words[28] = pack_abgr(uvec4(uint(out_r), uint(out_g), uint(out_b), uint(out_a)));
 
     if (!gen_alpha_test(out_a)) return;
+
+    // apply_fog runs between alpha-test and blend (tev_comb_finish,
+    // gx_raster.c:2164-2179), strictly before blend_stage's late-Z --
+    // matched here exactly (fog, THEN the late-Z branch below).
+    gen_apply_fog(out_r, out_g, out_b, x, y, zval);
 
     if (zt_enable && !zt_early) {
         if (!zt_pass) return;
@@ -1339,11 +1497,10 @@ void main() {
     uint count = job.words[draw_push.tile_header_base + tile * 2u + 1u];
     for (uint i = 0u; i < count; ++i) {
         uint packet = job.words[draw_push.tile_index_base + first + i];
-        /* Phase 1a (docs/GX_GENERAL_TEV.md): packet stride grown 128->256
-         * words (DRAW_PACKET_BYTES 512->1024 in gx_vulkan.c). Words 0..111
-         * keep their exact prior meaning; 112..255 are the new general
-         * block, not yet read by any shader path (id 31 unclassified). */
-        current_word_base = draw_push.word_base + packet * 256u;
+        /* Phase 1b (docs/GX_GENERAL_TEV.md): packet stride grown 256->272
+         * words (DRAW_PACKET_BYTES 1024->1088 in gx_vulkan.c) for the fog BP
+         * window + vp_wd() XF register, words 256..267. */
+        current_word_base = draw_push.word_base + packet * 272u;
         shade_pixel(x, y);
     }
 }

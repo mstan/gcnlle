@@ -92,6 +92,12 @@ void gx_raster_efb_data(const u32** color, const u32** depth,
 void gx_raster_efb_data_mutable(u32** color, u32** depth,
                                 u32* width, u32* height);
 
+/* Phase 1b general TEV fog (docs/GX_GENERAL_TEV.md): apply_fog's range-adjust
+ * path reads XF register 0x101a (viewport width, vp_wd()) -- raw word, same
+ * host-order XF memory gx_raster_init() was given. Used by gx_vulkan.c's
+ * snapshot_fused_draw to pack the identical value for the GPU path. */
+u32 gx_raster_xf_word(u32 addr);
+
 /* CPU EFB aperture access (physical 0x08000000..0x0BFFFFFF, normally reached
  * through the SDK's 0xC8000000 effective mapping). `address` keeps the encoded
  * x/y and color-vs-depth plane bits. Returns 1 when the access is implemented;

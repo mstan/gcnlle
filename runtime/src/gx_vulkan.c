@@ -7,6 +7,7 @@
  */
 #include "gx/gx_vulkan.h"
 #include "gx/gx.h"       /* XFB RAM publication guard shared with VI */
+#include "gx/gx_raster.h"      /* gx_raster_xf_word — phase 1b fog vp_wd() XF register */
 #include "cpu/native_code.h"   /* content_dirty — XFB readback writes to RAM */
 
 #include <stdio.h>
@@ -48,7 +49,11 @@
  * change is exercised (and load-bearing) under the existing 30 programs
  * before anything ever classifies to the still-unused id 31. See the layout
  * table in snapshot_fused_draw's comment. */
-#define DRAW_PACKET_BYTES 1024u
+/* Phase 1b (general TEV fog+CMPR, docs/GX_GENERAL_TEV.md): grown again from
+ * 256 to 272 words to fit the raw fog BP window (0xE8-0xF2, 11 words) plus
+ * the vp_wd() XF register (1 word) fog needs; words 0..255 keep their exact
+ * phase-1a meaning. See the layout table in snapshot_fused_draw's comment. */
+#define DRAW_PACKET_BYTES 1088u
 /* Phase 1a general TEV program (docs/GX_GENERAL_TEV.md): id 31, the first
  * program compute_program_id (gx_raster.c) derives from an eligibility gate
  * rather than an exact per-shape signature match. */
@@ -1226,7 +1231,8 @@ static GxVkTlutEntry* find_tlut_binding(u32 tmem_offset, u32 length) {
  * decode_texture_g supports. */
 static int general_texture_format_ok(u32 format) {
     return format == 0u || format == 1u || format == 2u || format == 3u ||
-           format == 5u || format == 6u || format == 8u || format == 9u;
+           format == 5u || format == 6u || format == 8u || format == 9u ||
+           format == 0xEu;   /* CMPR, phase 1b: docs/GX_GENERAL_TEV.md */
 }
 
 /* One texture unit's resident-eligibility check, shared by programs 1..30
@@ -1374,8 +1380,8 @@ static int resolve_fused_texture(const GxRasterTriangleJob* job,
 static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
                                 const GxVkTextureEntry* texture,
                                 const GxVkGeneralTex* gen) {
-    _Static_assert(DRAW_PACKET_BYTES == 256u * sizeof(u32),
-                   "general block (words 112..255) layout assumes a 256-word packet");
+    _Static_assert(DRAW_PACKET_BYTES == 272u * sizeof(u32),
+                   "general block (words 112..267) layout assumes a 272-word packet");
     _Static_assert(sizeof(GxRasterTriScan) == 21u * sizeof(u32),
                    "GPU triangle scan packet layout changed");
     _Static_assert(sizeof(GxRasterSlope) == 7u * sizeof(u32),
@@ -1437,11 +1443,9 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
      * GxRasterTriangleJob::bm_au's comment. */
     words[111] = (u32)job->bm_au;
 
-    /* Phase 1a general block (docs/GX_GENERAL_TEV.md), words 112..255.
-     * NOT YET consumed by the shader (id 31 is not classified to by
-     * compute_program_id yet -- this pass only lands the packer+stride so
-     * the 128->256-word stride change is exercised, and provably inert,
-     * under every existing program 1..30). Layout (144 words total):
+    /* General block (docs/GX_GENERAL_TEV.md), words 112..267. Phase 1a
+     * (program 31, live since 11ae141) added 112..255; phase 1b adds
+     * 256..267 for fog. Layout (156 words total):
      *
      *   112        raw GenMode            BP 0x00 (numtexgens/numtevstages/
      *                                     numcolchans bitfields, undecoded)
@@ -1483,11 +1487,20 @@ static void snapshot_fused_draw(const GxRasterTriangleJob* job, u32* words,
      *              caller after ensure_resident_texture/_tlut assign the
      *              real gpu_offset -- see resident_record_draw/
      *              submit_fused_draw)
+     *   256..266   raw fog BP window                              BP 0xE8-0xF2
+     *              (range_base, 5x K-table regs, fog-a, fog-proj/denom,
+     *              fog-shift, fog-param3/fsel+c, fog color -- see
+     *              apply_fog's exact field-by-field derivation, gx_raster.c
+     *              ~1866-1935, and gen_apply_fog's mirrored comments)
+     *   267        raw XF register 0x101a (vp_wd(), viewport width) --
+     *              apply_fog's range-adjust path only, gx_raster.c:4592
      *
      * Raw BP windows (not pre-decoded fields) per the spec's auditability
      * rule: the eventual shader re-derives bitfields with a line-for-line
      * port of the CPU extraction, so every GLSL helper can cite the exact
      * C function it transcribes. */
+    memcpy(words + 256u, s_vk.draw_bp + 0xE8, 11u * sizeof(*words));
+    words[267] = gx_raster_xf_word(0x101au);
     memcpy(words + 113u, s_vk.draw_bp + 0xC0, 32u * sizeof(*words));
     memcpy(words + 145u, s_vk.draw_bp + 0x28, 8u * sizeof(*words));
     memcpy(words + 153u, s_vk.draw_bp + 0xF6, 8u * sizeof(*words));
