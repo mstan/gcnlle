@@ -134,7 +134,16 @@ enum {
     GCN_SNAP_SEC_GX_REGS     = 18,
     GCN_SNAP_SEC_TMEM        = 19,
     GCN_SNAP_SEC_EFB         = 20,
-    GCN_SNAP_SEC_COUNT_MAX   = 21   /* array sizing only; not written */
+    /* SNAPSHOT_RESUME pass C: OPTIONAL section (the versioned TOC lets a
+     * reader skip tags it doesn't recognize/care about — v1 pass-A/B blobs
+     * simply lack this tag, and gcn_snapshot_load already treats a missing
+     * FIND_SEC result as "section absent", not an error). Cumulative XFB
+     * hash-chain state (gcn_gx_xfb_hash_get_state) + the IPL frame counter
+     * (gcn_gx_frame_count), captured whenever GCN_GX_XFB_HASH=1 was set at
+     * capture time — the production-tier suffix-chain-equality proof needs
+     * the resumed run to CONTINUE the chain from here, not restart it. */
+    GCN_SNAP_SEC_XFB_HASH    = 21,
+    GCN_SNAP_SEC_COUNT_MAX   = 22   /* array sizing only; not written */
 };
 
 typedef struct {
@@ -574,6 +583,21 @@ int gcn_snapshot_save(const char* path, CPUState* cpu, char* why, size_t why_siz
         sb_u32(&sec[nsec].buf, h);
         sb_put(&sec[nsec].buf, color, (size_t)w * h * sizeof(u32));
         sb_put(&sec[nsec].buf, depth, (size_t)w * h * sizeof(u32));
+    }
+    END_SEC();
+
+    BEGIN_SEC(GCN_SNAP_SEC_XFB_HASH);
+    {
+        /* Written unconditionally (harmless — restore only ever seeds from
+         * it when GCN_GX_XFB_HASH=1 in the RESUMING process too); the chain
+         * value is meaningless if hashing was off at capture (stays at the
+         * FNV-1a offset basis, pubs stays 0), which restore's own
+         * GCN_GX_XFB_HASH=1 gate makes harmless either way. */
+        u64 chain = 0, pubs = 0;
+        gcn_gx_xfb_hash_get_state(&chain, &pubs);
+        sb_u64(&sec[nsec].buf, chain);
+        sb_u64(&sec[nsec].buf, pubs);
+        sb_u64(&sec[nsec].buf, gcn_gx_frame_count());
     }
     END_SEC();
 
@@ -1039,10 +1063,10 @@ int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
     const u8 *p_cpu=NULL,*p_disp=NULL,*p_mem1=NULL,*p_l1=NULL,*p_mem2=NULL,*p_exi=NULL,
              *p_mca=NULL,*p_mcb=NULL,*p_vi=NULL,*p_si=NULL,*p_pi=NULL,*p_mi=NULL,
              *p_ai=NULL,*p_di=NULL,*p_aram=NULL,*p_dspcore=NULL,*p_dspdev=NULL,
-             *p_gx=NULL,*p_tmem=NULL,*p_efb=NULL;
+             *p_gx=NULL,*p_tmem=NULL,*p_efb=NULL,*p_xfbhash=NULL;
     size_t l_cpu=0,l_disp=0,l_mem1=0,l_l1=0,l_mem2=0,l_exi=0,l_mca=0,l_mcb=0,l_vi=0,
            l_si=0,l_pi=0,l_mi=0,l_ai=0,l_di=0,l_aram=0,l_dspcore=0,l_dspdev=0,l_gx=0,
-           l_tmem=0,l_efb=0;
+           l_tmem=0,l_efb=0,l_xfbhash=0;
     FIND_SEC(GCN_SNAP_SEC_CPU_FIXED, p_cpu, l_cpu);
     FIND_SEC(GCN_SNAP_SEC_DISPATCH, p_disp, l_disp);
     FIND_SEC(GCN_SNAP_SEC_MEM1, p_mem1, l_mem1);
@@ -1063,6 +1087,7 @@ int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
     FIND_SEC(GCN_SNAP_SEC_GX_REGS, p_gx, l_gx);
     FIND_SEC(GCN_SNAP_SEC_TMEM, p_tmem, l_tmem);
     FIND_SEC(GCN_SNAP_SEC_EFB, p_efb, l_efb);
+    FIND_SEC(GCN_SNAP_SEC_XFB_HASH, p_xfbhash, l_xfbhash);  /* optional — v1 pass-A/B blobs lack it */
     #undef FIND_SEC
 
     /* `ctx` is the caller's parameter (boot.c's own GcnDebugCtx), NOT looked
@@ -1184,6 +1209,26 @@ int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
                 "gcn snapshot: EFB dimension mismatch (captured %ux%u, live %ux%u) "
                 "— skipping EFB restore\n", w, h, live_w, live_h);
         }
+    }
+
+    /* SNAPSHOT_RESUME pass C: seed the cumulative XFB hash chain/pub-count/
+     * frame-count, but ONLY when GCN_GX_XFB_HASH=1 in THIS (resuming)
+     * process too — seeding a chain nothing will ever feed into again is
+     * pointless, and gx.c's own gx_xfb_hash_on() gate already makes
+     * feed/publish_done no-ops when unset, so an unconditional seed would
+     * silently do nothing useful anyway. Absent section (older pass-A/B
+     * blobs) is not an error — just nothing to seed. */
+    if (p_xfbhash && getenv("GCN_GX_XFB_HASH") && getenv("GCN_GX_XFB_HASH")[0] == '1') {
+        SnapCur c; cr_init(&c, p_xfbhash, l_xfbhash);
+        u64 chain = cr_u64(&c);
+        u64 pubs = cr_u64(&c);
+        u64 frames = cr_u64(&c);
+        gcn_gx_xfb_hash_set_state(chain, pubs);
+        gcn_gx_set_frame_count(frames);
+        fprintf(stdout,
+            "gcn snapshot: seeded XFB hash chain=%016llx pubs=%llu frames=%llu\n",
+            (unsigned long long)chain, (unsigned long long)pubs,
+            (unsigned long long)frames);
     }
 
     free(blob);

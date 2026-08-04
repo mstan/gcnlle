@@ -473,14 +473,28 @@ void gcn_gx_xfb_hash_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows) {
     s_xfb_hash_chain = h;
 }
 
+/* GCN_GX_XFB_HASH_EVERY=1: print the chain at EVERY publication instead of
+ * just the first + every 256th — SNAPSHOT_RESUME pass C's mechanical
+ * offline diff (full-boot sequence vs. resumed sequence) needs the complete
+ * per-publication sequence, not breadcrumbs. Both runs being diffed must set
+ * this for the sequences to be directly comparable line-for-line. */
+static int gx_xfb_hash_every(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("GCN_GX_XFB_HASH_EVERY");
+        on = (e && e[0] == '1') ? 1 : 0;
+    }
+    return on;
+}
+
 void gcn_gx_xfb_hash_publish_done(void) {
     if (!gx_xfb_hash_on())
         return;
     s_xfb_hash_pubs++;
     /* First publication plus every 256th thereafter: enough breadcrumbs to
      * bisect a divergence to a <=256-publication window without printing a
-     * line per frame. */
-    if (s_xfb_hash_pubs == 1 || (s_xfb_hash_pubs % 256) == 0)
+     * line per frame. GCN_GX_XFB_HASH_EVERY=1 prints all of them instead. */
+    if (gx_xfb_hash_every() || s_xfb_hash_pubs == 1 || (s_xfb_hash_pubs % 256) == 0)
         fprintf(stderr, "[gx-xfb-hash] publication=%llu chain=%016llx\n",
                 (unsigned long long)s_xfb_hash_pubs,
                 (unsigned long long)s_xfb_hash_chain);
@@ -490,6 +504,24 @@ u64 gcn_gx_xfb_generation(void) {
 }
 
 u64 gcn_gx_frame_count(void) { return s_gx_frames; }
+
+/* SNAPSHOT_RESUME pass C (docs/SNAPSHOT_RESUME.md): the XFB hash chain is
+ * CUMULATIVE (the running FNV-1a accumulator already folds in every prior
+ * publication's bytes — see the doc comment above gcn_gx_xfb_hash_feed), so
+ * proving suffix-chain equality between a full-boot run and a resumed run
+ * requires the resumed run to SEED its chain/publication-count/frame-count
+ * from the values captured at snapshot time, then continue accumulating
+ * from there. Only meaningful when GCN_GX_XFB_HASH=1 in both the capturing
+ * and resuming process; harmless (never read back) otherwise. */
+void gcn_gx_xfb_hash_get_state(u64* chain, u64* pubs) {
+    if (chain) *chain = s_xfb_hash_chain;
+    if (pubs) *pubs = s_xfb_hash_pubs;
+}
+void gcn_gx_xfb_hash_set_state(u64 chain, u64 pubs) {
+    s_xfb_hash_chain = chain;
+    s_xfb_hash_pubs = pubs;
+}
+void gcn_gx_set_frame_count(u64 frames) { s_gx_frames = frames; }
 
 /* Guest address of the display list currently executing (0 = top-level
  * stream). Provenance stamp for gx_raster's coverage-anomaly census. */

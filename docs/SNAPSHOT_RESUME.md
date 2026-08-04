@@ -1,6 +1,6 @@
 # Snapshot/resume and BIOS skip — implementation spec
 
-Status: DESIGN (2026-08-03). User policy: LLE is a floor; HLE is an
+Status: LANDED (2026-08-03, passes A-C @72fd15a..this commit). Production-tier proof: suffix-chain equality, 341/341 publications byte-exact, resume completes the standing golden ed27f20acbdfe1d0. User policy: LLE is a floor; HLE is an
 opt-in optimization. Two tiers share one mechanism:
 
 - **Iteration tier** (dev tooling): save/restore full machine state at an
