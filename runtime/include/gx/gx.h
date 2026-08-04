@@ -145,6 +145,20 @@ void gcn_gx_xfb_write_end(void);
 void gcn_gx_xfb_hash_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows);
 void gcn_gx_xfb_hash_publish_done(void);
 
+/* SNAPSHOT_RESUME pass C: get/set the cumulative chain + publication count
+ * (see gx.c's doc comment above gcn_gx_xfb_hash_get_state). Restore must
+ * call the setter (when GCN_GX_XFB_HASH=1) BEFORE any further XFB
+ * publication happens in the resumed process, or the chain silently
+ * restarts from the FNV-1a offset basis instead of continuing. */
+void gcn_gx_xfb_hash_get_state(u64* chain, u64* pubs);
+void gcn_gx_xfb_hash_set_state(u64 chain, u64 pubs);
+
+/* SNAPSHOT_RESUME pass C: load-mirror of gcn_gx_frame_count, so the resumed
+ * process's "completed N IPL frames" bookkeeping (and anything keyed off
+ * it, e.g. gx_raster's frame-anomaly census) continues the captured count
+ * instead of restarting at 0. */
+void gcn_gx_set_frame_count(u64 frames);
+
 /* Completed-frame counter (accepted GXSetDrawDone writes). Provenance stamp
  * for diagnostics that need to name "which frame" (e.g. gx_raster's
  * big-triangle census). */
