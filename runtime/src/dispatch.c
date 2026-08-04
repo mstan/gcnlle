@@ -490,12 +490,36 @@ static inline int gcn_dispatch_native(CPUState* ctx) {
     return gcn_title_module_call(ctx, ctx->pc);
 }
 
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side timing-model state.
+ * Promoted from gcn_dispatch_run's function-static locals to file scope —
+ * identical lifetime/semantics (still exactly one persistent instance,
+ * monotonic across nested-or-repeated gcn_dispatch_run calls), but now
+ * reachable from gcn_dispatch_timing_get/gcn_dispatch_timing_set for
+ * snapshot save/restore. See the per-field comments at their original
+ * declaration site (now just below) for what each one means. */
+static u64 s_device_cycles = 0;
+static u64 s_prev_cycles = 0;
+static u64 s_tb_remainder = 0;
+static u64 s_dsp_remainder = 0;
+
+/* SAVE accessor: dispatch.c's own timing-model residue, NOT part of
+ * CPUState — a snapshot must capture these alongside CPUState or derived
+ * cycle-accuracy timing (device clock / TB:core ratio / DSP:CPU ratio)
+ * desyncs by up to one block's worth of residue after a restore. */
+void gcn_dispatch_timing_get(u64* device_cycles, u64* prev_cycles,
+                              u64* tb_remainder, u64* dsp_remainder) {
+    if (device_cycles) *device_cycles = s_device_cycles;
+    if (prev_cycles)   *prev_cycles   = s_prev_cycles;
+    if (tb_remainder)  *tb_remainder  = s_tb_remainder;
+    if (dsp_remainder) *dsp_remainder = s_dsp_remainder;
+}
+
 /* Own the run loop (rather than the generated static-inline dolrecomp_run_blocks)
  * so we can advance the time base between blocks — otherwise mftb reads a frozen
  * TB and firmware delay loops spin forever. */
 int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
     u32 blocks = 0;
-    static u64 device_cycles = 0;   /* monotonic across nested/repeated runs */
+#define device_cycles s_device_cycles   /* monotonic across nested/repeated runs */
 
     /* Derived cycle accuracy: state for gcn_dispatch_charge, all monotonic /
      * persistent across nested-or-repeated gcn_dispatch_run calls, same as
@@ -507,9 +531,9 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
      *   dsp_remainder — fixed-point residue for the derived mode DSP ratio.
      * ctx->cycles only ever grows (cpu.h), so prev_cycles starts at 0 exactly
      * like it. */
-    static u64 prev_cycles = 0;
-    static u64 tb_remainder = 0;
-    static u64 dsp_remainder = 0;
+#define prev_cycles s_prev_cycles
+#define tb_remainder s_tb_remainder
+#define dsp_remainder s_dsp_remainder
 
     /* Timing-mode selection. UNIFORM (the fixed legacy per-block constants)
      * is the DEFAULT: it is the fully-validated configuration (goldens,
@@ -795,6 +819,10 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         blocks++;
     }
     return 1;
+#undef device_cycles
+#undef prev_cycles
+#undef tb_remainder
+#undef dsp_remainder
 }
 
 u32 gcn_dispatch_entry(void) {

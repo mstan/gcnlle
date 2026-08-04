@@ -24,24 +24,58 @@
 #include "di/di.h"   /* ROADMAP M5: insert_disc/eject_disc reach into the DI device */
 #include "exi/exi.h" /* rtc_state: live one-shot-synchronized RTC state */
 #include "dsp/dsp.h" /* audio_state: current AID DMA registers */
+#include "vi/vi.h"
+#include "si/si.h"
+#include "pi/pi.h"
+#include "ai/ai.h"
+#include "mi/mi.h"
+#include "cp/cp.h"
+#include "pe/pe.h"
+#include "gp/gp.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* What the server can reach into to answer state queries. Fields may be NULL;
- * a command needing a NULL dependency returns an "unavailable" error. */
+ * a command needing a NULL dependency returns an "unavailable" error.
+ *
+ * SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md): vi/si/pi/ai/mi/cp/pe/gp were
+ * added so runtime/src/snapshot.c has one place to reach every device
+ * boot.c constructs as function-static locals in main() — the same
+ * "boot.c owns the instances, hands out borrowed pointers" pattern this
+ * struct already used for cpu/di/exi/dsp. gcn_debug_server_ctx() exposes
+ * the registered struct read-only for that purpose (and any future one). */
 typedef struct {
     CPUState* cpu;   /* regs + RAM (get_registers, read_ram, write_ram)        */
     GcnDi*    di;     /* disc interface (insert_disc, eject_disc)              */
     GcnExi*   exi;    /* EXI RTC state (rtc_state)                             */
     GcnDsp*   dsp;    /* DSP AID DMA state (audio_state)                       */
+    GcnVi*    vi;
+    GcnSi*    si;
+    GcnPi*    pi;
+    GcnAi*    ai;
+    GcnMi*    mi;
+    GcnCp*    cp;
+    GcnPe*    pe;
+    GcnGp*    gp;
 } GcnDebugCtx;
 
 /* Start listening if GCN_DEBUG_PORT is set (else a no-op returning 0). Returns
  * the bound port on success, 0 if disabled, -1 on socket error. `ctx` is
  * borrowed (must outlive the server — boot.c keeps it in static/stack scope). */
 int  gcn_debug_server_start(const GcnDebugCtx* ctx);
+
+/* SNAPSHOT_RESUME: read-only access to the ctx registered by
+ * gcn_debug_server_start, for runtime/src/snapshot.c's SAVE path. Returns a
+ * pointer to an all-NULL static (never NULL itself) so callers never need a
+ * NULL check on the return value, only on its fields. NOTE: gcn_debug_server
+ * _start returns early (never populating the ctx) unless GCN_DEBUG_PORT is
+ * set — same precondition GCN_CHECKPOINT_PC already has (it's parsed in the
+ * same early-return-gated body) — so GCN_SNAPSHOT_SAVE inherits that
+ * requirement too: it only ever fires from inside the checkpoint-park path,
+ * which cannot itself be armed without GCN_DEBUG_PORT. */
+const GcnDebugCtx* gcn_debug_server_ctx(void);
 
 /* Non-blocking service: accept pending clients, process complete request lines,
  * send responses. Call once per block from the dispatch loop. No-op if disabled. */

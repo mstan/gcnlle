@@ -788,6 +788,11 @@ static const char* gx_vk_program_label(u32 program) {
     return buf;
 }
 
+int gx_vulkan_resident_busy(void) {
+    return s_vk.resident_mode &&
+           (s_vk.resident_recording || s_vk.resident_inflight != 0);
+}
+
 void gx_vulkan_shadow_shutdown(void) {
     if (s_vk.resident_mode &&
         (s_vk.resident_recording || s_vk.resident_inflight) &&
@@ -3564,5 +3569,6 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     (void)bp; (void)ram; (void)ram_size; return -1;
 }
 int gx_vulkan_resident_sync_to_software(void) { return 1; }
+int gx_vulkan_resident_busy(void) { return 0; }
 
 #endif

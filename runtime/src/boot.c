@@ -752,7 +752,13 @@ int main(int argc, char** argv) {
      * is set) the TCP debug query surface over them + live CPU/RAM state. */
     gcn_rings_init();
     gcn_ring_watch_init();   /* [gcn-watch] arm GCN_WATCH write watch if set */
-    GcnDebugCtx dbg = { .cpu = &cpu, .di = &di, .exi = &exi, .dsp = &dsp };
+    /* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md): the vi/si/pi/ai/mi/cp/pe/gp
+     * fields let runtime/src/snapshot.c's SAVE path reach every device
+     * boot.c owns, through the same borrowed-pointer registration this
+     * struct already used for cpu/di/exi/dsp — no separate registry needed. */
+    GcnDebugCtx dbg = { .cpu = &cpu, .di = &di, .exi = &exi, .dsp = &dsp,
+                        .vi = &vi, .si = &si, .pi = &pi, .ai = &ai,
+                        .mi = &mi, .cp = &cp, .pe = &pe, .gp = &gp };
     int dbg_port = gcn_debug_server_start(&dbg);
 
     /* GCN_WINDOW=1 (opt-in): native Win32 display + keyboard-pad window,

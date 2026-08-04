@@ -54,6 +54,78 @@ int      dsp_lle_take_interrupt(void);
 uint8_t* dsp_lle_aram(void);
 uint32_t dsp_lle_aram_size(void);
 
+/* SNAPSHOT_RESUME pass A (docs/SNAPSHOT_RESUME.md): hand-rolled, exhaustive
+ * field-by-field save of the DSP-LLE core, deliberately NOT routed through
+ * SDSP::DoState/DSPCore::DoState (Core/DSP/DSPCore.cpp:390-418,600-606) —
+ * Common/ChunkFile.h's PointerWrap is a no-op stub in this runtime (every
+ * Do/DoArray/DoPOD is an empty template, IsReadMode() always false), so
+ * DoState is never actually invoked anywhere in the wrapper. This struct
+ * covers everything DoState's own field list would have serialized PLUS the
+ * two gaps found in the SAVE-side survey: DSPCore::m_core_state (never
+ * DoState'd upstream) and Accelerator::m_reads_stopped (internal ACCOV latch,
+ * "not exposed via any register", also never DoState'd upstream) — plus the
+ * cross-thread g_dsp_int_pending flag (dsp_lle_c.cpp), which is runtime-only
+ * state with no SDSP/DSPCore equivalent at all. irom/coef are deliberately
+ * NOT included: both are static ROM content reloaded from the same on-disk
+ * dumps at every gcn_dsp_init, never mutated at runtime (DSPCore.cpp's own
+ * DoState excludes them for the same reason). Sizes are fixed compile-time
+ * constants (DSP_IRAM_SIZE/DSP_DRAM_SIZE/DSP_STACK_DEPTH, DSPCore.h) — kept
+ * as literal array sizes here (rather than including DSPCore.h from a public
+ * C header) with a static_assert in the .cpp pinning them against upstream. */
+typedef struct {
+    /* DSP_Regs r (DSPCore.h:244-285). */
+    uint16_t r_ar[4];
+    uint16_t r_ix[4];
+    uint16_t r_wr[4];
+    uint16_t r_st[4];
+    uint16_t r_cr;
+    uint16_t r_sr;
+    uint64_t r_prod;        /* r.prod.val                                   */
+    uint32_t r_ax[2];       /* r.ax[i].val                                  */
+    uint64_t r_ac[2];       /* r.ac[i].val (low 48 bits meaningful)         */
+
+    uint16_t pc;
+    uint16_t control_reg;
+    uint64_t control_reg_init_code_clear_time;
+    uint8_t  reg_stack_ptrs[4];
+    uint8_t  exceptions;             /* pending-exception bitmask            */
+    uint8_t  external_interrupt_waiting;
+    uint8_t  reset_dspjit_codespace; /* JIT-only; always 0 (Interpreter core)*/
+    uint16_t reg_stacks[4][32];      /* DSP_STACK_DEPTH = 0x20                */
+
+    uint16_t ifx_regs[256];          /* accelerator/DMA hardware regs         */
+    uint32_t mailbox[2];             /* [0]=PeekMailbox(CPU) [1]=PeekMailbox(DSP) */
+
+    uint16_t iram[4096];             /* DSP_IRAM_SIZE contents                */
+    uint16_t dram[4096];             /* DSP_DRAM_SIZE contents                */
+
+    int32_t  core_state;             /* DSP::State (Stopped/Running/Stepping) —
+                                       * gap in upstream DoState.              */
+
+    /* Accelerator (DSPAccelerator.h). */
+    uint32_t accel_start_address;
+    uint32_t accel_end_address;
+    uint32_t accel_current_address;
+    uint16_t accel_sample_format;
+    int16_t  accel_gain;
+    int16_t  accel_yn1;
+    int16_t  accel_yn2;
+    uint16_t accel_pred_scale;
+    uint16_t accel_input;
+    uint8_t  accel_reads_stopped;    /* gap in upstream DoState                */
+
+    int32_t  dsp_int_pending;        /* g_dsp_int_pending — cross-thread
+                                       * pending-not-yet-latched DSP->CPU
+                                       * interrupt edge; no DoState equivalent
+                                       * at all. */
+} GcnDspLleSnapshot;
+
+/* Fills *out from the live core. Returns 0 (out left untouched) if no core
+ * exists yet (g_core == NULL) or out is NULL. Caller must have already
+ * quiesced the GCN_DSP_THREAD worker (dsp_thread_drain, dsp.c) so nothing
+ * mutates core state concurrently with this read. */
+int dsp_lle_save_state(GcnDspLleSnapshot* out);
+
 #ifdef __cplusplus
 }
 #endif

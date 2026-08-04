@@ -21,6 +21,7 @@
 #include "di/di.h"         /* insert_disc/eject_disc: runtime disc mount lifecycle */
 #include "host/host_audio.h" /* audio_state: WASAPI queue/signal acceptance */
 #include "memory/memory.h"   /* coherent MEM1/MEM2/locked-L1 debug reads */
+#include "debug/snapshot.h"  /* SNAPSHOT_RESUME: GCN_SNAPSHOT_SAVE hooks the checkpoint park below */
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -1014,6 +1015,8 @@ void gcn_debug_server_pump(void) {
     }
 }
 
+const GcnDebugCtx* gcn_debug_server_ctx(void) { return &s_ctx; }
+
 int gcn_debug_server_quit_requested(void) { return s_quit; }
 
 int gcn_debug_server_cosim_enabled(void) { return s_cosim_enabled; }
@@ -1037,6 +1040,31 @@ int gcn_debug_server_checkpoint_before_block(void) {
         (s_checkpoint_have_gpr || s_checkpoint_have_lr)
             ? " (register condition matched)" : "");
     fflush(stdout);
+
+    /* SNAPSHOT_RESUME pass A (docs/SNAPSHOT_RESUME.md): the checkpoint park
+     * above is exactly the "clean dispatcher boundary" the spec requires —
+     * dispatch.c's call site (gcn_debug_server_checkpoint_before_block,
+     * dispatch.c:591) runs strictly before gcn_dispatch_native/
+     * gcn_interpreter_step for the pending block, so no instruction is ever
+     * mid-execution here. GCN_SNAPSHOT_SAVE=<path> captures the full
+     * machine state right now; GCN_SNAPSHOT_EXIT=1 exits immediately after
+     * (success or failure) instead of falling through to the interactive
+     * TCP park loop below. */
+    const char* snap_path = getenv("GCN_SNAPSHOT_SAVE");
+    if (snap_path && *snap_path) {
+        char why[256];
+        int rc = gcn_snapshot_save(snap_path, cpu, why, sizeof why);
+        if (rc == GCN_SNAPSHOT_OK)
+            fprintf(stdout, "gcn snapshot: saved to '%s'\n", snap_path);
+        else
+            fprintf(stderr, "gcn snapshot: FAILED (rc=%d): %s\n", rc, why);
+        fflush(stdout);
+        fflush(stderr);
+        const char* exit_env = getenv("GCN_SNAPSHOT_EXIT");
+        if (exit_env && *exit_env && *exit_env != '0')
+            exit(rc == GCN_SNAPSHOT_OK ? 0 : 1);
+    }
+
     while (s_enabled && !s_quit && s_checkpoint_parked) {
         gcn_debug_server_pump();
         Sleep(1);

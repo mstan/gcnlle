@@ -26,4 +26,12 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size);
 int gx_vulkan_resident_flush(void);
 int gx_vulkan_resident_sync_to_software(void);
 
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side drain-assert: 1 iff the
+ * resident backend has a batch mid-recording or submitted-but-unfenced
+ * in-flight work (the same pair gx_vulkan_shadow_shutdown force-flushes
+ * before teardown). Callers must gx_vulkan_resident_flush() first — this
+ * only checks, it never flushes. 0 (never busy) when the resident backend
+ * isn't active at all. */
+int gx_vulkan_resident_busy(void);
+
 #endif /* GCN_GX_GX_VULKAN_H */

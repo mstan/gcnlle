@@ -59,6 +59,8 @@
 #include "cpu/cpu.h"
 #include "cp/cp.h"
 #include "pe/pe.h"
+#include "gp/gp.h"   /* GcnGp — gcn_gx_confirm_drained's gp->count check      */
+#include <stddef.h>  /* size_t — gcn_gx_confirm_drained's why/why_size        */
 
 /* Nominal bytes drained per tick. Fifo.cpp meters GPU work in cycles; we have no
  * cycle-accurate GPU model, so we drain a fixed budget per block. Exact GPU
@@ -94,12 +96,26 @@ void gcn_gx_tick(u32 cycles);
  * Always valid (static storage), contents all-zero until the first TLUT load. */
 const u8* gcn_gx_tmem(void);
 
+/* SNAPSHOT_RESUME SAVE-side accessors: the 256-entry BP register file and the
+ * XF matrix/light-memory-plus-registers block (gcn_gx_xf_words() entries,
+ * currently 0x1058), read-only. Always valid (both back the s_gx singleton,
+ * static storage). Caller must have already confirmed drain (see
+ * gcn_gx_confirm_drained) before treating these as a stable snapshot. */
+const u32* gcn_gx_bp(void);
+const u32* gcn_gx_xf(void);
+u32 gcn_gx_xf_words(void);
+
 /* G3 pipeline join (default on; GCN_GX_PIPELINE=0 disables, gx.c): block until the worker has
  * decoded every FIFO byte pushed so far. No-op when the pipeline is off.
  * Call before any gate-visible read of GX-produced state that PE fences
  * don't already cover: end-of-run (pre-GCN_MEM_DUMP), debug-server
  * screenshots, the PI fifo-reset hook. */
 void gcn_gx_pipeline_drain(void);
+
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side hard drain-assert.
+ * Caller MUST call gcn_gx_pipeline_drain() first — see gx.c for the exact
+ * conditions checked and why this only checks rather than drives-to-empty. */
+int gcn_gx_confirm_drained(GcnGp* gp, GcnCp* cp, char* why, size_t why_size);
 
 /* Host scanout snapshots and EFB->XFB materialization share guest MEM1. The
  * guest commonly reuses one XFB address, so a VI field can otherwise copy

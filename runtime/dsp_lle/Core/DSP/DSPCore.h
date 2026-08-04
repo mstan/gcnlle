@@ -421,6 +421,18 @@ struct SDSP
   Analyzer& GetAnalyzer() { return m_analyzer; }
   const Analyzer& GetAnalyzer() const { return m_analyzer; }
 
+  // [gcnrecomp vendored addition] Read-only access to the accelerator/DMA
+  // IFX register bank and the accelerator object, for the runtime's
+  // hand-rolled snapshot save (runtime/dsp_lle/src/dsp_lle_c.cpp
+  // dsp_lle_save_state). PointerWrap (Common/ChunkFile.h) is a no-op stub in
+  // this runtime, so SDSP::DoState below is never actually invoked; these
+  // getters are what let the C-API shim reach the same fields DoState would
+  // have serialized (m_ifx_regs, m_accelerator) without making them public
+  // wholesale. Upstream keeps both private.
+  const std::array<u16, 256>& IFXRegs() const { return m_ifx_regs; }
+  Accelerator* GetAccelerator() { return m_accelerator.get(); }
+  const Accelerator* GetAccelerator() const { return m_accelerator.get(); }
+
   DSP_Regs r{};
   u16 pc = 0;
 
