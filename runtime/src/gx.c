@@ -9,6 +9,8 @@
 #include "gx/gx.h"
 #include "gx/gx_raster.h"
 #include "gx/gx_render.h"
+#include "gx/gx_vulkan.h"   /* gx_vulkan_resident_busy — snapshot drain-assert */
+#include "gp/gp.h"          /* GcnGp — snapshot drain-assert reads gp->count  */
 #include "debug/rings.h"
 
 #include <math.h>        /* fabsf — [gx-xfaudit] matrix-scale classification */
@@ -584,6 +586,63 @@ static void gx_pipe_drain_worker(void) {
 void gcn_gx_pipeline_drain(void) {
     gx_pipe_drain_worker();
     gx_render_flush();
+}
+
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side hard drain-assert — the
+ * survey's concrete "fully drained" definition, turned into an actual check
+ * rather than the best-effort drain-and-flush gcn_gx_pipeline_drain does.
+ * Caller MUST call gcn_gx_pipeline_drain() (which also forces
+ * gx_render_flush() -> gx_vulkan_resident_flush() when the resident Vulkan
+ * backend is active) immediately before calling this: this function only
+ * CHECKS, it never drives anything toward empty, so calling it without a
+ * prior drain will spuriously fail on ordinary live-frame state.
+ *
+ * Returns 1 iff every condition holds (safe to serialize GX state with no
+ * live pipeline work outstanding); 0 otherwise, with a human-readable reason
+ * written to `why` (best-effort, snprintf-truncated to why_size; `why`/
+ * why_size may be 0/NULL to skip the message). */
+int gcn_gx_confirm_drained(GcnGp* gp, GcnCp* cp, char* why, size_t why_size) {
+    if (gp && gp->count != 0) {
+        if (why) snprintf(why, why_size,
+            "gather pipe not empty (gp->count=%u)", gp->count);
+        return 0;
+    }
+    if (cp && gcn_cp_fifo_rw_distance(cp) != 0) {
+        if (why) snprintf(why, why_size,
+            "CP FIFO not empty (rw_distance=%u)", gcn_cp_fifo_rw_distance(cp));
+        return 0;
+    }
+    if (cp && gcn_cp_at_breakpoint(cp)) {
+        if (why) snprintf(why, why_size, "CP is stuck at a breakpoint");
+        return 0;
+    }
+    if (s_gx.buf_len != 0) {
+        if (why) snprintf(why, why_size,
+            "GX consumer staging buffer not empty (buf_len=%u)", s_gx.buf_len);
+        return 0;
+    }
+    if (s_pipe_on == 1) {
+        s64 produced  = __atomic_load_n(&s_pipe_produced, __ATOMIC_ACQUIRE);
+        s64 done_upto = __atomic_load_n(&s_pipe_done_upto, __ATOMIC_ACQUIRE);
+        if (done_upto != produced) {
+            if (why) snprintf(why, why_size,
+                "GX pipeline worker not caught up (done_upto=%lld produced=%lld)",
+                (long long)done_upto, (long long)produced);
+            return 0;
+        }
+        if (s_scan_carry_len != 0) {
+            if (why) snprintf(why, why_size,
+                "GX scanner carry not empty (%u bytes)", s_scan_carry_len);
+            return 0;
+        }
+    }
+    if (gx_vulkan_resident_busy()) {
+        if (why) snprintf(why, why_size,
+            "Vulkan resident backend has a batch in flight");
+        return 0;
+    }
+    if (why && why_size) why[0] = 0;
+    return 1;
 }
 
 void gcn_gx_pipeline_shutdown(void) {
@@ -1266,6 +1325,14 @@ static void gx_on_xf(GcnGx* gx, u16 address, u8 count, const u8* data) {
 static u8 s_gx_tmem[0x100000];
 
 const u8* gcn_gx_tmem(void) { return s_gx_tmem; }
+
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side accessors: the BP/XF
+ * register files backing s_gx, read-only, for runtime/src/snapshot.c. Sizes
+ * match cp.h/pe.h's own reg[]-exposure precedent (this struct just isn't a
+ * GcnCp/GcnPe, it's the GX consumer's own mirror — see gx.c's GcnGx doc). */
+const u32* gcn_gx_bp(void) { return s_gx.bp; }
+const u32* gcn_gx_xf(void) { return s_gx.xf; }
+u32 gcn_gx_xf_words(void) { return GX_XF_MEM_WORDS; }
 
 static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     /* Flipper BPMEM_BP_MASK is a one-shot write mask, not an ordinary state

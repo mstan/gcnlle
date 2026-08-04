@@ -6,12 +6,14 @@
 #include "dsp_lle_c.h"
 
 #include "Core/DSP/DSPCore.h"
+#include "Core/DSP/DSPAccelerator.h"  /* full Accelerator definition — dsp_lle_save_state */
 #include "Core/DSP/DSPTables.h"
 #include "Core/DSP/Interpreter/DSPInterpreter.h"
 #include "Core/DSP/Interpreter/DSPIntTables.h"
 
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>  // memset (dsp_lle_save_state)
 #include <chrono>   // GCN_DSP_STATS wall-clock accounting only
 
 // Wired by dsp_lle_init; read by src/host.cpp (the DSP::Host callbacks).
@@ -197,6 +199,75 @@ void dsp_lle_update(int ppc_cycles) {
 
 int dsp_lle_halted(void) {
   return g_core && (g_core->DSPState().control_reg & CR_HALT) != 0;
+}
+
+// SNAPSHOT_RESUME pass A: static_assert the hand-rolled GcnDspLleSnapshot
+// array sizes (dsp_lle_c.h) against the real compile-time constants, so a
+// future upstream resync that changes DSP_IRAM_SIZE/DSP_DRAM_SIZE/
+// DSP_STACK_DEPTH fails the build here instead of silently truncating a save.
+static_assert(DSP_IRAM_SIZE == 4096, "GcnDspLleSnapshot::iram size mismatch");
+static_assert(DSP_DRAM_SIZE == 4096, "GcnDspLleSnapshot::dram size mismatch");
+static_assert(DSP_STACK_DEPTH == 32, "GcnDspLleSnapshot::reg_stacks size mismatch");
+
+int dsp_lle_save_state(GcnDspLleSnapshot* out) {
+  if (!g_core || !out) return 0;
+  memset(out, 0, sizeof(*out));
+
+  SDSP& dsp = g_core->DSPState();
+  for (int i = 0; i < 4; i++) {
+    out->r_ar[i] = dsp.r.ar[i];
+    out->r_ix[i] = dsp.r.ix[i];
+    out->r_wr[i] = dsp.r.wr[i];
+    out->r_st[i] = dsp.r.st[i];
+  }
+  out->r_cr = dsp.r.cr;
+  out->r_sr = dsp.r.sr;
+  out->r_prod = dsp.r.prod.val;
+  out->r_ax[0] = dsp.r.ax[0].val;
+  out->r_ax[1] = dsp.r.ax[1].val;
+  out->r_ac[0] = dsp.r.ac[0].val;
+  out->r_ac[1] = dsp.r.ac[1].val;
+
+  out->pc = dsp.pc;
+  out->control_reg = dsp.control_reg;
+  out->control_reg_init_code_clear_time = dsp.control_reg_init_code_clear_time;
+  for (int i = 0; i < 4; i++) out->reg_stack_ptrs[i] = dsp.reg_stack_ptrs[i];
+  out->exceptions = dsp.exceptions;
+  out->external_interrupt_waiting = dsp.external_interrupt_waiting.load() ? 1 : 0;
+  out->reset_dspjit_codespace = dsp.reset_dspjit_codespace ? 1 : 0;
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < DSP_STACK_DEPTH; j++)
+      out->reg_stacks[i][j] = dsp.reg_stacks[i][j];
+
+  {
+    const auto& ifx = dsp.IFXRegs();
+    for (size_t i = 0; i < ifx.size() && i < 256; i++) out->ifx_regs[i] = ifx[i];
+  }
+  out->mailbox[0] = g_core->PeekMailbox(Mailbox::CPU);
+  out->mailbox[1] = g_core->PeekMailbox(Mailbox::DSP);
+
+  if (dsp.iram)
+    for (uint32_t i = 0; i < DSP_IRAM_SIZE; i++) out->iram[i] = dsp.iram[i];
+  if (dsp.dram)
+    for (uint32_t i = 0; i < DSP_DRAM_SIZE; i++) out->dram[i] = dsp.dram[i];
+
+  out->core_state = (int32_t)g_core->GetState();
+
+  if (Accelerator* acc = dsp.GetAccelerator()) {
+    out->accel_start_address = acc->GetStartAddress();
+    out->accel_end_address = acc->GetEndAddress();
+    out->accel_current_address = acc->GetCurrentAddress();
+    out->accel_sample_format = acc->GetSampleFormat();
+    out->accel_gain = acc->GetGain();
+    out->accel_yn1 = acc->GetYn1();
+    out->accel_yn2 = acc->GetYn2();
+    out->accel_pred_scale = acc->GetPredScale();
+    out->accel_input = acc->GetInput();
+    out->accel_reads_stopped = acc->GetReadsStopped() ? 1 : 0;
+  }
+
+  out->dsp_int_pending = g_dsp_int_pending;
+  return 1;
 }
 
 int dsp_lle_take_interrupt(void) {

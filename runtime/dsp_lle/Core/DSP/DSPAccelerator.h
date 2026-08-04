@@ -29,6 +29,14 @@ public:
   s16 GetYn2() const { return m_yn2; }
   u16 GetPredScale() const { return m_pred_scale; }
   u16 GetInput() const { return m_input; }
+  // [gcnrecomp vendored addition] m_reads_stopped is internal ACCOV-latch
+  // state "not exposed via any register" (see the field comment below) and
+  // is therefore NOT covered by any register read/write path — but it IS
+  // real architectural state (it changes whether ReadSample advances
+  // m_current_address), so the runtime's hand-rolled snapshot save
+  // (runtime/dsp_lle/src/dsp_lle_c.cpp dsp_lle_save_state) needs a getter.
+  // Upstream keeps this private/unexposed.
+  bool GetReadsStopped() const { return m_reads_stopped; }
   void SetStartAddress(u32 address);
   void SetEndAddress(u32 address);
   void SetCurrentAddress(u32 address);

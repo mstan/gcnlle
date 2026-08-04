@@ -45,4 +45,12 @@ const u8* gcn_dispatch_bs1_snapshot(u32* len_out);
  * policy. */
 void gcn_dispatch_throttle_on_field(void* user, double field_period_sec);
 
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side accessor: dispatch.c's
+ * own timing-model residue (device clock / TB remainder / DSP remainder),
+ * which is NOT part of CPUState and must be captured alongside it — losing
+ * these on a restore silently perturbs derived-cycle-accuracy timing by up
+ * to one block's worth of residue. Any output pointer may be NULL. */
+void gcn_dispatch_timing_get(u64* device_cycles, u64* prev_cycles,
+                              u64* tb_remainder, u64* dsp_remainder);
+
 #endif /* GCN_DISPATCH_H */

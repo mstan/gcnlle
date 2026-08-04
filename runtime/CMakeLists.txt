@@ -335,6 +335,7 @@ if(GCN_WITH_GENERATED)
     src/gx_raster.c
     src/gx_vulkan.c
     src/debug_server.c
+    src/snapshot.c
     src/host_audio.c
     src/host_window.c
     ${GCN_TITLE_MODULE_SOURCE}
@@ -383,6 +384,27 @@ if(GCN_WITH_GENERATED)
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm ole32 uuid avrt
                          user32 gdi32 opengl32)
+  # SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md): stamp the framework commit id
+  # into the snapshot header (snapshot.c's GCN_BUILD_GIT_SHA). Best-effort —
+  # falls back to snapshot.h's own "unknown" default if git isn't available
+  # at configure time (e.g. a source tarball with no .git).
+  find_package(Git QUIET)
+  if(GIT_FOUND)
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE GCN_BUILD_GIT_SHA
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      RESULT_VARIABLE GCN_GIT_RESULT)
+    if(NOT GCN_GIT_RESULT EQUAL 0 OR NOT GCN_BUILD_GIT_SHA)
+      set(GCN_BUILD_GIT_SHA "unknown")
+    endif()
+  else()
+    set(GCN_BUILD_GIT_SHA "unknown")
+  endif()
+  set_property(SOURCE src/snapshot.c APPEND PROPERTY COMPILE_DEFINITIONS
+               GCN_BUILD_GIT_SHA="${GCN_BUILD_GIT_SHA}")
   if(Vulkan_FOUND)
     set(GX_CLEAR_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_clear.comp.inc)
     set(GX_XFB_COPY_SPV_INC ${CMAKE_CURRENT_BINARY_DIR}/gx_xfb_copy.comp.inc)
