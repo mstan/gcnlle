@@ -37,6 +37,9 @@ public:
   // (runtime/dsp_lle/src/dsp_lle_c.cpp dsp_lle_save_state) needs a getter.
   // Upstream keeps this private/unexposed.
   bool GetReadsStopped() const { return m_reads_stopped; }
+  // [gcnrecomp vendored addition] SNAPSHOT_RESUME pass B (restore side):
+  // the setter half of GetReadsStopped above.
+  void SetReadsStopped(bool v) { m_reads_stopped = v; }
   void SetStartAddress(u32 address);
   void SetEndAddress(u32 address);
   void SetCurrentAddress(u32 address);

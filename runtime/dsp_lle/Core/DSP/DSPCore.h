@@ -433,6 +433,20 @@ struct SDSP
   Accelerator* GetAccelerator() { return m_accelerator.get(); }
   const Accelerator* GetAccelerator() const { return m_accelerator.get(); }
 
+  // [gcnrecomp vendored addition] SNAPSHOT_RESUME pass B (restore side):
+  // mutable counterparts of the getters above, plus a raw (side-effect-free)
+  // mailbox setter — WriteMailboxLow/High are the "real" hardware-facing
+  // writes and may have side effects beyond storing the value; restore wants
+  // to reproduce the exact captured atomic value, nothing more. Upstream has
+  // neither (no savestate consumer ever needed a restore path here because
+  // DoState's PointerWrap does the symmetric Do() for both directions —
+  // moot in this runtime, since PointerWrap is a no-op stub, see
+  // Common/ChunkFile.h).
+  std::array<u16, 256>& IFXRegsMutable() { return m_ifx_regs; }
+  void SetMailboxRaw(Mailbox mailbox, u32 value) {
+    m_mailbox[static_cast<u32>(mailbox)].store(value);
+  }
+
   DSP_Regs r{};
   u16 pc = 0;
 

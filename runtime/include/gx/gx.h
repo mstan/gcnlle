@@ -105,6 +105,11 @@ const u32* gcn_gx_bp(void);
 const u32* gcn_gx_xf(void);
 u32 gcn_gx_xf_words(void);
 
+/* SNAPSHOT_RESUME restore-side load-mirrors of the three accessors above. */
+void gcn_gx_set_bp(const u32* bp);
+void gcn_gx_set_xf(const u32* xf, u32 words);
+void gcn_gx_set_tmem(const u8* data, u32 len);
+
 /* G3 pipeline join (default on; GCN_GX_PIPELINE=0 disables, gx.c): block until the worker has
  * decoded every FIFO byte pushed so far. No-op when the pipeline is off.
  * Call before any gate-visible read of GX-produced state that PE fences

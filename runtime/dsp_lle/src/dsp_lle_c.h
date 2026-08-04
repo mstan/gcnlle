@@ -126,6 +126,17 @@ typedef struct {
  * mutates core state concurrently with this read. */
 int dsp_lle_save_state(GcnDspLleSnapshot* out);
 
+/* SNAPSHOT_RESUME pass B (restore side): the load-mirror of
+ * dsp_lle_save_state. Writes every field back into the live core (must
+ * already exist — call after dsp_lle_init), copies iram/dram contents, then
+ * re-runs the same post-load re-analysis Core/DSP/DSPCore.cpp's own DoState
+ * does after a real load (Host::CodeLoaded on the restored IRAM — IRAM CRC
+ * + Analyzer::Analyze), since PointerWrap is a no-op stub here and that
+ * path never fires on its own. Returns 0 (nothing done) if no core exists
+ * yet or `in` is NULL. Caller must have the GCN_DSP_THREAD worker quiesced
+ * (same precondition as dsp_lle_save_state). */
+int dsp_lle_load_state(const GcnDspLleSnapshot* in);
+
 #ifdef __cplusplus
 }
 #endif

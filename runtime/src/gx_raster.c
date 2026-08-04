@@ -8588,3 +8588,24 @@ void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
     for (int i = 0; i < GX_MT_MAX; i++)
         s_tev_w[i].wid = i;   /* indexes s_texel_cache_w/s_rb_w; see Tev.wid */
 }
+
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) restore-side: covers the two
+ * gaps the pass-A survey found in gx_raster_init's own reset coverage
+ * (hazard #12) — the GCN_GX_TEV_CENSUS diagnostic accumulators and the
+ * per-draw texel decode cache. Deliberately does NOT touch s_efb_color/
+ * s_efb_depth (gx_raster_init already zeroed those once during the normal
+ * device-construction pass that always runs before a restore overlay; the
+ * snapshot's EFB section is written on top of that afterward — calling
+ * gx_raster_init again here would race/clobber that overlay depending on
+ * call order, so this function is deliberately narrower). Both target
+ * areas are pure host-side diagnostic/decode memoization, never
+ * guest-visible, so a full clear here is always safe. */
+void gx_raster_restore_reset(void) {
+    memset(s_census, 0, sizeof s_census);
+    s_census_cur = -1;
+    memset(s_census_overflow_hashes, 0, sizeof s_census_overflow_hashes);
+    s_census_overflow_shapes = 0;
+    s_census_overflow_draws = 0;
+    memset(s_texel_cache_w, 0, sizeof s_texel_cache_w);
+    s_texel_cache_gen = 0;
+}

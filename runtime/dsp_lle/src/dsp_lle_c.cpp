@@ -7,6 +7,7 @@
 
 #include "Core/DSP/DSPCore.h"
 #include "Core/DSP/DSPAccelerator.h"  /* full Accelerator definition — dsp_lle_save_state */
+#include "Core/DSP/DSPHost.h"         /* DSP::Host::CodeLoaded — dsp_lle_load_state's post-load re-analyze */
 #include "Core/DSP/DSPTables.h"
 #include "Core/DSP/Interpreter/DSPInterpreter.h"
 #include "Core/DSP/Interpreter/DSPIntTables.h"
@@ -267,6 +268,77 @@ int dsp_lle_save_state(GcnDspLleSnapshot* out) {
   }
 
   out->dsp_int_pending = g_dsp_int_pending;
+  return 1;
+}
+
+int dsp_lle_load_state(const GcnDspLleSnapshot* in) {
+  if (!g_core || !in) return 0;
+
+  SDSP& dsp = g_core->DSPState();
+  for (int i = 0; i < 4; i++) {
+    dsp.r.ar[i] = in->r_ar[i];
+    dsp.r.ix[i] = in->r_ix[i];
+    dsp.r.wr[i] = in->r_wr[i];
+    dsp.r.st[i] = in->r_st[i];
+  }
+  dsp.r.cr = in->r_cr;
+  dsp.r.sr = in->r_sr;
+  dsp.r.prod.val = in->r_prod;
+  dsp.r.ax[0].val = in->r_ax[0];
+  dsp.r.ax[1].val = in->r_ax[1];
+  dsp.r.ac[0].val = in->r_ac[0];
+  dsp.r.ac[1].val = in->r_ac[1];
+
+  dsp.pc = in->pc;
+  dsp.control_reg = in->control_reg;
+  dsp.control_reg_init_code_clear_time = in->control_reg_init_code_clear_time;
+  for (int i = 0; i < 4; i++) dsp.reg_stack_ptrs[i] = in->reg_stack_ptrs[i];
+  dsp.exceptions = in->exceptions;
+  dsp.external_interrupt_waiting.store(in->external_interrupt_waiting != 0);
+  dsp.reset_dspjit_codespace = in->reset_dspjit_codespace != 0;
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < DSP_STACK_DEPTH; j++)
+      dsp.reg_stacks[i][j] = in->reg_stacks[i][j];
+
+  {
+    auto& ifx = dsp.IFXRegsMutable();
+    for (size_t i = 0; i < ifx.size() && i < 256; i++) ifx[i] = in->ifx_regs[i];
+  }
+  dsp.SetMailboxRaw(Mailbox::CPU, in->mailbox[0]);
+  dsp.SetMailboxRaw(Mailbox::DSP, in->mailbox[1]);
+
+  if (dsp.iram)
+    for (uint32_t i = 0; i < DSP_IRAM_SIZE; i++) dsp.iram[i] = in->iram[i];
+  if (dsp.dram)
+    for (uint32_t i = 0; i < DSP_DRAM_SIZE; i++) dsp.dram[i] = in->dram[i];
+
+  g_core->SetState(static_cast<State>(in->core_state));
+
+  if (Accelerator* acc = dsp.GetAccelerator()) {
+    acc->SetStartAddress(in->accel_start_address);
+    acc->SetEndAddress(in->accel_end_address);
+    acc->SetCurrentAddress(in->accel_current_address);
+    acc->SetSampleFormat(in->accel_sample_format);
+    acc->SetGain(in->accel_gain);
+    acc->SetYn1(in->accel_yn1);
+    acc->SetYn2(in->accel_yn2);
+    acc->SetPredScale(in->accel_pred_scale);
+    acc->SetInput(in->accel_input);
+    acc->SetReadsStopped(in->accel_reads_stopped != 0);
+  }
+
+  g_dsp_int_pending = in->dsp_int_pending;
+
+  // Mirror DSPCore.cpp's own post-load DoState behavior (DSPCore.cpp:415-416,
+  // `if (p.IsReadMode()) Host::CodeLoaded(...)`), which never fires in this
+  // runtime because PointerWrap::IsReadMode() always returns false (see
+  // Common/ChunkFile.h). Re-analyzing the restored IRAM here is what makes
+  // the Analyzer's idle-skip/loop-detection tables valid again — without it
+  // they'd still reflect whatever ucode (if any) ran before this restore.
+  if (dsp.iram)
+    DSP::Host::CodeLoaded(*g_core, reinterpret_cast<const u8*>(dsp.iram),
+                          DSP_IRAM_BYTE_SIZE);
+
   return 1;
 }
 
