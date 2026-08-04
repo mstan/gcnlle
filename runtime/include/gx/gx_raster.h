@@ -98,6 +98,13 @@ void gx_raster_efb_data_mutable(u32** color, u32** depth,
  * snapshot_fused_draw to pack the identical value for the GPU path. */
 u32 gx_raster_xf_word(u32 addr);
 
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) restore-side: resets the
+ * GCN_GX_TEV_CENSUS accumulators and the per-draw texel decode cache — the
+ * two host-memo gaps gx_raster_init's own reset doesn't cover. Safe to call
+ * any time (both are pure diagnostics/decode memoization); never touches
+ * the EFB planes. */
+void gx_raster_restore_reset(void);
+
 /* CPU EFB aperture access (physical 0x08000000..0x0BFFFFFF, normally reached
  * through the SDK's 0xC8000000 effective mapping). `address` keeps the encoded
  * x/y and color-vs-depth plane bits. Returns 1 when the access is implemented;

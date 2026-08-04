@@ -69,6 +69,11 @@ typedef enum {
 /* Bring the rings up (clears all three, resets the block index). Idempotent. */
 void gcn_rings_init(void);
 
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) restore-side: full reset of
+ * EVERY ring including psq/watch (gcn_rings_init alone misses those — see
+ * its own doc note). Always safe: nothing here is guest-visible. */
+void gcn_rings_reset(void);
+
 /* --- hot-path record calls (cheap; safe from any runtime path) --- */
 
 /* One MMIO access. rw: 0=read 1=write. mapped: 1 if a device claimed the addr,

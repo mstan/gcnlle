@@ -514,6 +514,19 @@ void gcn_dispatch_timing_get(u64* device_cycles, u64* prev_cycles,
     if (dsp_remainder) *dsp_remainder = s_dsp_remainder;
 }
 
+/* SNAPSHOT_RESUME pass B (restore side): the load-mirror of
+ * gcn_dispatch_timing_get. Must be called before the restored gcn_dispatch_
+ * run begins (or at least before the first gcn_dispatch_charge call), or the
+ * derived-cycle-accuracy residues start from zero instead of the captured
+ * mid-run values. */
+void gcn_dispatch_timing_set(u64 device_cycles, u64 prev_cycles,
+                              u64 tb_remainder, u64 dsp_remainder) {
+    s_device_cycles = device_cycles;
+    s_prev_cycles = prev_cycles;
+    s_tb_remainder = tb_remainder;
+    s_dsp_remainder = dsp_remainder;
+}
+
 /* Own the run loop (rather than the generated static-inline dolrecomp_run_blocks)
  * so we can advance the time base between blocks — otherwise mftb reads a frozen
  * TB and firmware delay loops spin forever. */

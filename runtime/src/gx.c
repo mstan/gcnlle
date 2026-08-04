@@ -1334,6 +1334,27 @@ const u32* gcn_gx_bp(void) { return s_gx.bp; }
 const u32* gcn_gx_xf(void) { return s_gx.xf; }
 u32 gcn_gx_xf_words(void) { return GX_XF_MEM_WORDS; }
 
+/* SNAPSHOT_RESUME pass B (restore side): load-mirrors of the three
+ * accessors above. Caller must have already confirmed the pipeline is
+ * drained (same precondition gcn_gx_confirm_drained checks for a capture —
+ * a restore happens before any dispatch runs, so this is trivially true,
+ * but the ordering still matters relative to any lazily-created worker
+ * thread: call these before gcn_gx_tick/gcn_gx_pipeline_drain are ever
+ * invoked again). */
+void gcn_gx_set_bp(const u32* bp) {
+    if (bp) memcpy(s_gx.bp, bp, sizeof s_gx.bp);
+}
+void gcn_gx_set_xf(const u32* xf, u32 words) {
+    if (!xf) return;
+    if (words > GX_XF_MEM_WORDS) words = GX_XF_MEM_WORDS;
+    memcpy(s_gx.xf, xf, (size_t)words * sizeof(u32));
+}
+void gcn_gx_set_tmem(const u8* data, u32 len) {
+    if (!data) return;
+    if (len > sizeof s_gx_tmem) len = (u32)sizeof s_gx_tmem;
+    memcpy(s_gx_tmem, data, len);
+}
+
 static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     /* Flipper BPMEM_BP_MASK is a one-shot write mask, not an ordinary state
      * register. Merge the next BP write with the old destination, then reset

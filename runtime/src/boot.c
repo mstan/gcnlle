@@ -106,6 +106,7 @@
 #include "gx/gx.h"
 #include "debug/rings.h"
 #include "debug/debug_server.h"
+#include "debug/snapshot.h"    /* SNAPSHOT_RESUME: GCN_SNAPSHOT_SAVE/LOAD */
 #include "host/host_audio.h"   /* real AID DMA -> interactive WASAPI output */
 #include "host/host_window.h"  /* GCN_WINDOW=1: opt-in native display window */
 #include "util/crc32.h"
@@ -792,6 +793,32 @@ int main(int argc, char** argv) {
         const char* ref_env = getenv("GCN_BS1_REFERENCE");
         if (ref_env && *ref_env)
             gcn_dispatch_arm_bs1_snapshot(GCN_BS1_BS2_DMA_LEN);
+    }
+
+    /* SNAPSHOT_RESUME pass B (docs/SNAPSHOT_RESUME.md): GCN_SNAPSHOT_LOAD=
+     * <path> overlays a captured machine state onto everything device
+     * construction just built above (bus/exi/si/pi/dsp/ai/vi/di/mi/pe/cp/gp,
+     * MMIO install, debug server, rings, host window — every host callback
+     * is already correctly (re)bound). Nothing above this point is skipped
+     * or special-cased for a restore: the normal BS1/BS2 seed already ran
+     * (harmlessly — every field it touched is about to be overwritten by
+     * the overlay). After a successful load, cpu.pc is the restored PC and
+     * run_blocks/bs1_mode below apply unchanged; a failed load exits loudly
+     * rather than running from a partially-overlaid, guest-visible-state-
+     * inconsistent CPUState. */
+    const char* snapshot_load_path = getenv("GCN_SNAPSHOT_LOAD");
+    if (snapshot_load_path && *snapshot_load_path) {
+        char why[256];
+        int rc = gcn_snapshot_load(snapshot_load_path, &cpu, &dbg, why, sizeof why);
+        if (rc != GCN_SNAPSHOT_OK) {
+            fprintf(stderr, "gcn snapshot: LOAD FAILED (rc=%d) from '%s': %s\n",
+                    rc, snapshot_load_path, why);
+            cpu_free(&cpu);
+            free(payload);
+            return 1;
+        }
+        fprintf(stdout, "gcn snapshot: restored from '%s' — resuming at pc=0x%08X\n",
+                snapshot_load_path, cpu.pc);
     }
 
     fprintf(stdout,

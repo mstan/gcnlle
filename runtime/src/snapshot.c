@@ -19,6 +19,9 @@
 #include "gx/gx_vulkan.h"
 #include "util/crc32.h"
 #include "dsp_lle_c.h"
+#include "cpu/native_code.h"
+#include "cpu/title_module.h"
+#include "debug/rings.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +72,44 @@ static void sb_u32(SnapBuf* b, u32 v) { sb_put(b, &v, sizeof v); }
 static void sb_u64(SnapBuf* b, u64 v) { sb_put(b, &v, sizeof v); }
 static void sb_f64(SnapBuf* b, f64 v) { sb_put(b, &v, sizeof v); }
 static void sb_bool(SnapBuf* b, int v) { sb_u8(b, v ? 1 : 0); }
+
+/* ---- read cursor (pass B restore) -------------------------------------
+ * Mirrors SnapBuf for reading: a bounds-checked cursor over a fixed byte
+ * range (one section's payload). Reading past the end is clamped and marks
+ * `ok = 0` rather than reading out of bounds — a truncated/corrupt section
+ * degrades to zeros instead of crashing. */
+typedef struct {
+    const u8* data;
+    size_t    len;
+    size_t    pos;
+    int       ok;
+} SnapCur;
+
+static void cr_init(SnapCur* c, const u8* data, size_t len) {
+    c->data = data; c->len = len; c->pos = 0; c->ok = 1;
+}
+
+static void cr_get(SnapCur* c, void* out, size_t n) {
+    if (c->pos + n > c->len) {
+        if (out && n) memset(out, 0, n);
+        c->ok = 0;
+        c->pos = c->len;
+        return;
+    }
+    if (out && n) memcpy(out, c->data + c->pos, n);
+    c->pos += n;
+}
+
+/* Like cr_get but for large fixed-destination buffers (RAM/ARAM/TMEM/EFB)
+ * where `n` may legitimately be huge — same clamp-and-zero-fill behavior,
+ * just without the fixed-size intermediate that cr_u32/etc. use. */
+static void cr_bytes(SnapCur* c, void* out, size_t n) { cr_get(c, out, n); }
+
+static u8  cr_u8 (SnapCur* c) { u8  v = 0; cr_get(c, &v, sizeof v); return v; }
+static u16 cr_u16(SnapCur* c) { u16 v = 0; cr_get(c, &v, sizeof v); return v; }
+static u32 cr_u32(SnapCur* c) { u32 v = 0; cr_get(c, &v, sizeof v); return v; }
+static u64 cr_u64(SnapCur* c) { u64 v = 0; cr_get(c, &v, sizeof v); return v; }
+static int cr_bool(SnapCur* c) { return cr_u8(c) != 0; }
 
 /* ---- section tags (order here == on-disk order; see snapshot.h) ------ */
 
@@ -601,6 +642,584 @@ int gcn_snapshot_save(const char* path, CPUState* cpu, char* why, size_t why_siz
         if (why) snprintf(why, why_size, "fwrite/fclose failed for '%s'", path);
         return GCN_SNAPSHOT_ERR_IO;
     }
+
+    return GCN_SNAPSHOT_OK;
+}
+
+/* =========================================================================
+ * SNAPSHOT_RESUME pass B — RESTORE side.
+ *
+ * Every read_XXX function below is the load-mirror of the matching write_XXX
+ * above: same field order, same exclusions (host pointers/callbacks/FILE*
+ * are never read back — they're already correctly (re)bound by boot.c's
+ * normal device-construction sequence, which MUST have already run before
+ * gcn_snapshot_load is called; see snapshot.h's contract comment). Sections
+ * are located via the TOC (tag/offset/length), so read order does not need
+ * to match write order.
+ * ========================================================================= */
+
+static void read_cpu_fixed(SnapCur* c, CPUState* cpu) {
+    cr_bytes(c, cpu->gpr, sizeof cpu->gpr);
+    cr_bytes(c, cpu->fpr, sizeof cpu->fpr);
+    cr_bytes(c, cpu->ps1, sizeof cpu->ps1);
+    cpu->pc = cr_u32(c); cpu->lr = cr_u32(c); cpu->ctr = cr_u32(c);
+    cpu->cr = cr_u32(c); cpu->xer = cr_u32(c); cpu->fpscr = cr_u32(c);
+    cpu->msr = cr_u32(c); cpu->srr0 = cr_u32(c); cpu->srr1 = cr_u32(c);
+    cpu->dar = cr_u32(c); cpu->dsisr = cr_u32(c); cpu->ear = cr_u32(c);
+    cpu->hid2 = cr_u32(c);
+    cpu->timebase = cr_u64(c);
+    cr_bytes(c, cpu->sr, sizeof cpu->sr);
+    cr_bytes(c, cpu->gqr, sizeof cpu->gqr);
+    cr_bytes(c, cpu->spr, sizeof cpu->spr);
+    cpu->exception = cr_u32(c);
+    cpu->program_exception = cr_u32(c);
+    cpu->tlb_last_vps = cr_u32(c);
+    cpu->tlb_last_index = cr_u32(c);
+    cpu->tlb_invalidate_count = cr_u32(c);
+    cpu->external_addr = cr_u32(c);
+    cpu->external_value = cr_u32(c);
+    cpu->external_rid = cr_u8(c);
+    cpu->external_read_count = cr_u8(c);
+    cpu->external_write_count = cr_u8(c);
+    cpu->reserve_addr = cr_u32(c);
+    cpu->reserve_valid = cr_bool(c);
+    cr_bytes(c, cpu->locked_cache_tag, sizeof cpu->locked_cache_tag);
+    for (u32 i = 0; i < 512; i++) cpu->locked_cache_valid[i] = (bool)cr_bool(c);
+    cpu->cycles = cr_u64(c);
+    cpu->cycle_deadline = cr_u64(c);
+    cpu->halted = (bool)cr_bool(c);
+    cpu->halt_reason = (int)cr_u32(c);
+    /* ram/ram_size/mem2/mem2_size/rom_window/rom_window_size/the six host
+     * bindings: never read here (write_cpu_fixed never wrote them either) —
+     * already correct from cpu_init + boot.c's device construction. */
+}
+
+static void read_dispatch(SnapCur* c) {
+    u64 device_cycles = cr_u64(c), prev_cycles = cr_u64(c);
+    u64 tb_remainder = cr_u64(c), dsp_remainder = cr_u64(c);
+    gcn_dispatch_timing_set(device_cycles, prev_cycles, tb_remainder, dsp_remainder);
+}
+
+static void read_exi(SnapCur* c, GcnExi* exi) {
+    GcnExiChannel tmp[GCN_EXI_CHANNELS];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) {
+        tmp[i].csr = cr_u32(c);
+        tmp[i].mar = cr_u32(c);
+        tmp[i].len = cr_u32(c);
+        tmp[i].cr = cr_u32(c);
+        tmp[i].data = cr_u32(c);
+    }
+    u8 sram[GCN_SRAM_SIZE_BYTES]; cr_bytes(c, sram, sizeof sram);
+    u32 rtc_counter = cr_u32(c);
+    u64 rtc_anchor = cr_u64(c);
+    u32 rtc_running = cr_u32(c);
+    u32 op[GCN_EXI_CHANNELS], rom_off[GCN_EXI_CHANNELS], dev_pos[GCN_EXI_CHANNELS];
+    u8 prev_cs[GCN_EXI_CHANNELS]; u32 have_cmd[GCN_EXI_CHANNELS]; u8 dev_present[GCN_EXI_CHANNELS];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) op[i] = cr_u32(c);
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) rom_off[i] = cr_u32(c);
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) dev_pos[i] = cr_u32(c);
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) prev_cs[i] = cr_u8(c);
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) have_cmd[i] = cr_u32(c);
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) dev_present[i] = cr_u8(c);
+    u32 irq_level = cr_u32(c);
+
+    if (!exi) return;
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->channels[i] = tmp[i];
+    memcpy(exi->sram, sram, sizeof sram);
+    /* Direct field assignment ONLY — never gcn_rtc_sample_host_local (hazard
+     * #7): that call samples the HOST's current wall clock, which would
+     * silently replace the captured guest time with "now" on every restore. */
+    exi->rtc.counter = rtc_counter;
+    exi->rtc.anchor_cycles = rtc_anchor;
+    exi->rtc.running = (int)rtc_running;
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->op[i] = (int)op[i];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->rom_offset[i] = rom_off[i];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->dev_pos[i] = dev_pos[i];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->prev_cs[i] = prev_cs[i];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->have_cmd[i] = (int)have_cmd[i];
+    for (u32 i = 0; i < GCN_EXI_CHANNELS; i++) exi->dev_present[i] = dev_present[i];
+    exi->irq_level = (int)irq_level;
+    /* rom/rom_size/rom_base/owned_rom (hazard: content-addressed, already
+     * reconstructed by boot.c's normal GCN_BOOT_BS1 rom-window setup, which
+     * runs unconditionally as part of device construction), card[3]
+     * (borrowed pointers — already correct; card CONTENTS are restored
+     * separately by read_memcard), irq/irq_user/persist/persist_user/
+     * card_persist/card_persist_user (host callbacks, already correctly
+     * wired): none of these are touched here. */
+}
+
+/* Loads a memory card's captured image + transaction state into `mc` (must
+ * already exist — boot.c's normal setup_memcard already installed a default
+ * formatted card there). If the snapshot's slot was empty, `mc` is left as
+ * boot.c's default construction set it up (a documented pass-B limitation:
+ * a captured "truly absent" slot cannot currently be reproduced when
+ * boot.c's own default-on slot-A construction always installs a card —
+ * see docs/SNAPSHOT_RESUME.md's memcard survey note). */
+static void read_memcard(SnapCur* c, GcnMemcard* mc) {
+    int present = cr_bool(c);
+    u32 size_bytes = cr_u32(c);
+    if (!present || !mc) return;
+
+    u16 size_mbits = cr_u16(c);
+    u16 card_id = cr_u16(c);
+    u32 command = cr_u32(c);
+    u32 position = cr_u32(c);
+    u32 address = cr_u32(c);
+    u32 status = cr_u32(c);
+    u8 prog_buf[GCN_MC_PAGE_BYTES]; cr_bytes(c, prog_buf, sizeof prog_buf);
+    u32 interrupt_switch = cr_u32(c);
+    u32 interrupt_set = cr_u32(c);
+    u32 dirty = cr_u32(c);
+
+    u8* buf = (u8*)malloc(size_bytes ? size_bytes : 1u);
+    if (buf) cr_bytes(c, buf, size_bytes);
+    else { cr_bytes(c, NULL, size_bytes); return; } /* skip payload, leave mc untouched */
+
+    gcn_memcard_free(mc);              /* release whatever setup_memcard installed */
+    gcn_memcard_init(mc, buf, size_bytes);  /* takes ownership of buf */
+    mc->size_mbits = size_mbits;
+    mc->card_id = card_id;
+    mc->command = (int)command;
+    mc->position = position;
+    mc->address = address;
+    mc->status = (int)status;
+    memcpy(mc->prog_buf, prog_buf, sizeof prog_buf);
+    mc->interrupt_switch = (int)interrupt_switch;
+    mc->interrupt_set = (int)interrupt_set;
+    mc->dirty = (int)dirty;
+}
+
+static void read_vi(SnapCur* c, GcnVi* vi) {
+    u16 reg[GCN_VI_SIZE / 2]; cr_bytes(c, reg, sizeof reg);
+    u32 half_line_count = cr_u32(c);
+    u64 now_cycles = cr_u64(c), last_cycles = cr_u64(c), ticks_last_line_start = cr_u64(c);
+    u32 irq_level = cr_u32(c);
+    if (!vi) return;
+    memcpy(vi->reg, reg, sizeof reg);
+    vi->half_line_count = half_line_count;
+    vi->now_cycles = now_cycles;
+    vi->last_cycles = last_cycles;
+    vi->ticks_last_line_start = ticks_last_line_start;
+    vi->irq_level = (int)irq_level;
+    /* tphl_cache/tphl_key deliberately left as gcn_vi_init set them
+     * (0xFFFFFFFF key forces recompute) — pure memo of reg[], RESET not SAVE. */
+}
+
+static void read_si(SnapCur* c, GcnSi* si) {
+    GcnSiChannel ch[GCN_SI_CHANNELS];
+    for (u32 i = 0; i < GCN_SI_CHANNELS; i++) {
+        ch[i].out = cr_u32(c);
+        ch[i].in_hi = cr_u32(c);
+        ch[i].in_lo = cr_u32(c);
+        ch[i].connected = cr_u8(c);
+        ch[i].rdst = cr_u8(c);
+        ch[i].norep = cr_u8(c);
+        ch[i].mode = cr_u8(c);
+    }
+    u32 poll = cr_u32(c), comcsr = cr_u32(c), sisr = cr_u32(c), exilk = cr_u32(c);
+    u8 iobuf[128]; cr_bytes(c, iobuf, sizeof iobuf);
+    u32 irq_level = cr_u32(c);
+    u32 next_poll_halfline = cr_u32(c);
+    if (!si) return;
+    for (u32 i = 0; i < GCN_SI_CHANNELS; i++) si->ch[i] = ch[i];
+    si->poll = poll; si->comcsr = comcsr; si->sisr = sisr; si->exilk = exilk;
+    memcpy(si->iobuf, iobuf, sizeof iobuf);
+    si->irq_level = (int)irq_level;
+    si->next_poll_halfline = next_poll_halfline;
+    /* si->input intentionally untouched — GCN_SNAPSHOT_FLAG_SI_INPUT_RESET_
+     * NEUTRAL: stays at gcn_si_init's power-on-neutral report. */
+}
+
+static void read_pi(SnapCur* c, GcnPi* pi) {
+    u32 reg[GCN_PI_SIZE / 4]; cr_bytes(c, reg, sizeof reg);
+    u32 intsr = cr_u32(c);
+    if (!pi) return;
+    memcpy(pi->reg, reg, sizeof reg);
+    __atomic_store_n(&pi->intsr, intsr, __ATOMIC_RELEASE);
+}
+
+static void read_mi(SnapCur* c, GcnMi* mi) {
+    u16 reg[GCN_MI_SIZE / 2]; cr_bytes(c, reg, sizeof reg);
+    if (!mi) return;
+    memcpy(mi->reg, reg, sizeof reg);
+}
+
+static void read_ai(SnapCur* c, GcnAi* ai) {
+    u32 control = cr_u32(c), volume = cr_u32(c), sample_counter = cr_u32(c), int_timing = cr_u32(c);
+    u32 tick_accum = cr_u32(c);
+    u64 cycle_accum_x2 = cr_u64(c);
+    u32 irq_level = cr_u32(c);
+    if (!ai) return;
+    ai->control = control; ai->volume = volume;
+    ai->sample_counter = sample_counter; ai->int_timing = int_timing;
+    ai->tick_accum = tick_accum; ai->cycle_accum_x2 = cycle_accum_x2;
+    ai->irq_level = (int)irq_level;
+}
+
+/* Parses the DI section fully; applies everything EXCEPT disc_size/
+ * disc_present to `di` (those two must reflect whatever disc boot.c's
+ * normal GCN_DISC construction actually just mounted via a real fopen —
+ * hazard #3: disc_file is never touched here, so its paired disc_size/
+ * disc_present bookkeeping must come from that real re-mount, not the
+ * blob). `out_disc_size` (may be NULL) always receives the CAPTURED value,
+ * for the identity-gate check in gcn_snapshot_load. */
+static void read_di(SnapCur* c, GcnDi* di, u64* out_disc_size) {
+    u32 disr = cr_u32(c), dicvr = cr_u32(c);
+    u32 cmdbuf[3]; cr_bytes(c, cmdbuf, sizeof cmdbuf);
+    u32 dimar = cr_u32(c), dilength = cr_u32(c), dicr = cr_u32(c), diimmbuf = cr_u32(c);
+    u8 drive_state = cr_u8(c);
+    u32 error_code = cr_u32(c);
+    u8 enable_dtk = cr_u8(c), cmd_pending = cr_u8(c), pending_intr = cr_u8(c);
+    u32 irq_level = cr_u32(c);
+    u64 disc_size = cr_u64(c);
+    u32 disc_present = cr_u32(c); (void)disc_present;
+    if (out_disc_size) *out_disc_size = disc_size;
+    if (!di) return;
+    di->disr = disr; di->dicvr = dicvr;
+    memcpy(di->cmdbuf, cmdbuf, sizeof cmdbuf);
+    di->dimar = dimar; di->dilength = dilength; di->dicr = dicr; di->diimmbuf = diimmbuf;
+    di->drive_state = drive_state;
+    di->error_code = error_code;
+    di->enable_dtk = enable_dtk;
+    di->cmd_pending = cmd_pending;
+    di->pending_intr = pending_intr;
+    di->irq_level = (int)irq_level;
+    /* disc_file/disc_size/disc_present: never touched — see doc comment. */
+}
+
+static void read_gx_regs(SnapCur* c, GcnCp* cp, GcnPe* pe) {
+    u32 bp[256]; cr_bytes(c, bp, sizeof bp);
+    u32 xf_words = cr_u32(c);
+    /* gcn_gx_set_xf itself clamps to the compiled-in GX_XF_MEM_WORDS (private
+     * to gx.c); a heap buffer avoids needing that constant exposed here just
+     * to size a fixed array. */
+    u32* xf = (u32*)calloc(xf_words ? xf_words : 1u, sizeof(u32));
+    if (xf) {
+        cr_bytes(c, xf, (size_t)xf_words * sizeof(u32));
+        gcn_gx_set_bp(bp);
+        gcn_gx_set_xf(xf, xf_words);
+        free(xf);
+    } else {
+        cr_bytes(c, NULL, (size_t)xf_words * sizeof(u32));
+        gcn_gx_set_bp(bp);
+    }
+
+    u16 cp_reg[GCN_CP_SIZE / 2]; cr_bytes(c, cp_reg, sizeof cp_reg);
+    u32 gp_read_enable = cr_u32(c), bp_enable = cr_u32(c);
+    u32 hi_wm_int = cr_u32(c), lo_wm_int = cr_u32(c);
+    u32 gp_link_enable = cr_u32(c), bp_int = cr_u32(c);
+    u32 hi_wm = cr_u32(c), lo_wm = cr_u32(c), breakpoint = cr_u32(c);
+    u32 cp_irq_level = cr_u32(c);
+    if (cp) {
+        memcpy(cp->reg, cp_reg, sizeof cp_reg);
+        cp->gp_read_enable = (int)gp_read_enable;
+        cp->bp_enable = (int)bp_enable;
+        cp->hi_wm_int = (int)hi_wm_int;
+        cp->lo_wm_int = (int)lo_wm_int;
+        cp->gp_link_enable = (int)gp_link_enable;
+        cp->bp_int = (int)bp_int;
+        cp->hi_wm = (int)hi_wm;
+        cp->lo_wm = (int)lo_wm;
+        cp->breakpoint = (int)breakpoint;
+        cp->irq_level = (int)cp_irq_level;
+    }
+
+    u16 pe_reg[GCN_PE_SIZE / 2]; cr_bytes(c, pe_reg, sizeof pe_reg);
+    u16 token = cr_u16(c);
+    u32 token_enable = cr_u32(c), finish_enable = cr_u32(c);
+    u32 signal_token = cr_u32(c), signal_finish = cr_u32(c);
+    u32 token_level = cr_u32(c), finish_level = cr_u32(c);
+    if (pe) {
+        memcpy(pe->reg, pe_reg, sizeof pe_reg);
+        pe->token = token;
+        pe->token_enable = (int)token_enable;
+        pe->finish_enable = (int)finish_enable;
+        pe->signal_token_interrupt = (int)signal_token;
+        pe->signal_finish_interrupt = (int)signal_finish;
+        pe->token_level = (int)token_level;
+        pe->finish_level = (int)finish_level;
+    }
+}
+
+int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
+                      char* why, size_t why_size) {
+    if (why && why_size) why[0] = 0;
+    if (!path || !cpu || !ctx) {
+        if (why) snprintf(why, why_size, "null path/cpu/ctx");
+        return GCN_SNAPSHOT_ERR_IO;
+    }
+
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        if (why) snprintf(why, why_size, "fopen('%s', \"rb\") failed", path);
+        return GCN_SNAPSHOT_ERR_IO;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); if (why) snprintf(why, why_size, "fseek failed"); return GCN_SNAPSHOT_ERR_IO; }
+    long file_len_l = ftell(f);
+    if (file_len_l < 0) { fclose(f); if (why) snprintf(why, why_size, "ftell failed"); return GCN_SNAPSHOT_ERR_IO; }
+    rewind(f);
+    size_t file_len = (size_t)file_len_l;
+    u8* blob = (u8*)malloc(file_len ? file_len : 1u);
+    if (!blob) { fclose(f); if (why) snprintf(why, why_size, "out of memory reading '%s' (%zu bytes)", path, file_len); return GCN_SNAPSHOT_ERR_ALLOC; }
+    size_t got = fread(blob, 1, file_len, f);
+    fclose(f);
+    if (got != file_len) {
+        free(blob);
+        if (why) snprintf(why, why_size, "short read on '%s' (%zu of %zu bytes)", path, got, file_len);
+        return GCN_SNAPSHOT_ERR_IO;
+    }
+
+    /* ---- structural gate: magic/version/footer CRC32 (never bypassable —
+     * a bad magic/version/CRC means the blob itself is suspect, and
+     * GCN_SNAPSHOT_FORCE cannot fix a corrupt file). ---- */
+    if (file_len < 8 + GCN_SNAPSHOT_COMMIT_LEN + 12 + 4) {
+        free(blob);
+        if (why) snprintf(why, why_size, "file too small to be a snapshot (%zu bytes)", file_len);
+        return GCN_SNAPSHOT_ERR_FORMAT;
+    }
+    SnapCur hc; cr_init(&hc, blob, file_len);
+    u32 magic = cr_u32(&hc);
+    u32 version = cr_u32(&hc);
+    char commit[GCN_SNAPSHOT_COMMIT_LEN]; cr_bytes(&hc, commit, sizeof commit);
+    u32 content_crc = cr_u32(&hc);
+    u32 flags = cr_u32(&hc);
+    u32 nsec = cr_u32(&hc);
+    if (magic != GCN_SNAPSHOT_MAGIC || version != GCN_SNAPSHOT_FORMAT_VERSION) {
+        free(blob);
+        if (why) snprintf(why, why_size,
+            "bad magic/version (magic=0x%08X version=%u, expected 0x%08X/%u)",
+            magic, version, GCN_SNAPSHOT_MAGIC, GCN_SNAPSHOT_FORMAT_VERSION);
+        return GCN_SNAPSHOT_ERR_FORMAT;
+    }
+    if (file_len < 4) { free(blob); if (why) snprintf(why, why_size, "truncated footer"); return GCN_SNAPSHOT_ERR_FORMAT; }
+    size_t footer_off = file_len - 4;
+    u32 stored_footer_crc; memcpy(&stored_footer_crc, blob + footer_off, 4);
+    u32 computed_footer_crc = gcn_crc32(blob, (u32)footer_off);
+    if (stored_footer_crc != computed_footer_crc) {
+        free(blob);
+        if (why) snprintf(why, why_size, "footer CRC32 mismatch (stored=0x%08X computed=0x%08X)",
+            stored_footer_crc, computed_footer_crc);
+        return GCN_SNAPSHOT_ERR_FORMAT;
+    }
+
+    /* TOC. */
+    if (nsec > GCN_SNAP_SEC_COUNT_MAX) {
+        free(blob);
+        if (why) snprintf(why, why_size, "implausible section_count=%u", nsec);
+        return GCN_SNAPSHOT_ERR_FORMAT;
+    }
+    u32 toc_tag[GCN_SNAP_SEC_COUNT_MAX];
+    u64 toc_off[GCN_SNAP_SEC_COUNT_MAX];
+    u64 toc_len[GCN_SNAP_SEC_COUNT_MAX];
+    for (u32 i = 0; i < nsec; i++) {
+        toc_tag[i] = cr_u32(&hc);
+        toc_off[i] = cr_u64(&hc);
+        toc_len[i] = cr_u64(&hc);
+    }
+    if (!hc.ok) {
+        free(blob);
+        if (why) snprintf(why, why_size, "truncated TOC");
+        return GCN_SNAPSHOT_ERR_FORMAT;
+    }
+    /* Section payloads are stored as {u32 tag; u64 length; payload} right at
+     * each TOC offset; the TOC's own offset already points at that tag word
+     * (see snapshot.h's format doc), so the payload itself starts +12 later. */
+    #define FIND_SEC(TAG, OUTP, OUTLEN) do { \
+        (OUTP) = NULL; (OUTLEN) = 0; \
+        for (u32 _i = 0; _i < nsec; _i++) { \
+            if (toc_tag[_i] == (TAG)) { \
+                u64 _o = toc_off[_i] + 12u; \
+                u64 _l = toc_len[_i]; \
+                if (_o <= file_len && _o + _l <= file_len) { (OUTP) = blob + _o; (OUTLEN) = (size_t)_l; } \
+                break; \
+            } \
+        } \
+    } while (0)
+
+    const u8 *p_cpu=NULL,*p_disp=NULL,*p_mem1=NULL,*p_l1=NULL,*p_mem2=NULL,*p_exi=NULL,
+             *p_mca=NULL,*p_mcb=NULL,*p_vi=NULL,*p_si=NULL,*p_pi=NULL,*p_mi=NULL,
+             *p_ai=NULL,*p_di=NULL,*p_aram=NULL,*p_dspcore=NULL,*p_dspdev=NULL,
+             *p_gx=NULL,*p_tmem=NULL,*p_efb=NULL;
+    size_t l_cpu=0,l_disp=0,l_mem1=0,l_l1=0,l_mem2=0,l_exi=0,l_mca=0,l_mcb=0,l_vi=0,
+           l_si=0,l_pi=0,l_mi=0,l_ai=0,l_di=0,l_aram=0,l_dspcore=0,l_dspdev=0,l_gx=0,
+           l_tmem=0,l_efb=0;
+    FIND_SEC(GCN_SNAP_SEC_CPU_FIXED, p_cpu, l_cpu);
+    FIND_SEC(GCN_SNAP_SEC_DISPATCH, p_disp, l_disp);
+    FIND_SEC(GCN_SNAP_SEC_MEM1, p_mem1, l_mem1);
+    FIND_SEC(GCN_SNAP_SEC_LOCKED_L1, p_l1, l_l1);
+    FIND_SEC(GCN_SNAP_SEC_MEM2, p_mem2, l_mem2);
+    FIND_SEC(GCN_SNAP_SEC_EXI, p_exi, l_exi);
+    FIND_SEC(GCN_SNAP_SEC_MEMCARD_A, p_mca, l_mca);
+    FIND_SEC(GCN_SNAP_SEC_MEMCARD_B, p_mcb, l_mcb);
+    FIND_SEC(GCN_SNAP_SEC_VI, p_vi, l_vi);
+    FIND_SEC(GCN_SNAP_SEC_SI, p_si, l_si);
+    FIND_SEC(GCN_SNAP_SEC_PI, p_pi, l_pi);
+    FIND_SEC(GCN_SNAP_SEC_MI, p_mi, l_mi);
+    FIND_SEC(GCN_SNAP_SEC_AI, p_ai, l_ai);
+    FIND_SEC(GCN_SNAP_SEC_DI, p_di, l_di);
+    FIND_SEC(GCN_SNAP_SEC_ARAM, p_aram, l_aram);
+    FIND_SEC(GCN_SNAP_SEC_DSP_CORE, p_dspcore, l_dspcore);
+    FIND_SEC(GCN_SNAP_SEC_DSP_DEVICE, p_dspdev, l_dspdev);
+    FIND_SEC(GCN_SNAP_SEC_GX_REGS, p_gx, l_gx);
+    FIND_SEC(GCN_SNAP_SEC_TMEM, p_tmem, l_tmem);
+    FIND_SEC(GCN_SNAP_SEC_EFB, p_efb, l_efb);
+    #undef FIND_SEC
+
+    /* `ctx` is the caller's parameter (boot.c's own GcnDebugCtx), NOT looked
+     * up via gcn_debug_server_ctx() — that registry is only populated when
+     * GCN_DEBUG_PORT is set, and restore must work without it. */
+
+    /* ---- identity gate: disc-size (provisional — see snapshot.h doc). ---- */
+    if (p_di) {
+        SnapCur dc; cr_init(&dc, p_di, l_di);
+        u64 captured_disc_size = 0;
+        read_di(&dc, NULL, &captured_disc_size);
+        u64 live_disc_size = ctx->di ? ctx->di->disc_size : 0;
+        if (captured_disc_size != live_disc_size) {
+            const char* force = getenv("GCN_SNAPSHOT_FORCE");
+            int forced = force && *force && *force != '0';
+            fprintf(stderr,
+                "gcn snapshot: disc-size identity mismatch (captured=%llu live=%llu)%s\n",
+                (unsigned long long)captured_disc_size, (unsigned long long)live_disc_size,
+                forced ? " — GCN_SNAPSHOT_FORCE=1 set, proceeding (iteration-tier only)" : "");
+            if (!forced) {
+                free(blob);
+                if (why) snprintf(why, why_size,
+                    "disc-size identity mismatch (captured=%llu live=%llu); "
+                    "set GCN_SNAPSHOT_FORCE=1 to override (iteration tier only)",
+                    (unsigned long long)captured_disc_size, (unsigned long long)live_disc_size);
+                return GCN_SNAPSHOT_ERR_IDENTITY;
+            }
+        }
+    }
+    (void)content_crc; (void)commit; (void)flags;
+
+    /* ---- overlay: CPUState, dispatch timing, MEM1/L1/MEM2 bytes. ---- */
+    if (p_cpu) { SnapCur c; cr_init(&c, p_cpu, l_cpu); read_cpu_fixed(&c, cpu); }
+    if (p_disp) { SnapCur c; cr_init(&c, p_disp, l_disp); read_dispatch(&c); }
+    if (p_mem1) { SnapCur c; cr_init(&c, p_mem1, l_mem1); cr_bytes(&c, cpu->ram, cpu->ram_size); }
+    if (p_l1) {
+        SnapCur c; cr_init(&c, p_l1, l_l1);
+        u32 l1_size = cr_u32(&c);
+        u32 have_size = 0;
+        u8* l1 = gcn_mem_locked_l1(cpu, &have_size);
+        if (l1 && have_size) cr_bytes(&c, l1, (l1_size < have_size) ? l1_size : have_size);
+    }
+    if (p_mem2) {
+        SnapCur c; cr_init(&c, p_mem2, l_mem2);
+        u32 mem2_size = cr_u32(&c);
+        if (cpu->mem2 && mem2_size && mem2_size <= cpu->mem2_size)
+            cr_bytes(&c, cpu->mem2, mem2_size);
+    }
+
+    /* ---- overlay: devices. ---- */
+    if (p_exi) { SnapCur c; cr_init(&c, p_exi, l_exi); read_exi(&c, ctx->exi); }
+    if (p_mca && ctx->exi) { SnapCur c; cr_init(&c, p_mca, l_mca); read_memcard(&c, ctx->exi->card[0]); }
+    if (p_mcb && ctx->exi) { SnapCur c; cr_init(&c, p_mcb, l_mcb); read_memcard(&c, ctx->exi->card[1]); }
+    if (p_vi) { SnapCur c; cr_init(&c, p_vi, l_vi); read_vi(&c, ctx->vi); }
+    if (p_si) { SnapCur c; cr_init(&c, p_si, l_si); read_si(&c, ctx->si); }
+    if (p_pi) { SnapCur c; cr_init(&c, p_pi, l_pi); read_pi(&c, ctx->pi); }
+    if (p_mi) { SnapCur c; cr_init(&c, p_mi, l_mi); read_mi(&c, ctx->mi); }
+    if (p_ai) { SnapCur c; cr_init(&c, p_ai, l_ai); read_ai(&c, ctx->ai); }
+    if (p_di) { SnapCur c; cr_init(&c, p_di, l_di); read_di(&c, ctx->di, NULL); }
+
+    /* ---- overlay: ARAM + DSP core + DSP device. ---- */
+    if (p_aram) {
+        SnapCur c; cr_init(&c, p_aram, l_aram);
+        u32 aram_size = cr_u32(&c);
+        u8* aram = dsp_lle_aram();
+        u32 have = dsp_lle_aram_size();
+        if (aram && have) cr_bytes(&c, aram, (aram_size < have) ? aram_size : have);
+    }
+    if (p_dspcore && l_dspcore >= sizeof(GcnDspLleSnapshot)) {
+        GcnDspLleSnapshot dsp_core;
+        memcpy(&dsp_core, p_dspcore, sizeof dsp_core);
+        dsp_lle_load_state(&dsp_core);
+    }
+    if (p_dspdev && ctx->dsp) {
+        SnapCur c; cr_init(&c, p_dspdev, l_dspdev);
+        GcnDsp* dsp = ctx->dsp;
+        u16 reg[GCN_DSP_SIZE / 2]; cr_bytes(&c, reg, sizeof reg);
+        u16 csr = cr_u16(&c);
+        int dma_active = cr_bool(&c);
+        u32 dma_cycles_left = cr_u32(&c);
+        u32 aid_source = cr_u32(&c);
+        u16 aid_ctrl = cr_u16(&c);
+        u32 aid_cur_addr = cr_u32(&c);
+        u16 aid_blocks_left = cr_u16(&c);
+        u8 aid_int_pending = cr_u8(&c);
+        u32 aid_accum = cr_u32(&c);
+        u32 irq_level = cr_u32(&c);
+        memcpy(dsp->reg, reg, sizeof reg);
+        dsp->csr = csr;
+        dsp->dma_active = dma_active;
+        dsp->dma_cycles_left = dma_cycles_left;
+        dsp->aid_source = aid_source;
+        dsp->aid_ctrl = aid_ctrl;
+        dsp->aid_cur_addr = aid_cur_addr;
+        dsp->aid_blocks_left = aid_blocks_left;
+        dsp->aid_int_pending = aid_int_pending;
+        dsp->aid_accum = aid_accum;
+        dsp->irq_level = (int)irq_level;
+    }
+
+    /* ---- overlay: GX regs, TMEM, EFB planes. ---- */
+    if (p_gx) { SnapCur c; cr_init(&c, p_gx, l_gx); read_gx_regs(&c, ctx->cp, ctx->pe); }
+    if (p_tmem) {
+        gcn_gx_set_tmem(p_tmem, (u32)l_tmem);
+    }
+    if (p_efb) {
+        SnapCur c; cr_init(&c, p_efb, l_efb);
+        u32 w = cr_u32(&c), h = cr_u32(&c);
+        u32* color = NULL; u32* depth = NULL; u32 live_w = 0, live_h = 0;
+        gx_raster_efb_data_mutable(&color, &depth, &live_w, &live_h);
+        if (w == live_w && h == live_h) {
+            /* Common case (EFB_WIDTH/HEIGHT are fixed compile-time constants,
+             * unchanged across builds): a straight full-plane copy, color
+             * then depth, matching write_gx_regs' capture order exactly. */
+            if (color) cr_bytes(&c, color, (size_t)w * h * sizeof(u32));
+            if (depth) cr_bytes(&c, depth, (size_t)w * h * sizeof(u32));
+        } else {
+            fprintf(stderr,
+                "gcn snapshot: EFB dimension mismatch (captured %ux%u, live %ux%u) "
+                "— skipping EFB restore\n", w, h, live_w, live_h);
+        }
+    }
+
+    free(blob);
+
+    /* ---- RESET-side host-memo fixups a restore needs (never a fresh boot,
+     * which starts every one of these already-clean). ---- */
+    /* Hazard #2: gcn_native_code_reset() would mark stale MEM1 pages
+     * "valid" again (it's a blind clear, monotonic-until-reset by design) —
+     * unsound here since the just-loaded RAM is NOT what any native chunk
+     * was compiled against at a byte level until re-verified. Invalidate
+     * the whole range instead: falls through to the interpreter/AOT
+     * content-check path exactly like a real icbi would, and the
+     * content-stale bitmap this sets doubles as the interpreter's
+     * page-CRC-memo funnel (native_code.c's own asymmetric reset
+     * comment: "All-stale, not all-clean"). */
+    gcn_native_code_invalidate(GC_RAM_BASE, GC_MAIN_RAM_SIZE);
+    /* AOT title-module chunk verification states: same monotonic-until-
+     * invalidated shape as the bitmap above (aot_module.c's states[] never
+     * un-verifies itself). gcn_title_module_icbi is the existing exposed
+     * entry point (title_module.c.in) that calls gcn_aot_module_invalidate
+     * on the live module singleton. */
+    gcn_title_module_icbi(GC_RAM_BASE, GC_MAIN_RAM_SIZE);
+    /* Rings: pure observability, always safe to fully clear. */
+    gcn_rings_reset();
+    /* GX draw-config-cache/census/texel-cache host memos: gx_raster_init
+     * already ran once during normal device construction (zeroing the
+     * config cache and the EFB planes); this covers the two gaps it
+     * doesn't (hazard #12), without re-touching EFB (already overlaid
+     * above with the real captured content). */
+    gx_raster_restore_reset();
+    /* gx_vulkan.c's entire GxVk struct (RESET, hazard confirmed in the
+     * survey): nothing to do here — it is rebuilt from the just-restored
+     * GX regs (BP/XF/CP/PE) via its own normal init path, which boot.c's
+     * device construction already ran (unconditionally, before this
+     * function was ever called) and which reads live BP/XF/TMEM lazily on
+     * first use, not at init time. */
 
     return GCN_SNAPSHOT_OK;
 }

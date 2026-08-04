@@ -53,4 +53,9 @@ void gcn_dispatch_throttle_on_field(void* user, double field_period_sec);
 void gcn_dispatch_timing_get(u64* device_cycles, u64* prev_cycles,
                               u64* tb_remainder, u64* dsp_remainder);
 
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) restore-side: load-mirror of
+ * gcn_dispatch_timing_get above. Call before resuming gcn_dispatch_run. */
+void gcn_dispatch_timing_set(u64 device_cycles, u64 prev_cycles,
+                              u64 tb_remainder, u64 dsp_remainder);
+
 #endif /* GCN_DISPATCH_H */

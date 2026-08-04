@@ -578,3 +578,17 @@ int gcn_ring_event_json(char* out, int cap, int max_entries) {
     n += snprintf(out + n, (size_t)(cap - n), "],\"count\":%d}\n", emitted);
     return n;
 }
+
+/* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) restore-side: gcn_rings_init
+ * does NOT cover the psq/watch rings (declared later in this file; hazard
+ * #11 from the pass-A survey). This is the unified reset a restore should
+ * call — every ring here is pure observability (never guest-visible), so a
+ * full clear is always safe, unlike the native-code/AOT verification
+ * bitmaps which must go to all-invalid, not all-clean. */
+void gcn_rings_reset(void) {
+    gcn_rings_init();
+    memset(s_psq, 0, sizeof s_psq);
+    s_psq_count = 0;
+    memset(s_watch, 0, sizeof s_watch);
+    s_watch_count = 0;
+}
