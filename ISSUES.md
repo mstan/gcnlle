@@ -172,6 +172,35 @@ retained software/interpreter/DSP-LLE paths. A complete exercised
 force-floor gate, actual 60-Hz presentation, and release-quality audio are
 not yet established.
 
+## Late-session addendum (2026-08-10, after the checkpoint above)
+
+- **Attract loop closed end-to-end once, zero-input** (title → storybook
+  attract → title, t=566 s) — first time the title sequence has been observed
+  completing. Evidence: `TITLESEQ2_ATTRACT.md` + `titleseq3-*` in the capture
+  tree.
+- **New framework bug `beads-u2x.1`**: rendering-only corruption (static
+  magenta XFB noise, guest alive underneath) at the *second* attract
+  transition. TLUT COW ring pegged at 65536/65536 with 236 rollovers — the
+  TLUT rollover path was never exercised by any prior validation (texture
+  arena was; TLUT was not) — plus 1,770 unsupported EFB copy `0x018A03`
+  fallbacks confined to the corruption window. **COW promotion is blocked on
+  a forced-small-TLUT-arena test.**
+- **New framework bug `beads-u2x.2`**: WW ocean renders flat solid blue (no
+  waves/specular/foam) in both render paths from t=0; Dolphin's zero-input
+  title additionally shows a logo overlay + daytime lighting ours lacks.
+  Suspected shared-model gap — the golden chain is self-referential (proves
+  determinism, not correctness), so corun/chain gates are structurally blind
+  to it. Memory-card-state divergence (we auto-format blank card A; Dolphin
+  had none and blocks on the no-save dialog loop) must be eliminated first.
+- **Oracle facts** (`ORACLE_CADENCE.md`): Dolphin dumps 1 PNG per VI field at
+  59.94 Hz with no dedup; exact-hash dedup is useless (per-field noise) — use
+  perceptually-thresholded diffs. Dolphin never starts a New Game without
+  input.
+- **Cadence unification**: "audio full speed, visuals slow" is guest
+  render-cadence collapse in heavy scenes (measured live: 59.3 fields/s but
+  ~6.7 new frames/s), same root as the 57.7% fallback-wait cost — the
+  optimization track directly buys visible frames.
+
 ## Outstanding — correctness / validation
 
 - **Intro→menu fly-in corun divergence** (pre-existing, IPL menu route
