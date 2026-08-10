@@ -1,16 +1,22 @@
 # Known Issues and Validation Status
 
-Status as of 2026-08-09 (Wind Waker 60-FPS capacity checkpoint; supersedes the
-2026-08-03 checkpoint). Framework parent `5a7a972` on
-`experiment/moderngekko-gpl`; title repo pin `a5a8937`.
+Status as of 2026-08-09. Local framework commit `a2a90cc` on
+`experiment/moderngekko-gpl` contains the current COW experiment; it descends
+from framework checkpoint `5a7a972`. WindWakerRecomp remains at title commit
+`a5a8937` and still pins framework `8a2e0d2`, so the COW work is not integrated.
 
 ## Where we are
 
-Standing goal (`.claude/GOAL.md`): 60 FPS sustained with headroom. The fixed
+Standing goal (`beads-b29`): 60 FPS sustained with headroom. The fixed
 snapshot-resumed title-sailing suffix starts at cumulative frame 332 and ends
 at 1015, so its timed interval contains **683 new DrawDone events**. All
 accepted runs retain the golden XFB chain `ed27f20acbdfe1d0` (1338 cumulative
 publications), poison=0, and 539/539 native verifications.
+
+`GXSetDrawDone` throughput is an unthrottled emulation-capacity proxy, not a
+measurement of distinct host-presented frames. Never divide the cumulative
+1015 count by suffix wall time. A 60-Hz presentation claim requires explicit
+VI/presenter cadence and headed-output evidence.
 
 | Exact level-1 metric | Fixed-slot baseline | Texture/TLUT COW opt-in |
 |---|---:|---:|
@@ -61,24 +67,33 @@ the 2026-08-03 burndown, and 24.3 s with the then-current PGO build.
   Iteration workflow: save once (`GCN_CHECKPOINT_PC=0x80003140
   GCN_SNAPSHOT_SAVE=<p> GCN_SNAPSHOT_EXIT=1`), then every run
   `GCN_SNAPSHOT_LOAD=<p>` with budget 72,467,144 — skips ~1/3 of wall.
+- `a2a90cc` **Immutable resident texture/TLUT staging epochs** — opt-in,
+  default-off COW reduced exact level-1 submissions from 1,881 to 895 and
+  raised the fixed-suffix capacity result from 74.12 to 88.13 DrawDone/s.
+  Golden XFB, 522/0 GPU/software plane checks, 76/0 EFB-texture checks,
+  forced-small-arena rollover, and both Vulkan/non-Vulkan 14-test suites pass.
+  The two-sample ABBA result is strong candidate evidence, not broad title or
+  presentation acceptance.
 
-## Outstanding — performance and release integration
+## Outstanding — performance measurement and release integration
 
-1. **Separate capacity, audio, and presentation acceptance.** Exact emulation
-   capacity now clears the 66/s headroom gate. Audio-on endurance and a
-   VI/presenter-specific 60 Hz metric remain distinct release gates; this
-   route's DrawDone cadence is about 50 events per guest-audio second.
-2. **Promote or retain opt-in COW deliberately.** `GCN_GX_VK_TEXTURE_COW=1`
-   is exact on the measured route and recovers the former tiny-draw regression,
-   but default promotion should follow broader title/endurance coverage.
-3. **DSP AOT.** DSP-LLE is ~28% of dispatch wall and already flush-batched
-   (4096-cycle cap); the interpreter core itself is the remaining cost.
-   DOLPHIN_AUDIT.md CPU item 5.
-4. **General TEV phases 2+**: mip sampling, z-texture, indirect stages /
-   bump-alpha ras channels, >2 texgens — each still a loud per-draw
-   fallback with a census bucket (2.4%/0.9%/~0% of pixels respectively).
-5. Residual icbi-cluster interpreter cost (~6% of pc-cycles, uniform mode
-   never fires the fa9c162 batcher — deadline pre-expired by design).
+1. **Post-COW attribution first.** Measure current submit reasons and exclusive
+   waits, epoch high-water/rollover, fallback weight, CPU/DSP/GX shares, and
+   VI/presenter cadence on the same 683-event suffix. No next optimization has
+   current ranking evidence.
+2. **Keep the metrics separate.** Capacity clears the 66 DrawDone/s gate on
+   this route. Audio-on endurance and VI/presenter-specific 60-Hz behavior are
+   distinct release gates; the route produces about 50 DrawDone events per
+   guest-audio second.
+3. **Do not promote historical rankings.** The level-1 TEV regression, old
+   ~28% DSP share, residual icbi cost, and 5.8% PGO result all predate COW.
+   They remain hypotheses until a post-COW profile refreshes them.
+4. **Choose the next lever from exclusive cost.** Only after attribution,
+   optimize the largest measured remaining cost while preserving forceable
+   software/interpreter/DSP-LLE floors and loud fallback.
+5. **Promote or retain COW deliberately.** Broader title/endurance, paced
+   presentation, reset/snapshot/shutdown, and force-floor coverage must precede
+   default promotion and title pinning.
 
 ## Outstanding — correctness / validation
 
@@ -99,9 +114,10 @@ the 2026-08-03 burndown, and 24.3 s with the then-current PGO build.
   preclude it; the drain-assert is the gate).
 - **July checkpoint items still open**: WGL flicker final validation
   (clean unobstructed 60 s capture on the inner Game Play screen),
-  audio-enabled endurance run (pacing + zero sustained WASAPI underruns
-  together), window-resize stress test, in-menu memcard copy/delete
-  interactive acceptance pass.
+  audio-enabled endurance with guest-audio duration, host-ring full wait,
+  DrawDone count, VI/presenter cadence, and zero sustained underruns/drops;
+  window-resize stress; and in-menu memcard copy/delete acceptance. Audio
+  endurance is a pacing/quality gate, not proof of 60-Hz presentation.
 
 ## Process / tooling notes (this session)
 

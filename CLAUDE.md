@@ -1,5 +1,10 @@
 # gcnrecomp — working notes for Claude
 
+Current handoff: [`docs/HANDOFF_2026-08-09.md`](docs/HANDOFF_2026-08-09.md).
+The COW implementation is local commit `a2a90cc` on branch
+`experiment/moderngekko-gpl`; WindWakerRecomp still pins `8a2e0d2`. Do not
+describe the COW result as title-pinned or as proof of 60-Hz presentation.
+
 Read **PRINCIPLES.md** first; it governs everything. Highlights that bite here:
 
 - **LLE-first is the whole point.** We recompile the real GameCube **IPL** and
@@ -38,8 +43,9 @@ Read **PRINCIPLES.md** first; it governs everything. Highlights that bite here:
 
 `./build.sh` (exports `/c/msys64/mingw64/bin` onto PATH — without it CMake's
 try-compile fails with a bare "cannot compile a simple test program" because
-gcc can't find its own runtime DLLs). Recompiler currently builds green,
-10/10 ctest.
+gcc can't find its own runtime DLLs). The current COW checkpoint builds in both
+Vulkan and `GCN_VULKAN=OFF` configurations and passes the 14-test runtime suite
+in each configuration when the MinGW CTest runner is used.
 
 ## Reference clones (surface-investigated, kept out of tree)
 
