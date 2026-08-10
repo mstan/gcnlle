@@ -20,6 +20,7 @@
 #include "si/si.h"         /* set_input: injected pad-report surface */
 #include "di/di.h"         /* insert_disc/eject_disc: runtime disc mount lifecycle */
 #include "host/host_audio.h" /* audio_state: WASAPI queue/signal acceptance */
+#include "host/host_window.h" /* present_state: GCN_PRESENT_STATS=1 cadence counters */
 #include "memory/memory.h"   /* coherent MEM1/MEM2/locked-L1 debug reads */
 #include "debug/snapshot.h"  /* SNAPSHOT_RESUME: GCN_SNAPSHOT_SAVE hooks the checkpoint park below */
 
@@ -728,6 +729,30 @@ static void handle_line(Client* c, const char* line) {
             (unsigned long long)a.wait_milliseconds,
             (unsigned long long)a.dropped_frames,
             aid_source, aid_cur_addr, aid_blocks_left, aid_ctrl);
+    }
+    else if (!strcmp(cmd, "present_state")) {
+        /* Mirrors audio_state above: a flat JSON dump of the GCN_PRESENT_STATS=1
+         * VI/presenter cadence counters (host_window.h's GcnPresentStats) plus
+         * the VI field tick count (vi.h) — the release-gate "VI/presenter
+         * cadence" metrics (fields/s, distinct vs coalesced presents, present
+         * latency) in one query. All-zero/false when the env var is unset;
+         * this endpoint itself has no cost gate of its own since it only runs
+         * on an explicit debug-client query, never on the hot path. */
+        GcnPresentStats p;
+        gcn_host_window_get_stats(&p);
+        u64 vi_fields = gcn_vi_get_field_count();
+        double latency_avg_ms = p.latency_samples
+            ? p.latency_sum_ms / (double)p.latency_samples : 0.0;
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"enabled\":%s,\"vi_fields\":%llu,"
+            "\"posts\":%llu,\"distinct\":%llu,\"coalesced\":%llu,"
+            "\"latency_avg_ms\":%.3f,\"latency_max_ms\":%.3f}\n",
+            p.enabled ? "true" : "false",
+            (unsigned long long)vi_fields,
+            (unsigned long long)p.posts,
+            (unsigned long long)p.distinct,
+            (unsigned long long)p.coalesced,
+            latency_avg_ms, p.latency_max_ms);
     }
     else if (!strcmp(cmd, "gx_draw_state")) {
         /* Retire the GX queue before reading the retained per-config draw

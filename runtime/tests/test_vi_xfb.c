@@ -13,6 +13,9 @@ int gcn_host_window_enabled(void) { return 0; }
 void gcn_host_window_present(const u8* xfb, u32 width, u32 height, u32 stride) {
     (void)xfb; (void)width; (void)height; (void)stride;
 }
+/* GCN_PRESENT_STATS=1 cached flag (also owned by host_window.c, see its doc
+ * comment) — inert here for the same reason as gcn_host_window_enabled above. */
+int gcn_present_stats_enabled(void) { return 0; }
 void gcn_gx_xfb_read_begin(void) {}
 void gcn_gx_xfb_read_end(void) {}
 u64 gcn_gx_xfb_generation(void) { return 0; }

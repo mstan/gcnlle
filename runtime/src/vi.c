@@ -8,10 +8,17 @@
 #include "vi/vi.h"
 #include "debug/rings.h"
 #include "gx/gx.h"          /* atomic host snapshot vs worker XFB writes */
-#include "host/host_window.h"  /* GCN_WINDOW=1 field-boundary present hook, see below */
+#include "host/host_window.h"  /* GCN_WINDOW=1 field-boundary present hook, see below;
+                                 * also owns the GCN_PRESENT_STATS=1 cached flag the
+                                 * field counter below is gated on. */
 
 #include <stdio.h>
 #include <string.h>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>        /* QueryPerformanceCounter/Frequency — GCN_PRESENT_STATS
+                              * fields/s only; same API dispatch.c's GCN_THROTTLE and
+                              * host_audio.c already use for wall-clock measurement. */
 
 /* The dispatch loop ticks one VI (like the one DSP core); registered at init. */
 static GcnVi* s_vi = NULL;
@@ -23,6 +30,16 @@ static CPUState* s_vi_cpu = NULL;
  * fields retain the last complete texture instead of republishing an XFB
  * while the guest is still building its successor. */
 static u64 s_presented_xfb_generation = 0;
+
+/* ---- opt-in VI field-cadence counter (GCN_PRESENT_STATS=1) ----
+ * Counts field-boundary ticks for the fields/s teardown stat below.
+ * Gated on the same cached flag host_window.c's present-stats use; zero
+ * cost when unset beyond that one int compare per halfline. Fixed-origin
+ * rate (first counted field -> now), same idea as dispatch.c's
+ * GCN_THROTTLE wall-clock anchor: never re-baselined mid-run. */
+static u64 s_vi_field_count = 0;
+static LARGE_INTEGER s_vi_field_first_qpc;
+static int s_vi_field_first_qpc_set = 0;
 
 void gcn_vi_set_irq(GcnVi* vi, GcnViIrqFn fn, void* user) {
     vi->irq = fn;
@@ -127,6 +144,18 @@ static void vi_advance_halfline(GcnVi* vi) {
      * (that's what "even field begins" means — the odd field's length); the
      * even field's own length is the other vi_halflines_field() call. Zero
      * cost when no hook is registered (GcnViFieldFn doc, vi.h). */
+    /* GCN_PRESENT_STATS=1 (opt-in): count this field. Independent of
+     * field_hook/GCN_WINDOW below — runs whether or not throttling or the
+     * host window are active, so headless/oracle runs can measure VI cadence
+     * too. */
+    if (is_at_field_boundary && gcn_present_stats_enabled()) {
+        if (!s_vi_field_first_qpc_set) {
+            QueryPerformanceCounter(&s_vi_field_first_qpc);
+            s_vi_field_first_qpc_set = 1;
+        }
+        s_vi_field_count++;
+    }
+
     if (is_at_field_boundary && vi->field_hook) {
         u32 field_hl = (old_hl == 0u)
             ? even_field_begin
@@ -277,6 +306,26 @@ int gcn_vi_xfb_info(u32* addr, u32* width, u32* height, u32* stride) {
         *stride = full_stride;
     }
     return (*addr != 0 && *width != 0 && *height != 0) ? 1 : 0;
+}
+
+u64 gcn_vi_get_field_count(void) {
+    return s_vi_field_count;
+}
+
+void gcn_vi_print_present_stats(void) {
+    if (!gcn_present_stats_enabled()) return;
+    double fields_per_sec = 0.0;
+    if (s_vi_field_first_qpc_set && s_vi_field_count > 0) {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        double elapsed = (double)(now.QuadPart - s_vi_field_first_qpc.QuadPart) /
+                          (double)freq.QuadPart;
+        if (elapsed > 0.0)
+            fields_per_sec = (double)s_vi_field_count / elapsed;
+    }
+    fprintf(stderr, "vi: fields=%llu (%.1f/s)\n",
+            (unsigned long long)s_vi_field_count, fields_per_sec);
 }
 
 void gcn_vi_init(GcnVi* vi) {
