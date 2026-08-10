@@ -375,6 +375,49 @@ Measured outcomes (fixed 110M-block headed route):
   motivating datum for a resident tiny-draw batching pass — the next
   designed lever; revisit the default when it lands.
 
+## Exercised example: immutable texture/TLUT staging epochs (2026-08-09)
+
+`GCN_GX_VK_SUBMIT_STATS=1` first partitioned every resident submit by its
+immediate trigger. On the fixed snapshot-resumed Wind Waker suffix, exact
+general-TEV level 1 made 1,881 command-buffer submissions: 929 texture
+overwrites, 682 `GXSetDrawDone` boundaries, 225 unsupported-triangle syncs,
+38 pending-RAM overlaps, five CPU EFB reads, and two pipeline drains. The
+fixed texture slots were therefore a real batching barrier, but not the only
+one.
+
+`GCN_GX_VK_TEXTURE_COW=1` makes texture and TLUT uploads immutable within
+bounded staging epochs (4 MiB and 64 KiB by default). A changed cache entry
+gets a new aligned offset, while every already-recorded draw packet retains
+the old scalar offset it captured. Arena exhaustion submits, fences, and
+materializes through the existing exact boundary before advancing the epoch
+and reusing offset zero. A bounded binding-stability retry prevents a later
+texture/TLUT rollover from invalidating an earlier binding for the same
+not-yet-recorded draw. Unsupported or impossible binding sets still fall back
+to the faithful software path.
+
+`GCN_GX_VK_TEXTURE_COW_BYTES` and `GCN_GX_VK_TLUT_COW_BYTES` are diagnostic
+arena caps used to force rollover coverage; they apply only when COW is on.
+The optimization remains opt-in pending broader release integration.
+
+Evidence (72,467,144-block suffix, 683 new `GXSetDrawDone` events, title pin
+`a5a8937`, golden chain `1338/ed27f20acbdfe1d0`):
+
+- Same-binary unthrottled capacity, with only the non-architectural WASAPI
+  sink detached (`GCN_AUDIO=0`; DSP-LLE/AID still execute): OFF 9.17/9.26 s,
+  ON 7.79/7.71 s. Median-equivalent capacity rises from 74.12 to 88.13
+  DrawDone/s (13.49 to 11.35 ms/event), about 19% more throughput.
+- Resident work rises from 129,823 to 135,940 triangles while submissions fall
+  from 1,881 to 895 and synchronized fallbacks fall from 411,355 to 405,238.
+- Audio-on runs remain intentionally paced by 436,840 samples / 32 kHz =
+  13.651 s of guest PCM; accepted COW samples had zero underruns and zero
+  drops. Raw audio-on wall FPS is therefore not a headroom metric.
+- Full corun: 522 plane checks, zero divergences. Resident EFB-to-texture
+  verification: 76 comparisons, zero mismatches. Runtime tests: 14/14 in both
+  Vulkan and `GCN_VULKAN=OFF` builds.
+- A forced 512 KiB texture epoch exercised 68 rollovers, including 34 with
+  live work requiring a command submission, and retained the golden chain,
+  frame/draw/native/interpreter counts, and clean shutdown.
+
 ## Wind Waker performance burndown after this exemplar
 
 The most recent headed title-screen log attributes the urgent work as follows:

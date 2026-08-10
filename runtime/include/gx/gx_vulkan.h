@@ -23,7 +23,13 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
                                 int after_software);
 /* 1=handled on GPU, 0=synchronized software fallback required, -1=fatal. */
 int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size);
-int gx_vulkan_resident_flush(void);
+typedef enum {
+    GX_VK_FLUSH_DRAWDONE = 0,
+    GX_VK_FLUSH_PE_TOKEN,
+    GX_VK_FLUSH_PE_TOKEN_INT,
+    GX_VK_FLUSH_PIPELINE_DRAIN
+} GxVkFlushReason;
+int gx_vulkan_resident_flush(GxVkFlushReason reason);
 int gx_vulkan_resident_sync_to_software(void);
 
 /* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side drain-assert: 1 iff the

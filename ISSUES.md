@@ -1,22 +1,34 @@
 # Known Issues and Validation Status
 
-Status as of 2026-08-03 (Wind Waker 60-FPS burndown session; supersedes the
-2026-07-15 checkpoint). Framework at `8a2e0d2` on `experiment/moderngekko-gpl`
-(= `master`); title repo pin `a5a8937`.
+Status as of 2026-08-09 (Wind Waker 60-FPS capacity checkpoint; supersedes the
+2026-08-03 checkpoint). Framework parent `5a7a972` on
+`experiment/moderngekko-gpl`; title repo pin `a5a8937`.
 
 ## Where we are
 
-Standing goal (`.claude/GOAL.md`): 60 FPS sustained with headroom. On the
-fixed 110M-block headed WW route (true reset → IPL menu → main.dol → title
-sailing), all byte-exact against the golden XFB chain `ed27f20acbdfe1d0`
-(1338 publications / 1015 frames / poison=0):
+Standing goal (`.claude/GOAL.md`): 60 FPS sustained with headroom. The fixed
+snapshot-resumed title-sailing suffix starts at cumulative frame 332 and ends
+at 1015, so its timed interval contains **683 new DrawDone events**. All
+accepted runs retain the golden XFB chain `ed27f20acbdfe1d0` (1338 cumulative
+publications), poison=0, and 539/539 native verifications.
 
-| Metric | 2026-08-03 morning | now |
-|---|---|---|
-| Route wall | 94.7 s | 25.9 s (24.3 s with PGO opt-in) |
-| Headed fps, route average | 11.7 | ~39–42 |
-| Synchronized GX fallbacks | 538,977 | 535,166 (411,347 at `GCN_GX_GENERAL_TEV=1`) |
-| Dispatch wall split | block-exec-dominated | balanced ~31/28/30 CPU/DSP/GX |
+| Exact level-1 metric | Fixed-slot baseline | Texture/TLUT COW opt-in |
+|---|---:|---:|
+| Unthrottled capacity wall (median of interleaved pair) | 9.215 s | 7.750 s |
+| Capacity | 74.12 DrawDone/s | 88.13 DrawDone/s |
+| Emulation work per DrawDone | 13.49 ms | 11.35 ms |
+| Resident triangles / submissions | 129,823 / 1,881 | 135,940 / 895 |
+| Synchronized fallbacks | 411,355 | 405,238 |
+
+These capacity runs use `GCN_AUDIO=0`, which detaches only the
+non-architectural WASAPI PCM sink; DSP-LLE, AID DMA/timing, interrupts, and
+firmware execution remain active. Audio-on runs emit 436,840 samples at
+32 kHz (13.651 s of guest audio) and intentionally block on the full host
+ring, so their roughly 14 s wall time / 49 DrawDone/s is a realtime-audio
+quality measurement, not an emulation-headroom metric. Accepted audio-on COW
+samples had zero underruns and zero drops. The older true-reset 110M-block
+route remains historical context: 94.7 s at the morning baseline, 25.9 s after
+the 2026-08-03 burndown, and 24.3 s with the then-current PGO build.
 
 ## Landed this session (each with its full gate matrix; see commit messages
 ## and ENHANCEMENTS.md exemplar entries for evidence)
@@ -50,20 +62,22 @@ sailing), all byte-exact against the golden XFB chain `ed27f20acbdfe1d0`
   GCN_SNAPSHOT_SAVE=<p> GCN_SNAPSHOT_EXIT=1`), then every run
   `GCN_SNAPSHOT_LOAD=<p>` with budget 72,467,144 — skips ~1/3 of wall.
 
-## Outstanding — performance (next levers, in order)
+## Outstanding — performance and release integration
 
-1. **Resident tiny-draw batching.** The motivating datum: fog/CMPR residency
-   (level 1) moves ~124K tiny triangles onto the GPU and LOSES ~12–13% wall
-   to per-draw dispatch overhead despite killing their syncs. Batching flips
-   that lever positive and attacks the remaining ~535K synchronized
-   fallbacks. Revisit the `GCN_GX_GENERAL_TEV` default when it lands.
-2. **DSP AOT.** DSP-LLE is ~28% of dispatch wall and already flush-batched
+1. **Separate capacity, audio, and presentation acceptance.** Exact emulation
+   capacity now clears the 66/s headroom gate. Audio-on endurance and a
+   VI/presenter-specific 60 Hz metric remain distinct release gates; this
+   route's DrawDone cadence is about 50 events per guest-audio second.
+2. **Promote or retain opt-in COW deliberately.** `GCN_GX_VK_TEXTURE_COW=1`
+   is exact on the measured route and recovers the former tiny-draw regression,
+   but default promotion should follow broader title/endurance coverage.
+3. **DSP AOT.** DSP-LLE is ~28% of dispatch wall and already flush-batched
    (4096-cycle cap); the interpreter core itself is the remaining cost.
    DOLPHIN_AUDIT.md CPU item 5.
-3. **General TEV phases 2+**: mip sampling, z-texture, indirect stages /
+4. **General TEV phases 2+**: mip sampling, z-texture, indirect stages /
    bump-alpha ras channels, >2 texgens — each still a loud per-draw
    fallback with a census bucket (2.4%/0.9%/~0% of pixels respectively).
-4. Residual icbi-cluster interpreter cost (~6% of pc-cycles, uniform mode
+5. Residual icbi-cluster interpreter cost (~6% of pc-cycles, uniform mode
    never fires the fa9c162 batcher — deadline pre-expired by design).
 
 ## Outstanding — correctness / validation

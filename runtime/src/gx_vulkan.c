@@ -178,6 +178,7 @@ typedef struct {
     u32 address, format, width, height, length;
     u8* bytes;
     u32 gpu_offset, gpu_capacity;
+    u64 gpu_epoch;
     int gpu_dirty;
     u64 stamp;
 } GxVkTextureEntry;
@@ -193,6 +194,7 @@ typedef struct {
     u32 tmem_offset, length;
     u8* bytes;
     u32 gpu_offset, gpu_capacity;
+    u64 gpu_epoch;
     int gpu_dirty;
     u64 stamp;
 } GxVkTlutEntry;
@@ -215,6 +217,44 @@ typedef struct {
                     * since general draws are not guaranteed to sample
                     * texmap 0 at all, let alone at stage 0. */
 } GxVkGeneralTex;
+
+typedef enum {
+    GXVK_SUBMIT_SHUTDOWN = 0,
+    GXVK_SUBMIT_COMMAND_RING_FULL,
+    GXVK_SUBMIT_TEXTURE_UPDATE,
+    GXVK_SUBMIT_TLUT_UPDATE,
+    GXVK_SUBMIT_TEXTURE_EPOCH_FULL,
+    GXVK_SUBMIT_TLUT_EPOCH_FULL,
+    GXVK_SUBMIT_DRAW_ARENA_FULL,
+    GXVK_SUBMIT_PENDING_RAM_OVERLAP,
+    GXVK_SUBMIT_SYNC_UNSUPPORTED_TRIANGLE,
+    GXVK_SUBMIT_SYNC_CORUN_EFB_COPY,
+    GXVK_SUBMIT_SYNC_UNSUPPORTED_EFB_COPY,
+    GXVK_SUBMIT_SYNC_CPU_EFB_READ,
+    GXVK_SUBMIT_EFB_TEX_RING_FULL,
+    GXVK_SUBMIT_EFB_TEX_GPU_STATS,
+    GXVK_SUBMIT_EFB_TEX_VERIFY,
+    GXVK_SUBMIT_EFB_TEX_STATS_VERIFY,
+    GXVK_SUBMIT_XFB_RING_FULL,
+    GXVK_SUBMIT_XFB_GPU_STATS,
+    GXVK_SUBMIT_FLUSH_DRAWDONE,
+    GXVK_SUBMIT_FLUSH_PE_TOKEN,
+    GXVK_SUBMIT_FLUSH_PE_TOKEN_INT,
+    GXVK_SUBMIT_FLUSH_PIPELINE_DRAIN,
+    GXVK_SUBMIT_UNKNOWN,
+    GXVK_SUBMIT_COUNT
+} GxVkSubmitTrigger;
+
+static const char* const s_submit_trigger_names[GXVK_SUBMIT_COUNT] = {
+    "shutdown", "command-ring-full", "texture-update", "tlut-update",
+    "texture-epoch-full", "tlut-epoch-full", "draw-arena-full",
+    "pending-ram-overlap", "sync-unsupported-triangle",
+    "sync-corun-efb-copy", "sync-unsupported-efb-copy", "sync-cpu-efb-read",
+    "efb-tex-ring-full", "efb-tex-gpu-stats", "efb-tex-verify",
+    "efb-tex-stats-verify", "xfb-ring-full", "xfb-gpu-stats",
+    "flush-drawdone", "flush-pe-token", "flush-pe-token-int",
+    "flush-pipeline-drain", "unknown"
+};
 
 typedef struct {
     VkInstance instance;
@@ -287,6 +327,8 @@ typedef struct {
     GxVkTlutEntry tlut_cache[GX_VK_TLUT_CACHE_ENTRIES];
     u64 tlut_stamp;
     u32 tlut_arena_used;   /* bytes consumed so far in TLUT_SHADOW_BYTES */
+    u32 tlut_arena_limit;
+    u64 tlut_epoch;
     int resident_mode;
     int resident_recording;
     u32 resident_inflight;
@@ -303,6 +345,15 @@ typedef struct {
     int efb_copy_verify;         /* GCN_GX_EFB_COPY_VERIFY=1 */
     u64 efb_copy_verify_compares;
     u32 texture_arena_used;
+    u32 texture_arena_limit;
+    u64 texture_epoch;
+    int resident_cow;
+    u64 texture_cow_versions;
+    u64 tlut_cow_versions;
+    u64 texture_epoch_rollovers;
+    u64 tlut_epoch_rollovers;
+    u32 texture_arena_highwater;
+    u32 tlut_arena_highwater;
     u64 resident_batches;
     u64 resident_triangles;
     u64 resident_fallbacks;
@@ -310,6 +361,14 @@ typedef struct {
     u64 resident_wait_tsc;
     u64 resident_copy_total_tsc;
     u64 resident_copy_memcpy_tsc;
+    int submit_stats;
+    u64 submit_requests[GXVK_SUBMIT_COUNT];
+    u64 submit_queue_submits[GXVK_SUBMIT_COUNT];
+    u64 submit_noops[GXVK_SUBMIT_COUNT];
+    u64 submit_empty_fences[GXVK_SUBMIT_COUNT];
+    u64 submit_wait_calls[GXVK_SUBMIT_COUNT];
+    u64 submit_wait_blocked[GXVK_SUBMIT_COUNT];
+    u64 submit_wait_tsc[GXVK_SUBMIT_COUNT];
     u32 corun_tile_programs[EFB_TILE_COUNT]; /* 1<<program per tile since the
                                               * last corun compare (bit 0 =
                                               * general/unsupported) — names
@@ -329,8 +388,9 @@ static GxVkShadow s_vk;
 static int compare_plane(const char* name, const u32* software,
                          const u32* gpu);
 static u32 texture_encoded_size(u32 format, u32 width, u32 height);
-static int resident_submit_batch(void);
+static int resident_submit_batch(GxVkSubmitTrigger trigger);
 
+/* 0=failure, 1=completed during bounded spin, 2=completed after blocking. */
 static int resident_wait_fence(void) {
     /* Resident batches are normally tens of microseconds. Avoid a scheduler
      * sleep/wake round trip for that fast path, but bound host CPU use and
@@ -344,7 +404,7 @@ static int resident_wait_fence(void) {
         _mm_pause();
     }
     return vkWaitForFences(s_vk.device, 1, &s_vk.resident_fence,
-                           VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+                           VK_TRUE, UINT64_MAX) == VK_SUCCESS ? 2 : 0;
 }
 
 static u32 gpu_time_begin(u32 kind) {
@@ -796,7 +856,7 @@ int gx_vulkan_resident_busy(void) {
 void gx_vulkan_shadow_shutdown(void) {
     if (s_vk.resident_mode &&
         (s_vk.resident_recording || s_vk.resident_inflight) &&
-        !resident_submit_batch())
+        !resident_submit_batch(GXVK_SUBMIT_SHUTDOWN))
         fprintf(stderr, "gx_vulkan: final resident batch submission failed\n");
     if (s_vk.comparisons)
         fprintf(stderr,
@@ -872,6 +932,35 @@ void gx_vulkan_shadow_shutdown(void) {
                 (unsigned long long)s_vk.resident_triangles,
                 (unsigned long long)s_vk.resident_batches,
                 (unsigned long long)s_vk.resident_fallbacks);
+    if (s_vk.submit_stats) {
+        for (u32 i = 0; i < GXVK_SUBMIT_COUNT; ++i) {
+            if (!s_vk.submit_requests[i])
+                continue;
+            fprintf(stderr,
+                    "gx_vulkan: submit trigger=%s requests=%llu command-submits=%llu "
+                    "noop=%llu empty-fence=%llu waits=%llu blocked=%llu "
+                    "wait-cycles=%llu\n",
+                    s_submit_trigger_names[i],
+                    (unsigned long long)s_vk.submit_requests[i],
+                    (unsigned long long)s_vk.submit_queue_submits[i],
+                    (unsigned long long)s_vk.submit_noops[i],
+                    (unsigned long long)s_vk.submit_empty_fences[i],
+                    (unsigned long long)s_vk.submit_wait_calls[i],
+                    (unsigned long long)s_vk.submit_wait_blocked[i],
+                    (unsigned long long)s_vk.submit_wait_tsc[i]);
+        }
+    }
+    if (s_vk.resident_cow)
+        fprintf(stderr,
+                "gx_vulkan: resident COW texture-versions=%llu rollovers=%llu "
+                "highwater=%u/%u tlut-versions=%llu rollovers=%llu "
+                "highwater=%u/%u\n",
+                (unsigned long long)s_vk.texture_cow_versions,
+                (unsigned long long)s_vk.texture_epoch_rollovers,
+                s_vk.texture_arena_highwater, s_vk.texture_arena_limit,
+                (unsigned long long)s_vk.tlut_cow_versions,
+                (unsigned long long)s_vk.tlut_epoch_rollovers,
+                s_vk.tlut_arena_highwater, s_vk.tlut_arena_limit);
     if (s_corun == 1) {
         fprintf(stderr,
                 "gx_vulkan: co-run differential: %llu plane checks, "
@@ -1156,6 +1245,31 @@ int gx_vulkan_resident_init(void) {
     if (!gx_vulkan_shadow_init())
         return 0;
     s_vk.resident_mode = 1;
+    s_vk.submit_stats = getenv("GCN_GX_VK_SUBMIT_STATS") ? 1 : 0;
+    s_vk.texture_arena_limit = TEXTURE_SHADOW_BYTES;
+    s_vk.tlut_arena_limit = TLUT_SHADOW_BYTES;
+    s_vk.texture_epoch = 1u;
+    s_vk.tlut_epoch = 1u;
+    { const char* e = getenv("GCN_GX_VK_TEXTURE_COW");
+      s_vk.resident_cow = e && strcmp(e, "1") == 0; }
+    if (s_vk.resident_cow) {
+        const char* texture_limit = getenv("GCN_GX_VK_TEXTURE_COW_BYTES");
+        const char* tlut_limit = getenv("GCN_GX_VK_TLUT_COW_BYTES");
+        if (texture_limit && *texture_limit) {
+            const unsigned long value = strtoul(texture_limit, NULL, 0);
+            if (value >= 256u && value <= TEXTURE_SHADOW_BYTES)
+                s_vk.texture_arena_limit = (u32)value & ~255u;
+        }
+        if (tlut_limit && *tlut_limit) {
+            const unsigned long value = strtoul(tlut_limit, NULL, 0);
+            if (value >= 256u && value <= TLUT_SHADOW_BYTES)
+                s_vk.tlut_arena_limit = (u32)value & ~255u;
+        }
+        fprintf(stderr,
+                "gx_vulkan: immutable texture/TLUT COW epochs active "
+                "(texture=%u bytes tlut=%u bytes)\n",
+                s_vk.texture_arena_limit, s_vk.tlut_arena_limit);
+    }
     memset(s_vk.draw_validate_remaining, 0,
            sizeof s_vk.draw_validate_remaining);
     fprintf(stderr,
@@ -1637,7 +1751,7 @@ static int resident_begin_commands(void) {
     if (s_vk.resident_recording)
         return 1;
     if (s_vk.resident_inflight == XFB_RING_SIZE &&
-        !resident_submit_batch())
+        !resident_submit_batch(GXVK_SUBMIT_COMMAND_RING_FULL))
         return 0;
     s_vk.command_buffer = s_vk.command_buffers[s_vk.resident_inflight];
     if (vkResetCommandBuffer(s_vk.command_buffer, 0) != VK_SUCCESS)
@@ -1858,13 +1972,27 @@ static void gx_vk_dump_general_debug(void) {
     memset(d, 0, GENERAL_DEBUG_BYTES);
 }
 
-static int resident_submit_batch(void) {
+static int resident_submit_batch(GxVkSubmitTrigger trigger) {
+    if ((u32)trigger >= GXVK_SUBMIT_COUNT)
+        trigger = GXVK_SUBMIT_UNKNOWN;
+    const int stats = s_vk.submit_stats;
+    u64 batches_before = 0;
+    if (stats) {
+        const int had_recording = s_vk.resident_recording;
+        const int had_inflight = s_vk.resident_inflight != 0u;
+        batches_before = s_vk.resident_batches;
+        s_vk.submit_requests[trigger]++;
+        if (!had_recording && !had_inflight)
+            s_vk.submit_noops[trigger]++;
+    }
     int had_pending = s_vk.resident_pending_count != 0u;
     u64 t0 = __rdtsc();
     int signaled = s_vk.resident_recording;
     if (!resident_submit_current(signaled))
         return 0;
     if (!signaled && s_vk.resident_inflight) {
+        if (stats)
+            s_vk.submit_empty_fences[trigger]++;
         if (vkResetFences(s_vk.device, 1, &s_vk.resident_fence) != VK_SUCCESS)
             return 0;
         VkSubmitInfo empty = {0};
@@ -1873,8 +2001,20 @@ static int resident_submit_batch(void) {
             return 0;
         signaled = 1;
     }
-    if (signaled && !resident_wait_fence())
-        return 0;
+    if (stats && s_vk.resident_batches != batches_before)
+        s_vk.submit_queue_submits[trigger] +=
+            s_vk.resident_batches - batches_before;
+    if (signaled) {
+        const u64 wait_t0 = stats ? __rdtsc() : 0u;
+        const int wait_result = resident_wait_fence();
+        if (!wait_result)
+            return 0;
+        if (stats) {
+            s_vk.submit_wait_calls[trigger]++;
+            s_vk.submit_wait_blocked[trigger] += (u64)(wait_result == 2);
+            s_vk.submit_wait_tsc[trigger] += __rdtsc() - wait_t0;
+        }
+    }
     if (s_vk.general_debug_armed && signaled)
         gx_vk_dump_general_debug();
     u64 t2 = __rdtsc();
@@ -1910,24 +2050,57 @@ static int resident_submit_batch(void) {
 static int ensure_resident_texture(GxVkTextureEntry* texture) {
     if (!texture)
         return 1;
-    if (!texture->gpu_dirty && texture->gpu_capacity >= texture->length)
+    if (!texture->gpu_dirty && texture->gpu_capacity >= texture->length &&
+        texture->gpu_epoch == s_vk.texture_epoch)
         return 1;
-    /* A content update may target bytes referenced by already-recorded draws.
-     * Complete those draws before reusing the arena range. */
-    if ((s_vk.resident_recording || s_vk.resident_inflight) &&
-        !resident_submit_batch())
-        return 0;
-    if (texture->gpu_capacity < texture->length) {
-        u32 offset = (s_vk.texture_arena_used + 255u) & ~255u;
-        u32 capacity = (texture->length + 255u) & ~255u;
-        if ((u64)offset + capacity > TEXTURE_SHADOW_BYTES)
+    int live = s_vk.resident_recording || s_vk.resident_inflight;
+    if (!s_vk.resident_cow && live) {
+        /* Baseline: complete draws before overwriting this entry's fixed slot. */
+        if (!resident_submit_batch(GXVK_SUBMIT_TEXTURE_UPDATE))
             return 0;
+        live = 0;
+    }
+
+    const u32 capacity = (texture->length + 255u) & ~255u;
+    const u32 limit = s_vk.resident_cow ? s_vk.texture_arena_limit :
+                                             TEXTURE_SHADOW_BYTES;
+    const int need_version = texture->gpu_capacity < texture->length ||
+                             texture->gpu_epoch != s_vk.texture_epoch ||
+                             (s_vk.resident_cow && live);
+    if (need_version) {
+        u32 offset = (s_vk.texture_arena_used + 255u) & ~255u;
+        if (capacity > limit) {
+            static int warned = 0;
+            if (!warned++)
+                fprintf(stderr,
+                        "gx_vulkan: texture version %u bytes exceeds COW arena %u; "
+                        "falling back\n", capacity, limit);
+            return 0;
+        }
+        if ((u64)offset + capacity > limit) {
+            if (!s_vk.resident_cow)
+                return 0;
+            if (live && !resident_submit_batch(GXVK_SUBMIT_TEXTURE_EPOCH_FULL))
+                return 0;
+            s_vk.texture_epoch++;
+            if (!s_vk.texture_epoch)
+                s_vk.texture_epoch = 1u;
+            s_vk.texture_arena_used = 0;
+            s_vk.texture_epoch_rollovers++;
+            offset = 0;
+        }
         texture->gpu_offset = offset;
         texture->gpu_capacity = capacity;
+        texture->gpu_epoch = s_vk.texture_epoch;
         s_vk.texture_arena_used = offset + capacity;
+        if (s_vk.texture_arena_used > s_vk.texture_arena_highwater)
+            s_vk.texture_arena_highwater = s_vk.texture_arena_used;
+        if (s_vk.resident_cow)
+            s_vk.texture_cow_versions++;
     }
     memcpy(s_vk.staging_map + TEXTURE_SHADOW_OFFSET + texture->gpu_offset,
            texture->bytes, texture->length);
+    texture->gpu_epoch = s_vk.texture_epoch;
     texture->gpu_dirty = 0;
     return 1;
 }
@@ -1937,22 +2110,50 @@ static int ensure_resident_texture(GxVkTextureEntry* texture) {
 static int ensure_resident_tlut(GxVkTlutEntry* entry) {
     if (!entry)
         return 1;
-    if (!entry->gpu_dirty && entry->gpu_capacity >= entry->length)
+    if (!entry->gpu_dirty && entry->gpu_capacity >= entry->length &&
+        entry->gpu_epoch == s_vk.tlut_epoch)
         return 1;
-    if ((s_vk.resident_recording || s_vk.resident_inflight) &&
-        !resident_submit_batch())
-        return 0;
-    if (entry->gpu_capacity < entry->length) {
-        u32 offset = (s_vk.tlut_arena_used + 255u) & ~255u;
-        u32 capacity = (entry->length + 255u) & ~255u;
-        if ((u64)offset + capacity > TLUT_SHADOW_BYTES)
+    int live = s_vk.resident_recording || s_vk.resident_inflight;
+    if (!s_vk.resident_cow && live) {
+        if (!resident_submit_batch(GXVK_SUBMIT_TLUT_UPDATE))
             return 0;
+        live = 0;
+    }
+
+    const u32 capacity = (entry->length + 255u) & ~255u;
+    const u32 limit = s_vk.resident_cow ? s_vk.tlut_arena_limit :
+                                             TLUT_SHADOW_BYTES;
+    const int need_version = entry->gpu_capacity < entry->length ||
+                             entry->gpu_epoch != s_vk.tlut_epoch ||
+                             (s_vk.resident_cow && live);
+    if (need_version) {
+        u32 offset = (s_vk.tlut_arena_used + 255u) & ~255u;
+        if (capacity > limit)
+            return 0;
+        if ((u64)offset + capacity > limit) {
+            if (!s_vk.resident_cow)
+                return 0;
+            if (live && !resident_submit_batch(GXVK_SUBMIT_TLUT_EPOCH_FULL))
+                return 0;
+            s_vk.tlut_epoch++;
+            if (!s_vk.tlut_epoch)
+                s_vk.tlut_epoch = 1u;
+            s_vk.tlut_arena_used = 0;
+            s_vk.tlut_epoch_rollovers++;
+            offset = 0;
+        }
         entry->gpu_offset = offset;
         entry->gpu_capacity = capacity;
+        entry->gpu_epoch = s_vk.tlut_epoch;
         s_vk.tlut_arena_used = offset + capacity;
+        if (s_vk.tlut_arena_used > s_vk.tlut_arena_highwater)
+            s_vk.tlut_arena_highwater = s_vk.tlut_arena_used;
+        if (s_vk.resident_cow)
+            s_vk.tlut_cow_versions++;
     }
     memcpy(s_vk.staging_map + TLUT_SHADOW_OFFSET + entry->gpu_offset,
            entry->bytes, entry->length);
+    entry->gpu_epoch = s_vk.tlut_epoch;
     entry->gpu_dirty = 0;
     return 1;
 }
@@ -1969,11 +2170,28 @@ static int resident_record_draw(const GxRasterTriangleJob* job) {
         return 0;
     GxVkTextureEntry* texture = NULL;
     GxVkGeneralTex gen = {0};
-    if (!resolve_fused_texture(job, &texture, &gen) ||
-        !ensure_resident_texture(gen.tex[0]) ||
-        !ensure_resident_texture(gen.tex[1]) ||
-        !ensure_resident_tlut(gen.tlut[0]) ||
-        !ensure_resident_tlut(gen.tlut[1]))
+    if (!resolve_fused_texture(job, &texture, &gen))
+        return 0;
+
+    /* A later binding can roll its arena epoch and invalidate an earlier
+     * binding prepared for this same not-yet-recorded packet. Retry the small
+     * binding set until every offset belongs to one current immutable epoch.
+     * If the simultaneously required versions cannot fit, fall back rather
+     * than alternating rollovers forever. */
+    int bindings_ready = 0;
+    for (u32 attempt = 0; attempt < 8u && !bindings_ready; ++attempt) {
+        if (!ensure_resident_texture(gen.tex[0]) ||
+            !ensure_resident_texture(gen.tex[1]) ||
+            !ensure_resident_tlut(gen.tlut[0]) ||
+            !ensure_resident_tlut(gen.tlut[1]))
+            return 0;
+        bindings_ready =
+            (!gen.tex[0] || gen.tex[0]->gpu_epoch == s_vk.texture_epoch) &&
+            (!gen.tex[1] || gen.tex[1]->gpu_epoch == s_vk.texture_epoch) &&
+            (!gen.tlut[0] || gen.tlut[0]->gpu_epoch == s_vk.tlut_epoch) &&
+            (!gen.tlut[1] || gen.tlut[1]->gpu_epoch == s_vk.tlut_epoch);
+    }
+    if (!bindings_ready)
         return 0;
 
     u32 tx0 = (u32)job->scan.minx / 16u;
@@ -1997,7 +2215,8 @@ static int resident_record_draw(const GxRasterTriangleJob* job) {
                 break;
             }
     if (full) {
-        if (!s_vk.resident_job_count || !resident_submit_batch())
+        if (!s_vk.resident_job_count ||
+            !resident_submit_batch(GXVK_SUBMIT_DRAW_ARENA_FULL))
             return 0;
     }
     if (!resident_begin_commands())
@@ -2251,7 +2470,7 @@ static int validate_texture_binding(const u32* bp, const u8* ram, u32 ram_size,
      * guest RAM, and a pending copy's bytes only land there at batch
      * completion (resident_materialize_pending). */
     if (resident_pending_ram_overlap(address, length) &&
-        !resident_submit_batch()) {
+        !resident_submit_batch(GXVK_SUBMIT_PENDING_RAM_OVERLAP)) {
         fprintf(stderr,
                 "gx_vulkan: pending-copy flush before texture snapshot "
                 "failed (unit=%u addr=%08X len=%u)\n", unit, address, length);
@@ -2534,7 +2753,7 @@ static void corun_compare_planes(const u32* sw_color, const u32* sw_depth) {
     memset(s_vk.corun_tile_programs, 0, sizeof s_vk.corun_tile_programs);
 }
 
-static int resident_sync_to_software(void) {
+static int resident_sync_to_software(GxVkSubmitTrigger trigger) {
     if (!s_vk.resident_efb_valid)
         return 1;
     if (!resident_begin_commands() || !resident_emit_draw_batch())
@@ -2580,7 +2799,7 @@ static int resident_sync_to_software(void) {
     vkCmdPipelineBarrier(s_vk.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0,
                          0, NULL, 1, &to_host, 0, NULL);
-    if (!resident_submit_batch() || !invalidate_readback())
+    if (!resident_submit_batch(trigger) || !invalidate_readback())
         return 0;
     u32 *color = NULL, *depth = NULL;
     gx_raster_efb_data_mutable(&color, &depth, NULL, NULL);
@@ -2600,7 +2819,7 @@ static int resident_sync_to_software(void) {
 }
 
 int gx_vulkan_resident_sync_to_software(void) {
-    return resident_sync_to_software();
+    return resident_sync_to_software(GXVK_SUBMIT_SYNC_CPU_EFB_READ);
 }
 
 int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
@@ -2663,7 +2882,7 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
          * corun_compare_planes() diffs against at the next fallback sync. */
         return s_corun == 1 ? 0 : 1;
 
-    if (!resident_sync_to_software())
+    if (!resident_sync_to_software(GXVK_SUBMIT_SYNC_UNSUPPORTED_TRIANGLE))
         return -1;
     s_vk.resident_efb_valid = 0;
     s_vk.resident_fallbacks++;
@@ -3025,7 +3244,7 @@ static int gx_vulkan_resident_efb_tex_copy(const u32* bp, u32 copy_word,
         return 0;
 
     if (s_vk.resident_pending_tex_count == EFB_TEX_RING_SIZE &&
-        !resident_submit_batch())
+        !resident_submit_batch(GXVK_SUBMIT_EFB_TEX_RING_FULL))
         return -1;
     if (!resident_begin_commands())
         return -1;
@@ -3077,8 +3296,15 @@ static int gx_vulkan_resident_efb_tex_copy(const u32* bp, u32 copy_word,
     pending->slot_offset = slot_offset;
     s_vk.resident_pending_tex_count++;
 
-    if ((s_vk.gpu_stats || s_vk.efb_copy_verify) && !resident_submit_batch())
-        return -1;
+    if (s_vk.gpu_stats || s_vk.efb_copy_verify) {
+        const GxVkSubmitTrigger trigger =
+            s_vk.gpu_stats ?
+                (s_vk.efb_copy_verify ? GXVK_SUBMIT_EFB_TEX_STATS_VERIFY :
+                                      GXVK_SUBMIT_EFB_TEX_GPU_STATS) :
+                GXVK_SUBMIT_EFB_TEX_VERIFY;
+        if (!resident_submit_batch(trigger))
+            return -1;
+    }
 
     if (s_vk.efb_copy_verify && !resident_efb_copy_verify_one(&d, ram))
         return -1;
@@ -3115,7 +3341,7 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
      * golden sw-vs-vk runs cover it. */
     if (s_corun == 1) {
         if (s_vk.resident_efb_valid) {
-            if (!resident_sync_to_software())
+            if (!resident_sync_to_software(GXVK_SUBMIT_SYNC_CORUN_EFB_COPY))
                 return -1;
             s_vk.resident_efb_valid = 0;
         }
@@ -3142,7 +3368,7 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     if (((copy_word >> 7) & 3u) != 0u ||
         ((copy_word >> 14) & 1u) == 0u ||
         !decode_copy(bp, &copy_push) || !copy_push.copy_enable) {
-        if (!resident_sync_to_software())
+        if (!resident_sync_to_software(GXVK_SUBMIT_SYNC_UNSUPPORTED_EFB_COPY))
             return -1;
         s_vk.resident_efb_valid = 0;
         s_vk.resident_fallbacks++;
@@ -3152,7 +3378,7 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
         return 0;
     }
     if (s_vk.resident_pending_count == XFB_RING_SIZE &&
-        !resident_submit_batch())
+        !resident_submit_batch(GXVK_SUBMIT_XFB_RING_FULL))
         return -1;
     if (!resident_begin_commands())
         return -1;
@@ -3278,7 +3504,7 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     pending->slot_offset = slot_offset;
     s_vk.resident_pending_count++;
     if (s_vk.gpu_stats) {
-        if (!resident_submit_batch())
+        if (!resident_submit_batch(GXVK_SUBMIT_XFB_GPU_STATS))
             return -1;
     }
     /* Keep the copy and all following draws in this command buffer until the
@@ -3293,10 +3519,18 @@ int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     return 1;
 }
 
-int gx_vulkan_resident_flush(void) {
+int gx_vulkan_resident_flush(GxVkFlushReason reason) {
     if (!s_vk.resident_mode)
         return 1;
-    return resident_submit_batch();
+    GxVkSubmitTrigger trigger = GXVK_SUBMIT_UNKNOWN;
+    switch (reason) {
+    case GX_VK_FLUSH_DRAWDONE: trigger = GXVK_SUBMIT_FLUSH_DRAWDONE; break;
+    case GX_VK_FLUSH_PE_TOKEN: trigger = GXVK_SUBMIT_FLUSH_PE_TOKEN; break;
+    case GX_VK_FLUSH_PE_TOKEN_INT: trigger = GXVK_SUBMIT_FLUSH_PE_TOKEN_INT; break;
+    case GX_VK_FLUSH_PIPELINE_DRAIN: trigger = GXVK_SUBMIT_FLUSH_PIPELINE_DRAIN; break;
+    default: break;
+    }
+    return resident_submit_batch(trigger);
 }
 
 int gx_vulkan_shadow_prepare_efb(const u32* bp, const u32* color,
@@ -3568,6 +3802,7 @@ int gx_vulkan_resident_triangle(const GxRasterTriangleJob* job,
 int gx_vulkan_resident_efb_copy(const u32* bp, u8* ram, u32 ram_size) {
     (void)bp; (void)ram; (void)ram_size; return -1;
 }
+int gx_vulkan_resident_flush(GxVkFlushReason reason) { (void)reason; return 1; }
 int gx_vulkan_resident_sync_to_software(void) { return 1; }
 int gx_vulkan_resident_busy(void) { return 0; }
 

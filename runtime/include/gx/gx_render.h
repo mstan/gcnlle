@@ -9,13 +9,21 @@
 
 #include "gx/gx_raster.h"
 
+typedef enum {
+    GX_RENDER_FLUSH_DRAWDONE = 0,
+    GX_RENDER_FLUSH_PE_TOKEN,
+    GX_RENDER_FLUSH_PE_TOKEN_INT,
+    GX_RENDER_FLUSH_PIPELINE_DRAIN,
+    GX_RENDER_FLUSH_COUNT
+} GxRenderFlushReason;
+
 void gx_render_init(CPUState* cpu, const u32* bp, const u32* xf);
 void gx_render_shutdown(void);
 
 void gx_render_draw(const GxCpState* cp, u32 prim, u32 vat,
                     const u8* verts, u32 nverts, u32 vstride);
 void gx_render_efb_copy(const GxCpState* cp);
-void gx_render_flush(void);
+void gx_render_flush(GxRenderFlushReason reason);
 
 /* Make the software EFB planes current for a synchronous CPU peek. Software
  * and Vulkan-shadow modes are already current; resident Vulkan downloads its
