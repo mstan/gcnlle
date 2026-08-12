@@ -40,4 +40,10 @@ int gx_vulkan_resident_sync_to_software(void);
  * isn't active at all. */
 int gx_vulkan_resident_busy(void);
 
+/* beads-u2x.1 TLUT-COW corruption hunt: dumps the last `count` entries of the
+ * always-on (opt-in GCN_GX_VK_TLUT_TRACE=1) TLUT/texture residency ring to
+ * stderr. No-op (returns 0) if the trace wasn't enabled or nothing was
+ * recorded yet. count==0 dumps everything currently held. */
+int gx_vulkan_tlut_ring_dump(u32 count);
+
 #endif /* GCN_GX_GX_VULKAN_H */

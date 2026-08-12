@@ -15,6 +15,7 @@
 #include "dsp/dsp.h"       /* gcn_dsp_flush: catch a batched core up before dsp_state peeks it */
 #include "gx/gx.h"         /* gcn_gx_pipeline_drain — screenshot join (G3) */
 #include "gx/gx_raster.h"  /* retained TEV/texture snapshots */
+#include "gx/gx_vulkan.h"  /* beads-u2x.1 TLUT/texture residency ring */
 #include "vi/vi.h"         /* screenshot: XFB scanout geometry */
 #include "vi/yuy2.h"       /* screenshot: YUY2->RGB (shared with host_window.c) */
 #include "si/si.h"         /* set_input: injected pad-report surface */
@@ -764,6 +765,19 @@ static void handle_line(Client* c, const char* line) {
         if (n < 0)
             n = snprintf(s_resp, GCN_DBG_RESP_CAP,
                 "{\"ok\":false,\"error\":\"GX snapshot unavailable\"}\n");
+    }
+    else if (!strcmp(cmd, "tlut_ring_dump")) {
+        /* beads-u2x.1 TLUT-COW corruption hunt: prints the last `count`
+         * entries of the always-on (opt-in GCN_GX_VK_TLUT_TRACE=1)
+         * TLUT/texture residency ring to stderr (this process's err.log),
+         * not into the JSON response -- the ring can be thousands of
+         * entries, far past a sane response size, and the launch protocol
+         * already tails err.log. */
+        u32 count = 0; json_uint(line, "count", &count);
+        int dumped = gx_vulkan_tlut_ring_dump(count);
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"dumped\":%s,\"note\":\"see stderr/err.log\"}\n",
+            dumped ? "true" : "false");
     }
     else if (!strcmp(cmd, "screenshot") || !strcmp(cmd, "screenshot_file")) {
         /* Decode the XFB the VI is scanning out into a PPM on disk. Geometry
