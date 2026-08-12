@@ -379,7 +379,7 @@ Measured outcomes (fixed 110M-block headed route):
   29.44s vs 25.69s): ~124K extra tiny GPU triangles cost more dispatch
   than their saved synchronizations recover. Shipped opt-in (level 1),
   default stays at the phase-1a gate (level 2). This was the historical
-  motivation for resident tiny-draw batching; `a2a90cc` changed that cost
+  motivation for resident tiny-draw batching; `c77e8e2` changed that cost
   structure, so post-COW attribution now decides the next lever.
 
 ## Exercised example: immutable texture/TLUT staging epochs (2026-08-09)
@@ -427,7 +427,7 @@ Evidence (72,467,144-block suffix, 683 new `GXSetDrawDone` events, title pin
 
 ## Wind Waker next-step gate after texture COW
 
-The previous GX/fallback ranking predates `a2a90cc` and is historical only.
+The previous GX/fallback ranking predates `c77e8e2` and is historical only.
 Texture/TLUT COW changed submission behavior enough that no further
 optimization has current ranking evidence.
 

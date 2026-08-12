@@ -1,10 +1,10 @@
 # Known Issues and Validation Status
 
-Status as of 2026-08-10. Local framework HEAD `5e7c536` (docs) sits on the
-COW experiment commit `a2a90cc`, on `experiment/moderngekko-gpl`.
+Status as of 2026-08-10. Local framework HEAD `0ea8219` (docs) sits on the
+COW experiment commit `c77e8e2`, on `experiment/moderngekko-gpl`.
 WindWakerRecomp remains at title commit `e32ecef` and still pins framework
-`8a2e0d2`, so the COW work is not integrated or pinned by the title. New this
-session: framework commit `427735d`, opt-in `GCN_PRESENT_STATS`
+`c7a7fe2`, so the COW work is not integrated or pinned by the title. New this
+session: framework commit `7955c2e`, opt-in `GCN_PRESENT_STATS`
 presenter/VI cadence counters (posts/coalesced/distinct/latency, plus a TCP
 `present_state` query) — validated 14/14 on both the Vulkan and non-Vulkan
 suites, golden gates byte-identical, measured overhead ≤0.3% both disabled
@@ -47,7 +47,7 @@ historical context: 94.7 s at the morning baseline, 25.9 s after the
 
 ## Landed this session
 
-- **`GCN_PRESENT_STATS=1` presenter/VI cadence counters** (`427735d`) —
+- **`GCN_PRESENT_STATS=1` presenter/VI cadence counters** (`7955c2e`) —
   opt-in posts/coalesced/distinct-present/latency
   counters in `host_window.c`, a field-tick counter in `vi.c`, a
   teardown print for both, and a TCP `present_state` debug-server query.

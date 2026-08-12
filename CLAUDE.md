@@ -1,8 +1,8 @@
 # gcnrecomp — working notes for Claude
 
 Current handoff: [`docs/HANDOFF_2026-08-09.md`](docs/HANDOFF_2026-08-09.md).
-The COW implementation is local commit `a2a90cc` on branch
-`experiment/moderngekko-gpl`; WindWakerRecomp still pins `8a2e0d2`. Do not
+The COW implementation is local commit `c77e8e2` on branch
+`experiment/moderngekko-gpl`; WindWakerRecomp still pins `c7a7fe2`. Do not
 describe the COW result as title-pinned or as proof of 60-Hz presentation.
 
 Read **PRINCIPLES.md** first; it governs everything. Highlights that bite here:

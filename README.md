@@ -28,7 +28,7 @@ and disc-detection screen.
 - The real IPL/DI/apploader path reaches the Wind Waker title sailing sequence
   through content-validated native code plus loud interpreter fallback. This
   is an engineering acceptance route, not a whole-game or release claim.
-- Local experiment commit `a2a90cc` adds default-off immutable texture/TLUT
+- Local experiment commit `c77e8e2` adds default-off immutable texture/TLUT
   staging epochs. On the fixed 683-`GXSetDrawDone` suffix it raises measured
   unthrottled capacity from 74.12 to 88.13 completions/s while retaining the
   golden XFB and forceable software/LLE floors. Actual 60-Hz presentation,
