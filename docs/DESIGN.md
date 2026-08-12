@@ -151,11 +151,8 @@ islands nothing consumes.
   matches our C-based ecosystem, it has full paired-singles, and — crucially —
   it is **OS-agnostic / CPU-only**, so there is no baked-in HLE to fight when
   we point it at firmware instead of a game.
-- **Accept GPL-3.0.** DolRecomp, reshine, and GXRuntime are all GPL-3.0; the
-  only permissive engine (gcrecomp) has no evidence of booting anything. We
-  take the proven-but-copyleft path; the whole project is therefore GPL-3.0.
-  (The permissive alternative — a clean-room PPC front-end — was considered and
-  rejected as more upfront work for no functional gain here.)
+- **GPL-3.0.** DolRecomp, reshine, and GXRuntime are GPL-3.0; the whole
+  project is GPL-3.0 (see `LICENSE` and `THIRD_PARTY_NOTICES.md`).
 - **Write our own LLE runtime** pointed at the **IPL** (not a game DOL). This
   is the net-new work and the whole reason the project exists.
 - **Dolphin is the oracle** (it boots the real IPL as "GameCube Main Menu").

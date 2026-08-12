@@ -18,9 +18,14 @@ The content-validated title-module activation in `runtime/src/aot_module.c`
 and `runtime/tools/gen_title_module_tables.py` adapts the chunk identity and
 invalidate/reverify design from
 [ExpansionPak/ModernGekko](https://github.com/ExpansionPak/ModernGekko) and its
-RecompCore-ModernGekko dependency, licensed GPL-3.0-or-later. Exact reference
-revisions and the retained LLE boundary are documented in
-`docs/GPL_EXPERIMENT.md`.
+RecompCore-ModernGekko dependency, licensed GPL-3.0-or-later. Reference
+revisions: ModernGekko `dda273bddf486063df0b9c3c8dc2ca479f8d0180`,
+RecompCore-ModernGekko `e13ab348f13cd67879f6db6e9d7185410f8f62c6`, DolRecomp
+`93b881c8f73df1d64a88491f2aa50c7c9ed2384d`; adapted from RecompCore's
+`StaticRecompCore_SMC.cpp` and `module-template/gen_module_tables.py`.
+ModernGekko's Dolphin chassis is not linked; this runtime retains exclusive
+ownership of reset, BS1/BS2/IPL execution, MMIO, DI, EXI, SI, DSP, GX, timing,
+apploader execution, and guest memory writes.
 
 ## Dolphin DSP LLE and format references
 
