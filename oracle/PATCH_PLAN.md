@@ -256,6 +256,320 @@ Because GX FIFO bytes bypass MMIO (§b):
 
 ---
 
+### f1. `-v Software` EFB->XFB copy hook — VERIFIED on the pinned checkout (2026-08-11)
+
+Per COSIM_DESIGN.md §7 task 2. Read the actual source, not inferred.
+
+**Trigger site** — `Source/Core/VideoCommon/BPStructs.cpp`, function
+`BPWritten(...)`, `case BPMEM_TRIGGER_EFB_COPY:` (line 240). The
+`PE_copy.copy_to_xfb == 1` branch (line ~315-343) computes `destAddr`
+(`bpmem.copyTexDest << 5`), `destStride` (`bpmem.copyDestStride << 5`), and
+calls (line 339):
+```cpp
+g_texture_cache->CopyRenderTargetToTexture(
+    destAddr, EFBCopyFormat::XFB, copy_width, height, destStride,
+    is_depth_copy, srcRect, false, false, yScale, ...);
+```
+
+**Copy-execute site (the actual hook, common to every backend — NOT
+backend-specific code as originally assumed)** —
+`Source/Core/VideoCommon/TextureCacheBase.cpp`,
+`void TextureCacheBase::CopyRenderTargetToTexture(...)` (line 2129).
+`TextureCacheBase` is the shared, non-virtual implementation for this
+function; `SW::TextureCache` (`Source/Core/VideoBackends/Software/TextureCache.h`)
+only overrides the two backend-specific sub-steps
+(`CopyEFB`/`CopyEFBToCacheEntry`), not this function.
+
+- `const bool is_xfb_copy = ...` at line 2193.
+- `bool copy_to_vram = g_backend_info.bSupportsCopyToVram && ...` at line 2194.
+  For `-v Software`, `g_backend_info.bSupportsCopyToVram = false` is set
+  unconditionally in `Source/Core/VideoBackends/Software/SWmain.cpp:71`, so
+  `copy_to_vram` is **always false** for this backend → `copy_to_ram` is
+  always true (line 2195-2197: `!copy_to_vram` alone forces it) and the
+  VRAM-entry block (`if (copy_to_vram) {...}`, line 2304) never executes, so
+  `entry` stays null and the deferred-flush branch (`else { entry->pending_efb_copy
+  = ... }`, line ~2410-2417) is unreachable — Software always takes the
+  **immediate flush** branch.
+- Immediate flush, line 2404-2408:
+  ```cpp
+  if (!copy_to_vram || !g_ActiveConfig.bDeferEFBCopies)
+  {
+    // Immediately flush it.
+    WriteEFBCopyToRAM(dst, bytes_per_row / sizeof(u32), num_blocks_y, dstStride,
+                      std::move(staging_texture));
+  }
+  ```
+  `WriteEFBCopyToRAM` (line 2535-2541) calls
+  `staging_texture->ReadTexels(copy_rect, dst_ptr, stride)` — **synchronous**,
+  blocks until the encoded bytes have actually landed at `dst_ptr`. `dst`
+  (line 2244: `memory.GetPointerForRange(dstAddr, covered_range)`) is a raw
+  pointer directly into **guest RAM at the real XFB destination address**,
+  not an EFB-source staging buffer.
+- **Format confirmed XFB-destination YUY2, not EFB-source**: `TextureEncoder::Encode`
+  (`Source/Core/VideoBackends/Software/TextureCache.h:19`, called from `CopyEFB`
+  override) encodes EFB pixels into the `EFBCopyFormat::XFB` (YUY2) layout
+  *before* `WriteEFBCopyToRAM` flushes it to `dst` — so by the time the hook
+  fires, `dst` already holds final YUY2 bytes, exactly what VI scans out.
+- **Height is exact, no padding**: `TexDecoder_GetEFBCopyBaseFormat(EFBCopyFormat::XFB)
+  == TextureFormat::XFB` (`TextureDecoder_Common.cpp:244-245`), whose block
+  height is `1` (`TextureDecoder_Common.cpp:125-126` / `:193-194`), so
+  `num_blocks_y == tex_h` exactly (`actualHeight = AlignUp(tex_h, 1) == tex_h`)
+  — `num_blocks_y*dstStride` is both the exact live-data span and within
+  `covered_range`, so reading exactly `num_blocks_y*dstStride` bytes from
+  `dst` is safe and lossless.
+
+**Conclusion:** hook immediately after the `WriteEFBCopyToRAM(...)` call at
+`TextureCacheBase.cpp:2406-2408`, guarded by `if (is_xfb_copy)`, using
+`dst`/`dstAddr`/`tex_w`/`num_blocks_y`/`dstStride` already in scope. This one
+site is correct for **every** backend (it is common code, not
+`VideoBackends/Software/*`), but for `-v Software` specifically it is
+*guaranteed* synchronous/immediate (never the deferred path other backends
+can take), which is exactly the property the byte-exact comparator needs.
+Implemented as `GcnTrace::EmitXfbCopy(...)`, see task 3 below.
+
+### f2. Two environment footguns hit while validating task 3 (2026-08-11) — read before any future headless invocation
+
+**1. `-v Software` is silently WRONG and falls back to the default backend
+(D3D11 on this Windows box) with no error.** The Software backend's CLI/config
+match key is `SW::VideoSoftware::CONFIG_NAME = "Software Renderer"`
+(`Source/Core/VideoBackends/Software/VideoBackend.h:22`), **not** `"Software"`.
+`VideoBackendBase::ActivateBackend()` (`VideoCommon/VideoBackendBase.cpp:239-252`)
+does a `std::ranges::find` by `GetConfigName()`; on no match it just `return`s
+and silently keeps whatever `g_video_backend` already defaulted to —
+`backends.front()` from `GetAvailableBackends()` (`:204-236`), which on
+`_WIN32` is `DX11::VideoBackend` (pushed first, `:208`). **This means every
+prior "-v Software" invocation in this repo's own scripts and in the
+"dolphin-oracle-recipe" memory note was actually running D3D11**, not the
+software rasterizer — confirmed by instrumenting `ActivateBackend` directly:
+requesting `"Software"` logs a clean list of 6 registered backends (`D3D`,
+`D3D12`, `OGL`, `Vulkan`, `Software Renderer`, `Null`) and "NO MATCH, keeping
+default (D3D)". It still renders a correct-looking frame (D3D11 works fine),
+which is why this went unnoticed — the bug is invisible unless you check
+`g_backend_info.bSupportsCopyToVram` or similar backend-identity state.
+**Always pass the full string `Software Renderer` (quoted) to `-v`/
+`--video_backend` on this checkout**, or use `-C
+Dolphin.Core.GFXBackend="Software Renderer"`.
+
+**2. `-v "Software Renderer"` (with the embedded space) requires the space to
+survive into the actual `argv[]` the process receives, and several common
+Windows launch paths silently swallow it without any error:**
+- **PowerShell `Start-Process -ArgumentList @(...)`** joins the array with
+  plain spaces — it does **not** re-quote elements containing spaces (unlike
+  `System.Diagnostics.ProcessStartInfo.ArgumentList` used directly from .NET
+  code, which does). Verified by instrumenting `wmain()`
+  (`Source/Core/DolphinNoGUI/MainNoGUI.cpp:405-415`) to print
+  `GetCommandLineW()` and the resulting `argv[]`: an array element
+  `'Software Renderer'` arrives on the wire as bare `-v Software Renderer`,
+  which `CommandLineToArgvW` (correctly) splits into two argv entries
+  `"Software"` and `"Renderer"` — the option parser only consumes the first.
+  **Fix:** embed literal quotes in the array element itself:
+  `@('-v','"Software Renderer"', ...)`.
+- **A `.bat` file containing `-v "Software Renderer"` literally does carry the
+  quotes through correctly** (cmd.exe does not strip them from an external
+  command's argument text) — this form works as-is.
+- Only once the space survives into `argv[]` does `ActivateBackend` find the
+  `"Software Renderer"` entry (confirmed via the same instrumentation).
+
+**3. Even with the name fixed, the true Software Renderer backend CANNOT
+initialize under `--platform=headless` on Windows in this checkout, and fails
+*silently* (clean exit, no console output, no log) unless `Dolphin.Interface.
+UsePanicHandlers` is left in its default state.** `VideoSoftware::Initialize`
+(`VideoBackends/Software/SWmain.cpp:92-96`) calls `SWOGLWindow::Create(wsi)`
+(`VideoBackends/Software/SWOGLWindow.cpp:18-28`), which calls
+`GLContext::Create(wsi)` (`Common/GL/GLContext.cpp:78-118`). That function's
+platform dispatch is:
+  ```cpp
+  #if defined(_WIN32)
+    if (wsi.type == WindowSystemType::Windows)
+      context = std::make_unique<GLContextWGL>();
+  #endif
+  ...
+  #if HAVE_EGL
+    if (wsi.type == WindowSystemType::Headless || wsi.type == WindowSystemType::FBDev)
+      context = std::make_unique<GLContextEGL>();
+  #endif
+    if (!context) return nullptr;
+  ```
+  There is **no Windows-headless case**: `WindowSystemType::Windows` needs a
+  real `HWND` (not present under `--platform=headless`), and the
+  `WindowSystemType::Headless` branch is gated behind `HAVE_EGL`, which this
+  build does not define for Windows (ANGLE/EGL not wired up in this checkout's
+  Windows target). So `GLContext::Create` returns `nullptr` unconditionally
+  for headless on Windows, `SWOGLWindow::Create` hits its
+  `PanicAlertFmt("Failed to create OpenGL window")` path and returns
+  `nullptr`, and `VideoSoftware::Initialize` returns `false` — Dolphin then
+  aborts the boot before any GX/BP traffic exists. `PanicAlertFmt` output
+  (like all of Dolphin's own logger) goes to `<userdir>/Logs/`, which is only
+  created if file logging is explicitly enabled — with the default config
+  there is genuinely **zero output anywhere**, just a clean `exit(0)` in well
+  under a second. Do not mistake this for "reached the menu instantly" or
+  "trace tap broken" — it is a headless/Windows OpenGL-context limitation,
+  upstream of anything this patch touches.
+- **Workaround used to validate task 3:** `-v Null`. `Null::VideoBackend` sets
+  `g_backend_info.bSupportsCopyToVram = false` the same as the Software
+  backend (confirmed by instrumenting the `copy_to_vram`/`copy_to_ram`
+  computation directly: identical values, identical branch taken —
+  `copy_to_vram=0 copy_to_ram=1`, immediate-flush branch, `is_xfb_copy=1`) and
+  needs no real GPU/window surface, so it exercises the *exact* hook site
+  and code path task 2/3 target, just with the Null backend's (uninteresting,
+  possibly-blank) pixel content instead of real software-rasterized pixels.
+  This is sufficient to validate the dump *mechanism* (task 3's literal
+  acceptance: correct prefix, correct byte count, sequential ordinals) but
+  **not** sufficient for any real pixel-content comparison — getting the real
+  Software Renderer backend running (on Linux where `HAVE_EGL` is normally
+  available, or by wiring up EGL/ANGLE for the Windows target) is a
+  precondition for COSIM_DESIGN.md §6's actual validation runs and should be
+  tracked as its own follow-up rather than assumed solved by this patch.
+
+### f3. beads-u2x.3 fixed (2026-08-11): loud backend-selection failure + real headless Software Renderer on Windows
+
+Both bugs in f2 above are now fixed. **Bead beads-u2x.3, status done.**
+
+**Fix 1 — silent backend fallback (f2 point 1).**
+`VideoBackendBase::ActivateBackend()` (`Source/Core/VideoCommon/VideoBackendBase.cpp:241`)
+now:
+- Resolves the convenience alias `"Software"` → `"Software Renderer"` before
+  the `std::ranges::find` (so both spellings work; no more space-in-argv
+  footgun for the common case).
+- On no match, prints `FATAL: unknown video backend '<name>' ...` plus the
+  full list of registered backend names to stderr and calls `std::exit(1)`
+  instead of silently `return`ing and leaving `g_video_backend` at
+  `backends.front()` (DX11 on Windows). Verified: `-v Bogus` now prints the
+  fatal line and exits 1 (previously: silent D3D11).
+- On a successful activation, unconditionally prints
+  `[gcnrecomp] video backend ACTIVE: '<resolved>' (requested '<name>')` to
+  stderr — this is now the loud, unambiguous way to confirm which backend is
+  really live, since the old code path made that state invisible short of
+  instrumenting internals.
+
+**Fix 2 — headless Software Renderer on Windows (f2 point 3).**
+Investigated whether GLContext is used for anything besides presentation in
+this backend: **confirmed no** — `Rasterizer.cpp` and `EfbInterface.cpp`
+(grepped for `gl[A-Z]|GL_|OpenGL`) make **zero** GL calls; rasterization is
+pure CPU. The only two GL uses are (1) the `GLExtensions::Init`/GL-3.1 gate in
+`SWOGLWindow::Initialize` and (2) the presentation quad in
+`SWOGLWindow::ShowImage`, and `SWGfx::ShowImage`
+(`Source/Core/VideoBackends/Software/SWGfx.cpp:110-115`) *already* skips
+calling into (2) whenever `IsHeadless()` is true — the only thing missing was
+a way to reach that headless state on Windows at all, since
+`GLContext::Create` (`Common/GL/GLContext.cpp:78-108`) has no
+`WindowSystemType::Windows`-without-HWND branch and the
+`WindowSystemType::Headless` branch is `#if HAVE_EGL`, undefined on this
+Windows build (confirmed in f2 point 3 already).
+
+Chose the **no-present mode** option (not the hidden-HWND fallback) since it
+was not structurally hard once traced: it only required propagating a
+"no GLContext acquired" state through three call sites, all already
+identified:
+- `SWOGLWindow::Initialize` (`SWOGLWindow.cpp:35`): if
+  `wsi.type == WindowSystemType::Headless`, return `true` immediately without
+  calling `GLContext::Create` or doing any of the shader/texture GL setup.
+  `m_gl_context` stays null.
+- `SWOGLWindow::IsHeadless()` (`SWOGLWindow.cpp:30`): now
+  `!m_gl_context || m_gl_context->IsHeadless()` instead of unconditionally
+  dereferencing `m_gl_context->IsHeadless()`.
+- `SWOGLWindow::ShowImage` (`SWOGLWindow.cpp:87`): defensive `if
+  (!m_gl_context) return;` guard (belt-and-suspenders; `SWGfx::ShowImage`
+  already gates this call on `!IsHeadless()`).
+- `SWGfx::BindBackbuffer` (`SWGfx.cpp:58`) and `SWGfx::GetSurfaceInfo`
+  (`SWGfx.cpp:138`): both called `m_window->GetContext()` and dereferenced it
+  unguarded for backbuffer width/height (presentation-window sizing only,
+  irrelevant to EFB/XFB content) — both now null-check and fall back to a
+  1x1/0x0 placeholder (already clamped to 1 by the existing `std::max(...,
+  1u)` in `GetSurfaceInfo`).
+
+Diff stat (`git diff --stat`):
+```
+ Source/Core/VideoBackends/Software/SWGfx.cpp       | 21 +++++++++---
+ Source/Core/VideoBackends/Software/SWOGLWindow.cpp | 27 ++++++++++++++-
+ Source/Core/VideoCommon/VideoBackendBase.cpp       | 40 ++++++++++++++++++++--
+ 3 files changed, 81 insertions(+), 7 deletions(-)
+```
+
+**Build:** MSBuild solution-level `/t:DolphinNoGUI` failed for an unrelated
+reason — the vendored `glslang` external's Makefile-type project
+(`Externals/glslang/glslang.vcxproj`) re-invokes `cmake` + a nested
+`msbuild.exe` + `mkdir -p`/`copy` every build regardless of whether its
+outputs are current, and that nested invocation fails intermittently under
+`/m:2` (and even `/m:1`) with `exited with code -1` — pre-existing, unrelated
+to this patch, and glslang's own outputs were already present and current.
+**Workaround:** build the two projects that actually needed rebuilding
+directly, skipping already-built project references:
+```
+MSBuild Source/Core/DolphinLib.vcxproj  -p:Configuration=Release -p:Platform=x64 -p:BuildProjectReferences=false -m:2
+MSBuild Source/Core/DolphinNoGUI/DolphinNoGUI.vcxproj -p:Configuration=Release -p:Platform=x64 -p:BuildProjectReferences=false -m:2
+```
+(`BuildProjectReferences=false` skips rebuilding referenced projects — safe
+here since only `DolphinLib`'s own three source files changed; `glslang.lib`
+etc. were already built and current.) Confirmed the compiler actually
+recompiled the three touched files (`SWGfx.cpp`, `SWOGLWindow.cpp`,
+`VideoBackendBase.cpp`) and relinked both `DolphinLib.lib` and
+`DolphinNoGUI.exe`.
+
+**Environment footgun hit during validation, distinct from f2's:**
+`NoDefaultCurrentDirectoryInExePath=1` is set process-wide on this box, so
+`cmd.exe` (including inside a `.bat`) will **not** find a bare
+`DolphinNoGUI.exe` by searching the current directory even right after a
+successful `cd /d` into the directory containing it (`dir DolphinNoGUI.exe`
+succeeds in the same shell; running it bare fails with "not recognized as an
+internal or external command"). Always invoke it by full path
+(`F:\...\Binary\x64\DolphinNoGUI.exe ...`) in any script on this box, not by
+bare name after a `cd`.
+
+**Validation (headless boot with the TRUE Software Renderer, NTSC_U IPL,
+`GCN_TRACE_XFB_DUMP`, two independent ~45s runs from a fresh user dir each):**
+- **(i) backend identity, loud:** stderr showed
+  `[gcnrecomp] video backend ACTIVE: 'Software Renderer' (requested 'Software
+  Renderer')` on both runs — confirmed the real software rasterizer was live,
+  not a silent D3D11 fallback.
+- **(ii) real pixels:** run 1 produced 3353 `dolphin.N.yuy2` dumps; run 2
+  (independent boot) produced 2441. Histogrammed several (`dolphin.10`,
+  `.1000`, `.3000`, `.3352`): all non-constant (dozens of distinct byte
+  values, not a solid fill) — unlike task 3's `-v Null` mechanism-only proof,
+  which had no real pixel content. Decoded `dolphin.10.yuy2` (592x226 YUY2,
+  header-declared `width` is the real pixel width, stride == width*2 bytes)
+  to PPM/PNG and visually confirmed the GameCube cube boot logo; decoded
+  `dolphin.2500.yuy2` and `dolphin.3352.yuy2` and visually confirmed the IPL
+  main-menu card carousel ("Game Play" panel with the pink dot border and,
+  in later frames, the neighboring "Options"/"Calendar" panel labels) —
+  unambiguous real software-rasterized IPL content, not blank/constant bytes.
+- **(iii) unknown backend fails loudly:** `-v Bogus` printed the `FATAL:
+  unknown video backend 'Bogus' ...` line (with the full registered-backend
+  list) to stderr and exited with code 1 — matches the fix-1 acceptance
+  criterion exactly.
+
+**Determinism (cheap two-run byte-exact diff, same boot command, same ~45s
+wall bound, fresh user dir each run):** of 2441 overlapping `pub_seq`
+ordinals, publications **0 through 1050 were byte-exact identical** between
+the two independent runs; **1390 of the 2441 overlapping files (57%) differed
+starting at `pub_seq` 1051**. Decoding a divergent pair (`dolphin.1051.yuy2`,
+86846 of 267596 bytes differing) showed both runs at the *same* menu-carousel
+scene ("Game Play" panel, "Options"/"Calendar" neighbors visible) but at a
+visibly different rotation/pan phase — **animation-timing drift, not
+rasterizer non-determinism**. This is the expected consequence of *not*
+setting `PATCH_PLAN.md §d`'s determinism knobs
+(`Dolphin.Core.CPUCore=0`/interpreter, `Dolphin.Core.EnableCustomRTC=True` +
+fixed `CustomRTCValue`) for this quick validation run — the CPU core defaults
+to JIT (wall-clock/host-timing-coupled) and the RTC defaults to real time, so
+the two runs' menu-animation phase relative to `pub_seq` drifts as soon as
+the boot reaches the animated menu, exactly the failure mode those knobs
+exist to eliminate. **The pre-menu boot prefix (0-1050) being byte-exact is
+itself decent evidence the software rasterizer is deterministic** for a
+fixed instruction stream; confirming determinism *through* the animated menu
+requires re-running this same two-run diff with the interpreter + custom-RTC
+knobs set, which is follow-up work, not done here.
+
+**Anomalies noted, not investigated further (out of scope for this bead):**
+- Run 1 and run 2 reached different total publication counts (3353 vs 2441)
+  in the same ~45s wall-clock bound — consistent with the same JIT/host-timing
+  coupling that explains the animation-phase drift above, not a new bug.
+- `dolphin.3000.yuy2` in run 1 had `height=2` (vs. the usual 226) — a
+  much-smaller-than-usual publication, plausibly a partial/transition-frame
+  copy; not confirmed against Dolphin's own copy-size logic, flagged only in
+  case it recurs as a real bug once determinism-knob-pinned comparisons start.
+
+---
+
 ## Emitting the record
 
 Add a tiny local writer TU in the Dolphin tree (e.g.

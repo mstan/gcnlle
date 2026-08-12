@@ -19,8 +19,10 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import select
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -1301,6 +1303,287 @@ def cmd_ab_milestone(args: argparse.Namespace) -> int:
         runtime.close()
 
 
+_XFB_INDEX_RE = {
+    "runtime": re.compile(r"^runtime\.(\d+)\.yuy2$"),
+    "dolphin": re.compile(r"^dolphin\.(\d+)\.yuy2$"),
+}
+
+
+def discover_max_xfb_index(directory: pathlib.Path, prefix: str) -> int:
+    """Highest ordinal named `<prefix>.<k>.yuy2` in `directory`, or -1 if none.
+
+    Used only to size the k-range xfb-diff walks (COSIM_DESIGN.md §4) — a
+    missing intermediate file inside that range is a pairing_gap finding, not
+    silently skipped.
+    """
+    pattern = _XFB_INDEX_RE[prefix]
+    highest = -1
+    if directory.is_dir():
+        for entry in directory.iterdir():
+            match = pattern.match(entry.name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    return highest
+
+
+def read_xfb_dump(path: pathlib.Path) -> dict[str, Any]:
+    """Parse one runtime.<k>.yuy2 / dolphin.<k>.yuy2 file: a little-endian
+    width,height,stride u32 prefix followed by exactly stride*height raw
+    bytes (COSIM_DESIGN.md §3/§2 — same wire shape on both sides)."""
+    with open(path, "rb") as handle:
+        header = handle.read(12)
+        if len(header) < 12:
+            return {"error": "header_too_short", "header_bytes": len(header)}
+        width, height, stride = struct.unpack("<III", header)
+        payload = handle.read()
+    expected = stride * height
+    if len(payload) != expected:
+        return {
+            "error": "payload_size_mismatch",
+            "width": width, "height": height, "stride": stride,
+            "expected_bytes": expected, "actual_bytes": len(payload),
+        }
+    return {"width": width, "height": height, "stride": stride, "payload": payload}
+
+
+def xfb_tile_for_offset(
+    offset: int, width: int, height: int, stride: int, grid: int
+) -> tuple[int, int] | None:
+    """8x8 (default) tile-grid localization for one differing byte offset.
+
+    Returns None for a byte inside row padding (stride > width*2) — that
+    region is not part of any visible tile and is reported separately so it
+    cannot be mistaken for a rendering-content divergence.
+    """
+    if stride <= 0 or height <= 0:
+        return None
+    row = offset // stride
+    col = offset % stride
+    row_bytes = width * 2
+    if row >= height or col >= row_bytes or row_bytes <= 0:
+        return None
+    tile_row = min(grid - 1, (row * grid) // height)
+    tile_col = min(grid - 1, (col * grid) // row_bytes)
+    return tile_row, tile_col
+
+
+def compare_xfb_payloads(
+    a: bytes, b: bytes, width: int, height: int, stride: int, grid: int
+) -> dict[str, Any]:
+    """Byte-exact diff + tile-grid localization for one paired XFB dump."""
+    differing = 0
+    padding_differing = 0
+    first: int | None = None
+    tiles: dict[str, int] = {}
+    for offset, (byte_a, byte_b) in enumerate(zip(a, b)):
+        if byte_a == byte_b:
+            continue
+        differing += 1
+        if first is None:
+            first = offset
+        tile = xfb_tile_for_offset(offset, width, height, stride, grid)
+        if tile is None:
+            padding_differing += 1
+        else:
+            key = f"{tile[0]},{tile[1]}"
+            tiles[key] = tiles.get(key, 0) + 1
+    return {
+        "differing_byte_count": differing,
+        "padding_differing_byte_count": padding_differing,
+        "first_offset": first,
+        "tiles": tiles,
+    }
+
+
+def yuy2_pixel_to_rgb(y8: int, u8: int, v8: int) -> tuple[float, float, float]:
+    """Inverse BT.601, transcribed from the matrix documented at
+    runtime/src/debug_server.c:747-749 (also runtime/include/vi/yuy2.h) —
+    the exact formula Dolphin's TextureConversionShader.cpp:1009-1035 uses,
+    so the perceptual fallback (COSIM_DESIGN.md §4) decodes both sides
+    identically."""
+    yc = 1.164 * (y8 - 16.0)
+    r = yc + 1.596 * (v8 - 128.0)
+    g = yc - 0.813 * (v8 - 128.0) - 0.391 * (u8 - 128.0)
+    b = yc + 2.018 * (u8 - 128.0)
+    clamp = lambda c: 0.0 if c < 0.0 else 255.0 if c > 255.0 else c
+    return clamp(r), clamp(g), clamp(b)
+
+
+def xfb_perceptual_delta(
+    a: bytes, b: bytes, width: int, height: int, stride: int
+) -> float:
+    """Mean absolute per-channel RGB difference after YUY2 decode
+    (COSIM_DESIGN.md §4 "Perceptual fallback only for documented-
+    nondeterministic layers") — diagnostic only, never the pass/fail basis."""
+    total = 0.0
+    count = 0
+    for y in range(height):
+        row_a = a[y * stride:y * stride + width * 2]
+        row_b = b[y * stride:y * stride + width * 2]
+        for x in range(0, width - 1, 2):
+            y0a, ua, y1a, va = row_a[x * 2:x * 2 + 4]
+            y0b, ub, y1b, vb = row_b[x * 2:x * 2 + 4]
+            for ya, yb, u_a, v_a, u_b, v_b in (
+                (y0a, y0b, ua, va, ub, vb),
+                (y1a, y1b, ua, va, ub, vb),
+            ):
+                ra = yuy2_pixel_to_rgb(ya, u_a, v_a)
+                rb = yuy2_pixel_to_rgb(yb, u_b, v_b)
+                total += abs(ra[0] - rb[0]) + abs(ra[1] - rb[1]) + abs(ra[2] - rb[2])
+                count += 3
+    return total / count if count else 0.0
+
+
+def cmd_xfb_diff(args: argparse.Namespace) -> int:
+    """Compare runtime.<k>.yuy2 (runtime-dir) against dolphin.<k+offset>.yuy2
+    (dolphin-dir) — COSIM_DESIGN.md §4. Pure filesystem comparator: no GDB
+    stub, no debug port, so it runs against dumps captured by separate,
+    already-finished runtime/Dolphin processes."""
+    runtime_dir = pathlib.Path(args.runtime_dir)
+    dolphin_dir = pathlib.Path(args.dolphin_dir)
+    offset = args.dolphin_offset
+    grid = args.tile_grid
+
+    max_runtime = discover_max_xfb_index(runtime_dir, "runtime")
+    max_dolphin = discover_max_xfb_index(dolphin_dir, "dolphin")
+    upper = max(max_runtime, max_dolphin - offset)
+    if args.first_n is not None:
+        upper = min(upper, args.first_n - 1)
+
+    compared = 0
+    first_divergence: int | None = None
+    first_geometry_mismatch: int | None = None
+    first_pairing_gap: int | None = None
+
+    for k in range(0, upper + 1):
+        runtime_path = runtime_dir / f"runtime.{k}.yuy2"
+        dolphin_path = dolphin_dir / f"dolphin.{k + offset}.yuy2"
+        runtime_present = runtime_path.is_file()
+        dolphin_present = dolphin_path.is_file()
+        if not (runtime_present and dolphin_present):
+            # A gap is a harness/alignment problem (§1 item 3), never itself
+            # the finding — reported under its own "kind", not folded into
+            # first_divergence.
+            entry = {
+                "k": k,
+                "kind": "pairing_gap",
+                "runtime_path": str(runtime_path),
+                "dolphin_path": str(dolphin_path),
+                "runtime_missing": not runtime_present,
+                "dolphin_missing": not dolphin_present,
+            }
+            print(json.dumps(entry, separators=(",", ":")))
+            if first_pairing_gap is None:
+                first_pairing_gap = k
+            continue
+
+        runtime_dump = read_xfb_dump(runtime_path)
+        dolphin_dump = read_xfb_dump(dolphin_path)
+        entry = {
+            "k": k,
+            "kind": "compared",
+            "runtime_k": k,
+            "dolphin_k": k + offset,
+            "runtime_path": str(runtime_path),
+            "dolphin_path": str(dolphin_path),
+        }
+        if "error" in runtime_dump or "error" in dolphin_dump:
+            entry["kind"] = "read_error"
+            entry["runtime_error"] = runtime_dump.get("error")
+            entry["dolphin_error"] = dolphin_dump.get("error")
+            print(json.dumps(entry, separators=(",", ":")))
+            if first_divergence is None:
+                first_divergence = k
+            compared += 1
+            continue
+
+        geometry_match = (
+            runtime_dump["width"] == dolphin_dump["width"]
+            and runtime_dump["height"] == dolphin_dump["height"]
+            and runtime_dump["stride"] == dolphin_dump["stride"]
+        )
+        entry["geometry"] = {
+            "runtime": {"width": runtime_dump["width"], "height": runtime_dump["height"],
+                        "stride": runtime_dump["stride"]},
+            "dolphin": {"width": dolphin_dump["width"], "height": dolphin_dump["height"],
+                        "stride": dolphin_dump["stride"]},
+        }
+        entry["geometry_match"] = geometry_match
+        if not geometry_match:
+            # A geometry mismatch is a VI-register-programming divergence,
+            # triaged separately from a rendering-content divergence (§4).
+            entry["exact_match"] = False
+            print(json.dumps(entry, separators=(",", ":")))
+            if first_geometry_mismatch is None:
+                first_geometry_mismatch = k
+            if first_divergence is None:
+                first_divergence = k
+            compared += 1
+            continue
+
+        payload_a = runtime_dump["payload"]
+        payload_b = dolphin_dump["payload"]
+        exact = payload_a == payload_b
+        entry["exact_match"] = exact
+        if exact:
+            entry["differing_byte_count"] = 0
+            entry["padding_differing_byte_count"] = 0
+            entry["first_difference"] = None
+            entry["tiles"] = {}
+        else:
+            diff = compare_xfb_payloads(
+                payload_a, payload_b,
+                runtime_dump["width"], runtime_dump["height"], runtime_dump["stride"],
+                grid,
+            )
+            first_offset = diff["first_offset"]
+            tile = xfb_tile_for_offset(
+                first_offset, runtime_dump["width"], runtime_dump["height"],
+                runtime_dump["stride"], grid,
+            )
+            entry["differing_byte_count"] = diff["differing_byte_count"]
+            entry["padding_differing_byte_count"] = diff["padding_differing_byte_count"]
+            entry["first_difference"] = {
+                "offset": first_offset,
+                "runtime_byte": payload_a[first_offset],
+                "dolphin_byte": payload_b[first_offset],
+                "tile": None if tile is None else {"row": tile[0], "col": tile[1]},
+            }
+            entry["tiles"] = diff["tiles"]
+            if first_divergence is None:
+                first_divergence = k
+            if args.perceptual_fallback:
+                # Exact-byte result above is always printed; this is an
+                # additional, explicitly-requested diagnostic, never a
+                # silent override (§4 "the fallback never silently hides a
+                # real divergence").
+                delta = xfb_perceptual_delta(
+                    payload_a, payload_b,
+                    runtime_dump["width"], runtime_dump["height"], runtime_dump["stride"],
+                )
+                entry["perceptual_fallback"] = {
+                    "layers": args.perceptual_fallback,
+                    "mean_abs_channel_diff": delta,
+                    "threshold": args.perceptual_threshold,
+                    "would_pass_perceptually": delta <= args.perceptual_threshold,
+                }
+        print(json.dumps(entry, separators=(",", ":")))
+        compared += 1
+
+    result = "pass" if first_divergence is None and first_pairing_gap is None else "fail"
+    summary = {
+        "kind": "summary",
+        "compared": compared,
+        "dolphin_offset": offset,
+        "first_divergence": first_divergence,
+        "first_geometry_mismatch": first_geometry_mismatch,
+        "first_pairing_gap": first_pairing_gap,
+        "result": result,
+    }
+    print(json.dumps(summary, separators=(",", ":")))
+    return 0 if result == "pass" else 1
+
+
 def add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--exe", required=True)
     parser.add_argument("--ipl", required=True)
@@ -1532,6 +1815,50 @@ def main() -> int:
         ),
     )
     ab_milestone.set_defaults(func=cmd_ab_milestone)
+
+    xfb_diff = sub.add_parser(
+        "xfb-diff",
+        help=(
+            "compare runtime.<k>.yuy2 / dolphin.<k+offset>.yuy2 XFB dumps "
+            "(COSIM_DESIGN.md sec4); filesystem-only, no GDB/debug-port"
+        ),
+    )
+    xfb_diff.add_argument(
+        "--runtime-dir", required=True,
+        help="directory containing runtime.<k>.yuy2 dumps",
+    )
+    xfb_diff.add_argument(
+        "--dolphin-dir", required=True,
+        help="directory containing dolphin.<k>.yuy2 dumps",
+    )
+    xfb_diff.add_argument(
+        "--dolphin-offset", type=int, default=0,
+        help=(
+            "publication-count offset from the sec1 snapshot-resume handshake: "
+            "runtime.<k> pairs with dolphin.<k + offset>"
+        ),
+    )
+    xfb_diff.add_argument(
+        "--first-n", type=int,
+        help="stop after this many runtime ordinals (default: walk every ordinal found)",
+    )
+    xfb_diff.add_argument(
+        "--tile-grid", type=int, default=8,
+        help="tile-grid edge length for divergence localization (default: 8x8)",
+    )
+    xfb_diff.add_argument(
+        "--perceptual-fallback", action="append", default=[], metavar="LAYER",
+        help=(
+            "name a documented-nondeterministic layer (e.g. dither) to also "
+            "report a BT.601 perceptual delta on byte-divergent frames; "
+            "repeatable; the exact-byte result is always reported regardless"
+        ),
+    )
+    xfb_diff.add_argument(
+        "--perceptual-threshold", type=float, default=4.0,
+        help="mean abs per-channel RGB delta below which --perceptual-fallback reports a perceptual pass",
+    )
+    xfb_diff.set_defaults(func=cmd_xfb_diff)
 
     args = parser.parse_args()
     try:

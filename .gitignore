@@ -36,3 +36,9 @@ _*/
 *.bmp
 *.json.tmp
 !docs/**/*.png
+
+# cosim fixtures: binary card images are generated, not tracked (see fixtures/README.md)
+fixtures/*.raw
+# oracle validation scratch userdirs
+oracle/task3_validate_userdir/
+oracle/task3_validate_xfbdump/
