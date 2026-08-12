@@ -833,6 +833,13 @@ int main(int argc, char** argv) {
      * trace close, GCN_MEM_DUMP, XFB hashes, RAM teardown) can observe or
      * release its state. No-op when the synchronous path is selected. */
     gcn_gx_pipeline_shutdown();
+    /* GCN_PRESENT_STATS=1 (opt-in): VI/presenter cadence teardown summary —
+     * "vi: fields=..." and "host_window: present stats ...". Both are pure
+     * reads of counters collected during the run just above; neither stops
+     * the (still-running, process-lifetime) window thread. No-op, no output,
+     * when the env var is unset. */
+    gcn_vi_print_present_stats();
+    gcn_host_window_print_stats();
     /* Don't park waiting on a TCP "quit" that may never come if what actually
      * ended the run was the host window closing (GCN_WINDOW=1, no debug
      * client attached). */

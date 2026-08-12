@@ -20,6 +20,39 @@
  * GCN_WINDOW=1 check. */
 int gcn_host_window_enabled(void);
 
+/* Cached (same pattern) GCN_PRESENT_STATS=1 check — opt-in VI/presenter
+ * cadence counters (posts/coalesced/distinct/latency here, field ticks in
+ * vi.c). Independent of GCN_WINDOW: reading it costs one getenv the first
+ * call, an int compare every call after, and is false (all counters
+ * inert) whenever the var is unset — see host_window.c's present path and
+ * vi.c's vi_advance_halfline for the gated increments. */
+int gcn_present_stats_enabled(void);
+
+/* Snapshot of the present/VI cadence counters GCN_PRESENT_STATS=1 collects,
+ * mirroring GcnHostAudioStats's role for "audio_state" (host_audio.h): a
+ * flat copy for the teardown print and the TCP debug server's
+ * "present_state" query. All fields are 0 when GCN_PRESENT_STATS is unset. */
+typedef struct {
+    bool enabled;
+    u64  posts;             /* gcn_host_window_present() calls                    */
+    u64  coalesced;         /* posts that overwrote a still-pending mailbox slot  */
+    u64  distinct;          /* fields actually converted+presented by the window
+                              * thread (do_present() reaching the draw/blit path) */
+    u64  latency_samples;   /* presents with a measured post->present latency     */
+    double latency_sum_ms;  /* sum of those latencies, ms (avg = sum/samples)     */
+    double latency_max_ms;
+} GcnPresentStats;
+
+void gcn_host_window_get_stats(GcnPresentStats* out);
+
+/* Print the "host_window: present stats ..." teardown summary (house style:
+ * see gx_vulkan.c/host_audio.c's own one-line summaries). No-op unless
+ * GCN_PRESENT_STATS=1. The window thread itself is never stopped by this —
+ * it lives for the process like every other host_window state — this only
+ * reads the counters, so it is safe to call once, any time after the
+ * dispatch loop that drove the presents has stopped. */
+void gcn_host_window_print_stats(void);
+
 /* Spawn the window thread (registers the window class, creates the window,
  * runs the message pump) and block until it is ready (or a startup timeout
  * elapses, logged loudly). No-op if GCN_WINDOW is unset, or if already

@@ -3,6 +3,10 @@
 *Self-contained. Written to be read cold (e.g. pasted into another LLM for
 discussion). Last updated 2026-07-09.*
 
+> Historical scope note: this document describes the original IPL-only bring-up
+> plan. The runtime now reaches a commercial Wind Waker title route; use
+> `../README.md`, `../ISSUES.md`, and `HANDOFF_2026-08-09.md` for current status.
+
 ---
 
 ## 1. Goal

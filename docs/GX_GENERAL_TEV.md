@@ -1,7 +1,10 @@
 # General TEV program (exact-integer ubershader) — implementation spec
 
-Status: DESIGN (2026-08-03). Owner: coordinator session; implementation via
-subagent(s) against this spec. Survey basis: full read of gx_raster.c
+Status: **implemented historical specification** (2026-08-03). Program 31 is
+present in the current runtime: phase 1a is the default level 2, while exact
+fog+CMPR level 1 remains opt-in. Current measurements and next-step decisions
+are in `../ISSUES.md`; the survey below records the design basis and must not be
+treated as a current bottleneck ranking. Survey basis: full read of gx_raster.c
 software general path + gx_vulkan.c/gx_draw_f.comp fused infrastructure
 (citations verified 2026-08-03 at commit 00337d4).
 

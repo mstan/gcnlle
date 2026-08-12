@@ -1,6 +1,9 @@
 # Perf campaign 3 — correctness-preserving CPU + GPU architecture to 60 FPS
 
-Status: active (2026-07-14).
+Status: **historical campaign record** (2026-07-14), superseded by the
+2026-08-09 checkpoint in `../ISSUES.md`. Its 42.89-DrawDone/s result and ranked
+next steps predate the page-CRC, general-TEV, snapshot/resume, and texture-COW
+work; do not use them as current performance or priority claims.
 
 Current accepted cadence is **42.89 FPS** (1,291 `GXSetDrawDone` completions in
 30.10 seconds), up from the reproduced 21.27 FPS baseline. The first CPU-only

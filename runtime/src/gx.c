@@ -617,7 +617,7 @@ static void gx_pipe_drain_worker(void) {
 
 void gcn_gx_pipeline_drain(void) {
     gx_pipe_drain_worker();
-    gx_render_flush();
+    gx_render_flush(GX_RENDER_FLUSH_PIPELINE_DRAIN);
 }
 
 /* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side hard drain-assert — the
@@ -1424,7 +1424,7 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
     switch (cmd) {
     case GX_BP_SETDRAWDONE:            /* BPStructs.cpp:180-201 */
         if ((value & 0xFFu) == 0x02u) {
-            gx_render_flush();
+            gx_render_flush(GX_RENDER_FLUSH_DRAWDONE);
             /* All preceding EFB copies are now materialized in MEM1. Publish
              * this generation before PE finish lets VI present only complete
              * guest frames, never an intermediate copy from the same frame. */
@@ -1455,11 +1455,11 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
         }
         break;
     case GX_BP_PE_TOKEN_ID:            /* BPStructs.cpp:202-217 (no interrupt) */
-        gx_render_flush();
+        gx_render_flush(GX_RENDER_FLUSH_PE_TOKEN);
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 0);
         break;
     case GX_BP_PE_TOKEN_INT_ID:        /* BPStructs.cpp:218-233 (interrupt) */
-        gx_render_flush();
+        gx_render_flush(GX_RENDER_FLUSH_PE_TOKEN_INT);
         gcn_pe_set_token(gx->pe, (u16)(value & 0xFFFFu), 1);
         break;
     case GX_BP_LOADTLUT1: {            /* BPStructs.cpp BPMEM_LOADTLUT1 */

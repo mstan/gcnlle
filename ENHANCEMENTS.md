@@ -128,6 +128,13 @@ Report both:
   per wall second);
 - remaining headroom attribution and fallback coverage.
 
+For snapshot-resumed routes, record the seeded boundary, final boundary, and
+timed suffix; never divide a cumulative counter by suffix wall time. Separate
+unthrottled emulation capacity from host pacing. Detaching a host audio sink is
+valid only when the guest DSP-LLE/AID work remains active and audio-on quality
+is reported separately. `GXSetDrawDone` throughput is not present cadence;
+claim 60-Hz output only from explicit VI/presenter timing plus headed evidence.
+
 ### 8. Promote or reject
 
 An exact candidate is promoted only when:
@@ -371,34 +378,72 @@ Measured outcomes (fixed 110M-block headed route):
   ~12-13% wall REGRESSION when resident (interleaved 6-run A/B, median
   29.44s vs 25.69s): ~124K extra tiny GPU triangles cost more dispatch
   than their saved synchronizations recover. Shipped opt-in (level 1),
-  default stays at the phase-1a gate (level 2). Recorded as the
-  motivating datum for a resident tiny-draw batching pass — the next
-  designed lever; revisit the default when it lands.
+  default stays at the phase-1a gate (level 2). This was the historical
+  motivation for resident tiny-draw batching; `a2a90cc` changed that cost
+  structure, so post-COW attribution now decides the next lever.
 
-## Wind Waker performance burndown after this exemplar
+## Exercised example: immutable texture/TLUT staging epochs (2026-08-09)
 
-The most recent headed title-screen log attributes the urgent work as follows:
+`GCN_GX_VK_SUBMIT_STATS=1` first partitioned every resident submit by its
+immediate trigger. On the fixed snapshot-resumed Wind Waker suffix, exact
+general-TEV level 1 made 1,881 command-buffer submissions: 929 texture
+overwrites, 682 `GXSetDrawDone` boundaries, 225 unsupported-triangle syncs,
+38 pending-RAM overlaps, five CPU EFB reads, and two pipeline drains. The
+fixed texture slots were therefore a real batching barrier, but not the only
+one.
 
-1. **Restore GX overlap.** Eliminate the `97+32` permanent pipeline poison and
-   verify that recoverable top-level primitives continue to re-seed safely.
-2. **Expand exact resident GX coverage.** Roughly 5.4 million draws fell back
-   synchronously, dominated by general/program-0 triangle state. Implement the
-   observed state behind `gx_render`, co-run against software, and retain loud
-   fallback.
-3. **Implement observed EFB-copy states.** The title repeatedly uses copy
-   states `0x01023B` and `0x010263`; synchronize/corun before promotion.
-4. **Reduce GPU publication joins.** Keep EFB/XFB data resident until a real
-   guest observation boundary; never delay PE/token/CPU-read visibility.
-5. **Close interpreter coverage.** The headed checkpoint still executed about
-   27.0 million interpreter instructions with 24,600 unique misses versus
-   about 298.6 million native title dispatches.
-6. **Re-profile CPU/dispatch only after GX fallback collapses.** Then apply the
-   proven `ndsrecomp` sequence: exact RAM fast paths, generation-aware dispatch
-   caches, source-aware fallthrough attribution, validated superblocks, and
-   scoped PGO.
-7. **Consider title HLE last.** Use content identity, declared live state,
-   `verify` mode, and exact LLE fallback. Prefer platform-wide exact work while
-   it dominates.
+`GCN_GX_VK_TEXTURE_COW=1` makes texture and TLUT uploads immutable within
+bounded staging epochs (4 MiB and 64 KiB by default). A changed cache entry
+gets a new aligned offset, while every already-recorded draw packet retains
+the old scalar offset it captured. Arena exhaustion submits, fences, and
+materializes through the existing exact boundary before advancing the epoch
+and reusing offset zero. A bounded binding-stability retry prevents a later
+texture/TLUT rollover from invalidating an earlier binding for the same
+not-yet-recorded draw. Unsupported or impossible binding sets still fall back
+to the faithful software path.
+
+`GCN_GX_VK_TEXTURE_COW_BYTES` and `GCN_GX_VK_TLUT_COW_BYTES` are diagnostic
+arena caps used to force rollover coverage; they apply only when COW is on.
+The optimization remains opt-in pending broader release integration.
+
+Evidence (72,467,144-block suffix, 683 new `GXSetDrawDone` events, title pin
+`a5a8937`, golden chain `1338/ed27f20acbdfe1d0`):
+
+- Same-binary unthrottled capacity, with only the non-architectural WASAPI
+  sink detached (`GCN_AUDIO=0`; DSP-LLE/AID still execute): OFF 9.17/9.26 s,
+  ON 7.79/7.71 s. Median-equivalent capacity rises from 74.12 to 88.13
+  DrawDone/s (13.49 to 11.35 ms/event), about 19% more throughput.
+- Resident work rises from 129,823 to 135,940 triangles while submissions fall
+  from 1,881 to 895 and synchronized fallbacks fall from 411,355 to 405,238.
+- Audio-on runs remain intentionally paced by 436,840 samples / 32 kHz =
+  13.651 s of guest PCM; accepted COW samples had zero underruns and zero
+  drops. Raw audio-on wall FPS is therefore not a headroom metric.
+- Full corun: 522 plane checks, zero divergences. Resident EFB-to-texture
+  verification: 76 comparisons, zero mismatches. Runtime tests: 14/14 in both
+  Vulkan and `GCN_VULKAN=OFF` builds.
+- A forced 512 KiB texture epoch exercised 68 rollovers, including 34 with
+  live work requiring a command submission, and retained the golden chain,
+  frame/draw/native/interpreter counts, and clean shutdown.
+
+## Wind Waker next-step gate after texture COW
+
+The previous GX/fallback ranking predates `a2a90cc` and is historical only.
+Texture/TLUT COW changed submission behavior enough that no further
+optimization has current ranking evidence.
+
+1. **Measure post-COW attribution first.** On the same 683-event suffix,
+   partition submit reasons and exclusive waits; texture/TLUT epoch pressure;
+   fallback draw/pixel weight; CPU, DSP, and GX active work; host-audio wait;
+   and VI/presenter cadence.
+2. **Keep acceptance domains separate.** Report unthrottled capacity, realtime
+   audio quality/endurance, and displayed presentation cadence independently.
+   Do not call `GXSetDrawDone`/s displayed FPS.
+3. **Choose only the largest measured lever.** Refresh coverage before more
+   TEV work, profile before DSP/AOT or CPU work, and treat historical PGO
+   profiles as stale after source changes.
+4. **Preserve the faithful floor.** Any retained acceleration keeps software,
+   interpreter, and DSP-LLE modes forceable; unsupported cases fall back
+   loudly and exact candidates retain differential/corun gates.
 
 ## Clean handoff checklist
 
@@ -407,9 +452,10 @@ Before another agent takes over:
 - stop any `gcn_boot` process cleanly with the TCP `quit` command;
 - record current system load and whether timing is admissible;
 - include the exact build/test/run commands and log paths;
-- commit framework changes to `master` and push `origin/master`;
-- update `WindWakerRecomp/gcnrecomp.lock`, its handoff note, and push its
-  `master`;
+- record framework branch/commit and whether it is local, pushed, merged, or
+  title-pinned; never imply integration that has not happened;
+- update `WindWakerRecomp/gcnrecomp.lock` only after the owner authorizes
+  integration and the title-specific gates pass;
 - leave generated code, ISO/firmware, captures, Ghidra databases, and build
   products untracked;
 - state which checks are complete and which remain pending.

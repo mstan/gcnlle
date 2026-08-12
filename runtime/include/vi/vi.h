@@ -176,4 +176,15 @@ int gcn_vi_xfb_info(u32* addr, u32* width, u32* height, u32* stride);
 u32  gcn_vi_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_vi_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 
+/* GCN_PRESENT_STATS=1 (opt-in, host/host_window.h owns the cached getenv
+ * flag): the field-boundary tick count vi_advance_halfline collects. 0 when
+ * the flag is unset or no field has ticked yet. Exposed separately from the
+ * print function below so the TCP debug server's "present_state" query can
+ * report it without going through stderr. */
+u64  gcn_vi_get_field_count(void);
+/* Print the "vi: fields=N (X.X/s)" teardown summary. No-op unless
+ * GCN_PRESENT_STATS=1. Rate is fields-counted / wall-seconds-since-first-
+ * counted-field (same fixed-origin idea as dispatch.c's GCN_THROTTLE). */
+void gcn_vi_print_present_stats(void);
+
 #endif /* GCN_VI_VI_H */

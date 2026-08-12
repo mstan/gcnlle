@@ -150,9 +150,17 @@ void gx_render_efb_copy(const GxCpState* cp) {
     }
 }
 
-void gx_render_flush(void) {
+void gx_render_flush(GxRenderFlushReason reason) {
+    GxVkFlushReason vk_reason = GX_VK_FLUSH_PIPELINE_DRAIN;
+    switch (reason) {
+    case GX_RENDER_FLUSH_DRAWDONE: vk_reason = GX_VK_FLUSH_DRAWDONE; break;
+    case GX_RENDER_FLUSH_PE_TOKEN: vk_reason = GX_VK_FLUSH_PE_TOKEN; break;
+    case GX_RENDER_FLUSH_PE_TOKEN_INT: vk_reason = GX_VK_FLUSH_PE_TOKEN_INT; break;
+    case GX_RENDER_FLUSH_PIPELINE_DRAIN: break;
+    default: break;
+    }
     if (s_mode == GX_RENDER_VULKAN_RESIDENT &&
-        !gx_vulkan_resident_flush()) {
+        !gx_vulkan_resident_flush(vk_reason)) {
         fprintf(stderr, "gx_render: Vulkan resident flush failed\n");
         abort();
     }

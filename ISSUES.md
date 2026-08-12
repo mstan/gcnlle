@@ -1,70 +1,205 @@
 # Known Issues and Validation Status
 
-Status as of 2026-08-03 (Wind Waker 60-FPS burndown session; supersedes the
-2026-07-15 checkpoint). Framework at `8a2e0d2` on `experiment/moderngekko-gpl`
-(= `master`); title repo pin `a5a8937`.
+Status as of 2026-08-10. Local framework HEAD `5e7c536` (docs) sits on the
+COW experiment commit `a2a90cc`, on `experiment/moderngekko-gpl`.
+WindWakerRecomp remains at title commit `e32ecef` and still pins framework
+`8a2e0d2`, so the COW work is not integrated or pinned by the title. New this
+session: framework commit `427735d`, opt-in `GCN_PRESENT_STATS`
+presenter/VI cadence counters (posts/coalesced/distinct/latency, plus a TCP
+`present_state` query) — validated 14/14 on both the Vulkan and non-Vulkan
+suites, golden gates byte-identical, measured overhead ≤0.3% both disabled
+and enabled.
 
 ## Where we are
 
-Standing goal (`.claude/GOAL.md`): 60 FPS sustained with headroom. On the
-fixed 110M-block headed WW route (true reset → IPL menu → main.dol → title
-sailing), all byte-exact against the golden XFB chain `ed27f20acbdfe1d0`
-(1338 publications / 1015 frames / poison=0):
+Standing goal (`beads-b29`): 60 FPS sustained with headroom. The fixed
+snapshot-resumed title-sailing suffix starts at cumulative frame 332 and ends
+at 1015: 1015 cumulative minus 332 snapshot-seeded leaves **683 timed
+DrawDone events**, the only valid denominator for this suffix. All accepted
+runs retain the golden XFB chain `ed27f20acbdfe1d0` (1338 cumulative
+publications), poison=0, and 539/539 native verifications.
 
-| Metric | 2026-08-03 morning | now |
-|---|---|---|
-| Route wall | 94.7 s | 25.9 s (24.3 s with PGO opt-in) |
-| Headed fps, route average | 11.7 | ~39–42 |
-| Synchronized GX fallbacks | 538,977 | 535,166 (411,347 at `GCN_GX_GENERAL_TEV=1`) |
-| Dispatch wall split | block-exec-dominated | balanced ~31/28/30 CPU/DSP/GX |
+`GXSetDrawDone` throughput is an unthrottled emulation-capacity proxy, not a
+measurement of distinct host-presented frames. Never divide the cumulative
+1015 count by suffix wall time. A 60-Hz presentation claim requires explicit
+VI/presenter cadence and headed-output evidence — see "Presentation cadence"
+below for the first measurement of that evidence.
 
-## Landed this session (each with its full gate matrix; see commit messages
-## and ENHANCEMENTS.md exemplar entries for evidence)
+| Exact level-1 metric | Fixed-slot baseline | Texture/TLUT COW opt-in |
+|---|---:|---:|
+| Unthrottled capacity wall (median of 3 ABBA rounds) | 9.153 s | 8.068 s |
+| Capacity | 74.62 DrawDone/s | 84.66 DrawDone/s |
+| On/off wall ratio | | 0.8815 |
 
-- `00337d4` **Native-miss page-CRC memo** — the dominant hidden cost: a 4 KiB
-  CRC32 per interpreted-fallback dispatch. Route wall −64.7%. Content-stale
-  bitmap in the `gcn_native_code_invalidate` funnel + `content_dirty` for
-  non-fence RAM writers (dcbz, gather pipe, GX copies, ARAM/memcard DMA).
-  Identity is icache-coherent by contract.
-- `3b58247` **Resident EFB→texture copies** (0x01023B RG8 / 0x010263 RGBA8),
-  bit-exact tiled integer encode, `GCN_GX_EFB_COPY_VERIFY` compare knob;
-  review-found fix: texture snapshots flush overlapping pending copies.
-- `11ae141` / `c6af812` **General TEV program (program 31)** — full integer
-  TEV pipeline in `gx_draw_f.comp`, ~1.25 B brute-force cases, per-triangle
-  differential, corun, chain-golden at every knob level. Key discovery:
-  Vulkan FDiv is ~2.5 ULP vs x86's correctly-rounded divss — `exact_rcp`/
-  `exact_div` (Newton+Markstein on `precise fma()`) now back every GPU
-  divide that mirrors a CPU divide. `GCN_GX_GENERAL_TEV`: 0=off, 1=full
-  (fog+CMPR resident — exact but measured ~12–13% wall REGRESSION from tiny-
-  draw dispatch, shipped opt-in), 2=phase-1a gate (default).
-- **PGO retrained on the WW route** — `runtime/build-pgo-windwaker`
-  (gitignored), select via `GCN_RUNTIME_BUILD_DIR`; ~5.8% median,
-  chain-exact. Recipe in title `docs/BRINGUP.md`. Supersedes the old
-  `runtime/build-pgo` mixed-path cache note from the July checkpoint.
-- `72fd15a`..`8a2e0d2` **Snapshot/resume + BIOS skip** (docs/
-  SNAPSHOT_RESUME.md) — PROVEN complete machine-state capture: save at the
-  `0x80003140` park (block 37,532,856), resume seeds the XFB hash chain and
-  completes the standing golden byte-exactly (341/341 overlapping
-  publications identical; corun 456 checks/0; independently reproduced).
-  Iteration workflow: save once (`GCN_CHECKPOINT_PC=0x80003140
-  GCN_SNAPSHOT_SAVE=<p> GCN_SNAPSHOT_EXIT=1`), then every run
-  `GCN_SNAPSHOT_LOAD=<p>` with budget 72,467,144 — skips ~1/3 of wall.
+The 3-round ABBA capacity re-measurement (`CAPACITY3.md`, 12/12 golden; a
+port-squatter first pass was invalidated and preserved rather than
+discarded) reconciles with the prior single-pair result (74.12/88.13
+DrawDone/s): the COW speedup replicates at **11.85% wall**, below the
+earlier 2-sample 15.9% figure, which was optimistic. Both arms clear the
+66 DrawDone/s gate. This remains unthrottled capacity, not FPS.
 
-## Outstanding — performance (next levers, in order)
+These capacity runs use `GCN_AUDIO=0`, which detaches only the
+non-architectural WASAPI PCM sink; DSP-LLE, AID DMA/timing, interrupts, and
+firmware execution remain active. See "Audio" below for this session's
+audio-on measurements. The older true-reset 110M-block route remains
+historical context: 94.7 s at the morning baseline, 25.9 s after the
+2026-08-03 burndown, and 24.3 s with the then-current PGO build.
 
-1. **Resident tiny-draw batching.** The motivating datum: fog/CMPR residency
-   (level 1) moves ~124K tiny triangles onto the GPU and LOSES ~12–13% wall
-   to per-draw dispatch overhead despite killing their syncs. Batching flips
-   that lever positive and attacks the remaining ~535K synchronized
-   fallbacks. Revisit the `GCN_GX_GENERAL_TEV` default when it lands.
-2. **DSP AOT.** DSP-LLE is ~28% of dispatch wall and already flush-batched
-   (4096-cycle cap); the interpreter core itself is the remaining cost.
-   DOLPHIN_AUDIT.md CPU item 5.
-3. **General TEV phases 2+**: mip sampling, z-texture, indirect stages /
-   bump-alpha ras channels, >2 texgens — each still a loud per-draw
-   fallback with a census bucket (2.4%/0.9%/~0% of pixels respectively).
-4. Residual icbi-cluster interpreter cost (~6% of pc-cycles, uniform mode
-   never fires the fa9c162 batcher — deadline pre-expired by design).
+## Landed this session
+
+- **`GCN_PRESENT_STATS=1` presenter/VI cadence counters** (`427735d`) —
+  opt-in posts/coalesced/distinct-present/latency
+  counters in `host_window.c`, a field-tick counter in `vi.c`, a
+  teardown print for both, and a TCP `present_state` debug-server query.
+  14/14 on both Vulkan and non-Vulkan ctest suites, golden gates
+  byte-identical with the flag on or off, overhead ≤0.3% either way. This
+  is the instrumentation that produced the "Presentation cadence" numbers
+  below — the first measured (not inferred) VI/presenter cadence data for
+  this route.
+
+## Post-COW attribution (`ATTRIBUTION.md`, cross-checked against an
+## independently-built `COUNTER_INVENTORY.md`)
+
+Exclusive submit-wait ranking on the 683-event suffix:
+
+| Wait reason | Exclusive cycles | Share |
+|---|---:|---:|
+| sync-unsupported-triangle | 1.757 B | 57.7% |
+| flush-drawdone | 1.098 B | 36.1% |
+| pending-ram-overlap | — | 4.4% |
+| texture-epoch-full | — | 1.3% |
+| (rest) | — | <1% |
+
+`texture-epoch-full` corresponds to the COW arena sitting at 99.8% high-water
+with 2 of 3 rollovers blocked. The fallback driver behind the dominant
+`sync-unsupported-triangle` share is **not** arena pressure: 405,238 draws
+fail `general_tev_eligible()` (`gx_raster.c:4106+`) outright, i.e. the
+general-TEV path rejects them before arena state is ever consulted.
+
+Main-thread shares from an INSTRUMENTED run (+24.6% overhead vs the
+uninstrumented baseline; shares only, not absolute costs): block-exec 26.9%,
+DSP 17.8%, gx-tick 35.9%. `gx-tick` is main-thread GX FIFO bookkeeping only —
+the actual rasterization runs on the worker thread, which currently has **no
+timing counter**, so its exclusive cost is unmeasured.
+
+Known measurement artifacts (do not re-derive conclusions from these without
+correcting them first):
+- The resident-timing "wait%" line divides by a mismatched denominator
+  (`gx_vulkan.c:2039` vs `2043`) — it is not a duty cycle as printed.
+- The "xfb-memcpy" bucket includes EFB→texture copy time, not just the XFB
+  memcpy.
+
+Not available from any current counter: draw-arena drain cost, per-pixel
+weight under Vulkan, and worker-thread GX exclusive time — closing these
+gaps is a prerequisite for a complete attribution, not just a nice-to-have.
+
+## Presentation cadence (`AUDIO_PRESENTATION.md` — first measurement via the
+## new `GCN_PRESENT_STATS` counters)
+
+Paced headed run (`GCN_THROTTLE=1`, vsync=1, audio=1): VI ticks at 59.7
+fields/s (NTSC-correct); distinct presents ≈23.3/s; coalesced posts 3/352,
+all during startup; post→present latency averages 2.11 ms, max 17.87 ms.
+
+The key finding: **posts=352 / fields=857 is identical in both the
+unthrottled and the paced run.** The ~24.6 new-frames/s guest publication
+cadence is therefore route-intrinsic guest behavior — it is not presenter
+loss and not an emulation-speed ceiling (the paced route runs ~47.6
+DrawDone/s against a measured 84.7 DrawDone/s unthrottled capacity, so there
+is large headroom left unused by this cadence). VI/field timing is
+independently correct at 59.7/s. Whether 60 Hz presentation of 60 *unique*
+frames per second is achievable on this route is **not established** — the
+open question is whether this route section is inherently ~24 fps guest
+content, not whether the presenter can keep up.
+
+## Audio
+
+Transport run: wall 23 s (host was under background load; recorded honestly
+rather than re-run clean), wait ratio 0.230, live-sample underruns=0/drops=0.
+Paced run: live-sample underruns=0/drops=0 throughout, out to 424,448+
+frames.
+
+The exit-line underrun counts printed at the end of parked runs (932/2348 in
+one capture) are a **parked-window artifact, not a real underrun rate**:
+once the guest reaches route end and stops producing, the sink keeps
+draining, and `underrun_span` attributes every subsequent underrun back to
+the final packet (436736). Any wall-time figure taken from a parked run must
+use the parked marker, not the exit line, and any exit-line audio count
+needs this caveat attached or it overstates underruns by orders of
+magnitude. PCM fidelity itself remains **unvalidated** — there is no capture
+knob in `host_audio.c` and no reference comparison has been done.
+
+## Floors (`FLOORS.md`)
+
+- Software-backend suffix is bit-exact golden (chain `ed27f20acbdfe1d0`),
+  with no COW involvement in that path.
+- DSP-LLE is synchronous by default (`dsp.c:123-135`) — confirmed by
+  reading the source; there is no affirmative log line that announces this
+  at runtime.
+- CPU force-interpreter control is confirmed **ABSENT**. The force-floor
+  gate is still not exercised — unchanged from the prior handoff.
+
+## Outstanding — performance measurement and release integration
+
+1. **Refresh the weighted fallback census next.** Per the attribution above,
+   the dominant cost is the 405,238 `general_tev_eligible()` fallback
+   rejections in `gx_raster.c:4106+`, not arena pressure. Before proposing
+   batching or the next exact-TEV phase, attribute those failures by
+   eligibility condition and by draw/triangle weight (a raw failure count
+   does not tell you which condition to fix first).
+2. **Confirm whether this route section is inherently low-fps guest
+   content.** The posts=352/fields=857 identity above means the ~24.6
+   frames/s cadence is not a presenter or emulation bottleneck. Compare
+   against the Dolphin oracle or a different (gameplay) section to
+   determine whether this is expected guest behavior for this specific
+   route section.
+3. **Keep the metrics separate.** Capacity clears the 66 DrawDone/s gate on
+   this route (both arms). VI/field timing is correct at 59.7/s. Neither of
+   those establishes 60 Hz presentation of unique frames, and audio
+   endurance/quality is a distinct gate from both.
+4. **Do not promote historical rankings that predate this attribution
+   pass.** The level-1 TEV regression, old ~28% DSP share, residual icbi
+   cost, and 5.8% PGO result all predate COW and this attribution refresh.
+5. **Close the unmeasured gaps before calling attribution complete.**
+   Draw-arena drains, per-pixel weight under Vulkan, and worker-thread GX
+   exclusive time have no counters yet.
+6. **Promote or retain COW deliberately.** Broader title/endurance, paced
+   presentation, reset/snapshot/shutdown, and force-floor coverage must
+   precede default promotion and title pinning.
+
+Allowed claim (still accurate, carried forward verbatim): the measured route
+clears the 66/s unthrottled emulation-capacity gate without removing the
+retained software/interpreter/DSP-LLE paths. A complete exercised
+force-floor gate, actual 60-Hz presentation, and release-quality audio are
+not yet established.
+
+## Late-session addendum (2026-08-10, after the checkpoint above)
+
+- **Attract loop closed end-to-end once, zero-input** (title → storybook
+  attract → title, t=566 s) — first time the title sequence has been observed
+  completing. Evidence: `TITLESEQ2_ATTRACT.md` + `titleseq3-*` in the capture
+  tree.
+- **New framework bug `beads-u2x.1`**: rendering-only corruption (static
+  magenta XFB noise, guest alive underneath) at the *second* attract
+  transition. TLUT COW ring pegged at 65536/65536 with 236 rollovers — the
+  TLUT rollover path was never exercised by any prior validation (texture
+  arena was; TLUT was not) — plus 1,770 unsupported EFB copy `0x018A03`
+  fallbacks confined to the corruption window. **COW promotion is blocked on
+  a forced-small-TLUT-arena test.**
+- **New framework bug `beads-u2x.2`**: WW ocean renders flat solid blue (no
+  waves/specular/foam) in both render paths from t=0; Dolphin's zero-input
+  title additionally shows a logo overlay + daytime lighting ours lacks.
+  Suspected shared-model gap — the golden chain is self-referential (proves
+  determinism, not correctness), so corun/chain gates are structurally blind
+  to it. Memory-card-state divergence (we auto-format blank card A; Dolphin
+  had none and blocks on the no-save dialog loop) must be eliminated first.
+- **Oracle facts** (`ORACLE_CADENCE.md`): Dolphin dumps 1 PNG per VI field at
+  59.94 Hz with no dedup; exact-hash dedup is useless (per-field noise) — use
+  perceptually-thresholded diffs. Dolphin never starts a New Game without
+  input.
+- **Cadence unification**: "audio full speed, visuals slow" is guest
+  render-cadence collapse in heavy scenes (measured live: 59.3 fields/s but
+  ~6.7 new frames/s), same root as the 57.7% fallback-wait cost — the
+  optimization track directly buys visible frames.
 
 ## Outstanding — correctness / validation
 
@@ -72,7 +207,7 @@ sailing), all byte-exact against the golden XFB chain `ed27f20acbdfe1d0`
   only): frames ~879–914, planes B/D/K/L/N, gpu≈2×sw alpha-halving
   signature. Not seen on the WW route.
 - **Latent PE-fence-poison hang note** in gx.c's drain loop (pre-existing
-  handoff note; never reproduced this session).
+  handoff note; never reproduced).
 - **Snapshot identity hash is provisional** — a MEM1 content hash, not a
   real disc/DOL identity (no DOL-load path exists to hash against yet).
   Flagged in `snapshot.h`. Required before the production BIOS-skip knob
@@ -83,21 +218,37 @@ sailing), all byte-exact against the golden XFB chain `ed27f20acbdfe1d0`
   snapshot, plus the identity hash above).
 - **Mid-game snapshot capture** untested (format deliberately doesn't
   preclude it; the drain-assert is the gate).
-- **July checkpoint items still open**: WGL flicker final validation
-  (clean unobstructed 60 s capture on the inner Game Play screen),
-  audio-enabled endurance run (pacing + zero sustained WASAPI underruns
-  together), window-resize stress test, in-menu memcard copy/delete
-  interactive acceptance pass.
+- **Audio-enabled endurance** (July checkpoint item, partial progress
+  tonight): the paced route now passes with live-sample underruns=0/drops=0
+  out to 424,448+ frames, and the exit-line underrun counts from parked runs
+  are understood to be a parked-window artifact rather than real drops (see
+  "Audio" above). Long-duration endurance beyond this route, and PCM
+  fidelity validation (no capture/reference-comparison tooling exists yet),
+  remain open.
+- **July checkpoint items still open**: WGL flicker final validation (clean
+  unobstructed 60 s capture on the inner Game Play screen); window-resize
+  stress; in-menu memcard copy/delete acceptance.
 
 ## Process / tooling notes (this session)
 
 - Builds ALWAYS BelowNormal priority, max 2 jobs. Launch runs via bash
   with file redirection — a PowerShell dual-pipe synchronous redirect
   deadlocks `gcn_boot` (voluminous stderr fills the pipe; caused one real
-  wedged run this session).
+  wedged run previously).
 - Verify every headed run through the TCP debug server (`GCN_DEBUG_PORT`,
   `tools/gcn_debug_client.py ping/screenshot`) — exit-gate greps prove
   nothing about a wedged run.
+- `GCN_GX_XFB_HASH=1` is required for the chain gates to run at all — a
+  prior handoff's recorded environment omitted it; don't reuse that env
+  verbatim.
+- The COW knob is `GCN_GX_VK_TEXTURE_COW=1`.
+- Debug ports 4380/4381 can be squatted by unrelated sibling processes —
+  check with `netstat` before picking a port for a new run.
+- `GCN_DEBUG_PORT` parks the process at route end rather than exiting: wall
+  time must be measured start→parked-marker, and the process must be quit
+  via `tools/gcn_debug_client.py`, not by waiting on exit.
+- Bash `$!` after `run.sh` is the wrong PID — `run.sh` execs, so `$!` is
+  not the actual runtime process.
 - Recompiler ctest requires `C:\msys64\mingw64\bin` on PATH or 3 tests
   fail with spurious compile errors.
 - The per-triangle differential knobs (`GCN_GX_VK_DRAW_VALIDATE`) are a

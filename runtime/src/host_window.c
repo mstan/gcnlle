@@ -92,6 +92,78 @@ int gcn_host_window_enabled(void) {
     return s_enabled;
 }
 
+/* ---- GCN_PRESENT_STATS=1 cached check (same lazy -1 sentinel pattern) ---- */
+int gcn_present_stats_enabled(void) {
+    static int s_enabled = -1;
+    if (s_enabled < 0) {
+        const char* e = getenv("GCN_PRESENT_STATS");
+        s_enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return s_enabled;
+}
+
+/* ---- opt-in present/VI cadence stats (GCN_PRESENT_STATS=1) ----
+ * Counts distinct presents, coalesced posts, and post->present latency for
+ * the mailbox above. Zero cost when unset beyond the cached getenv check
+ * above: no new locks anywhere in the present path, and every
+ * counter here is a plain (non-atomic) u64 touched only by its OWNING
+ * thread — posts/coalesced by the main emulation thread inside
+ * gcn_host_window_present, distinct/latency by the window thread inside
+ * do_present. gcn_host_window_get_stats() below does a lock-free struct
+ * copy for the teardown print and the TCP debug server's "present_state"
+ * query; a racy read of in-progress stats counters is acceptable (this is
+ * observability, never guest-visible state) the same way host_audio.c's
+ * GcnHostAudioStats is read without a lock. */
+static u64    s_stat_posts            = 0;
+static u64    s_stat_coalesced        = 0;
+static u64    s_stat_distinct         = 0;
+static u64    s_stat_latency_samples  = 0;
+static double s_stat_latency_sum_ms   = 0.0;
+static double s_stat_latency_max_ms   = 0.0;
+
+/* Latest-post wall-clock timestamp: written by the main thread on every
+ * post, read by the window thread once per do_present() to measure
+ * post->present latency. A single 64-bit slot with no lock — if a second
+ * post lands between the write and the read, the measurement is against
+ * whichever post's timestamp is newest, which is exactly the frame
+ * do_present() is about to draw (the mailbox already coalesces to "latest
+ * frame wins"), so this is race-TOLERANT, not merely race-ignored. */
+static volatile LONGLONG s_stat_last_post_qpc = 0;
+
+static double stat_qpc_freq_hz(void) {
+    static LARGE_INTEGER s_freq;
+    static int s_ready = 0;
+    if (!s_ready) {
+        QueryPerformanceFrequency(&s_freq);
+        s_ready = 1;
+    }
+    return (double)s_freq.QuadPart;
+}
+
+void gcn_host_window_get_stats(GcnPresentStats* out) {
+    if (!out) return;
+    out->enabled = gcn_present_stats_enabled() ? true : false;
+    out->posts = s_stat_posts;
+    out->coalesced = s_stat_coalesced;
+    out->distinct = s_stat_distinct;
+    out->latency_samples = s_stat_latency_samples;
+    out->latency_sum_ms = s_stat_latency_sum_ms;
+    out->latency_max_ms = s_stat_latency_max_ms;
+}
+
+void gcn_host_window_print_stats(void) {
+    if (!gcn_present_stats_enabled()) return;
+    double avg_ms = s_stat_latency_samples
+        ? s_stat_latency_sum_ms / (double)s_stat_latency_samples : 0.0;
+    fprintf(stderr,
+            "host_window: present stats posts=%llu distinct=%llu coalesced=%llu "
+            "latency avg=%.2fms max=%.2fms\n",
+            (unsigned long long)s_stat_posts,
+            (unsigned long long)s_stat_distinct,
+            (unsigned long long)s_stat_coalesced,
+            avg_ms, s_stat_latency_max_ms);
+}
+
 /* ---- shared publish buffer (main thread writes, window thread reads) ---- */
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static u8*  s_shared_data  = NULL;
@@ -584,6 +656,32 @@ static void do_present(HWND hwnd) {
     } else {
         InvalidateRect(hwnd, NULL, FALSE);
     }
+
+    /* GCN_PRESENT_STATS=1: this is the "distinct present" site — reached
+     * once per WM_GCN_PRESENT that carried an actual field (not the
+     * WM_PAINT expose/resize redraw path above do_present, which never
+     * calls this function). For the GL path the SwapBuffers inside
+     * gl_draw_quad() has already committed by the time we get here, so the
+     * latency below is genuinely post->swap-complete; the GDI path has no
+     * swapchain (see gdi_wait_for_compositor's doc comment) and only
+     * schedules the blit via InvalidateRect, so its latency is post->
+     * repaint-scheduled, a slight underestimate of true post->blit. */
+    if (gcn_present_stats_enabled()) {
+        s_stat_distinct++;
+        LONGLONG post_qpc = s_stat_last_post_qpc;
+        if (post_qpc) {
+            double freq = stat_qpc_freq_hz();
+            if (freq > 0.0) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                double ms = 1000.0 * (double)(now.QuadPart - post_qpc) / freq;
+                if (ms < 0.0) ms = 0.0;   /* defensive only; QPC is monotonic */
+                s_stat_latency_sum_ms += ms;
+                if (ms > s_stat_latency_max_ms) s_stat_latency_max_ms = ms;
+                s_stat_latency_samples++;
+            }
+        }
+    }
 }
 
 typedef HRESULT (WINAPI *gcn_DwmFlush_t)(void);
@@ -849,6 +947,19 @@ void gcn_host_window_present(const u8* xfb, u32 width, u32 height, u32 stride) {
     if (!gcn_host_window_enabled() || !s_hwnd || !xfb) return;
     if (width == 0 || height == 0 || stride == 0) return;
 
+    /* GCN_PRESENT_STATS=1: stamp the post BEFORE the memcpy/lock below so the
+     * latency measured at the present site includes the full mailbox publish
+     * (matches what "post" means to a caller waiting on the window to catch
+     * up), not just the message-post instant. Read once into a local so the
+     * getenv-cache check and the timestamp always agree within this call. */
+    int stats_on = gcn_present_stats_enabled();
+    if (stats_on) {
+        s_stat_posts++;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        s_stat_last_post_qpc = now.QuadPart;
+    }
+
     size_t need = (size_t)stride * (size_t)height;
     AcquireSRWLockExclusive(&s_lock);
     if (need > s_shared_cap) {
@@ -861,9 +972,18 @@ void gcn_host_window_present(const u8* xfb, u32 width, u32 height, u32 stride) {
     s_shared_valid = 1;
     ReleaseSRWLockExclusive(&s_lock);
 
-    if (InterlockedExchange(&s_present_posted, 1) == 0 &&
-        !PostMessageA(s_hwnd, WM_GCN_PRESENT, 0, 0))
-        InterlockedExchange(&s_present_posted, 0);
+    /* InterlockedExchange returning 1 means a previous post's mailbox slot
+     * was still pending (the window thread hasn't consumed WM_GCN_PRESENT
+     * yet) and this post just overwrote it — that previous field is the one
+     * GCN_PRESENT_STATS counts as coalesced, not this one (this one is what
+     * do_present() will actually draw). */
+    LONG prev_posted = InterlockedExchange(&s_present_posted, 1);
+    if (prev_posted == 0) {
+        if (!PostMessageA(s_hwnd, WM_GCN_PRESENT, 0, 0))
+            InterlockedExchange(&s_present_posted, 0);
+    } else if (stats_on) {
+        s_stat_coalesced++;
+    }
 }
 
 int gcn_host_window_quit_requested(void) {
