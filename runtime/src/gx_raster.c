@@ -17,6 +17,136 @@
 #include <stdint.h>      /* uintptr_t — GCN_GX_CFG_CACHE_VERIFY pointer-field compares */
 #include <stdlib.h>      /* getenv — GCN_GX_STATS cached read, see below; abort() — cfg-cache-verify mismatch */
 #include <string.h>
+#include <direct.h>
+
+static int s_efb_copy_dump_init;
+static char s_efb_copy_dump_dir[512];
+static u64 s_efb_copy_dump_every = 1;
+static u64 s_efb_copy_dump_seq;
+static u32 s_efb_copy_dump_errors;
+static int s_efb_copy_dump_texture_only;
+static int s_efb_source_dump_init;
+static char s_efb_source_dump_dir[512];
+static u64 s_efb_source_dump_every = 1;
+static int s_efb_source_dump_addr_enabled;
+static u32 s_efb_source_dump_addr;
+static u32 s_efb_source_dump_errors;
+
+static int efb_copy_dump_on(void) {
+    if (!s_efb_copy_dump_init) {
+        const char* dir = getenv("GCN_GX_EFB_COPY_DUMP");
+        if (dir && dir[0]) {
+            snprintf(s_efb_copy_dump_dir, sizeof s_efb_copy_dump_dir, "%s", dir);
+            _mkdir(s_efb_copy_dump_dir);
+        }
+        const char* ev = getenv("GCN_GX_EFB_COPY_DUMP_EVERY");
+        if (ev && ev[0]) {
+            unsigned long long parsed = strtoull(ev, NULL, 0);
+            if (parsed != 0)
+                s_efb_copy_dump_every = (u64)parsed;
+        }
+        const char* texture_only = getenv("GCN_GX_EFB_COPY_DUMP_TEXTURE_ONLY");
+        s_efb_copy_dump_texture_only = texture_only && texture_only[0] &&
+                                       strcmp(texture_only, "0") != 0;
+        s_efb_copy_dump_init = 1;
+    }
+    return s_efb_copy_dump_dir[0] != '\0';
+}
+
+static int efb_source_dump_on(void) {
+    if (!s_efb_source_dump_init) {
+        const char* dir = getenv("GCN_GX_EFB_SOURCE_DUMP");
+        if (dir && dir[0]) {
+            snprintf(s_efb_source_dump_dir, sizeof s_efb_source_dump_dir, "%s", dir);
+            _mkdir(s_efb_source_dump_dir);
+        }
+        const char* ev = getenv("GCN_GX_EFB_SOURCE_DUMP_EVERY");
+        if (ev && ev[0]) {
+            unsigned long long parsed = strtoull(ev, NULL, 0);
+            if (parsed != 0)
+                s_efb_source_dump_every = (u64)parsed;
+        }
+        const char* addr = getenv("GCN_GX_EFB_SOURCE_DUMP_ADDR");
+        if (addr && addr[0]) {
+            s_efb_source_dump_addr = (u32)strtoul(addr, NULL, 0);
+            s_efb_source_dump_addr_enabled = 1;
+        }
+        s_efb_source_dump_init = 1;
+    }
+    return s_efb_source_dump_dir[0] != '\0';
+}
+
+static void efb_copy_dump_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows,
+                               u32 logical_w, u32 logical_h, u32 dst_addr,
+                               u32 copy_word, u32 copy_format, u32 is_xfb,
+                               u32 cpu_pc, u64 frame, u64 xfb_pub_count,
+                               u64 source_hash, u32 source_mean,
+                               u32 src_left, u32 src_top, u32 src_width, u32 src_height,
+                               u32 source_flags, u32 pixel_format) {
+    u64 seq = s_efb_copy_dump_seq++;
+    if (!efb_copy_dump_on() || !base || !stride || !row_bytes || !rows)
+        return;
+    if (s_efb_copy_dump_texture_only && is_xfb)
+        return;
+    if (s_efb_copy_dump_every == 0 || (seq % s_efb_copy_dump_every) != 0)
+        return;
+
+    char path[1024];
+    size_t dir_len = strlen(s_efb_copy_dump_dir);
+    const char sep = (dir_len && (s_efb_copy_dump_dir[dir_len - 1] == '\\' ||
+                                  s_efb_copy_dump_dir[dir_len - 1] == '/')) ? '\0' : '\\';
+    if (sep)
+        snprintf(path, sizeof path, "%s\\runtime-efbcopy.%llu.bin",
+                 s_efb_copy_dump_dir, (unsigned long long)seq);
+    else
+        snprintf(path, sizeof path, "%sruntime-efbcopy.%llu.bin",
+                 s_efb_copy_dump_dir, (unsigned long long)seq);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        if (s_efb_copy_dump_errors < 8)
+            fprintf(stderr, "gx_raster: cannot open EFB-copy dump %s\n", path);
+        s_efb_copy_dump_errors++;
+        return;
+    }
+    const char magic[8] = { 'G', 'C', 'N', 'E', 'F', 'B', 'C', 'P' };
+    const u32 fields[10] = {
+        1u, is_xfb ? 1u : 0u, dst_addr, logical_w, logical_h,
+        row_bytes, rows, stride, copy_format, copy_word
+    };
+    int ok = fwrite(magic, 1, sizeof magic, f) == sizeof magic &&
+             fwrite(&seq, sizeof seq, 1, f) == 1 &&
+             fwrite(fields, sizeof(u32), 10, f) == 10;
+    for (u32 y = 0; ok && y < rows; y++)
+        ok = fwrite(base + (u64)y * stride, 1, row_bytes, f) == row_bytes;
+    fclose(f);
+    if (!ok && s_efb_copy_dump_errors < 8)
+        fprintf(stderr, "gx_raster: short write for EFB-copy dump %s\n", path);
+    if (!ok)
+        s_efb_copy_dump_errors++;
+
+    if (sep)
+        snprintf(path, sizeof path, "%s\\runtime-efbcopy.meta.jsonl", s_efb_copy_dump_dir);
+    else
+        snprintf(path, sizeof path, "%sruntime-efbcopy.meta.jsonl", s_efb_copy_dump_dir);
+    FILE* mf = fopen(path, "ab");
+    if (mf) {
+        fprintf(mf,
+            "{\"seq\":%llu,\"is_xfb\":%u,\"dst_addr\":%u,"
+            "\"pc\":%u,\"frame\":%llu,\"xfb_pub_count\":%llu,"
+            "\"logical_width\":%u,\"logical_height\":%u,\"row_bytes\":%u,"
+            "\"rows\":%u,\"stride\":%u,\"copy_format\":%u,\"copy_word\":%u,"
+            "\"src_left\":%u,\"src_top\":%u,\"src_width\":%u,\"src_height\":%u,"
+            "\"source_flags\":%u,\"pixel_format\":%u,\"source_hash\":\"%016llx\","
+            "\"source_mean\":%u}\n",
+            (unsigned long long)seq, is_xfb ? 1u : 0u, dst_addr,
+            cpu_pc, (unsigned long long)frame, (unsigned long long)xfb_pub_count,
+            logical_w, logical_h, row_bytes, rows, stride, copy_format, copy_word,
+            src_left, src_top, src_width, src_height, source_flags, pixel_format,
+            (unsigned long long)source_hash, source_mean);
+        fclose(mf);
+    }
+}
 #include <x86intrin.h>   /* __rdtsc — GCN_GX_STATS attribution only */
 #include <emmintrin.h>   /* SSE2 — EFB-copy scanline encode (GCN_GX_NO_SIMD knob) */
 #include <immintrin.h>   /* AVX2 — efb_clear_rect / EFB-copy scanline encode 8-wide
@@ -703,16 +833,56 @@ typedef struct {
 } GxDebugTexture;
 
 typedef struct {
+    u64 seq;
+    u32 pc, value, dl;
+} GxBpWriteProv;
+
+typedef struct {
+    u64 seq;
+    u32 pc, value, dl;
+} GxXfWriteProv;
+
+typedef struct {
+    GxBpWriteProv genmode, zmode, blendmode, pecontrol, alpha_test;
+} GxBpDrawProv;
+
+typedef struct {
     int valid;
-    u64 sequence, frame;
+    u32 mask[3];
+    u8 pos_mtx[3];
+    float obj[3][3], clip[3][4], screen[3][3];
+} GxDebugFirstTriangle;
+
+typedef struct {
+    int valid;
+    u32 pos_mtx;
+    u32 matrix_words[12];
+    float matrix[12];
+    u32 projection_type;
+    u32 projection_words[6];
+    float projection[6];
+    u32 viewport_words[6];
+    float viewport[6];
+    GxXfWriteProv matrix_prov[12];
+    GxXfWriteProv projection_prov[7];
+    GxXfWriteProv viewport_prov[6];
+} GxDebugXfSnapshot;
+
+typedef struct {
+    int valid;
+    u64 sequence, frame, xfb_pub_count;
     u32 cpu_pc, dl, prim, vat, nverts, vstride;
     u32 vertex_bytes;
     u64 vertex_hash;
     u8 vertex_head[32], vertex_tail[32];
     u32 vertex_head_len, vertex_tail_len;
+    u32 vcd_lo, vcd_hi, vat_g0, vat_g1, vat_g2;
+    u32 matrix_index_a, matrix_index_b;
+    u32 array_bases[16], array_strides[16];
     u32 census_hash, program_id;
     u32 genmode, alpha_test;
     u32 zmode, blendmode, dstalpha, pecontrol;
+    GxBpDrawProv bp_prov;
     u32 numtexgens, numcolchans, numtevstages;
     u32 bp_tev_ra[4], bp_tev_bg[4];
     s16 tev_reg[4][4], tev_konst[4][4];
@@ -727,6 +897,8 @@ typedef struct {
     int bbox_valid;
     s32 bbox_minx, bbox_miny, bbox_maxx, bbox_maxy;
     u32 largest_triangle_area;
+    GxDebugFirstTriangle first_triangle;
+    GxDebugXfSnapshot xf;
     struct {
         float obj[3], mv[3], clip[4], screen[3];
         float normal[3][3], texcoord[8][3];
@@ -746,13 +918,24 @@ static GxDebugDraw s_debug_pending;
 static int s_debug_pending_index = -1;
 static u64 s_debug_pending_pixels_before;
 static u64 s_debug_draw_sequence;
+static int s_debug_draw_state = -1;
+static int s_debug_draw_min_y = -1;
+static int s_debug_skip_draw_pc_init;
+static u32 s_debug_skip_draw_pc;
+static u32 s_debug_skip_draw_hits;
 
 #define GX_DEBUG_RECENT_MAX 2048u
 #define GX_DEBUG_LARGE_MAX 4096u
 typedef struct {
-    u64 sequence, frame;
-    u32 cpu_pc, dl, census_hash, prim, nverts, vstride;
+    u64 sequence, frame, xfb_pub_count;
+    u32 cpu_pc, dl, census_hash, prim, vat, nverts, vstride;
+    u32 vertex_bytes;
     u64 vertex_hash, pixels, alpha_tested, alpha_rejected, alpha_sum;
+    u8 vertex_head[32], vertex_tail[32];
+    u32 vertex_head_len, vertex_tail_len;
+    u32 vcd_lo, vcd_hi, vat_g0, vat_g1, vat_g2;
+    u32 matrix_index_a, matrix_index_b;
+    u32 array_bases[16], array_strides[16];
     u32 alpha_min, alpha_max;
     u64 blend_inputs, z_rejected, color_writes;
     u32 triangles_submitted, triangles_trivial_rejected, triangles_culled;
@@ -762,7 +945,10 @@ typedef struct {
     s32 bbox_minx, bbox_miny, bbox_maxx, bbox_maxy;
     u32 largest_triangle_area;
     float largest_screen[3][3];
-    u32 alpha_test, zmode, blendmode, pecontrol;
+    GxDebugFirstTriangle first_triangle;
+    GxDebugXfSnapshot xf;
+    u32 genmode, alpha_test, zmode, blendmode, pecontrol;
+    GxBpDrawProv bp_prov;
 } GxDebugRecent;
 static GxDebugRecent s_debug_recent[GX_DEBUG_RECENT_MAX];
 static u32 s_debug_recent_head, s_debug_recent_count;
@@ -775,6 +961,30 @@ static u64 s_debug_recent_sequence, s_debug_recent_latest_frame;
 static GxDebugRecent s_debug_large[GX_DEBUG_LARGE_MAX];
 static u32 s_debug_large_head, s_debug_large_count;
 static u64 s_debug_large_latest_frame;
+static u64 s_bp_prov_sequence;
+static GxBpWriteProv s_bp_prov[256];
+static u64 s_xf_prov_sequence;
+static GxXfWriteProv s_xf_prov[0x1058];
+
+void gx_raster_record_bp_write(u32 cmd, u32 value, u32 pc, u32 dl) {
+    if (cmd >= 256u)
+        return;
+    GxBpWriteProv* p = &s_bp_prov[cmd];
+    p->seq = ++s_bp_prov_sequence;
+    p->pc = pc;
+    p->value = value;
+    p->dl = dl;
+}
+
+void gx_raster_record_xf_write(u32 addr, u32 value, u32 pc, u32 dl) {
+    if (addr >= 0x1058u)
+        return;
+    GxXfWriteProv* p = &s_xf_prov[addr];
+    p->seq = ++s_xf_prov_sequence;
+    p->pc = pc;
+    p->value = value;
+    p->dl = dl;
+}
 
 void gx_raster_notify_bp_write(u32 cmd) {
     if (++s_bp_generation == 0) {
@@ -4638,6 +4848,57 @@ static void perspective_divide(OutVtx* v) {
     v->screenPosition[1] = v->projectedPosition[1] * wInv * vp_ht() + vp_yo();
     v->screenPosition[2] = v->projectedPosition[2] * wInv * vp_zr() + vp_fz();
 }
+
+static void debug_capture_xf_snapshot(u8 pos_mtx) {
+    GxDebugXfSnapshot* xf = &s_debug_pending.xf;
+    if (xf->valid)
+        return;
+    xf->valid = 1;
+    xf->pos_mtx = pos_mtx;
+    for (u32 i = 0; i < 12u; ++i) {
+        u32 addr = (u32)pos_mtx * 4u + i;
+        xf->matrix_words[i] = s_xf[addr];
+        xf->matrix[i] = xf_f(addr);
+        xf->matrix_prov[i] = s_xf_prov[addr];
+    }
+    xf->projection_type = s_xf[0x1026];
+    for (u32 i = 0; i < 6u; ++i) {
+        xf->projection_words[i] = s_xf[0x1020u + i];
+        xf->projection[i] = xf_f(0x1020u + i);
+        xf->projection_prov[i] = s_xf_prov[0x1020u + i];
+        xf->viewport_words[i] = s_xf[0x101au + i];
+        xf->viewport[i] = xf_f(0x101au + i);
+        xf->viewport_prov[i] = s_xf_prov[0x101au + i];
+    }
+    xf->projection_prov[6] = s_xf_prov[0x1026];
+}
+
+static void debug_capture_first_triangle(const OutVtx* v0, const OutVtx* v1,
+                                         const OutVtx* v2) {
+    if (s_debug_pending_index < 0 || s_debug_pending.first_triangle.valid)
+        return;
+    const OutVtx* v[3] = { v0, v1, v2 };
+    GxDebugFirstTriangle* first = &s_debug_pending.first_triangle;
+    first->valid = 1;
+    debug_capture_xf_snapshot(v0->posMtx);
+    for (u32 i = 0; i < 3u; ++i) {
+        first->mask[i] = (u32)calc_clip_mask(v[i]);
+        first->pos_mtx[i] = v[i]->posMtx;
+        memcpy(first->obj[i], v[i]->objPos, sizeof first->obj[i]);
+        memcpy(first->clip[i], v[i]->projectedPosition, sizeof first->clip[i]);
+        float w = v[i]->projectedPosition[3];
+        if (w != 0.0f) {
+            float wInv = 1.0f / w;
+            first->screen[i][0] =
+                v[i]->projectedPosition[0] * wInv * vp_wd() + vp_xo();
+            first->screen[i][1] =
+                v[i]->projectedPosition[1] * wInv * vp_ht() + vp_yo();
+            first->screen[i][2] =
+                v[i]->projectedPosition[2] * wInv * vp_zr() + vp_fz();
+        }
+    }
+}
+
 static int is_backface(const OutVtx* v0, const OutVtx* v1, const OutVtx* v2) {
     float x0 = v0->projectedPosition[0], x1 = v1->projectedPosition[0], x2 = v2->projectedPosition[0];
     float y0 = v0->projectedPosition[1], y1 = v1->projectedPosition[1], y2 = v2->projectedPosition[1];
@@ -4707,8 +4968,10 @@ static void clip_triangle(int* indices, int* numIndices, int mask) {
 }
 
 static void process_triangle(Tev* t, OutVtx* v0, OutVtx* v1, OutVtx* v2) {
-    if (s_debug_pending_index >= 0)
+    if (s_debug_pending_index >= 0) {
         s_debug_pending.triangles_submitted++;
+        debug_capture_first_triangle(v0, v1, v2);
+    }
     int m = calc_clip_mask(v0) & calc_clip_mask(v1) & calc_clip_mask(v2);
     if (m != 0) {
         if (s_debug_pending_index >= 0)
@@ -6309,11 +6572,18 @@ static u32 debug_texture_bytes(const TexUnitCfg* tc) {
     return (u32)bytes;
 }
 
-static void debug_capture_draw(u32 prim, u32 vat, const u8* verts,
-                               u32 nverts, u32 vstride) {
+static void debug_capture_draw(const GxCpState* cp, u32 prim, u32 vat,
+                               const u8* verts, u32 nverts, u32 vstride) {
     s_debug_pending_index = -1;
-    if (!s_tev_census || s_census_cur < 0 ||
-        s_census_cur >= GX_CENSUS_MAX)
+    if (s_debug_draw_state < 0) {
+        s_debug_draw_state = getenv("GCN_GX_DRAW_STATE") ? 1 : 0;
+        const char* min_y = getenv("GCN_GX_DRAW_MIN_Y");
+        if (min_y && *min_y)
+            s_debug_draw_min_y = atoi(min_y);
+    }
+    int have_census = s_tev_census && s_census_cur >= 0 &&
+                      s_census_cur < GX_CENSUS_MAX;
+    if (!have_census && !s_debug_draw_state)
         return;
 
     GxDebugDraw* d = &s_debug_pending;
@@ -6322,30 +6592,47 @@ static void debug_capture_draw(u32 prim, u32 vat, const u8* verts,
     d->last_tex_alpha_min = 255u;
     d->valid = 1;
     d->frame = gcn_gx_frame_count();
+    d->xfb_pub_count = gcn_gx_xfb_pub_count();
     d->cpu_pc = s_cpu ? s_cpu->pc : 0u;
     d->dl = gcn_gx_current_dl();
     d->prim = prim;
     d->vat = vat;
     d->nverts = nverts;
     d->vstride = vstride;
+    d->vcd_lo = cp->vtx_desc_lo;
+    d->vcd_hi = cp->vtx_desc_hi;
+    d->vat_g0 = cp->vat_g0[vat];
+    d->vat_g1 = cp->vat_g1[vat];
+    d->vat_g2 = cp->vat_g2[vat];
+    d->matrix_index_a = cp->matrix_index_a;
+    d->matrix_index_b = cp->matrix_index_b;
+    memcpy(d->array_bases, cp->array_bases, sizeof d->array_bases);
+    memcpy(d->array_strides, cp->array_strides, sizeof d->array_strides);
     {
         u64 bytes = (u64)nverts * vstride;
         if (bytes > 0xffffffffull)
             bytes = 0xffffffffull;
         d->vertex_bytes = (u32)bytes;
-        d->vertex_hash = debug_hash_bytes(verts, d->vertex_bytes);
-        d->vertex_head_len = d->vertex_bytes < sizeof d->vertex_head ?
-                             d->vertex_bytes : (u32)sizeof d->vertex_head;
-        d->vertex_tail_len = d->vertex_bytes < sizeof d->vertex_tail ?
-                             d->vertex_bytes : (u32)sizeof d->vertex_tail;
-        if (d->vertex_head_len)
-            memcpy(d->vertex_head, verts, d->vertex_head_len);
-        if (d->vertex_tail_len)
-            memcpy(d->vertex_tail,
-                   verts + d->vertex_bytes - d->vertex_tail_len,
-                   d->vertex_tail_len);
+        if (have_census || s_debug_draw_state) {
+            d->vertex_hash = debug_hash_bytes(verts, d->vertex_bytes);
+            d->vertex_head_len = d->vertex_bytes < sizeof d->vertex_head ?
+                                 d->vertex_bytes : (u32)sizeof d->vertex_head;
+            d->vertex_tail_len = d->vertex_bytes < sizeof d->vertex_tail ?
+                                 d->vertex_bytes : (u32)sizeof d->vertex_tail;
+            if (d->vertex_head_len)
+                memcpy(d->vertex_head, verts, d->vertex_head_len);
+            if (d->vertex_tail_len)
+                memcpy(d->vertex_tail,
+                       verts + d->vertex_bytes - d->vertex_tail_len,
+                       d->vertex_tail_len);
+        } else {
+            d->vertex_hash = ((u64)prim << 56) ^ ((u64)vat << 48) ^
+                             ((u64)nverts << 16) ^ (u64)vstride;
+        }
     }
-    d->census_hash = s_census[s_census_cur].hash;
+    d->census_hash = have_census ?
+                     s_census[s_census_cur].hash :
+                     (0xD0000000u | (s_cfg.program_id & 0x0FFFFFFFu));
     d->program_id = s_cfg.program_id;
     d->genmode = s_bp[0x00];
     d->alpha_test = s_bp[0xF3];
@@ -6353,6 +6640,11 @@ static void debug_capture_draw(u32 prim, u32 vat, const u8* verts,
     d->blendmode = s_bp[0x41];
     d->dstalpha = s_bp[0x42];
     d->pecontrol = s_bp[0x43];
+    d->bp_prov.genmode = s_bp_prov[0x00];
+    d->bp_prov.zmode = s_bp_prov[0x40];
+    d->bp_prov.blendmode = s_bp_prov[0x41];
+    d->bp_prov.pecontrol = s_bp_prov[0x43];
+    d->bp_prov.alpha_test = s_bp_prov[0xF3];
     d->numtexgens = s_cfg.numtexgens;
     d->numcolchans = s_cfg.numcolchans;
     d->numtevstages = s_cfg.numtevstages + 1u;
@@ -6371,57 +6663,82 @@ static void debug_capture_draw(u32 prim, u32 vat, const u8* verts,
         d->tev_konst[reg][3] = tev_konst->a;
     }
 
-    u32 active_textures = 0;
-    for (u32 stage = 0; stage < d->numtevstages && stage < 16u; ++stage) {
-        const TevStageCfg* sc = &s_cfg.stage[stage];
-        u32 order = s_bp[0x28 + (stage >> 1)];
-        d->stage[stage].order = order;
-        d->stage[stage].texcoord = sc->texcoordSel;
-        d->stage[stage].texmap = sc->texmap;
-        d->stage[stage].enable = sc->enable;
-        d->stage[stage].colorchan = sc->colorchan;
-        d->stage[stage].cc = sc->cc;
-        d->stage[stage].ac = sc->ac;
-        d->stage[stage].tevind = sc->tevind;
-        d->stage[stage].ksel = s_bp[0xF6u + (stage >> 1)];
-        d->stage[stage].kcsel =
-            (stage & 1u) ? bits(d->stage[stage].ksel, 14, 5) :
-                           bits(d->stage[stage].ksel, 4, 5);
-        d->stage[stage].kasel =
-            (stage & 1u) ? bits(d->stage[stage].ksel, 19, 5) :
-                           bits(d->stage[stage].ksel, 9, 5);
-        d->stage[stage].konst[0] = sc->stage_konst.r;
-        d->stage[stage].konst[1] = sc->stage_konst.g;
-        d->stage[stage].konst[2] = sc->stage_konst.b;
-        d->stage[stage].konst[3] = sc->stage_konst.a;
-        if (sc->enable && sc->texmap < 8u)
-            active_textures |= 1u << sc->texmap;
-    }
+    if (have_census) {
+        u32 active_textures = 0;
+        for (u32 stage = 0; stage < d->numtevstages && stage < 16u; ++stage) {
+            const TevStageCfg* sc = &s_cfg.stage[stage];
+            u32 order = s_bp[0x28 + (stage >> 1)];
+            d->stage[stage].order = order;
+            d->stage[stage].texcoord = sc->texcoordSel;
+            d->stage[stage].texmap = sc->texmap;
+            d->stage[stage].enable = sc->enable;
+            d->stage[stage].colorchan = sc->colorchan;
+            d->stage[stage].cc = sc->cc;
+            d->stage[stage].ac = sc->ac;
+            d->stage[stage].tevind = sc->tevind;
+            d->stage[stage].ksel = s_bp[0xF6u + (stage >> 1)];
+            d->stage[stage].kcsel =
+                (stage & 1u) ? bits(d->stage[stage].ksel, 14, 5) :
+                               bits(d->stage[stage].ksel, 4, 5);
+            d->stage[stage].kasel =
+                (stage & 1u) ? bits(d->stage[stage].ksel, 19, 5) :
+                               bits(d->stage[stage].ksel, 9, 5);
+            d->stage[stage].konst[0] = sc->stage_konst.r;
+            d->stage[stage].konst[1] = sc->stage_konst.g;
+            d->stage[stage].konst[2] = sc->stage_konst.b;
+            d->stage[stage].konst[3] = sc->stage_konst.a;
+            if (sc->enable && sc->texmap < 8u)
+                active_textures |= 1u << sc->texmap;
+        }
 
-    for (u32 unit = 0; unit < 8u; ++unit) {
-        const TexUnitCfg* tc = &s_cfg.tex[unit];
-        GxDebugTexture* t = &d->tex[unit];
-        t->mode0 = tx_mode0(unit);
-        t->mode1 = tx_mode1(unit);
-        t->image0 = tc->image0_raw;
-        t->image3 = tc->image3_raw;
-        t->tlut = s_bp[(unit < 4u ? 0x98u : 0xB8u) + (unit & 3u)];
-        t->fmt = tc->fmt;
-        t->width = (u32)tc->w1 + 1u;
-        t->height = (u32)tc->h1 + 1u;
-        t->phys = tc->phys;
-        t->active = (active_textures & (1u << unit)) != 0;
-        t->valid = tc->valid;
-        if (t->active && t->valid) {
-            t->bytes = debug_texture_bytes(tc);
-            t->hash = debug_hash_bytes(tc->src, t->bytes);
-            t->sample_len = t->bytes < sizeof t->sample ?
-                            t->bytes : (u32)sizeof t->sample;
-            memcpy(t->sample, tc->src, t->sample_len);
+        for (u32 unit = 0; unit < 8u; ++unit) {
+            const TexUnitCfg* tc = &s_cfg.tex[unit];
+            GxDebugTexture* t = &d->tex[unit];
+            t->mode0 = tx_mode0(unit);
+            t->mode1 = tx_mode1(unit);
+            t->image0 = tc->image0_raw;
+            t->image3 = tc->image3_raw;
+            t->tlut = s_bp[(unit < 4u ? 0x98u : 0xB8u) + (unit & 3u)];
+            t->fmt = tc->fmt;
+            t->width = (u32)tc->w1 + 1u;
+            t->height = (u32)tc->h1 + 1u;
+            t->phys = tc->phys;
+            t->active = (active_textures & (1u << unit)) != 0;
+            t->valid = tc->valid;
+            if (t->active && t->valid) {
+                t->bytes = debug_texture_bytes(tc);
+                t->hash = debug_hash_bytes(tc->src, t->bytes);
+                t->sample_len = t->bytes < sizeof t->sample ?
+                                t->bytes : (u32)sizeof t->sample;
+                memcpy(t->sample, tc->src, t->sample_len);
+            }
         }
     }
-    s_debug_pending_index = s_census_cur;
-    s_debug_pending_pixels_before = s_census[s_census_cur].pixels;
+    s_debug_pending_index = have_census ? s_census_cur : GX_CENSUS_MAX;
+    s_debug_pending_pixels_before = have_census ?
+                                    s_census[s_census_cur].pixels : 0u;
+}
+
+static int debug_should_skip_draw(void) {
+    if (!s_debug_skip_draw_pc_init) {
+        s_debug_skip_draw_pc_init = 1;
+        const char* env = getenv("GCN_GX_SKIP_DRAW_PC");
+        if (env && env[0])
+            s_debug_skip_draw_pc = (u32)strtoul(env, NULL, 0);
+    }
+    if (s_debug_skip_draw_pc != 0u && s_cpu &&
+        s_cpu->pc == s_debug_skip_draw_pc) {
+        s_debug_skip_draw_hits++;
+        if (s_debug_skip_draw_hits <= 16u ||
+            (s_debug_skip_draw_hits & 0x3fu) == 0u) {
+            fprintf(stderr,
+                    "[gx-skip-draw] hit #%u pc=0x%08X frame=%llu\n",
+                    s_debug_skip_draw_hits, s_debug_skip_draw_pc,
+                    (unsigned long long)gcn_gx_frame_count());
+        }
+        return 1;
+    }
+    return 0;
 }
 
 static void debug_copy_recent(GxDebugRecent* recent,
@@ -6430,13 +6747,35 @@ static void debug_copy_recent(GxDebugRecent* recent,
     memset(recent, 0, sizeof *recent);
     recent->sequence = sequence;
     recent->frame = pending->frame;
+    recent->xfb_pub_count = pending->xfb_pub_count;
     recent->cpu_pc = pending->cpu_pc;
     recent->dl = pending->dl;
     recent->census_hash = pending->census_hash;
     recent->prim = pending->prim;
+    recent->vat = pending->vat;
     recent->nverts = pending->nverts;
     recent->vstride = pending->vstride;
+    recent->vertex_bytes = pending->vertex_bytes;
     recent->vertex_hash = pending->vertex_hash;
+    recent->vertex_head_len = pending->vertex_head_len;
+    recent->vertex_tail_len = pending->vertex_tail_len;
+    if (pending->vertex_head_len)
+        memcpy(recent->vertex_head, pending->vertex_head,
+               pending->vertex_head_len);
+    if (pending->vertex_tail_len)
+        memcpy(recent->vertex_tail, pending->vertex_tail,
+               pending->vertex_tail_len);
+    recent->vcd_lo = pending->vcd_lo;
+    recent->vcd_hi = pending->vcd_hi;
+    recent->vat_g0 = pending->vat_g0;
+    recent->vat_g1 = pending->vat_g1;
+    recent->vat_g2 = pending->vat_g2;
+    recent->matrix_index_a = pending->matrix_index_a;
+    recent->matrix_index_b = pending->matrix_index_b;
+    memcpy(recent->array_bases, pending->array_bases,
+           sizeof recent->array_bases);
+    memcpy(recent->array_strides, pending->array_strides,
+           sizeof recent->array_strides);
     recent->pixels = pending->pixels;
     recent->alpha_tested = pending->alpha_tested;
     recent->alpha_rejected = pending->alpha_rejected;
@@ -6463,18 +6802,26 @@ static void debug_copy_recent(GxDebugRecent* recent,
         memcpy(recent->largest_screen[v],
                pending->largest_triangle[v].screen,
                sizeof recent->largest_screen[v]);
+    recent->first_triangle = pending->first_triangle;
+    recent->xf = pending->xf;
+    recent->genmode = pending->genmode;
     recent->alpha_test = pending->alpha_test;
     recent->zmode = pending->zmode;
     recent->blendmode = pending->blendmode;
     recent->pecontrol = pending->pecontrol;
+    recent->bp_prov = pending->bp_prov;
 }
 
 static void debug_finalize_draw(void) {
     int index = s_debug_pending_index;
-    if (index < 0 || index >= GX_CENSUS_MAX)
+    int have_census = index >= 0 && index < GX_CENSUS_MAX;
+    if (index < 0 || (!have_census && index != GX_CENSUS_MAX))
         return;
     GxDebugDraw* pending = &s_debug_pending;
-    pending->pixels = s_census[index].pixels - s_debug_pending_pixels_before;
+    pending->pixels = have_census ?
+                      s_census[index].pixels - s_debug_pending_pixels_before :
+                      (pending->color_writes ? pending->color_writes :
+                                               pending->blend_inputs);
     if (pending->frame > s_debug_recent_latest_frame)
         s_debug_recent_latest_frame = pending->frame;
     /* Keep the ring focused on draws that can explain a missing large scene
@@ -6484,9 +6831,13 @@ static void debug_finalize_draw(void) {
      * rejected-sky case), plus every draw with material raster coverage, but
      * only when BP color-update is enabled. Depth-only prepasses are already
      * represented by the per-config snapshots above. */
+    int lower_screen = s_debug_draw_min_y >= 0 &&
+                       pending->bbox_valid &&
+                       pending->bbox_maxy >= s_debug_draw_min_y;
     if (bits(pending->blendmode, 3, 1) &&
         pending->triangles_submitted != 0u &&
         ((pending->pixels == 0u && pending->triangles_submitted <= 8u) ||
+         lower_screen ||
          pending->bbox_area_sum >= 8192u ||
          pending->largest_triangle_area >= 4096u)) {
         u64 sequence = ++s_debug_recent_sequence;
@@ -6498,6 +6849,7 @@ static void debug_finalize_draw(void) {
             s_debug_recent_count++;
         if (pending->bbox_area_sum >= 8192u ||
             pending->largest_triangle_area >= 4096u ||
+            lower_screen ||
             pending->pixels >= 4096u) {
             GxDebugRecent* large =
                 &s_debug_large[s_debug_large_head % GX_DEBUG_LARGE_MAX];
@@ -6509,15 +6861,17 @@ static void debug_finalize_draw(void) {
                 s_debug_large_latest_frame = pending->frame;
         }
     }
-    GxDebugDraw* saved = &s_debug_draw[index];
-    /* Retain the draw with the greatest actual pixel contribution for each
-     * shading configuration. A tie favors the latest observation so moving
-     * texture contents remain inspectable. This makes the late TCP snapshot
-     * useful for scene coverage instead of preserving an arbitrary tiny tail
-     * draw that happened to share the same TEV program. */
-    if (!saved->valid || pending->pixels >= saved->pixels) {
-        *saved = *pending;
-        saved->sequence = ++s_debug_draw_sequence;
+    if (have_census) {
+        GxDebugDraw* saved = &s_debug_draw[index];
+        /* Retain the draw with the greatest actual pixel contribution for each
+         * shading configuration. A tie favors the latest observation so moving
+         * texture contents remain inspectable. This makes the late TCP snapshot
+         * useful for scene coverage instead of preserving an arbitrary tiny tail
+         * draw that happened to share the same TEV program. */
+        if (!saved->valid || pending->pixels >= saved->pixels) {
+            *saved = *pending;
+            saved->sequence = ++s_debug_draw_sequence;
+        }
     }
     s_debug_pending_index = -1;
 }
@@ -6537,12 +6891,104 @@ static int debug_json_append(char* out, size_t cap, int n,
     return n + wrote;
 }
 
+static int debug_json_append_hex_bytes(char* out, size_t cap, int n,
+                                       const u8* bytes, u32 len) {
+    static const char hex[] = "0123456789abcdef";
+    for (u32 b = 0; b < len && (size_t)n + 2u < cap; ++b) {
+        out[n++] = hex[bytes[b] >> 4];
+        out[n++] = hex[bytes[b] & 15u];
+    }
+    return n;
+}
+
+static int debug_json_append_xf_prov(char* out, size_t cap, int n,
+                                     const GxXfWriteProv* prov, u32 len) {
+    n = debug_json_append(out, cap, n, "[");
+    for (u32 i = 0; i < len; ++i) {
+        n = debug_json_append(out, cap, n, "%s[%llu,%u,%u,%u]",
+            i ? "," : "",
+            (unsigned long long)prov[i].seq, prov[i].pc,
+            prov[i].value, prov[i].dl);
+    }
+    return debug_json_append(out, cap, n, "]");
+}
+
 static int debug_json_append_recent(char* out, size_t cap, int n,
                                     const GxDebugRecent* r) {
-    return debug_json_append(out, cap, n,
-        "{\"sequence\":%llu,\"frame\":%llu,\"pc\":%u,\"dl\":%u,"
-        "\"hash\":\"%08x\",\"prim\":%u,\"nverts\":%u,\"vstride\":%u,"
-        "\"vertex_hash\":\"%016llx\",\"pixels\":%llu,"
+    int target_probe =
+        r->zmode == 23u &&
+        (r->blendmode & 0x00FFFFFFu) == 268u &&
+        (r->pecontrol & 0x00FFFFFFu) == 1u &&
+        (r->alpha_test & 0x00FFFFFFu) == 6553600u;
+    target_probe = target_probe ||
+        (r->genmode == 16400u && r->prim == 4u);
+    n = debug_json_append(out, cap, n,
+        "{\"sequence\":%llu,\"frame\":%llu,\"xfb_pub_count\":%llu,"
+        "\"pc\":%u,\"dl\":%u,"
+        "\"hash\":\"%08x\",\"prim\":%u,\"vat\":%u,\"nverts\":%u,"
+        "\"vstride\":%u,\"vertex_hash\":\"%016llx\"",
+        (unsigned long long)r->sequence,
+        (unsigned long long)r->frame,
+        (unsigned long long)r->xfb_pub_count, r->cpu_pc, r->dl,
+        r->census_hash, r->prim, r->vat, r->nverts, r->vstride,
+        (unsigned long long)r->vertex_hash);
+    if (target_probe) {
+        n = debug_json_append(out, cap, n,
+            ",\"vertex_bytes\":%u,\"vertex_head\":\"", r->vertex_bytes);
+        n = debug_json_append_hex_bytes(out, cap, n, r->vertex_head,
+                                        r->vertex_head_len);
+        n = debug_json_append(out, cap, n, "\",\"vertex_tail\":\"");
+        n = debug_json_append_hex_bytes(out, cap, n, r->vertex_tail,
+                                        r->vertex_tail_len);
+        n = debug_json_append(out, cap, n,
+            "\",\"cp\":{\"vcd_lo\":%u,\"vcd_hi\":%u,"
+            "\"vat_g0\":%u,\"vat_g1\":%u,\"vat_g2\":%u,"
+            "\"matrix_index_a\":%u,\"matrix_index_b\":%u,"
+            "\"array_bases\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+            "\"array_strides\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
+            r->vcd_lo, r->vcd_hi, r->vat_g0, r->vat_g1, r->vat_g2,
+            r->matrix_index_a, r->matrix_index_b,
+            r->array_bases[0], r->array_bases[1], r->array_bases[2],
+            r->array_bases[3], r->array_bases[4], r->array_bases[5],
+            r->array_bases[6], r->array_bases[7], r->array_bases[8],
+            r->array_bases[9], r->array_bases[10], r->array_bases[11],
+            r->array_bases[12], r->array_bases[13], r->array_bases[14],
+            r->array_bases[15],
+            r->array_strides[0], r->array_strides[1],
+            r->array_strides[2], r->array_strides[3],
+            r->array_strides[4], r->array_strides[5],
+            r->array_strides[6], r->array_strides[7],
+            r->array_strides[8], r->array_strides[9],
+            r->array_strides[10], r->array_strides[11],
+            r->array_strides[12], r->array_strides[13],
+            r->array_strides[14], r->array_strides[15]);
+        n = debug_json_append(out, cap, n,
+            ",\"xf\":{\"valid\":%s,\"pos_mtx\":%u,"
+            "\"projection_type\":%u,"
+            "\"matrix\":[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g],"
+            "\"projection\":[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g],"
+            "\"viewport\":[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]",
+            r->xf.valid ? "true" : "false", r->xf.pos_mtx,
+            r->xf.projection_type,
+            r->xf.matrix[0], r->xf.matrix[1], r->xf.matrix[2],
+            r->xf.matrix[3], r->xf.matrix[4], r->xf.matrix[5],
+            r->xf.matrix[6], r->xf.matrix[7], r->xf.matrix[8],
+            r->xf.matrix[9], r->xf.matrix[10], r->xf.matrix[11],
+            r->xf.projection[0], r->xf.projection[1],
+            r->xf.projection[2], r->xf.projection[3],
+            r->xf.projection[4], r->xf.projection[5],
+            r->xf.viewport[0], r->xf.viewport[1], r->xf.viewport[2],
+            r->xf.viewport[3], r->xf.viewport[4], r->xf.viewport[5]);
+        n = debug_json_append(out, cap, n, ",\"matrix_prov\":");
+        n = debug_json_append_xf_prov(out, cap, n, r->xf.matrix_prov, 12u);
+        n = debug_json_append(out, cap, n, ",\"projection_prov\":");
+        n = debug_json_append_xf_prov(out, cap, n, r->xf.projection_prov, 7u);
+        n = debug_json_append(out, cap, n, ",\"viewport_prov\":");
+        n = debug_json_append_xf_prov(out, cap, n, r->xf.viewport_prov, 6u);
+        n = debug_json_append(out, cap, n, "}");
+    }
+    n = debug_json_append(out, cap, n,
+        ",\"pixels\":%llu,"
         "\"alpha_tested\":%llu,\"alpha_rejected\":%llu,"
         "\"alpha_min\":%u,\"alpha_max\":%u,\"alpha_sum\":%llu,"
         "\"blend_inputs\":%llu,\"z_rejected\":%llu,\"color_writes\":%llu,"
@@ -6550,12 +6996,20 @@ static int debug_json_append_recent(char* out, size_t cap, int n,
         "\"bbox\":[%s,%d,%d,%d,%d,%llu],"
         "\"largest\":{\"area\":%u,\"screen\":["
         "[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g]]},"
-        "\"alpha_test\":%u,\"zmode\":%u,\"blendmode\":%u,"
-        "\"pecontrol\":%u}",
-        (unsigned long long)r->sequence,
-        (unsigned long long)r->frame, r->cpu_pc, r->dl,
-        r->census_hash, r->prim, r->nverts, r->vstride,
-        (unsigned long long)r->vertex_hash,
+        "\"first_triangle\":{\"valid\":%s,\"mask\":[%u,%u,%u],"
+        "\"pos_mtx\":[%u,%u,%u],"
+        "\"obj\":[[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g]],"
+        "\"clip\":[[%.9g,%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g,%.9g],"
+        "[%.9g,%.9g,%.9g,%.9g]],"
+        "\"screen\":[[%.9g,%.9g,%.9g],[%.9g,%.9g,%.9g],"
+        "[%.9g,%.9g,%.9g]]},"
+        "\"genmode\":%u,\"alpha_test\":%u,\"zmode\":%u,\"blendmode\":%u,"
+        "\"pecontrol\":%u,"
+        "\"bp_prov\":{\"genmode\":[%llu,%u,%u,%u],"
+        "\"zmode\":[%llu,%u,%u,%u],"
+        "\"blendmode\":[%llu,%u,%u,%u],"
+        "\"pecontrol\":[%llu,%u,%u,%u],"
+        "\"alpha_test\":[%llu,%u,%u,%u]}}",
         (unsigned long long)r->pixels,
         (unsigned long long)r->alpha_tested,
         (unsigned long long)r->alpha_rejected,
@@ -6575,8 +7029,46 @@ static int debug_json_append_recent(char* out, size_t cap, int n,
         r->largest_screen[0][2], r->largest_screen[1][0],
         r->largest_screen[1][1], r->largest_screen[1][2],
         r->largest_screen[2][0], r->largest_screen[2][1],
-        r->largest_screen[2][2], r->alpha_test, r->zmode,
-        r->blendmode, r->pecontrol);
+        r->largest_screen[2][2],
+        r->first_triangle.valid ? "true" : "false",
+        r->first_triangle.mask[0], r->first_triangle.mask[1],
+        r->first_triangle.mask[2],
+        r->first_triangle.pos_mtx[0], r->first_triangle.pos_mtx[1],
+        r->first_triangle.pos_mtx[2],
+        r->first_triangle.obj[0][0], r->first_triangle.obj[0][1],
+        r->first_triangle.obj[0][2], r->first_triangle.obj[1][0],
+        r->first_triangle.obj[1][1], r->first_triangle.obj[1][2],
+        r->first_triangle.obj[2][0], r->first_triangle.obj[2][1],
+        r->first_triangle.obj[2][2],
+        r->first_triangle.clip[0][0], r->first_triangle.clip[0][1],
+        r->first_triangle.clip[0][2], r->first_triangle.clip[0][3],
+        r->first_triangle.clip[1][0], r->first_triangle.clip[1][1],
+        r->first_triangle.clip[1][2], r->first_triangle.clip[1][3],
+        r->first_triangle.clip[2][0], r->first_triangle.clip[2][1],
+        r->first_triangle.clip[2][2], r->first_triangle.clip[2][3],
+        r->first_triangle.screen[0][0], r->first_triangle.screen[0][1],
+        r->first_triangle.screen[0][2], r->first_triangle.screen[1][0],
+        r->first_triangle.screen[1][1], r->first_triangle.screen[1][2],
+        r->first_triangle.screen[2][0], r->first_triangle.screen[2][1],
+        r->first_triangle.screen[2][2],
+        r->genmode, r->alpha_test, r->zmode,
+        r->blendmode, r->pecontrol,
+        (unsigned long long)r->bp_prov.genmode.seq,
+        r->bp_prov.genmode.pc, r->bp_prov.genmode.value,
+        r->bp_prov.genmode.dl,
+        (unsigned long long)r->bp_prov.zmode.seq,
+        r->bp_prov.zmode.pc, r->bp_prov.zmode.value,
+        r->bp_prov.zmode.dl,
+        (unsigned long long)r->bp_prov.blendmode.seq,
+        r->bp_prov.blendmode.pc, r->bp_prov.blendmode.value,
+        r->bp_prov.blendmode.dl,
+        (unsigned long long)r->bp_prov.pecontrol.seq,
+        r->bp_prov.pecontrol.pc, r->bp_prov.pecontrol.value,
+        r->bp_prov.pecontrol.dl,
+        (unsigned long long)r->bp_prov.alpha_test.seq,
+        r->bp_prov.alpha_test.pc, r->bp_prov.alpha_test.value,
+        r->bp_prov.alpha_test.dl);
+    return n;
 }
 
 int gx_raster_debug_draw_state_json(char* out, size_t cap) {
@@ -6930,6 +7422,8 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
         }
     }
     if (nverts < ((is_line || is_line_strip) ? 2u : 3u)) return;
+    if (debug_should_skip_draw())
+        return;
 
     /* BP register loads are separate FIFO commands, so no BP-derived state
      * can change between two draws unless gx_on_bp() advanced the relevant
@@ -6982,7 +7476,7 @@ static void gx_raster_draw_impl(const GxCpState* cp, u32 prim, u32 vat,
         ++s_cfg_cache_hits;
         if (s_cfg_cache_verify) draw_cfg_verify_hit("tier1", 0);
     }
-    debug_capture_draw(prim, vat, verts, nverts, vstride);
+    debug_capture_draw(cp, prim, vat, verts, nverts, vstride);
 
     /* Late-menu programs R/S submit millions of 3/4-vertex fans, most wholly
      * clipped or culled. Position/cull depends only on tf_position output, so
@@ -8148,6 +8642,92 @@ typedef struct {
     u8 r, g, b, a;
 } EfbCopyTexel;
 
+static void efb_copy_source_summary(
+        int left, int top, int out_w, int out_h, int half_scale, int depth,
+        u32 (*getpx)(u32), u64* out_hash, u32* out_mean) {
+    const int sample_w = 32;
+    const int sample_h = 24;
+    u64 h = 1469598103934665603ull;
+    u64 luma = 0;
+    for (int syi = 0; syi < sample_h; syi++) {
+        int oy = out_h > 1 ? (syi * (out_h - 1)) / (sample_h - 1) : 0;
+        int y = top + (half_scale ? oy * 2 : oy);
+        y = clampi(y, 0, (int)EFB_HEIGHT - 1);
+        for (int sxi = 0; sxi < sample_w; sxi++) {
+            int ox = out_w > 1 ? (sxi * (out_w - 1)) / (sample_w - 1) : 0;
+            int x = left + (half_scale ? ox * 2 : ox);
+            x = clampi(x, 0, (int)EFB_WIDTH - 1);
+            u32 c = depth ? GetPixelDepth((u32)y * EFB_WIDTH + (u32)x) :
+                            getpx((u32)y * EFB_WIDTH + (u32)x);
+            u8 r = depth ? (u8)(c >> 16) : (u8)(c >> 24);
+            u8 g = depth ? (u8)(c >> 8) : (u8)(c >> 16);
+            u8 b = (u8)c;
+            u8 bytes[4] = { r, g, b, depth ? 0xFFu : (u8)c };
+            for (int i = 0; i < 4; i++) {
+                h ^= bytes[i];
+                h *= 1099511628211ull;
+            }
+            luma += (u32)r * 299u + (u32)g * 587u + (u32)b * 114u;
+        }
+    }
+    if (out_hash) *out_hash = h;
+    if (out_mean) *out_mean = (u32)(luma / (1000u * (u32)sample_w * (u32)sample_h));
+}
+
+static void efb_copy_source_dump_feed(
+        u64 seq, u32 dst_addr, int left, int top, int out_w, int out_h,
+        int half_scale, int depth, u32 (*getpx)(u32)) {
+    if (!efb_source_dump_on() || out_w <= 0 || out_h <= 0)
+        return;
+    if (s_efb_source_dump_addr_enabled && dst_addr != s_efb_source_dump_addr)
+        return;
+    if (s_efb_source_dump_every == 0 || (seq % s_efb_source_dump_every) != 0)
+        return;
+
+    char path[1024];
+    size_t dir_len = strlen(s_efb_source_dump_dir);
+    const char sep = (dir_len && (s_efb_source_dump_dir[dir_len - 1] == '\\' ||
+                                  s_efb_source_dump_dir[dir_len - 1] == '/')) ? '\0' : '\\';
+    if (sep)
+        snprintf(path, sizeof path, "%s\\runtime-efbsource.%llu.ppm",
+                 s_efb_source_dump_dir, (unsigned long long)seq);
+    else
+        snprintf(path, sizeof path, "%sruntime-efbsource.%llu.ppm",
+                 s_efb_source_dump_dir, (unsigned long long)seq);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        if (s_efb_source_dump_errors < 8)
+            fprintf(stderr, "gx_raster: cannot open EFB-source dump %s\n", path);
+        s_efb_source_dump_errors++;
+        return;
+    }
+    fprintf(f, "P6\n%d %d\n255\n", out_w, out_h);
+    for (int oy = 0; oy < out_h; oy++) {
+        int y = top + (half_scale ? oy * 2 : oy);
+        y = clampi(y, 0, (int)EFB_HEIGHT - 1);
+        for (int ox = 0; ox < out_w; ox++) {
+            int x = left + (half_scale ? ox * 2 : ox);
+            x = clampi(x, 0, (int)EFB_WIDTH - 1);
+            u32 c = depth ? GetPixelDepth((u32)y * EFB_WIDTH + (u32)x) :
+                            getpx((u32)y * EFB_WIDTH + (u32)x);
+            u8 rgb[3] = {
+                depth ? (u8)(c >> 16) : (u8)(c >> 24),
+                depth ? (u8)(c >> 8) : (u8)(c >> 16),
+                (u8)c
+            };
+            if (fwrite(rgb, 1, sizeof rgb, f) != sizeof rgb) {
+                if (s_efb_source_dump_errors < 8)
+                    fprintf(stderr, "gx_raster: short write for EFB-source dump %s\n", path);
+                s_efb_source_dump_errors++;
+                fclose(f);
+                return;
+            }
+        }
+    }
+    fclose(f);
+}
+
 static EfbCopyTexel efb_copy_texture_sample(
         int x, int y, int left, int top, int right, int bottom,
         int clamp_top, int clamp_bottom, int half_scale, int depth,
@@ -8484,7 +9064,25 @@ void gx_raster_efb_copy(const GxCpState* cp) {
              * (src_w*2 valid bytes per row; dest_stride may include padding
              * the filter never touches) while still holding the writer
              * guard, then count this copy as one publication. */
+            u64 source_hash = 0;
+            u32 source_mean = 0;
+            efb_copy_source_summary(left, top, src_w, src_h, 0, 0,
+                                    copy_getpx, &source_hash, &source_mean);
+            u32 source_flags = (clamp_top ? 1u : 0u) |
+                               (clamp_bottom ? 2u : 0u) |
+                               (clear ? 64u : 0u);
+            u64 copy_seq = s_efb_copy_dump_seq;
+            efb_copy_source_dump_feed(copy_seq, dest_addr, left, top,
+                                      src_w, src_h, 0, 0, copy_getpx);
             gcn_gx_xfb_hash_feed(s_cpu->ram + phys, dest_stride, (u32)src_w * 2u, (u32)dst_h);
+            gcn_gx_xfb_dump_feed(s_cpu->ram + phys, dest_stride, (u32)src_w * 2u, (u32)dst_h);
+            efb_copy_dump_feed(s_cpu->ram + phys, dest_stride, (u32)src_w * 2u, (u32)dst_h,
+                               (u32)src_w, (u32)dst_h, dest_addr, copy, 15u, 1u,
+                               s_cpu ? s_cpu->pc : 0u, gcn_gx_frame_count(),
+                               gcn_gx_xfb_pub_count(),
+                               source_hash, source_mean,
+                               (u32)left, (u32)top, (u32)src_w, (u32)src_h,
+                               source_flags, (u32)s_pf);
             /* Device write to RAM: dirty the miss-CRC identity over the
              * whole copied span (conservatively including stride padding). */
             gcn_native_code_content_dirty(phys, (u32)((u64)dst_h * dest_stride));
@@ -8544,6 +9142,23 @@ void gx_raster_efb_copy(const GxCpState* cp) {
                         wab, wcde, wfg, copy_getpx);
                 }
             }
+            u64 source_hash = 0;
+            u32 source_mean = 0;
+            efb_copy_source_summary(left, top, out_w, out_h, half_scale, depth,
+                                    copy_getpx, &source_hash, &source_mean);
+            u32 source_flags = (clamp_top ? 1u : 0u) | (clamp_bottom ? 2u : 0u) |
+                               (half_scale ? 4u : 0u) | (depth ? 8u : 0u) |
+                               (intensity ? 16u : 0u) | (auto_conv ? 32u : 0u) |
+                               (clear ? 64u : 0u);
+            u64 copy_seq = s_efb_copy_dump_seq;
+            efb_copy_source_dump_feed(copy_seq, dest_addr, left, top, out_w, out_h,
+                                      half_scale, depth, copy_getpx);
+            efb_copy_dump_feed(s_cpu->ram + phys, dest_stride, tiles_x * block_bytes, tiles_y,
+                               (u32)out_w, (u32)out_h, dest_addr, copy, fmt, 0u,
+                               s_cpu ? s_cpu->pc : 0u, gcn_gx_frame_count(),
+                               gcn_gx_xfb_pub_count(),
+                               source_hash, source_mean, (u32)left, (u32)top,
+                               (u32)src_w, (u32)src_h, source_flags, (u32)s_pf);
             /* Device write to RAM (see the XFB copy above). */
             gcn_native_code_content_dirty(phys, (u32)(last - phys));
         }
@@ -8580,6 +9195,10 @@ void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf) {
     s_cfg_cache_tier1_advances = 0;
     memset(s_bp_irrelevant_change_count, 0, sizeof s_bp_irrelevant_change_count);
     memset(s_bp_relevant_change_count, 0, sizeof s_bp_relevant_change_count);
+    s_bp_prov_sequence = 0;
+    memset(s_bp_prov, 0, sizeof s_bp_prov);
+    s_xf_prov_sequence = 0;
+    memset(s_xf_prov, 0, sizeof s_xf_prov);
     s_scissor_key_valid = 0;
     memset(s_draw_shapes, 0, sizeof s_draw_shapes);
     memset(s_efb_color, 0, sizeof s_efb_color);

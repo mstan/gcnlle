@@ -69,27 +69,15 @@
  *     CVR back to 1 (open, CVRINT if it was closed) and ResetDrive(false) with
  *     no disc => CoverOpened again.
  *
- * COMPLETION MODEL: deferred to the next gcn_di_tick, NOT synchronous inside the
- * DICR write. Dolphin's ExecuteCommand runs the command effects immediately
- * (DIIMMBUF / memory writes / drive state+error / interrupt-type selection) but
- * defers the *completion* — clear TSTART, raise the interrupt — to a scheduled
- * FinishExecutingCommand event MINIMUM_COMMAND_LATENCY_US=300us later
- * (DVDInterface.cpp:1227-1233, FinishExecutingCommand:1306-1353). We mirror that
- * split: di_execute_command runs at the DICR write (it has CPUState* for the
- * Inquiry DMA and, now, the real disc-read DMA), latches the pending interrupt
- * type and leaves TSTART set; the next gcn_di_tick clears TSTART and fires the
- * interrupt. Deferring past the issuing block (rather than firing inside the
- * write) matches Dolphin's ordering — the guest sees DICR.TSTART=1 immediately
- * after its own write, then a later completion — and avoids delivering the DI
- * interrupt before the command-issue function has returned. Exact latency is
- * irrelevant to the value+order oracle diff (poll-collapsed); the load-bearing
- * property is "deferred, not in-write". Real disc reads are performed
- * SYNCHRONOUSLY inside di_execute_command too (a plain seek+fread of the
- * mounted image, not a background DVDThread) — command_handled_by_thread is
- * always false in this model, so completion still runs through the same
- * gcn_di_tick path as every other command; only the exact latency Dolphin's
- * DVDThread would add is not reproduced (irrelevant to the value+order diff,
- * same rationale as MINIMUM_COMMAND_LATENCY_US above).
+ * COMPLETION MODEL: deferred to gcn_di_tick, NOT synchronous inside the DICR
+ * write. Dolphin's ExecuteCommand runs immediate register effects
+ * (DIIMMBUF / drive state+error / interrupt-type selection) but defers
+ * completion — clear TSTART, raise the interrupt — to a scheduled event.
+ * Non-threaded commands use MINIMUM_COMMAND_LATENCY_US=300us; disc reads use
+ * READ_COMMAND_LATENCY_US plus Dolphin's DVDThread read-buffer/seek/raw-read
+ * timing and only land bytes in guest RAM when that delayed completion fires.
+ * Deferring past the issuing block matches Dolphin's ordering: the guest sees
+ * DICR.TSTART=1 immediately after its own write, then a later completion.
  *
  * DELIBERATELY DEFERRED (diverges loudly if exercised, never silently faked):
  *   - DTK audio streaming DATA PATH (the ADPCM decoder / position tracking /
@@ -228,10 +216,23 @@ typedef struct {
     u8  enable_dtk;       /* AudioBufferConfig-set DTK enable (handshake only —
                             * see di.h's DTK note; ResetDrive:316 clears it */
 
-    /* Deferred completion: a command runs its effects at the DICR write and
-     * latches the interrupt type here; the next gcn_di_tick completes it. */
+    /* Deferred completion: a command runs its immediate register effects at
+     * the DICR write and latches the interrupt type here. gcn_di_tick advances
+     * pending_cycles in core-clock cycles before completing it. */
     u8  cmd_pending;
     u8  pending_intr;    /* GCN_DI_INT_* */
+    u64 pending_cycles;
+
+    u8  pending_read_active;
+    u64 pending_read_offset;
+    u32 pending_read_length;
+    u32 pending_read_addr;
+
+    u64 now_cycles;
+    u64 read_buffer_start_offset;
+    u64 read_buffer_end_offset;
+    u64 read_buffer_start_time;
+    u64 read_buffer_end_time;
 
     int irq_level;       /* last DI->PI line level (edge detect for the ring) */
     GcnDiIrqFn irq;
@@ -250,10 +251,10 @@ typedef struct {
 
 void gcn_di_init(GcnDi* di);
 void gcn_di_set_irq(GcnDi* di, GcnDiIrqFn fn, void* user);
-/* Complete any command latched by the previous DICR TSTART write (clears TSTART
- * and raises the deferred interrupt). Called once per block by the dispatch
- * loop, exactly like gcn_vi_tick. */
-void gcn_di_tick(void);
+/* Advance pending DI work by `core_cycles` and complete any command whose
+ * Dolphin-style delay has elapsed. Called once per block by the dispatch loop,
+ * exactly like gcn_vi_tick. */
+void gcn_di_tick(CPUState* cpu, u32 core_cycles);
 u32  gcn_di_read(void* user, CPUState* cpu, u32 addr, u8 size);
 void gcn_di_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size);
 
@@ -282,7 +283,7 @@ void gcn_di_free(GcnDi* di);
  * gcn_di_eject_disc can all share one transcription. */
 void gcn_di_reset_drive(GcnDi* di, int spinup);
 /* No-arg trampoline around gcn_di_reset_drive(s_di, /spinup=/1), matching the
- * gcn_di_tick(void)/gcn_gp_reset(void) idiom other single-instance devices use
+ * gcn_di_tick(CPUState*,u32)/gcn_gp_reset(void) idiom other single-instance devices use
  * for cross-module hooks (pi.c stores a GcnPiResetDriveFn taking no args and
  * no user pointer, exactly like GcnPiFifoResetFn). Wired from boot.c via
  * gcn_pi_set_reset_drive_hook — see pi.h and the file header's "drive re-spin

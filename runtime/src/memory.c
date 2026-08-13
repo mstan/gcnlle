@@ -343,6 +343,7 @@ u64 mem_read64_legacy(CPUState* cpu, u32 addr) { return mem_read64_cia(cpu, addr
 
 void mem_write64_cia(CPUState* cpu, u32 addr, u64 value, u32 cia) {
     u32 avail;
+    gcn_ring_watch_check(addr, value, 8u, cia);   /* [gcn-watch] */
     u8* host = gcn_mem_resolve(cpu, addr, &avail);
     if (!host || avail < 8) {
         cpu->pc = cia;

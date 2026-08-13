@@ -1802,6 +1802,7 @@ static int resident_materialize_pending(void) {
              * software paths, and fused vs unfused programs, are compared by
              * output rather than code path. */
             gcn_gx_xfb_hash_feed(p->ram + p->address, p->stride, (u32)p->width * 2u, p->height);
+            gcn_gx_xfb_dump_feed(p->ram + p->address, p->stride, (u32)p->width * 2u, p->height);
             /* Device write to RAM: dirty the miss-CRC identity over the copied
              * span (see gx_raster.c's XFB copy). */
             gcn_native_code_content_dirty(p->address,

@@ -15,11 +15,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* The dispatch loop ticks one DI (like the one VI); registered at init. */
 static GcnDi* s_di = NULL;
 static FILE* s_di_journal = NULL;
 static u64 s_di_command_seq = 0;
+
+#define GCN_DI_CORE_CLOCK_HZ          486000000ull
+#define GCN_DI_MIN_COMMAND_LATENCY_US 300ull
+#define GCN_DI_READ_COMMAND_LATENCY_US 600ull
+#define GCN_DI_DVD_SECTOR_SIZE        0x800ull
+#define GCN_DI_DVD_ECC_BLOCK_SIZE     (16ull * GCN_DI_DVD_SECTOR_SIZE)
+#define GCN_DI_STREAMING_BUFFER_SIZE  (1024ull * 1024ull)
+#define GCN_DI_BUFFER_TRANSFER_RATE   (32ull * 1024ull * 1024ull)
+#define GCN_DI_BUFFER_BACK_SEEK_LIMIT (GCN_DI_DVD_ECC_BLOCK_SIZE * 2ull)
+
+static u64 di_us_to_cycles(u64 us) {
+    return us * (GCN_DI_CORE_CLOCK_HZ / 1000000ull);
+}
+
+static u64 di_align_down_u64(u64 v, u64 align) {
+    return v - (v % align);
+}
+
+static u64 di_align_up_u64(u64 v, u64 align) {
+    u64 rem = v % align;
+    return rem ? v + (align - rem) : v;
+}
 
 /* Optional, append-only command ledger for title bring-up. This is intentionally
  * below the DI register interface: it records what the real IPL/apploader
@@ -145,16 +168,162 @@ static int di_check_read_preconditions(GcnDi* di) {
     return 1;
 }
 
-/* ExecuteReadCommand:741-777, restricted to the synchronous (non-DVDThread)
- * model this runtime uses (see di.h's COMPLETION MODEL note) — the caller has
- * already run CheckReadPreconditions. `dvd_offset`/`dvd_length` are the
- * disc-side request; output_length is always di->dilength (the guest-
- * programmed DMA length register), matching every ExecuteCommand call site
- * (Read Sector passes m_DILENGTH, Read DiscID passes m_DILENGTH too). Reads
- * the mounted image directly into guest RAM at DIMAR — no host-RAM staging
- * buffer, matching the "pread-style, never load the disc into RAM" contract
- * (di.h). Returns the interrupt type (TCINT success / DEINT on Error #001). */
-static u8 di_do_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
+static double di_disc_physical_position(u64 offset) {
+    const double wii_layer_size = 0x118240000ull;
+    const double inner_radius = 0.024;
+    const double wii_outer_radius = 0.058;
+    const u64 two_layers = 0x118240000ull * 2ull;
+
+    offset %= two_layers;
+    if (offset > 0x118240000ull)
+        offset = two_layers - offset;
+
+    return sqrt((double)offset / wii_layer_size *
+                    (wii_outer_radius * wii_outer_radius - inner_radius * inner_radius) +
+                inner_radius * inner_radius);
+}
+
+static double di_seek_time(u64 offset_from, u64 offset_to) {
+    const double short_seek_max_distance = 0.001;
+    const double short_seek_constant = 0.035;
+    const double short_seek_velocity_inverse = 50.0;
+    const double long_seek_constant = 0.075;
+    const double long_seek_velocity_inverse = 4.5;
+
+    double distance = fabs(di_disc_physical_position(offset_from) -
+                           di_disc_physical_position(offset_to));
+    if (distance < short_seek_max_distance)
+        return distance * short_seek_velocity_inverse + short_seek_constant;
+    return distance * long_seek_velocity_inverse + long_seek_constant;
+}
+
+static double di_rotational_latency(u64 offset, double time) {
+    const double track_pitch = 0.00000074;
+    const double rotations_per_second = 28.5; /* GameCube disc */
+    const double target_angle = fmod(di_disc_physical_position(offset) / track_pitch, 1.0);
+    const double start_angle = fmod(time * rotations_per_second, 1.0);
+    const double angle_diff = fmod(target_angle + 1.0 - start_angle, 1.0);
+    return angle_diff / rotations_per_second;
+}
+
+static double di_raw_disc_read_time(u64 offset, u64 length) {
+    const double inner_radius = 0.024;
+    const double gc_outer_radius = 0.038;
+    const double inner_speed = 1024.0 * 1024.0 * 2.1;
+    const double outer_speed = 1024.0 * 1024.0 * 3.325;
+    double physical_offset = di_disc_physical_position(offset + length / 2ull);
+    double speed = (physical_offset - inner_radius) / (gc_outer_radius - inner_radius) *
+                       (outer_speed - inner_speed) +
+                   inner_speed;
+    if (speed < 1.0)
+        speed = 1.0;
+    return (double)length / speed;
+}
+
+static u64 di_seconds_to_cycles(double seconds) {
+    if (seconds <= 0.0)
+        return 0;
+    return (u64)(seconds * (double)GCN_DI_CORE_CLOCK_HZ);
+}
+
+static u64 di_schedule_read_cycles(GcnDi* di, u64 offset, u32 length) {
+    u64 current_time = di->now_cycles;
+    int seek = 0;
+    u64 head_position = 0;
+    u64 buffer_start = 0;
+    u64 buffer_end = 0;
+    u64 dvd_offset = di_align_down_u64(offset, GCN_DI_DVD_ECC_BLOCK_SIZE);
+    const u64 first_block = dvd_offset;
+    u64 ticks_until_completion = di_us_to_cycles(GCN_DI_READ_COMMAND_LATENCY_US);
+
+    if (di->read_buffer_start_time != di->read_buffer_end_time) {
+        buffer_start = di->read_buffer_end_offset > GCN_DI_STREAMING_BUFFER_SIZE ?
+                           di->read_buffer_end_offset - GCN_DI_STREAMING_BUFFER_SIZE :
+                           0;
+
+        if (current_time >= di->read_buffer_end_time) {
+            buffer_end = di->read_buffer_end_offset;
+        } else {
+            u64 elapsed = current_time > di->read_buffer_start_time ?
+                              current_time - di->read_buffer_start_time :
+                              0;
+            u64 duration = di->read_buffer_end_time - di->read_buffer_start_time;
+            u64 span = di->read_buffer_end_offset - di->read_buffer_start_offset;
+            u64 available = duration ? (elapsed * span / duration) : 0;
+            buffer_end = di->read_buffer_start_offset +
+                         di_align_down_u64(available, GCN_DI_DVD_ECC_BLOCK_SIZE);
+        }
+        head_position = buffer_end;
+        if (dvd_offset < buffer_start)
+            buffer_start = buffer_end = 0;
+    }
+
+    do {
+        u64 next_boundary = di_align_up_u64(offset + 1ull, GCN_DI_DVD_ECC_BLOCK_SIZE);
+        u32 chunk_length = (u32)(next_boundary - offset);
+        if (chunk_length > length)
+            chunk_length = length;
+
+        if (dvd_offset >= buffer_start && dvd_offset < buffer_end) {
+            ticks_until_completion +=
+                (u64)chunk_length * GCN_DI_CORE_CLOCK_HZ / GCN_DI_BUFFER_TRANSFER_RATE;
+        } else {
+            if (dvd_offset != head_position) {
+                seek = 1;
+                ticks_until_completion += di_seconds_to_cycles(di_seek_time(head_position, dvd_offset));
+                {
+                    double time_after_seek =
+                        (double)(current_time + ticks_until_completion) /
+                        (double)GCN_DI_CORE_CLOCK_HZ;
+                    ticks_until_completion +=
+                        di_seconds_to_cycles(di_rotational_latency(dvd_offset, time_after_seek));
+                }
+            } else {
+                ticks_until_completion +=
+                    di_seconds_to_cycles(di_raw_disc_read_time(dvd_offset,
+                                                               GCN_DI_DVD_ECC_BLOCK_SIZE));
+            }
+            head_position = dvd_offset + GCN_DI_DVD_ECC_BLOCK_SIZE;
+        }
+
+        offset += chunk_length;
+        length -= chunk_length;
+        dvd_offset += GCN_DI_DVD_ECC_BLOCK_SIZE;
+    } while (length > 0);
+
+    {
+        const u64 last_block = dvd_offset;
+        if (!(last_block - buffer_start <= GCN_DI_BUFFER_BACK_SEEK_LIMIT &&
+              buffer_start != buffer_end)) {
+            if (last_block >= buffer_end)
+                di->read_buffer_start_offset = last_block;
+            else
+                di->read_buffer_start_offset = buffer_end;
+
+            di->read_buffer_end_offset =
+                last_block + GCN_DI_STREAMING_BUFFER_SIZE - GCN_DI_BUFFER_BACK_SEEK_LIMIT;
+            if (seek) {
+                u64 min_end = first_block + GCN_DI_STREAMING_BUFFER_SIZE;
+                if (di->read_buffer_end_offset < min_end)
+                    di->read_buffer_end_offset = min_end;
+            }
+
+            di->read_buffer_start_time = current_time + ticks_until_completion;
+            di->read_buffer_end_time =
+                di->read_buffer_start_time +
+                di_seconds_to_cycles(di_raw_disc_read_time(
+                    di->read_buffer_start_offset,
+                    di->read_buffer_end_offset - di->read_buffer_start_offset));
+        }
+    }
+
+    return ticks_until_completion ? ticks_until_completion : 1;
+}
+
+/* ExecuteReadCommand:741-777. The caller has already run CheckReadPreconditions.
+ * Validate and schedule the read now, but do not expose data or TCINT until the
+ * Dolphin-style drive timing expires in gcn_di_tick. */
+static u8 di_prepare_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
     u32 output_length = di->dilength;
     if (dvd_length > output_length)          /* ExecuteReadCommand:757-762 clamp */
         dvd_length = output_length;
@@ -186,11 +355,46 @@ static u8 di_do_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
                 di->dimar);
         return GCN_DI_INT_DEINT;
     }
+    (void)dst;
     if (avail < dvd_length) {
         fprintf(stderr, "gcn di: DIMAR 0x%08X + 0x%X exceeds MEM1 (avail 0x%X) — clamping\n",
                 di->dimar, dvd_length, avail);
         dvd_length = avail;
     }
+
+    di->pending_read_active = 1;
+    di->pending_read_offset = dvd_offset;
+    di->pending_read_length = dvd_length;
+    di->pending_read_addr = di->dimar;
+    di->pending_cycles = di_schedule_read_cycles(di, dvd_offset, dvd_length);
+    return GCN_DI_INT_TCINT;
+}
+
+static void di_commit_pending_read(GcnDi* di, CPUState* cpu) {
+    if (!di->pending_read_active)
+        return;
+    di->pending_read_active = 0;
+
+    u64 dvd_offset = di->pending_read_offset;
+    u32 dvd_length = di->pending_read_length;
+    u32 dma_addr = di->pending_read_addr;
+    if (!dvd_length)
+        return;
+
+    if (!di->disc_file) {
+        fprintf(stderr, "gcn di: BUG â€” pending read with no open disc file\n");
+        return;
+    }
+
+    u32 avail = 0;
+    u8* dst = gcn_mem_resolve(cpu, dma_addr, &avail);
+    if (!dst) {
+        fprintf(stderr, "gcn di: DIMAR 0x%08X is not RAM-backed at completion â€” disc read dropped\n",
+                dma_addr);
+        return;
+    }
+    if (avail < dvd_length)
+        dvd_length = avail;
 
     _fseeki64(di->disc_file, (long long)dvd_offset, SEEK_SET);
     size_t got = fread(dst, 1, dvd_length, di->disc_file);
@@ -200,7 +404,7 @@ static u8 di_do_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
          * (shouldn't happen — disc_size IS the file's own on-open size) or a
          * host I/O error. Zero-fill rather than leave stale RAM, and say so. */
         memset(dst + got, 0, dvd_length - got);
-    gcn_native_code_invalidate(di->dimar, dvd_length);
+    gcn_native_code_invalidate(dma_addr, dvd_length);
 
     /* M5 SCOPE BOUNDARY (di.h GCN_DI_APPLOADER_OFFSET): a real disc read just
      * landed the apploader in RAM. Loud, ONE-TIME, general — fires for any
@@ -219,21 +423,16 @@ static u8 di_do_read(GcnDi* di, CPUState* cpu, u64 dvd_offset, u32 dvd_length) {
                 "the retail apploader and title as ordinary guest code. If "
                 "this is the dummy disc (tools/make_dummy_disc.py — entry "
                 "point 0 by construction), it still diverges loudly.\n",
-                di->dimar, dvd_length);
+                dma_addr, dvd_length);
             fflush(stdout);
         }
     }
-
-    return GCN_DI_INT_TCINT;
 }
 
 /* DVDInterface.cpp ExecuteCommand:782-1234, restricted to the GameCube-retail
- * command set the IPL issues. Runs the command's immediate effects and returns
- * the interrupt type to raise on completion (default TCINT). No command is ever
- * "handled by thread" here — real disc reads run SYNCHRONOUSLY inside this
- * function instead of via a background DVDThread (see di.h COMPLETION MODEL) —
- * so completion is always deferred to the next tick by the caller. `cpu` is
- * used for the Inquiry DMA and real disc-read DMA writes into guest RAM. */
+ * command set the IPL issues. Runs immediate register effects and returns the
+ * interrupt type to raise on delayed completion. Read commands schedule a
+ * Dolphin-style DVDThread delay and commit bytes in gcn_di_tick. */
 static u8 di_execute_command(GcnDi* di, CPUState* cpu) {
     u8 intr = GCN_DI_INT_TCINT;
     u8 cmd  = (u8)(di->cmdbuf[0] >> 24);
@@ -260,7 +459,7 @@ static u8 di_execute_command(GcnDi* di, CPUState* cpu) {
             if (!di_check_read_preconditions(di))   /* no disc/id/motor => DEINT */
                 intr = GCN_DI_INT_DEINT;
             else
-                intr = di_do_read(di, cpu, dvd_offset, di->cmdbuf[2]);
+                intr = di_prepare_read(di, cpu, dvd_offset, di->cmdbuf[2]);
             break;
         }
         case 0x40:                           /* Read DiscID: ExecuteCommand:860-876 */
@@ -271,7 +470,7 @@ static u8 di_execute_command(GcnDi* di, CPUState* cpu) {
             if (!di_check_read_preconditions(di))   /* no disc => DEINT */
                 intr = GCN_DI_INT_DEINT;
             else
-                intr = di_do_read(di, cpu, 0, 0x20u);   /* fixed 0x20-byte disc header */
+                intr = di_prepare_read(di, cpu, 0, 0x20u);   /* fixed 0x20-byte disc header */
             break;
         default:                             /* unknown read subcommand: logged, TCINT */
             break;
@@ -347,11 +546,21 @@ static u8 di_execute_command(GcnDi* di, CPUState* cpu) {
 /* DVDInterface.cpp FinishExecutingCommand:1306-1353, ReplyType::Interrupt. On a
  * successful transfer (TCINT) DIMAR advances by DILENGTH and DILENGTH clears;
  * then, iff TSTART is still set, clear it and raise the interrupt. */
-void gcn_di_tick(void) {
+void gcn_di_tick(CPUState* cpu, u32 core_cycles) {
     GcnDi* di = s_di;
+    if (di)
+        di->now_cycles += core_cycles;
     if (!di || !di->cmd_pending)
         return;
+    if (di->pending_cycles > core_cycles) {
+        di->pending_cycles -= core_cycles;
+        return;
+    }
+    di->pending_cycles = 0;
     di->cmd_pending = 0;
+
+    if (di->pending_intr == GCN_DI_INT_TCINT)
+        di_commit_pending_read(di, cpu);
 
     if (di->pending_intr == GCN_DI_INT_TCINT) {
         di->dimar += di->dilength;
@@ -379,6 +588,14 @@ void gcn_di_reset_drive(GcnDi* di, int spinup) {
         di->drive_state = GCN_DI_STATE_DISC_ID_NOT_READ;      /* :334-337 */
     di->error_code = GCN_DI_ERR_NONE;                          /* :339 */
     di->enable_dtk = 0;                                        /* :316 */
+    di->cmd_pending = 0;
+    di->pending_intr = GCN_DI_INT_TCINT;
+    di->pending_cycles = 0;
+    di->pending_read_active = 0;
+    di->read_buffer_start_offset = 0;
+    di->read_buffer_end_offset = 0;
+    di->read_buffer_start_time = 0;
+    di->read_buffer_end_time = 0;
 }
 
 /* No-arg trampoline for pi.c's reset_drive_hook (see di.h). */
@@ -406,7 +623,7 @@ void gcn_di_init(GcnDi* di) {
  * branch (no auto-disc-change path list, no Wii partition handling — GameCube
  * retail only, matching every other command in this file). Opens `path`
  * read-only; NEVER reads it into RAM (di.h's pread-style contract) — only its
- * size is queried up front, for the Error #001/BlockOOB bound in di_do_read. */
+ * size is queried up front, for the Error #001/BlockOOB bound in di_prepare_read. */
 int gcn_di_set_disc(GcnDi* di, const char* path) {
     if (!di || !path || !*path) return 0;
 
@@ -534,6 +751,8 @@ void gcn_di_write(void* user, CPUState* cpu, u32 addr, u32 value, u8 size) {
              * next gcn_di_tick (see di.h COMPLETION MODEL). */
             u8 opcode = (u8)(di->cmdbuf[0] >> 24);
             u8 subcmd = (u8)(di->cmdbuf[0] & 0xFFu);
+            di->pending_read_active = 0;
+            di->pending_cycles = di_us_to_cycles(GCN_DI_MIN_COMMAND_LATENCY_US);
             di->pending_intr = di_execute_command(di, cpu);
             di->cmd_pending = 1;
             di_log_command(di, cpu, opcode, subcmd, di->pending_intr);

@@ -7,6 +7,8 @@
  * dump walk the live window oldest->newest.
  */
 #include "debug/rings.h"
+#include "gx/gx.h"
+#include "memory/memory.h"
 
 #include <stdio.h>
 #include <stdlib.h>      /* getenv/strtoul — GCN_WATCH parse (gcn_ring_watch_init) */
@@ -59,6 +61,41 @@ typedef struct {
 } FifoEntry;
 
 typedef struct {
+    u32 addr;
+    u32 base;
+    u32 pointer;
+    u8  len;
+    u8  ok;
+    u8  deref;
+    u8  _pad;
+    u8  data[64];
+} GprProbeMemEntry;
+
+typedef struct {
+    u64 seq;
+    u64 block;
+    u64 xfb_pub;
+    u32 pc;
+    u32 lr;
+    u32 ctr;
+    u32 cr;
+    u32 xer;
+    u32 fpscr;
+    u32 gpr[32];
+    GprProbeMemEntry mem[4];
+} GprProbeEntry;
+
+typedef struct {
+    u32 pc;
+    u8  gpr;
+    u8  len;
+    u8  deref;
+    u8  _pad;
+    s32 offset;
+    s32 read_offset;
+} GprProbeMemSpec;
+
+typedef struct {
     u64 seq;
     u64 block;
     u32 pc;
@@ -77,14 +114,114 @@ static MmioEntry    s_mmio[GCN_MMIO_RING_CAP];
 static BlockEntry   s_block[GCN_BLOCK_RING_CAP];
 static EventEntry   s_event[GCN_EVENT_RING_CAP];
 static FifoEntry    s_fifo[GCN_FIFO_RING_CAP];
+static GprProbeEntry s_gpr_probe[GCN_GPR_PROBE_RING_CAP];
 static MemcardEntry s_memcard[GCN_MEMCARD_RING_CAP];
 
 static u64 s_mmio_count;   /* total ever recorded (also the next write index)   */
 static u64 s_block_count;
 static u64 s_event_count;
 static u64 s_fifo_count;
+static u64 s_gpr_probe_count;
 static u64 s_memcard_count;
 static u64 s_block_index;  /* monotonic retired-block counter (timeline stamp)  */
+
+#define GCN_GPR_PROBE_PC_MAX 64
+static int s_gpr_probe_inited;
+static u32 s_gpr_probe_pcs[GCN_GPR_PROBE_PC_MAX];
+static int s_gpr_probe_pc_count;
+static GprProbeMemSpec s_gpr_probe_mem_specs[4];
+static int s_gpr_probe_mem_spec_count;
+
+static u32 read_be32_unchecked(const u8* p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+static int parse_u64_field(const char** p, unsigned long long* out, char delimiter) {
+    char* end = NULL;
+    unsigned long long value = strtoull(*p, &end, 0);
+    if (end == *p || (delimiter == '\0' ? *end != '\0' : *end != delimiter))
+        return 0;
+    *out = value;
+    *p = delimiter == '\0' ? end : end + 1;
+    return 1;
+}
+
+static void parse_gpr_probe_mem_specs(const char* env) {
+    if (!env || !*env)
+        return;
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", env);
+    char* tok = strtok(buf, ",;");
+    while (tok && s_gpr_probe_mem_spec_count < (int)(sizeof s_gpr_probe_mem_specs / sizeof s_gpr_probe_mem_specs[0])) {
+        const char* p = tok;
+        unsigned long long pc = 0, gpr = 0, a = 0, b = 0, c = 0;
+        if (parse_u64_field(&p, &pc, ':') &&
+            parse_u64_field(&p, &gpr, ':') &&
+            parse_u64_field(&p, &a, ':') &&
+            parse_u64_field(&p, &b, '\0')) {
+            if (gpr >= 0 && gpr < 32 && b > 0 && b <= 64) {
+                GprProbeMemSpec* spec = &s_gpr_probe_mem_specs[s_gpr_probe_mem_spec_count++];
+                spec->pc = (u32)pc;
+                spec->gpr = (u8)gpr;
+                spec->offset = (s32)a;
+                spec->len = (u8)b;
+                spec->deref = 0;
+            }
+        } else {
+            p = tok;
+            if (parse_u64_field(&p, &pc, ':') &&
+                parse_u64_field(&p, &gpr, ':') &&
+                parse_u64_field(&p, &a, ':') &&
+                parse_u64_field(&p, &b, ':') &&
+                parse_u64_field(&p, &c, '\0')) {
+                if (gpr >= 0 && gpr < 32 && c > 0 && c <= 64) {
+                    GprProbeMemSpec* spec = &s_gpr_probe_mem_specs[s_gpr_probe_mem_spec_count++];
+                    spec->pc = (u32)pc;
+                    spec->gpr = (u8)gpr;
+                    spec->offset = (s32)a;
+                    spec->read_offset = (s32)b;
+                    spec->len = (u8)c;
+                    spec->deref = 1;
+                }
+            }
+        }
+        tok = strtok(NULL, ",;");
+    }
+    if (s_gpr_probe_mem_spec_count > 0) {
+        fprintf(stderr, "[gpr-probe] armed for %d inline memory specs\n",
+                s_gpr_probe_mem_spec_count);
+        fflush(stderr);
+    }
+}
+
+static void gpr_probe_init_once(void) {
+    if (s_gpr_probe_inited)
+        return;
+    s_gpr_probe_inited = 1;
+    const char* e = getenv("GCN_PROBE_PCS");
+    if (!e || !*e)
+        return;
+
+    const char* p = e;
+    while (*p && s_gpr_probe_pc_count < GCN_GPR_PROBE_PC_MAX) {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';')
+            p++;
+        if (!*p)
+            break;
+        char* end = NULL;
+        unsigned long value = strtoul(p, &end, 0);
+        if (end == p)
+            break;
+        s_gpr_probe_pcs[s_gpr_probe_pc_count++] = (u32)value;
+        p = end;
+    }
+    if (s_gpr_probe_pc_count > 0) {
+        fprintf(stderr, "[gpr-probe] armed for %d block-entry PCs\n",
+                s_gpr_probe_pc_count);
+        fflush(stderr);
+    }
+    parse_gpr_probe_mem_specs(getenv("GCN_PROBE_MEM"));
+}
 
 /* One bit per aligned word. MEM1/MEM2 code is observed through the cached
  * 0x80000000 alias in ordinary execution (24 MiB => 768 KiB); reset/BS1 code
@@ -106,12 +243,17 @@ void gcn_rings_init(void) {
     memset(s_block, 0, sizeof s_block);
     memset(s_event, 0, sizeof s_event);
     memset(s_fifo, 0, sizeof s_fifo);
+    memset(s_gpr_probe, 0, sizeof s_gpr_probe);
     memset(s_memcard, 0, sizeof s_memcard);
     memset(s_ram_pc_coverage, 0, sizeof s_ram_pc_coverage);
     memset(s_ipl_pc_coverage, 0, sizeof s_ipl_pc_coverage);
     s_mmio_count = s_block_count = s_event_count = s_fifo_count = 0;
+    s_gpr_probe_count = 0;
     s_memcard_count = 0;
     s_block_index = 0;
+    s_gpr_probe_inited = 0;
+    s_gpr_probe_pc_count = 0;
+    s_gpr_probe_mem_spec_count = 0;
 }
 
 void gcn_ring_mmio(u32 pc, u32 addr, u32 value, u8 size, u8 rw, u8 mapped) {
@@ -138,6 +280,62 @@ void gcn_ring_block_ex(u32 pc, u32 lr, u32 ctr, u32 srr0, u32 srr1, u32 msr,
         }
     }
     s_block_index++;
+}
+
+void gcn_ring_gpr_probe(CPUState* cpu, u32 pc, const u32 gpr[32], u32 lr,
+                        u32 ctr, u32 cr, u32 xer, u32 fpscr) {
+    gpr_probe_init_once();
+    if (s_gpr_probe_pc_count == 0)
+        return;
+    int hit = 0;
+    for (int i = 0; i < s_gpr_probe_pc_count; i++) {
+        if (s_gpr_probe_pcs[i] == pc) {
+            hit = 1;
+            break;
+        }
+    }
+    if (!hit)
+        return;
+
+    GprProbeEntry* e = &s_gpr_probe[s_gpr_probe_count & (GCN_GPR_PROBE_RING_CAP - 1)];
+    e->seq = s_gpr_probe_count++;
+    e->block = s_block_index;
+    e->xfb_pub = gcn_gx_xfb_pub_count();
+    e->pc = pc;
+    e->lr = lr;
+    e->ctr = ctr;
+    e->cr = cr;
+    e->xer = xer;
+    e->fpscr = fpscr;
+    memcpy(e->gpr, gpr, sizeof e->gpr);
+    memset(e->mem, 0, sizeof e->mem);
+    for (int i = 0; i < s_gpr_probe_mem_spec_count; i++) {
+        const GprProbeMemSpec* spec = &s_gpr_probe_mem_specs[i];
+        if (spec->pc != pc)
+            continue;
+        GprProbeMemEntry* m = &e->mem[i];
+        m->base = gpr[spec->gpr];
+        m->len = spec->len;
+        m->deref = spec->deref;
+        u32 addr = m->base + (u32)spec->offset;
+        if (spec->deref) {
+            u32 avail = 0;
+            u8* p = gcn_mem_resolve(cpu, addr, &avail);
+            if (!p || avail < 4u) {
+                m->addr = addr;
+                continue;
+            }
+            m->pointer = read_be32_unchecked(p);
+            addr = m->pointer + (u32)spec->read_offset;
+        }
+        m->addr = addr;
+        u32 avail = 0;
+        u8* p = gcn_mem_resolve(cpu, addr, &avail);
+        if (!p || avail < spec->len)
+            continue;
+        memcpy(m->data, p, spec->len);
+        m->ok = 1;
+    }
 }
 
 void gcn_ring_block_dump_stderr(int max_entries) {
@@ -264,24 +462,26 @@ void gcn_ring_watch_init(void) {
 
 /* Watch hits go into an always-on ring (dumped on demand by the corrupt-
  * upload trigger); only the first few print live as a liveness check. */
-typedef struct { u64 block; u32 pc, ea; u64 value; u8 size; u8 _pad[7]; } WatchEntry;
-#define GCN_WATCH_RING_CAP (1u << 12)
+typedef struct { u64 block; u64 xfb_pub; u32 pc, ea; u64 value; u8 size; u8 _pad[7]; } WatchEntry;
+#define GCN_WATCH_RING_CAP (1u << 20)
 static WatchEntry s_watch[GCN_WATCH_RING_CAP];
 static u64 s_watch_count;
 
 void gcn_ring_watch_hit(u32 ea, u64 value, u32 size, u32 cia) {
     WatchEntry* e = &s_watch[s_watch_count & (GCN_WATCH_RING_CAP - 1)];
     e->block = s_block_index;
+    e->xfb_pub = gcn_gx_xfb_pub_count();
     e->pc = cia; e->ea = ea; e->value = value; e->size = (u8)size;
     s_watch_count++;
     if (s_watch_count <= 12u) {
         f32 vf;
         u32 v32 = (u32)value;
         memcpy(&vf, &v32, 4);
-        fprintf(stderr, "[gcn-watch] #%llu blk=%llu pc=%08X ea=%08X size=%u "
+        fprintf(stderr, "[gcn-watch] #%llu blk=%llu pub=%llu pc=%08X ea=%08X size=%u "
                         "val=%0*llX(%.6g)\n",
                 (unsigned long long)s_watch_count,
-                (unsigned long long)s_block_index, cia, ea, size,
+                (unsigned long long)s_block_index,
+                (unsigned long long)e->xfb_pub, cia, ea, size,
                 (int)(size * 2u), (unsigned long long)value, (double)vf);
         fflush(stderr);
     }
@@ -290,11 +490,13 @@ void gcn_ring_watch_hit(u32 ea, u64 value, u32 size, u32 cia) {
 void gcn_ring_watch_hit_span(u32 ea, u32 len, u32 tag) {
     WatchEntry* e = &s_watch[s_watch_count & (GCN_WATCH_RING_CAP - 1)];
     e->block = s_block_index;
+    e->xfb_pub = gcn_gx_xfb_pub_count();
     e->pc = tag; e->ea = ea; e->value = len; e->size = 0;   /* size 0 = span */
     s_watch_count++;
-    fprintf(stderr, "[gcn-watch] SPAN #%llu blk=%llu tag=%08X ea=%08X len=%u\n",
+    fprintf(stderr, "[gcn-watch] SPAN #%llu blk=%llu pub=%llu tag=%08X ea=%08X len=%u\n",
             (unsigned long long)s_watch_count,
-            (unsigned long long)s_block_index, tag, ea, len);
+            (unsigned long long)s_block_index,
+            (unsigned long long)e->xfb_pub, tag, ea, len);
     fflush(stderr);
 }
 
@@ -312,9 +514,10 @@ void gcn_ring_watch_dump_stderr(int max_entries) {
         f32 vf;
         u32 v32 = (u32)e->value;
         memcpy(&vf, &v32, 4);
-        fprintf(stderr, "  #%llu blk=%llu pc=%08X ea=%08X size=%u val=%0*llX(%.6g)\n",
-                (unsigned long long)i, (unsigned long long)e->block, e->pc,
-                e->ea, e->size, (int)(e->size * 2u),
+        fprintf(stderr, "  #%llu blk=%llu pub=%llu pc=%08X ea=%08X size=%u val=%0*llX(%.6g)\n",
+                (unsigned long long)i, (unsigned long long)e->block,
+                (unsigned long long)e->xfb_pub, e->pc, e->ea, e->size,
+                (int)(e->size * 2u),
                 (unsigned long long)e->value, (double)vf);
     }
     fflush(stderr);
@@ -510,6 +713,78 @@ int gcn_ring_block_json(char* out, int cap, int max_entries) {
     return n;
 }
 
+int gcn_ring_gpr_probe_json(char* out, int cap, int max_entries) {
+    int n = (int)emit_prefix(out, cap, "gpr_probe", s_gpr_probe_count);
+    if (n < 0 || n >= cap) return n;
+    u64 avail = s_gpr_probe_count < GCN_GPR_PROBE_RING_CAP ? s_gpr_probe_count : GCN_GPR_PROBE_RING_CAP;
+    if ((u64)max_entries < avail) avail = (u64)max_entries;
+    u64 start = s_gpr_probe_count - avail;
+    int emitted = 0, first = 1;
+    int truncated = 0;
+    for (u64 s = start; s < s_gpr_probe_count; s++) {
+        GprProbeEntry* e = &s_gpr_probe[s & (GCN_GPR_PROBE_RING_CAP - 1)];
+        int w = snprintf(out + n, (size_t)(cap - n),
+            "%s{\"seq\":%llu,\"block\":%llu,\"xfb_pub_count\":%llu,\"pc\":%u,\"lr\":%u,\"ctr\":%u,"
+            "\"cr\":%u,\"xer\":%u,\"fpscr\":%u,\"gpr\":[",
+            first ? "" : ",", (unsigned long long)e->seq,
+            (unsigned long long)e->block, (unsigned long long)e->xfb_pub,
+            e->pc, e->lr, e->ctr, e->cr,
+            e->xer, e->fpscr);
+        if (w < 0 || n + w >= cap - 384) {
+            truncated = 1;
+            break;
+        }
+        n += w;
+        for (int i = 0; i < 32; i++) {
+            w = snprintf(out + n, (size_t)(cap - n), "%s%u",
+                         i ? "," : "", e->gpr[i]);
+            if (w < 0 || n + w >= cap - 64) {
+                truncated = 1;
+                break;
+            }
+            n += w;
+        }
+        if (truncated) break;
+        n += snprintf(out + n, (size_t)(cap - n), "],\"mem\":[");
+        int mem_first = 1;
+        static const char hexd[] = "0123456789abcdef";
+        for (int m = 0; m < 4; m++) {
+            const GprProbeMemEntry* me = &e->mem[m];
+            if (me->len == 0)
+                continue;
+            w = snprintf(out + n, (size_t)(cap - n),
+                         "%s{\"slot\":%d,\"addr\":%u,\"base\":%u,\"pointer\":%u,"
+                         "\"len\":%u,\"ok\":%u,\"deref\":%u,\"hex\":\"",
+                         mem_first ? "" : ",", m, me->addr, me->base, me->pointer,
+                         me->len, me->ok, me->deref);
+            if (w < 0 || n + w >= cap - 160) {
+                truncated = 1;
+                break;
+            }
+            n += w;
+            if (me->ok) {
+                for (int b = 0; b < me->len; b++) {
+                    if (n + 2 >= cap - 80) {
+                        truncated = 1;
+                        break;
+                    }
+                    out[n++] = hexd[me->data[b] >> 4];
+                    out[n++] = hexd[me->data[b] & 0xF];
+                }
+            }
+            if (truncated)
+                break;
+            n += snprintf(out + n, (size_t)(cap - n), "\"}");
+            mem_first = 0;
+        }
+        if (truncated) break;
+        n += snprintf(out + n, (size_t)(cap - n), "]}");
+        first = 0; emitted++;
+    }
+    n += snprintf(out + n, (size_t)(cap - n), "],\"count\":%d}\n", emitted);
+    return n;
+}
+
 int gcn_ring_fifo_json(char* out, int cap, int max_entries) {
     static const char hexd[] = "0123456789abcdef";
     int n = (int)emit_prefix(out, cap, "fifo", s_fifo_count);
@@ -591,4 +866,7 @@ void gcn_rings_reset(void) {
     s_psq_count = 0;
     memset(s_watch, 0, sizeof s_watch);
     s_watch_count = 0;
+    s_gpr_probe_inited = 0;
+    s_gpr_probe_pc_count = 0;
+    s_gpr_probe_mem_spec_count = 0;
 }

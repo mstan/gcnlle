@@ -34,6 +34,7 @@ extern "C" {
 #define GCN_BLOCK_RING_CAP (1u << 18)
 #define GCN_EVENT_RING_CAP (1u << 16)
 #define GCN_FIFO_RING_CAP  (1u << 16)   /* GX gather-pipe bursts (32 bytes each) */
+#define GCN_GPR_PROBE_RING_CAP (1u << 13) /* env-gated block-entry GPR snapshots */
 /* Memcard transaction ring (ROADMAP M4). EXI memory-card traffic is SPARSE
  * (presence poll + directory read + save read/write) compared to the VI/SI/GX
  * flood, so a small dedicated ring covers a very long wall-clock window — the
@@ -92,6 +93,16 @@ void gcn_ring_mmio(u32 pc, u32 addr, u32 value, u8 size, u8 rw, u8 mapped);
 void gcn_ring_block_ex(u32 pc, u32 lr, u32 ctr, u32 srr0, u32 srr1, u32 msr,
                        u32 exception);
 
+typedef struct CPUState CPUState;
+
+/* Env-gated guest-PC probe. Set GCN_PROBE_PCS to a comma/semicolon/space
+ * separated list of block-entry PCs; matching entries snapshot GPRs so TCP
+ * tools can inspect call/return arguments without patching generated code.
+ * Optional GCN_PROBE_MEM specs snapshot small RAM windows at the same instant,
+ * avoiding post-run reads of reused guest structs. */
+void gcn_ring_gpr_probe(CPUState* cpu, u32 pc, const u32 gpr[32], u32 lr,
+                        u32 ctr, u32 cr, u32 xer, u32 fpscr);
+
 /* One device/timeline edge (see GcnEventKind). Stamped with the block index. */
 void gcn_ring_event(u16 kind, u32 detail, u32 aux, u32 pc);
 
@@ -141,6 +152,7 @@ int gcn_ring_pc_seen(u32 pc);
 int gcn_ring_mmio_json(char* out, int cap, int max_entries,
                        u32 addr_filter, int have_filter, int rw_filter);
 int gcn_ring_block_json(char* out, int cap, int max_entries);
+int gcn_ring_gpr_probe_json(char* out, int cap, int max_entries);
 int gcn_ring_event_json(char* out, int cap, int max_entries);
 int gcn_ring_fifo_json(char* out, int cap, int max_entries);
 int gcn_ring_memcard_json(char* out, int cap, int max_entries);
@@ -185,7 +197,9 @@ void gcn_ring_watch_init(void);
 void gcn_ring_watch_hit(u32 ea, u64 value, u32 size, u32 cia);
 void gcn_ring_watch_dump_stderr(int max_entries);
 static inline void gcn_ring_watch_check(u32 ea, u64 value, u32 size, u32 cia) {
-    if ((u32)((ea & 0x1FFFFFFFu) - gcn_watch_lo) < gcn_watch_len)
+    u32 p = ea & 0x1FFFFFFFu;
+    if (gcn_watch_len != 0u &&
+        p < gcn_watch_lo + gcn_watch_len && p + size > gcn_watch_lo)
         gcn_ring_watch_hit(ea, value, size, cia);
 }
 

@@ -144,6 +144,8 @@ void gcn_gx_xfb_write_end(void);
  * resident, fused vs unfused shaders, SIMD vs scalar) produced it. */
 void gcn_gx_xfb_hash_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows);
 void gcn_gx_xfb_hash_publish_done(void);
+void gcn_gx_xfb_dump_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows);
+u64 gcn_gx_xfb_pub_count(void);
 
 /* SNAPSHOT_RESUME pass C: get/set the cumulative chain + publication count
  * (see gx.c's doc comment above gcn_gx_xfb_hash_get_state). Restore must

@@ -200,8 +200,9 @@ static void sram_persist_to_file(void* user) {
  *     default below).
  * With no env set, slot A still gets an in-memory formatted card so EXT reads
  * 1 (matching the Dolphin oracle's "card in slot A" config — this preserves
- * the validated boot), and slot B stays empty. Every guest write is flushed
- * back to the file on chip deselect (card_persist_to_file). */
+ * the validated boot), and slot B stays empty. Set GCN_MEMCARD_A_NONE=1 to
+ * leave slot A empty for no-card attract-oracle comparisons. Every guest write
+ * is flushed back to the file on chip deselect (card_persist_to_file). */
 typedef struct { const char* path[2]; } GcnCardPersistCtx;
 static GcnCardPersistCtx s_card_persist_ctx;
 
@@ -409,6 +410,13 @@ static void setup_memcard(GcnExi* exi, u32 ch, GcnMemcard* card, const char* pat
     set_card_flash_id(exi, ch, img);
 }
 
+static int memcard_slot_disabled(u32 ch) {
+    char env_name[24];
+    snprintf(env_name, sizeof env_name, "GCN_MEMCARD_%c_NONE", (char)('A' + ch));
+    const char* e = getenv(env_name);
+    return e && *e && *e != '0';
+}
+
 int main(int argc, char** argv) {
     const char* bs1_env = getenv("GCN_BOOT_BS1");
     int bs1_mode = bs1_env && *bs1_env && *bs1_env != '0';
@@ -580,13 +588,23 @@ int main(int argc, char** argv) {
     }
 
     /* ROADMAP M4: memory cards. Slot A defaults to a formatted card (EXT=1,
-     * matching the oracle); GCN_MEMCARD_A/B back either slot with a host .raw. */
+     * matching the historical card-present oracle); GCN_MEMCARD_A/B back either
+     * slot with a host .raw. GCN_MEMCARD_A_NONE=1 aligns to Dolphin SlotA=None. */
     static GcnMemcard card_a, card_b;
     gcn_exi_set_card_persist(&exi, card_persist_to_file, &s_card_persist_ctx);
-    setup_memcard(&exi, 0u, &card_a, getenv("GCN_MEMCARD_A"));   /* slot A (default on) */
+    if (memcard_slot_disabled(0u)) {
+        fprintf(stdout, "gcn boot: memory card A disabled by GCN_MEMCARD_A_NONE\n");
+        gcn_exi_set_memcard(&exi, 0u, NULL);
+    } else {
+        setup_memcard(&exi, 0u, &card_a, getenv("GCN_MEMCARD_A"));   /* slot A (default on) */
+    }
     const char* mcb_path = getenv("GCN_MEMCARD_B");
-    if (mcb_path && *mcb_path)
+    if (memcard_slot_disabled(1u)) {
+        fprintf(stdout, "gcn boot: memory card B disabled by GCN_MEMCARD_B_NONE\n");
+        gcn_exi_set_memcard(&exi, 1u, NULL);
+    } else if (mcb_path && *mcb_path) {
         setup_memcard(&exi, 1u, &card_b, mcb_path);              /* slot B (opt-in) */
+    }
 
     gcn_mmio_register(&bus, "EXI", GCN_EXI_BASE, GCN_EXI_REGISTER_BYTES,
                       gcn_exi_read, gcn_exi_write, &exi);

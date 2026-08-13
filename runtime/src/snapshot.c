@@ -382,6 +382,16 @@ static void write_di(SnapBuf* b, const GcnDi* di_in) {
     sb_u32(b, (u32)di->irq_level);
     sb_u64(b, di->disc_size);
     sb_u32(b, (u32)di->disc_present);
+    sb_u64(b, di->pending_cycles);
+    sb_u8(b, di->pending_read_active);
+    sb_u64(b, di->pending_read_offset);
+    sb_u32(b, di->pending_read_length);
+    sb_u32(b, di->pending_read_addr);
+    sb_u64(b, di->now_cycles);
+    sb_u64(b, di->read_buffer_start_offset);
+    sb_u64(b, di->read_buffer_end_offset);
+    sb_u64(b, di->read_buffer_start_time);
+    sb_u64(b, di->read_buffer_end_time);
 }
 
 /* GX register files: BP[256] + XF[gcn_gx_xf_words()] (gx.c's GcnGx mirror,
@@ -897,6 +907,16 @@ static void read_di(SnapCur* c, GcnDi* di, u64* out_disc_size) {
     u32 irq_level = cr_u32(c);
     u64 disc_size = cr_u64(c);
     u32 disc_present = cr_u32(c); (void)disc_present;
+    u64 pending_cycles = c->pos < c->len ? cr_u64(c) : 0;
+    u8 pending_read_active = c->pos < c->len ? cr_u8(c) : 0;
+    u64 pending_read_offset = c->pos < c->len ? cr_u64(c) : 0;
+    u32 pending_read_length = c->pos < c->len ? cr_u32(c) : 0;
+    u32 pending_read_addr = c->pos < c->len ? cr_u32(c) : 0;
+    u64 now_cycles = c->pos < c->len ? cr_u64(c) : 0;
+    u64 read_buffer_start_offset = c->pos < c->len ? cr_u64(c) : 0;
+    u64 read_buffer_end_offset = c->pos < c->len ? cr_u64(c) : 0;
+    u64 read_buffer_start_time = c->pos < c->len ? cr_u64(c) : 0;
+    u64 read_buffer_end_time = c->pos < c->len ? cr_u64(c) : 0;
     if (out_disc_size) *out_disc_size = disc_size;
     if (!di) return;
     di->disr = disr; di->dicvr = dicvr;
@@ -907,6 +927,16 @@ static void read_di(SnapCur* c, GcnDi* di, u64* out_disc_size) {
     di->enable_dtk = enable_dtk;
     di->cmd_pending = cmd_pending;
     di->pending_intr = pending_intr;
+    di->pending_cycles = pending_cycles;
+    di->pending_read_active = pending_read_active;
+    di->pending_read_offset = pending_read_offset;
+    di->pending_read_length = pending_read_length;
+    di->pending_read_addr = pending_read_addr;
+    di->now_cycles = now_cycles;
+    di->read_buffer_start_offset = read_buffer_start_offset;
+    di->read_buffer_end_offset = read_buffer_end_offset;
+    di->read_buffer_start_time = read_buffer_start_time;
+    di->read_buffer_end_time = read_buffer_end_time;
     di->irq_level = (int)irq_level;
     /* disc_file/disc_size/disc_present: never touched — see doc comment. */
 }
@@ -1139,8 +1169,20 @@ int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
 
     /* ---- overlay: devices. ---- */
     if (p_exi) { SnapCur c; cr_init(&c, p_exi, l_exi); read_exi(&c, ctx->exi); }
-    if (p_mca && ctx->exi) { SnapCur c; cr_init(&c, p_mca, l_mca); read_memcard(&c, ctx->exi->card[0]); }
-    if (p_mcb && ctx->exi) { SnapCur c; cr_init(&c, p_mcb, l_mcb); read_memcard(&c, ctx->exi->card[1]); }
+    if (p_mca && ctx->exi && ctx->exi->card[0]) {
+        SnapCur c; cr_init(&c, p_mca, l_mca); read_memcard(&c, ctx->exi->card[0]);
+    }
+    if (p_mca && ctx->exi && !ctx->exi->card[0]) {
+        ctx->exi->dev_present[0] = 0;
+        fprintf(stderr, "gcn snapshot: slot A memcard section ignored; slot disabled\n");
+    }
+    if (p_mcb && ctx->exi && ctx->exi->card[1]) {
+        SnapCur c; cr_init(&c, p_mcb, l_mcb); read_memcard(&c, ctx->exi->card[1]);
+    }
+    if (p_mcb && ctx->exi && !ctx->exi->card[1]) {
+        ctx->exi->dev_present[1] = 0;
+        fprintf(stderr, "gcn snapshot: slot B memcard section ignored; slot disabled\n");
+    }
     if (p_vi) { SnapCur c; cr_init(&c, p_vi, l_vi); read_vi(&c, ctx->vi); }
     if (p_si) { SnapCur c; cr_init(&c, p_si, l_si); read_si(&c, ctx->si); }
     if (p_pi) { SnapCur c; cr_init(&c, p_pi, l_pi); read_pi(&c, ctx->pi); }
@@ -1215,10 +1257,16 @@ int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
      * frame-count, but ONLY when GCN_GX_XFB_HASH=1 in THIS (resuming)
      * process too — seeding a chain nothing will ever feed into again is
      * pointless, and gx.c's own gx_xfb_hash_on() gate already makes
-     * feed/publish_done no-ops when unset, so an unconditional seed would
-     * silently do nothing useful anyway. Absent section (older pass-A/B
+     * NOTE: the gate below supersedes this historical hash-only comment;
+     * raw XFB dumps also need the saved ordinal. Absent section (older pass-A/B
      * blobs) is not an error — just nothing to seed. */
-    if (p_xfbhash && getenv("GCN_GX_XFB_HASH") && getenv("GCN_GX_XFB_HASH")[0] == '1') {
+    /* 2026-08-12: publication counting is now independent of hashing, so raw
+     * XFB dump resumes must seed the ordinal even with GCN_GX_XFB_HASH=0. */
+    const char* xfb_hash_env = getenv("GCN_GX_XFB_HASH");
+    const char* xfb_dump_env = getenv("GCN_GX_XFB_DUMP");
+    int seed_xfb_state = (xfb_hash_env && xfb_hash_env[0] == '1') ||
+                         (xfb_dump_env && xfb_dump_env[0] != '\0');
+    if (p_xfbhash && seed_xfb_state) {
         SnapCur c; cr_init(&c, p_xfbhash, l_xfbhash);
         u64 chain = cr_u64(&c);
         u64 pubs = cr_u64(&c);

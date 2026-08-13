@@ -649,6 +649,10 @@ static void handle_line(Client* c, const char* line) {
         u32 count = 256; json_uint(line, "count", &count);
         n = gcn_ring_block_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
     }
+    else if (!strcmp(cmd, "gpr_probe_dump")) {
+        u32 count = 256; json_uint(line, "count", &count);
+        n = gcn_ring_gpr_probe_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
+    }
     else if (!strcmp(cmd, "pc_seen")) {
         u32 pc = 0;
         if (!json_uint(line, "pc", &pc)) {
@@ -668,6 +672,13 @@ static void handle_line(Client* c, const char* line) {
         /* GX gather-pipe burst recorder (ROADMAP M2 packet inventory). */
         u32 count = 64; json_uint(line, "count", &count);
         n = gcn_ring_fifo_json(s_resp, GCN_DBG_RESP_CAP, (int)count);
+    }
+    else if (!strcmp(cmd, "watch_dump")) {
+        u32 count = 256; json_uint(line, "count", &count);
+        gcn_ring_watch_dump_stderr((int)count);
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+                     "{\"ok\":true,\"dumped\":%u,\"stream\":\"stderr\"}\n",
+                     count);
     }
     else if (!strcmp(cmd, "card_traffic")) {
         /* EXI memory-card transaction recorder (ROADMAP M4). Sparse always-on
@@ -754,6 +765,12 @@ static void handle_line(Client* c, const char* line) {
             (unsigned long long)p.distinct,
             (unsigned long long)p.coalesced,
             latency_avg_ms, p.latency_max_ms);
+    }
+    else if (!strcmp(cmd, "xfb_pub_count")) {
+        n = snprintf(s_resp, GCN_DBG_RESP_CAP,
+            "{\"ok\":true,\"pub_count\":%llu,\"generation\":%llu}\n",
+            (unsigned long long)gcn_gx_xfb_pub_count(),
+            (unsigned long long)gcn_gx_xfb_generation());
     }
     else if (!strcmp(cmd, "gx_draw_state")) {
         /* Retire the GX queue before reading the retained per-config draw

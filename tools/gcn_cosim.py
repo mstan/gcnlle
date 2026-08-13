@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import select
+import shutil
 import socket
 import struct
 import subprocess
@@ -35,10 +36,61 @@ class ProtocolError(RuntimeError):
     pass
 
 
+def host_path(value: str | os.PathLike[str]) -> str:
+    path = str(value)
+    if re.match(r"^[A-Za-z]:[\\/]", path) or path.startswith("\\\\"):
+        return path
+    if sys.platform.startswith("cygwin"):
+        path = os.path.abspath(path.replace("\\", "/"))
+        try:
+            return subprocess.check_output(
+                ["cygpath", "-w", path], text=True
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return str(pathlib.Path(path).resolve())
+
+
+def local_path(value: str | os.PathLike[str]) -> str:
+    path = str(value)
+    if sys.platform.startswith("cygwin"):
+        if re.match(r"^[A-Za-z]:[\\/]", path) or path.startswith("\\\\"):
+            try:
+                return subprocess.check_output(
+                    ["cygpath", "-u", path], text=True
+                ).strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return os.path.abspath(path.replace("\\", "/"))
+    return str(pathlib.Path(path).resolve())
+
+
+def parse_pad_pulse(spec: str) -> dict[str, int]:
+    parts = spec.split(":")
+    if len(parts) not in (2, 3, 5):
+        raise argparse.ArgumentTypeError(
+            "pad pulse must be PUB:BUTTONS[:POLLS[:STICK_X:STICK_Y]]"
+        )
+    try:
+        pulse = {
+            "pub": int(parts[0], 0),
+            "buttons": int(parts[1], 0),
+            "polls": int(parts[2], 0) if len(parts) >= 3 else 30,
+            "stick_x": int(parts[3], 0) if len(parts) == 5 else 0x80,
+            "stick_y": int(parts[4], 0) if len(parts) == 5 else 0x80,
+        }
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return pulse
+
+
 class JsonTcp:
     def __init__(self, port: int, timeout: float = 10.0):
         self.port = port
         self.timeout = timeout
+
+    def close(self) -> None:
+        pass
 
     def request(self, cmd: str, **params: Any) -> dict[str, Any]:
         request = {"id": 1, "cmd": cmd, **params}
@@ -235,20 +287,27 @@ class GdbRemote:
         return stop
 
 
-def wait_json(port: int, process: subprocess.Popen[Any], timeout: float = 30.0) -> JsonTcp:
+def wait_json(
+    port: int,
+    process: subprocess.Popen[Any],
+    timeout: float = 30.0,
+    name: str = "runtime",
+    request_timeout: float = 10.0,
+) -> JsonTcp:
     deadline = time.monotonic() + timeout
-    client = JsonTcp(port, timeout=5.0)
+    client = JsonTcp(port, timeout=min(5.0, request_timeout))
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise ProtocolError(f"runtime exited early with code {process.returncode}")
+            raise ProtocolError(f"{name} exited early with code {process.returncode}")
         try:
             client.request("ping")
+            client.timeout = request_timeout
             return client
         except (OSError, ProtocolError) as exc:
             last_error = exc
             time.sleep(0.05)
-    raise ProtocolError(f"runtime port {port} did not become ready: {last_error}")
+    raise ProtocolError(f"{name} port {port} did not become ready: {last_error}")
 
 
 def wait_parked(client: JsonTcp, instruction: int, timeout: float = 120.0) -> dict[str, Any]:
@@ -306,6 +365,29 @@ class RuntimeInstance:
         self.stderr.close()
 
 
+@dataclass
+class DolphinIplInstance:
+    process: subprocess.Popen[Any]
+    client: JsonTcp
+    stdout: Any
+    stderr: Any
+
+    def close(self, timeout: float = 3.0) -> None:
+        try:
+            if self.process.poll() is None:
+                self.client.request("quit")
+                self.process.wait(timeout=timeout)
+        except (OSError, ProtocolError, subprocess.TimeoutExpired):
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+        self.stdout.close()
+        self.stderr.close()
+
+
 def start_runtime(args: argparse.Namespace, name: str, port: int) -> RuntimeInstance:
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -314,9 +396,9 @@ def start_runtime(args: argparse.Namespace, name: str, port: int) -> RuntimeInst
     env = os.environ.copy()
     env.update(
         {
-            "GCN_DISC": str(pathlib.Path(args.disc).resolve()),
-            "GCN_DSP_ROM": str(pathlib.Path(args.dsp_rom).resolve()),
-            "GCN_DSP_COEF": str(pathlib.Path(args.dsp_coef).resolve()),
+            "GCN_DISC": host_path(args.disc),
+            "GCN_DSP_ROM": host_path(args.dsp_rom),
+            "GCN_DSP_COEF": host_path(args.dsp_coef),
             "GCN_DEBUG_PORT": str(port),
             "GCN_COSIM": "1",
             "GCN_CYCLES_DERIVED": "1",
@@ -334,8 +416,8 @@ def start_runtime(args: argparse.Namespace, name: str, port: int) -> RuntimeInst
     else:
         env.pop("GCN_BOOT_BS1", None)
     process = subprocess.Popen(
-        [str(pathlib.Path(args.exe).resolve()), str(pathlib.Path(args.ipl).resolve())],
-        cwd=str(pathlib.Path(args.exe).resolve().parent),
+        [local_path(args.exe), host_path(args.ipl)],
+        cwd=os.path.dirname(local_path(args.exe)),
         env=env,
         stdout=stdout,
         stderr=stderr,
@@ -343,6 +425,1150 @@ def start_runtime(args: argparse.Namespace, name: str, port: int) -> RuntimeInst
     client = wait_json(port, process)
     wait_parked(client, 0)
     return RuntimeInstance(name, process, client, stdout, stderr)
+
+
+def start_runtime_visual(args: argparse.Namespace) -> RuntimeInstance:
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "snapshot_exit", False) and not getattr(args, "snapshot_save", None):
+        raise ProtocolError("--snapshot-exit requires --snapshot-save")
+    stdout = (output_dir / "runtime-capture.out.log").open("wb")
+    stderr = (output_dir / "runtime-capture.err.log").open("wb")
+    env = os.environ.copy()
+    env.update(
+        {
+            "GCN_DISC": host_path(args.disc),
+            "GCN_DSP_ROM": host_path(args.dsp_rom),
+            "GCN_DSP_COEF": host_path(args.dsp_coef),
+            "GCN_DEBUG_PORT": str(args.port),
+            "GCN_CYCLES_DERIVED": "1",
+            "GCN_GX_PIPELINE": "0" if args.sync_gx else "1",
+            "GCN_GX_THREADS": "1",
+            "GCN_WINDOW": "0",
+            "GCN_AUDIO": "0",
+            "GCN_THROTTLE": "0",
+            "GCN_NATIVE_MISS_JOURNAL": str(output_dir / "runtime-capture-misses.jsonl"),
+            "GCN_DI_JOURNAL": str(output_dir / "runtime-capture-di.jsonl"),
+        }
+    )
+    if args.backend:
+        env["GCN_GX_BACKEND"] = args.backend
+    if args.draw_state:
+        env["GCN_GX_DRAW_STATE"] = "1"
+        if args.draw_min_y is not None:
+            env["GCN_GX_DRAW_MIN_Y"] = str(args.draw_min_y)
+    if args.tev_census:
+        env["GCN_GX_TEV_CENSUS"] = "1"
+    if args.skip_draw_pc:
+        env["GCN_GX_SKIP_DRAW_PC"] = args.skip_draw_pc
+    if args.gpr_probe_pc:
+        env["GCN_PROBE_PCS"] = ",".join(f"0x{pc:08X}" for pc in args.gpr_probe_pc)
+    if getattr(args, "gpr_probe_inline_memory", None):
+        env["GCN_PROBE_MEM"] = ",".join(args.gpr_probe_inline_memory)
+    if getattr(args, "watch_range", None):
+        env["GCN_WATCH"] = args.watch_range
+    if getattr(args, "checkpoint_pc", None) is not None:
+        env["GCN_CHECKPOINT_PC"] = f"0x{args.checkpoint_pc:08X}"
+        if getattr(args, "checkpoint_gpr", None) is not None:
+            env["GCN_CHECKPOINT_GPR"] = str(args.checkpoint_gpr)
+        if getattr(args, "checkpoint_gpr_value", None) is not None:
+            env["GCN_CHECKPOINT_GPR_VALUE"] = f"0x{args.checkpoint_gpr_value:08X}"
+        if getattr(args, "checkpoint_lr", None) is not None:
+            env["GCN_CHECKPOINT_LR"] = f"0x{args.checkpoint_lr:08X}"
+    if getattr(args, "snapshot_save", None):
+        env["GCN_SNAPSHOT_SAVE"] = host_path(args.snapshot_save)
+    if getattr(args, "snapshot_exit", False):
+        env["GCN_SNAPSHOT_EXIT"] = "1"
+    if args.efb_copy_dump:
+        env["GCN_GX_EFB_COPY_DUMP"] = host_path(output_dir)
+        env["GCN_GX_EFB_COPY_DUMP_EVERY"] = str(args.efb_copy_dump_every)
+    if args.efb_source_dump:
+        env["GCN_GX_EFB_SOURCE_DUMP"] = host_path(output_dir)
+        env["GCN_GX_EFB_SOURCE_DUMP_EVERY"] = str(args.efb_source_dump_every)
+        if args.efb_source_dump_addr:
+            env["GCN_GX_EFB_SOURCE_DUMP_ADDR"] = args.efb_source_dump_addr
+    if args.snapshot_load:
+        env["GCN_SNAPSHOT_LOAD"] = host_path(args.snapshot_load)
+    if getattr(args, "no_memcard_a", False):
+        env["GCN_MEMCARD_A_NONE"] = "1"
+    if args.boot_mode == "bs1":
+        env["GCN_BOOT_BS1"] = "1"
+    else:
+        env.pop("GCN_BOOT_BS1", None)
+
+    process = subprocess.Popen(
+        [local_path(args.exe), host_path(args.ipl), str(args.max_blocks)],
+        cwd=local_path(output_dir),
+        env=env,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    client = wait_json(
+        args.port,
+        process,
+        timeout=args.tcp_ready_timeout,
+        name="runtime",
+        request_timeout=args.request_timeout,
+    )
+    return RuntimeInstance("runtime-capture", process, client, stdout, stderr)
+
+
+def cmd_runtime_capture(args: argparse.Namespace) -> int:
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    poll_path = output_dir / "runtime-capture.poll.jsonl"
+    if "/" in args.screenshot_name or "\\" in args.screenshot_name:
+        raise ProtocolError("--screenshot-name must be a file name, not a path")
+    ppm_path = output_dir / args.screenshot_name
+    if ppm_path.suffix.lower() != ".ppm":
+        raise ProtocolError("--screenshot-name must end in .ppm")
+
+    runtime = start_runtime_visual(args)
+    try:
+        deadline = time.monotonic() + args.wait_timeout
+        last_pub = 0
+        last_generation = 0
+        final_screenshot: dict[str, Any] | None = None
+        snapshot_exit_path = (
+            pathlib.Path(args.snapshot_save)
+            if getattr(args, "snapshot_exit", False)
+            and getattr(args, "snapshot_save", None)
+            else None
+        )
+        with poll_path.open("w", encoding="utf-8") as poll:
+            for i in range(args.max_polls):
+                item: dict[str, Any] = {
+                    "time": time.time(),
+                    "i": i,
+                    "process_exited": runtime.process.poll() is not None,
+                }
+                try:
+                    item["ping"] = runtime.client.request("ping")
+                except (OSError, ProtocolError) as exc:
+                    item["ping_error"] = str(exc)
+                try:
+                    xfb = runtime.client.request("xfb_pub_count")
+                    item["xfb"] = xfb
+                    last_pub = int(xfb.get("pub_count", 0))
+                    last_generation = int(xfb.get("generation", 0))
+                except (OSError, ProtocolError) as exc:
+                    item["xfb_error"] = str(exc)
+
+                if item["process_exited"] and snapshot_exit_path is not None:
+                    item["snapshot_exit"] = {
+                        "path": str(snapshot_exit_path),
+                        "exists": snapshot_exit_path.exists(),
+                    }
+                    poll.write(json.dumps(item, separators=(",", ":")) + "\n")
+                    poll.flush()
+                    if not snapshot_exit_path.exists():
+                        raise ProtocolError(
+                            "runtime exited before writing requested snapshot: "
+                            f"{snapshot_exit_path}"
+                        )
+                    summary = {
+                        "ok": True,
+                        "output_dir": str(output_dir),
+                        "poll_path": str(poll_path),
+                        "snapshot_exit": True,
+                        "snapshot_path": str(snapshot_exit_path),
+                        "target_pub": args.target_pub,
+                        "last_pub_count": last_pub,
+                        "last_generation": last_generation,
+                    }
+                    summary_path = output_dir / "runtime-capture.summary.json"
+                    summary_path.write_text(
+                        json.dumps(summary, indent=2), encoding="utf-8"
+                    )
+                    summary["summary_path"] = str(summary_path)
+                    print(json.dumps(summary, separators=(",", ":")))
+                    return 0
+
+                if last_pub >= args.target_pub and i % args.screenshot_every == 0:
+                    try:
+                        screenshot = runtime.client.request(
+                            "screenshot", path=args.screenshot_name
+                        )
+                        item["screenshot"] = screenshot
+                        height = int(screenshot.get("height", 0))
+                        mean_luma = float(screenshot.get("mean_luma", 0.0))
+                        if height >= args.min_height and mean_luma >= args.min_luma:
+                            final_screenshot = screenshot
+                            if args.draw_state:
+                                try:
+                                    item["gx_draw_state"] = runtime.client.request(
+                                        "gx_draw_state"
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["gx_draw_state_error"] = str(exc)
+                            if args.pc_seen:
+                                item["pc_seen"] = []
+                                for pc in args.pc_seen:
+                                    try:
+                                        item["pc_seen"].append(
+                                            runtime.client.request("pc_seen", pc=pc)
+                                        )
+                                    except (OSError, ProtocolError) as exc:
+                                        item["pc_seen"].append(
+                                            {
+                                                "ok": False,
+                                                "pc": pc,
+                                                "error": str(exc),
+                                            }
+                                        )
+                            if args.block_dump_count:
+                                try:
+                                    item["block_dump"] = runtime.client.request(
+                                        "block_dump", count=args.block_dump_count
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["block_dump_error"] = str(exc)
+                            if args.fifo_dump_count:
+                                try:
+                                    item["fifo_dump"] = runtime.client.request(
+                                        "fifo_dump", count=args.fifo_dump_count
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["fifo_dump_error"] = str(exc)
+                            if getattr(args, "watch_dump_count", 0):
+                                try:
+                                    item["watch_dump"] = runtime.client.request(
+                                        "watch_dump", count=args.watch_dump_count
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["watch_dump_error"] = str(exc)
+                            if args.gpr_probe_dump_count:
+                                try:
+                                    item["gpr_probe_dump"] = runtime.client.request(
+                                        "gpr_probe_dump",
+                                        count=args.gpr_probe_dump_count,
+                                    )
+                                    if (
+                                        args.gpr_probe_memory
+                                        or args.gpr_probe_memory_deref
+                                    ):
+                                        item["gpr_probe_memory"] = sample_gpr_probe_memory(
+                                            runtime.client,
+                                            item["gpr_probe_dump"],
+                                            args.gpr_probe_memory,
+                                            "runtime",
+                                            args.gpr_probe_memory_deref,
+                                        )
+                                except (OSError, ProtocolError) as exc:
+                                    item["gpr_probe_dump_error"] = str(exc)
+                    except (OSError, ProtocolError) as exc:
+                        item["screenshot_error"] = str(exc)
+
+                poll.write(json.dumps(item, separators=(",", ":")) + "\n")
+                poll.flush()
+                if final_screenshot is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "runtime capture did not produce a qualifying "
+                        f"screenshot within {args.wait_timeout:g}s "
+                        f"(last_pub_count={last_pub}, generation={last_generation})"
+                    )
+                time.sleep(args.poll_interval)
+
+        if final_screenshot is None:
+            raise ProtocolError("runtime capture did not produce a qualifying screenshot")
+
+        draw_state_path: pathlib.Path | None = None
+        if args.draw_state:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "gx_draw_state" in item:
+                        draw_state_path = output_dir / "runtime-capture.draw-state.json"
+                        draw_state_path.write_text(
+                            json.dumps(item["gx_draw_state"], indent=2),
+                            encoding="utf-8",
+                        )
+
+        pc_seen_path: pathlib.Path | None = None
+        if args.pc_seen:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "pc_seen" in item:
+                        pc_seen_path = output_dir / "runtime-capture.pc-seen.json"
+                        pc_seen_path.write_text(
+                            json.dumps(item["pc_seen"], indent=2),
+                            encoding="utf-8",
+                        )
+
+        block_dump_path: pathlib.Path | None = None
+        if args.block_dump_count:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "block_dump" in item:
+                        block_dump_path = output_dir / "runtime-capture.block-dump.json"
+                        block_dump_path.write_text(
+                            json.dumps(item["block_dump"], indent=2),
+                            encoding="utf-8",
+                        )
+
+        fifo_dump_path: pathlib.Path | None = None
+        if args.fifo_dump_count:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "fifo_dump" in item:
+                        fifo_dump_path = output_dir / "runtime-capture.fifo-dump.json"
+                        fifo_dump_path.write_text(
+                            json.dumps(item["fifo_dump"], indent=2),
+                            encoding="utf-8",
+                        )
+
+        gpr_probe_dump_path: pathlib.Path | None = None
+        gpr_probe_memory_path: pathlib.Path | None = None
+        if args.gpr_probe_dump_count:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "gpr_probe_dump" in item:
+                        gpr_probe_dump_path = output_dir / "runtime-capture.gpr-probe.json"
+                        gpr_probe_dump_path.write_text(
+                            json.dumps(item["gpr_probe_dump"], indent=2),
+                            encoding="utf-8",
+                        )
+                    if "gpr_probe_memory" in item:
+                        gpr_probe_memory_path = (
+                            output_dir / "runtime-capture.gpr-probe-memory.json"
+                        )
+                        gpr_probe_memory_path.write_text(
+                            json.dumps(item["gpr_probe_memory"], indent=2),
+                            encoding="utf-8",
+                        )
+
+        png_path: pathlib.Path | None = None
+        if args.convert_png:
+            png_path = ppm_path.with_suffix(".png")
+            subprocess.run(
+                [args.magick, str(ppm_path), str(png_path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        summary = {
+            "ok": True,
+            "output_dir": str(output_dir),
+            "poll_path": str(poll_path),
+            "screenshot": final_screenshot,
+            "ppm_path": str(ppm_path),
+            "png_path": None if png_path is None else str(png_path),
+            "draw_state_path": None if draw_state_path is None else str(draw_state_path),
+            "pc_seen_path": None if pc_seen_path is None else str(pc_seen_path),
+            "block_dump_path": None if block_dump_path is None else str(block_dump_path),
+            "fifo_dump_path": None if fifo_dump_path is None else str(fifo_dump_path),
+            "gpr_probe_dump_path": (
+                None if gpr_probe_dump_path is None else str(gpr_probe_dump_path)
+            ),
+            "gpr_probe_memory_path": (
+                None if gpr_probe_memory_path is None else str(gpr_probe_memory_path)
+            ),
+            "target_pub": args.target_pub,
+            "last_pub_count": last_pub,
+            "last_generation": last_generation,
+        }
+        print(json.dumps(summary, separators=(",", ":")))
+        return 0
+    finally:
+        runtime.close()
+
+
+def cmd_runtime_pub_sweep(args: argparse.Namespace) -> int:
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    poll_path = output_dir / "runtime-pub-sweep.poll.jsonl"
+    if "/" in args.screenshot_prefix or "\\" in args.screenshot_prefix:
+        raise ProtocolError("--screenshot-prefix must be a file prefix, not a path")
+
+    targets = sorted(set(args.sample_pub))
+    if not targets:
+        raise ProtocolError("at least one --sample-pub is required")
+    pending = list(targets)
+    samples: list[dict[str, Any]] = []
+
+    runtime = start_runtime_visual(args)
+    try:
+        deadline = time.monotonic() + args.wait_timeout
+        last_pub = 0
+        last_generation = 0
+        snapshot_exit_path = (
+            pathlib.Path(args.snapshot_save)
+            if getattr(args, "snapshot_exit", False)
+            and getattr(args, "snapshot_save", None)
+            else None
+        )
+        with poll_path.open("w", encoding="utf-8") as poll:
+            for i in range(args.max_polls):
+                item: dict[str, Any] = {
+                    "time": time.time(),
+                    "i": i,
+                    "process_exited": runtime.process.poll() is not None,
+                }
+                try:
+                    item["ping"] = runtime.client.request("ping")
+                except (OSError, ProtocolError) as exc:
+                    item["ping_error"] = str(exc)
+                try:
+                    xfb = runtime.client.request("xfb_pub_count")
+                    item["xfb"] = xfb
+                    last_pub = int(xfb.get("pub_count", 0))
+                    last_generation = int(xfb.get("generation", 0))
+                except (OSError, ProtocolError) as exc:
+                    item["xfb_error"] = str(exc)
+
+                if item["process_exited"] and snapshot_exit_path is not None:
+                    item["snapshot_exit"] = {
+                        "path": str(snapshot_exit_path),
+                        "exists": snapshot_exit_path.exists(),
+                    }
+                    poll.write(json.dumps(item, separators=(",", ":")) + "\n")
+                    poll.flush()
+                    if not snapshot_exit_path.exists():
+                        raise ProtocolError(
+                            "runtime exited before writing requested snapshot: "
+                            f"{snapshot_exit_path}"
+                        )
+                    summary = {
+                        "ok": True,
+                        "output_dir": str(output_dir),
+                        "poll_path": str(poll_path),
+                        "snapshot_exit": True,
+                        "snapshot_path": str(snapshot_exit_path),
+                        "targets": targets,
+                        "samples": samples,
+                        "last_pub_count": last_pub,
+                        "last_generation": last_generation,
+                    }
+                    summary_path = output_dir / "runtime-pub-sweep.summary.json"
+                    summary_path.write_text(
+                        json.dumps(summary, indent=2), encoding="utf-8"
+                    )
+                    summary["summary_path"] = str(summary_path)
+                    print(json.dumps(summary, separators=(",", ":")))
+                    return 0
+
+                item["samples"] = []
+                while pending and last_pub >= pending[0] and i % args.screenshot_every == 0:
+                    target = pending.pop(0)
+                    stem = f"{args.screenshot_prefix}-pub{target:04d}"
+                    ppm_name = f"{stem}.ppm"
+                    sample: dict[str, Any] = {
+                        "target_pub": target,
+                        "observed_pub_count": last_pub,
+                        "observed_generation": last_generation,
+                        "ppm_path": str(output_dir / ppm_name),
+                    }
+                    pre_screenshot_draw_state: dict[str, Any] | None = None
+                    pre_screenshot_draw_state_error: str | None = None
+                    if args.draw_state:
+                        try:
+                            pre_screenshot_draw_state = runtime.client.request(
+                                "gx_draw_state"
+                            )
+                        except (OSError, ProtocolError) as exc:
+                            pre_screenshot_draw_state_error = str(exc)
+                    try:
+                        screenshot = runtime.client.request("screenshot", path=ppm_name)
+                        sample["screenshot"] = screenshot
+                        height = int(screenshot.get("height", 0))
+                        mean_luma = float(screenshot.get("mean_luma", 0.0))
+                        if height < args.min_height or mean_luma < args.min_luma:
+                            sample["accepted"] = False
+                            sample["reject_reason"] = (
+                                f"height={height} mean_luma={mean_luma:g}"
+                            )
+                        else:
+                            sample["accepted"] = True
+                            if getattr(args, "ram_dump", None) or getattr(
+                                args, "ram_dump_deref", None
+                            ):
+                                try:
+                                    ram_dump = sample_ram_dumps(
+                                        runtime.client,
+                                        args.ram_dump,
+                                        "runtime",
+                                        getattr(args, "ram_dump_deref", []),
+                                    )
+                                    ram_dump_path = output_dir / f"{stem}.ram-dump.json"
+                                    ram_dump_path.write_text(
+                                        json.dumps(ram_dump, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["ram_dump_path"] = str(ram_dump_path)
+                                except (OSError, ProtocolError) as exc:
+                                    sample["ram_dump_error"] = str(exc)
+                            if args.draw_state:
+                                try:
+                                    draw_state = pre_screenshot_draw_state
+                                    if draw_state is None:
+                                        if pre_screenshot_draw_state_error is not None:
+                                            raise ProtocolError(
+                                                pre_screenshot_draw_state_error
+                                            )
+                                        draw_state = runtime.client.request(
+                                            "gx_draw_state"
+                                        )
+                                    draw_state_path = output_dir / f"{stem}.draw-state.json"
+                                    draw_state_path.write_text(
+                                        json.dumps(draw_state, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["draw_state_path"] = str(draw_state_path)
+                                except (OSError, ProtocolError) as exc:
+                                    sample["draw_state_error"] = str(exc)
+                            if args.pc_seen:
+                                pc_seen = []
+                                for pc in args.pc_seen:
+                                    try:
+                                        pc_seen.append(runtime.client.request("pc_seen", pc=pc))
+                                    except (OSError, ProtocolError) as exc:
+                                        pc_seen.append(
+                                            {"ok": False, "pc": pc, "error": str(exc)}
+                                        )
+                                pc_seen_path = output_dir / f"{stem}.pc-seen.json"
+                                pc_seen_path.write_text(
+                                    json.dumps(pc_seen, indent=2),
+                                    encoding="utf-8",
+                                )
+                                sample["pc_seen_path"] = str(pc_seen_path)
+                            if args.block_dump_count:
+                                try:
+                                    block_dump = runtime.client.request(
+                                        "block_dump", count=args.block_dump_count
+                                    )
+                                    block_dump_path = output_dir / f"{stem}.block-dump.json"
+                                    block_dump_path.write_text(
+                                        json.dumps(block_dump, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["block_dump_path"] = str(block_dump_path)
+                                except (OSError, ProtocolError) as exc:
+                                    sample["block_dump_error"] = str(exc)
+                            if args.fifo_dump_count:
+                                try:
+                                    fifo_dump = runtime.client.request(
+                                        "fifo_dump", count=args.fifo_dump_count
+                                    )
+                                    fifo_dump_path = output_dir / f"{stem}.fifo-dump.json"
+                                    fifo_dump_path.write_text(
+                                        json.dumps(fifo_dump, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["fifo_dump_path"] = str(fifo_dump_path)
+                                except (OSError, ProtocolError) as exc:
+                                    sample["fifo_dump_error"] = str(exc)
+                            if getattr(args, "watch_dump_count", 0):
+                                try:
+                                    watch_dump = runtime.client.request(
+                                        "watch_dump", count=args.watch_dump_count
+                                    )
+                                    watch_dump_path = output_dir / f"{stem}.watch-dump.json"
+                                    watch_dump_path.write_text(
+                                        json.dumps(watch_dump, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["watch_dump_path"] = str(watch_dump_path)
+                                    sample["watch_dump_stderr_path"] = str(
+                                        output_dir / "runtime-capture.err.log"
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    sample["watch_dump_error"] = str(exc)
+                            if args.gpr_probe_dump_count:
+                                try:
+                                    gpr_probe_dump = runtime.client.request(
+                                        "gpr_probe_dump",
+                                        count=args.gpr_probe_dump_count,
+                                    )
+                                    gpr_probe_path = output_dir / f"{stem}.gpr-probe.json"
+                                    gpr_probe_path.write_text(
+                                        json.dumps(gpr_probe_dump, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["gpr_probe_dump_path"] = str(gpr_probe_path)
+                                    if (
+                                        args.gpr_probe_memory
+                                        or args.gpr_probe_memory_deref
+                                    ):
+                                        gpr_probe_memory = sample_gpr_probe_memory(
+                                            runtime.client,
+                                            gpr_probe_dump,
+                                            args.gpr_probe_memory,
+                                            "runtime",
+                                            args.gpr_probe_memory_deref,
+                                        )
+                                        gpr_probe_memory_path = (
+                                            output_dir / f"{stem}.gpr-probe-memory.json"
+                                        )
+                                        gpr_probe_memory_path.write_text(
+                                            json.dumps(gpr_probe_memory, indent=2),
+                                            encoding="utf-8",
+                                        )
+                                        sample["gpr_probe_memory_path"] = str(
+                                            gpr_probe_memory_path
+                                        )
+                                except (OSError, ProtocolError) as exc:
+                                    sample["gpr_probe_dump_error"] = str(exc)
+                            if args.convert_png:
+                                png_path = output_dir / f"{stem}.png"
+                                subprocess.run(
+                                    [args.magick, str(output_dir / ppm_name), str(png_path)],
+                                    check=True,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                sample["png_path"] = str(png_path)
+                    except (OSError, ProtocolError, subprocess.SubprocessError) as exc:
+                        sample["accepted"] = False
+                        sample["error"] = str(exc)
+                    samples.append(sample)
+                    item["samples"].append(sample)
+
+                poll.write(json.dumps(item, separators=(",", ":")) + "\n")
+                poll.flush()
+                if not pending:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "runtime publication sweep did not reach all targets within "
+                        f"{args.wait_timeout:g}s (last_pub_count={last_pub}, "
+                        f"generation={last_generation}, pending={pending})"
+                    )
+                time.sleep(args.poll_interval)
+
+        if pending:
+            raise ProtocolError(f"runtime publication sweep missing targets: {pending}")
+
+        summary = {
+            "ok": True,
+            "output_dir": str(output_dir),
+            "poll_path": str(poll_path),
+            "targets": targets,
+            "samples": samples,
+            "last_pub_count": last_pub,
+            "last_generation": last_generation,
+        }
+        summary_path = output_dir / "runtime-pub-sweep.summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        summary["summary_path"] = str(summary_path)
+        print(json.dumps(summary, separators=(",", ":")))
+        return 0
+    finally:
+        runtime.close()
+
+
+def dolphin_region_dir(region: str) -> str:
+    if region in ("NTSC_U", "USA"):
+        return "USA"
+    if region in ("NTSC_J", "JAP", "JPN"):
+        return "JAP"
+    if region in ("PAL", "EUR"):
+        return "EUR"
+    raise ProtocolError(f"unknown GameCube IPL region {region!r}")
+
+
+def start_dolphin_ipl_oracle(args: argparse.Namespace) -> DolphinIplInstance:
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    user_dir = output_dir / "dolphin-user"
+    gc_dir = user_dir / "GC"
+    region_dir = gc_dir / dolphin_region_dir(args.region)
+    region_dir.mkdir(parents=True, exist_ok=True)
+    gc_dir.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(local_path(args.ipl), region_dir / "IPL.bin")
+    shutil.copy2(local_path(args.dsp_rom), gc_dir / "dsp_rom.bin")
+    shutil.copy2(local_path(args.dsp_coef), gc_dir / "dsp_coef.bin")
+
+    stdout = (output_dir / "dolphin-ipl.out.log").open("wb")
+    stderr = (output_dir / "dolphin-ipl.err.log").open("wb")
+    env = os.environ.copy()
+    env["GCN_TRACE_TCP_PORT"] = str(args.dolphin_port)
+    if args.efb_copy_dump:
+        env["GCN_TRACE_EFB_COPY_DUMP"] = host_path(output_dir)
+        env["GCN_TRACE_EFB_COPY_DUMP_EVERY"] = str(args.efb_copy_dump_every)
+    if args.efb_source_dump:
+        env["GCN_TRACE_EFB_SOURCE_DUMP"] = host_path(output_dir)
+        env["GCN_TRACE_EFB_SOURCE_DUMP_EVERY"] = str(args.efb_source_dump_every)
+        if args.efb_source_dump_addr:
+            env["GCN_TRACE_EFB_SOURCE_DUMP_ADDR"] = args.efb_source_dump_addr
+    if args.sw_draw_state:
+        env["GCN_TRACE_SW_DRAW_STATE"] = "1"
+        env["GCN_TRACE_SW_DRAW_MIN_AREA"] = str(args.sw_draw_min_area)
+        env["GCN_TRACE_SW_DRAW_MIN_Y"] = str(args.sw_draw_min_y)
+    if getattr(args, "xf_context_state", False):
+        env["GCN_TRACE_XF_CONTEXT_STATE"] = "1"
+    if args.gpr_probe_pc:
+        env["GCN_TRACE_PROBE_PCS"] = ",".join(f"0x{pc:08X}" for pc in args.gpr_probe_pc)
+    if getattr(args, "gpr_probe_inline_memory", None):
+        env["GCN_TRACE_PROBE_MEM"] = ",".join(args.gpr_probe_inline_memory)
+    command = [
+        local_path(args.dolphin_exe),
+        "-u",
+        host_path(user_dir),
+        "--video_backend",
+        args.video_backend,
+    ]
+    if args.cpu_core is not None:
+        command.extend(["--config", f"Dolphin.Core.CPUCore={args.cpu_core}"])
+    if args.no_memcard_a:
+        command.extend(["--config", "Dolphin.Core.SlotA=255"])
+    command.extend([
+        f"--boot-gc-ipl={args.region}",
+        f"--ipl-disc={host_path(args.disc)}",
+    ])
+    process = subprocess.Popen(
+        command,
+        cwd=local_path(output_dir),
+        env=env,
+        stdout=stdout,
+        stderr=stderr,
+    )
+    client = wait_json(
+        args.dolphin_port,
+        process,
+        timeout=args.tcp_ready_timeout,
+        name="Dolphin",
+        request_timeout=args.request_timeout,
+    )
+    return DolphinIplInstance(process, client, stdout, stderr)
+
+
+def cmd_dolphin_ipl_capture(args: argparse.Namespace) -> int:
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    poll_path = output_dir / "dolphin-ipl-capture.poll.jsonl"
+    if "/" in args.screenshot_name or "\\" in args.screenshot_name:
+        raise ProtocolError("--screenshot-name must be a file name, not a path")
+    ppm_path = output_dir / args.screenshot_name
+    if ppm_path.suffix.lower() != ".ppm":
+        raise ProtocolError("--screenshot-name must end in .ppm")
+
+    dolphin = start_dolphin_ipl_oracle(args)
+    summary: dict[str, Any] = {}
+    try:
+        deadline = time.monotonic() + args.wait_timeout
+        last_pub = 0
+        final_screenshot: dict[str, Any] | None = None
+        pad_pulses = list(args.pad_pulse)
+        if args.pad_pulse_pub is not None:
+            pad_pulses.append(
+                {
+                    "pub": args.pad_pulse_pub,
+                    "buttons": args.pad_pulse_buttons,
+                    "polls": args.pad_pulse_polls,
+                    "stick_x": args.pad_pulse_stick_x,
+                    "stick_y": args.pad_pulse_stick_y,
+                }
+            )
+        pad_pulses.sort(key=lambda pulse: pulse["pub"])
+        pad_pulse_active = False
+        pad_pulse_index = 0
+        pad_pulse_polls_left = 0
+        with poll_path.open("w", encoding="utf-8") as poll:
+            for i in range(args.max_polls):
+                item: dict[str, Any] = {
+                    "time": time.time(),
+                    "i": i,
+                    "process_exited": dolphin.process.poll() is not None,
+                }
+                try:
+                    item["boot"] = dolphin.client.request("boot_state")
+                except (OSError, ProtocolError) as exc:
+                    item["boot_error"] = str(exc)
+                try:
+                    xfb = dolphin.client.request("xfb_pub_count")
+                    item["xfb"] = xfb
+                    last_pub = int(xfb.get("pub_count", 0))
+                except (OSError, ProtocolError) as exc:
+                    item["xfb_error"] = str(exc)
+
+                if pad_pulse_index < len(pad_pulses):
+                    pulse = pad_pulses[pad_pulse_index]
+                    if not pad_pulse_active and last_pub >= pulse["pub"]:
+                        try:
+                            item["pad_pulse_press"] = dolphin.client.request(
+                                "set_input",
+                                buttons=pulse["buttons"],
+                                stick_x=pulse["stick_x"],
+                                stick_y=pulse["stick_y"],
+                            )
+                            item["pad_pulse_index"] = pad_pulse_index
+                            pad_pulse_active = True
+                            pad_pulse_polls_left = max(1, pulse["polls"])
+                        except (OSError, ProtocolError) as exc:
+                            item["pad_pulse_error"] = str(exc)
+                            pad_pulse_index += 1
+                    elif pad_pulse_active:
+                        pad_pulse_polls_left -= 1
+                        if pad_pulse_polls_left <= 0:
+                            try:
+                                item["pad_pulse_release"] = dolphin.client.request(
+                                    "set_input", reset=1
+                                )
+                            except (OSError, ProtocolError) as exc:
+                                item["pad_pulse_release_error"] = str(exc)
+                            pad_pulse_active = False
+                            pad_pulse_index += 1
+
+                should_try_screenshot = False
+                if args.target_pub is not None and last_pub >= args.target_pub:
+                    should_try_screenshot = True
+                elif args.target_pub is None and last_pub > 0:
+                    should_try_screenshot = i % args.screenshot_every == 0
+
+                if should_try_screenshot:
+                    try:
+                        screenshot = dolphin.client.request(
+                            "screenshot_ppm", path=args.screenshot_name
+                        )
+                        item["screenshot"] = screenshot
+                        height = int(screenshot.get("height", 0))
+                        mean_luma = float(screenshot.get("mean_luma", 0.0))
+                        pub_seq = int(screenshot.get("pub_seq", 0))
+                        if (
+                            height >= args.min_height
+                            and mean_luma >= args.min_luma
+                            and pub_seq >= args.min_screenshot_pub
+                        ):
+                            final_screenshot = screenshot
+                            if getattr(args, "ram_dump", None) or getattr(
+                                args, "ram_dump_deref", None
+                            ):
+                                try:
+                                    item["ram_dump"] = sample_ram_dumps(
+                                        dolphin.client,
+                                        args.ram_dump,
+                                        "Dolphin",
+                                        getattr(args, "ram_dump_deref", []),
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["ram_dump_error"] = str(exc)
+                            if args.sw_draw_state:
+                                try:
+                                    item["sw_draw_state"] = dolphin.client.request(
+                                        "sw_draw_state"
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["sw_draw_state_error"] = str(exc)
+                            if getattr(args, "xf_context_state", False):
+                                try:
+                                    item["xf_context_state"] = dolphin.client.request(
+                                        "xf_context_state",
+                                        count=args.xf_context_count,
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    item["xf_context_state_error"] = str(exc)
+                            if args.gpr_probe_dump_count:
+                                try:
+                                    item["gpr_probe_dump"] = dolphin.client.request(
+                                        "gpr_probe_dump",
+                                        count=args.gpr_probe_dump_count,
+                                    )
+                                    if (
+                                        args.gpr_probe_memory
+                                        or args.gpr_probe_memory_deref
+                                    ):
+                                        item["gpr_probe_memory"] = sample_gpr_probe_memory(
+                                            dolphin.client,
+                                            item["gpr_probe_dump"],
+                                            args.gpr_probe_memory,
+                                            "Dolphin",
+                                            args.gpr_probe_memory_deref,
+                                        )
+                                except (OSError, ProtocolError) as exc:
+                                    item["gpr_probe_dump_error"] = str(exc)
+                    except (OSError, ProtocolError) as exc:
+                        item["screenshot_error"] = str(exc)
+
+                poll.write(json.dumps(item, separators=(",", ":")) + "\n")
+                poll.flush()
+                if final_screenshot is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Dolphin IPL capture did not produce a qualifying "
+                        f"screenshot within {args.wait_timeout:g}s "
+                        f"(last_pub_count={last_pub})"
+                    )
+                time.sleep(args.poll_interval)
+
+        if final_screenshot is None:
+            raise ProtocolError("Dolphin IPL capture did not produce a qualifying screenshot")
+
+        sw_draw_state_path: pathlib.Path | None = None
+        xf_context_state_path: pathlib.Path | None = None
+        gpr_probe_dump_path: pathlib.Path | None = None
+        gpr_probe_memory_path: pathlib.Path | None = None
+        ram_dump_path: pathlib.Path | None = None
+        if getattr(args, "ram_dump", None) or getattr(args, "ram_dump_deref", None):
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "ram_dump" in item:
+                        ram_dump_path = output_dir / "dolphin-ipl-capture.ram-dump.json"
+                        ram_dump_path.write_text(
+                            json.dumps(item["ram_dump"], indent=2),
+                            encoding="utf-8",
+                        )
+        if args.sw_draw_state:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "sw_draw_state" in item:
+                        sw_draw_state_path = output_dir / "dolphin-ipl-capture.sw-draw-state.json"
+                        sw_draw_state_path.write_text(
+                            json.dumps(item["sw_draw_state"], indent=2),
+                            encoding="utf-8",
+                        )
+        if getattr(args, "xf_context_state", False):
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "xf_context_state" in item:
+                        xf_context_state_path = (
+                            output_dir / "dolphin-ipl-capture.xf-context-state.json"
+                        )
+                        xf_context_state_path.write_text(
+                            json.dumps(item["xf_context_state"], indent=2),
+                            encoding="utf-8",
+                        )
+        if args.gpr_probe_dump_count:
+            with poll_path.open("r", encoding="utf-8") as poll:
+                for line in poll:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if "gpr_probe_dump" in item:
+                        gpr_probe_dump_path = output_dir / "dolphin-ipl-capture.gpr-probe.json"
+                        gpr_probe_dump_path.write_text(
+                            json.dumps(item["gpr_probe_dump"], indent=2),
+                            encoding="utf-8",
+                        )
+                    if "gpr_probe_memory" in item:
+                        gpr_probe_memory_path = (
+                            output_dir / "dolphin-ipl-capture.gpr-probe-memory.json"
+                        )
+                        gpr_probe_memory_path.write_text(
+                            json.dumps(item["gpr_probe_memory"], indent=2),
+                            encoding="utf-8",
+                        )
+
+        png_path: pathlib.Path | None = None
+        if args.convert_png:
+            png_path = ppm_path.with_suffix(".png")
+            subprocess.run(
+                [args.magick, str(ppm_path), str(png_path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        summary = {
+            "ok": True,
+            "output_dir": str(output_dir),
+            "poll_path": str(poll_path),
+            "screenshot": final_screenshot,
+            "ppm_path": str(ppm_path),
+            "png_path": None if png_path is None else str(png_path),
+            "sw_draw_state_path": None
+            if sw_draw_state_path is None
+            else str(sw_draw_state_path),
+            "gpr_probe_dump_path": None
+            if gpr_probe_dump_path is None
+            else str(gpr_probe_dump_path),
+            "xf_context_state_path": None
+            if xf_context_state_path is None
+            else str(xf_context_state_path),
+            "gpr_probe_memory_path": None
+            if gpr_probe_memory_path is None
+            else str(gpr_probe_memory_path),
+            "ram_dump_path": None if ram_dump_path is None else str(ram_dump_path),
+            "target_pub": args.target_pub,
+            "last_pub_count": last_pub,
+        }
+        print(json.dumps(summary, separators=(",", ":")))
+        return 0
+    finally:
+        dolphin.close(timeout=args.quit_timeout)
+
+
+def cmd_dolphin_ipl_sweep(args: argparse.Namespace) -> int:
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    poll_path = output_dir / "dolphin-ipl-sweep.poll.jsonl"
+    if "/" in args.screenshot_prefix or "\\" in args.screenshot_prefix:
+        raise ProtocolError("--screenshot-prefix must be a file prefix, not a path")
+
+    targets = sorted(set(args.sample_pub))
+    if not targets:
+        raise ProtocolError("at least one --sample-pub is required")
+    pending = list(targets)
+    samples: list[dict[str, Any]] = []
+
+    dolphin = start_dolphin_ipl_oracle(args)
+    try:
+        deadline = time.monotonic() + args.wait_timeout
+        last_pub = 0
+        with poll_path.open("w", encoding="utf-8") as poll:
+            for i in range(args.max_polls):
+                item: dict[str, Any] = {
+                    "time": time.time(),
+                    "i": i,
+                    "process_exited": dolphin.process.poll() is not None,
+                }
+                try:
+                    item["boot"] = dolphin.client.request("boot_state")
+                except (OSError, ProtocolError) as exc:
+                    item["boot_error"] = str(exc)
+                try:
+                    xfb = dolphin.client.request("xfb_pub_count")
+                    item["xfb"] = xfb
+                    last_pub = int(xfb.get("pub_count", 0))
+                except (OSError, ProtocolError) as exc:
+                    item["xfb_error"] = str(exc)
+
+                item["samples"] = []
+                while pending and last_pub >= pending[0] and i % args.screenshot_every == 0:
+                    target = pending.pop(0)
+                    stem = f"{args.screenshot_prefix}-pub{target:04d}"
+                    ppm_name = f"{stem}.ppm"
+                    sample: dict[str, Any] = {
+                        "target_pub": target,
+                        "observed_pub_count": last_pub,
+                        "ppm_path": str(output_dir / ppm_name),
+                    }
+                    try:
+                        screenshot = dolphin.client.request("screenshot_ppm", path=ppm_name)
+                        sample["screenshot"] = screenshot
+                        height = int(screenshot.get("height", 0))
+                        mean_luma = float(screenshot.get("mean_luma", 0.0))
+                        pub_seq = int(screenshot.get("pub_seq", 0))
+                        if (
+                            height < args.min_height
+                            or mean_luma < args.min_luma
+                            or pub_seq < args.min_screenshot_pub
+                        ):
+                            sample["accepted"] = False
+                            sample["reject_reason"] = (
+                                f"height={height} mean_luma={mean_luma:g} pub_seq={pub_seq}"
+                            )
+                        else:
+                            sample["accepted"] = True
+                            if getattr(args, "ram_dump", None) or getattr(
+                                args, "ram_dump_deref", None
+                            ):
+                                try:
+                                    ram_dump = sample_ram_dumps(
+                                        dolphin.client,
+                                        args.ram_dump,
+                                        "Dolphin",
+                                        getattr(args, "ram_dump_deref", []),
+                                    )
+                                    ram_dump_path = output_dir / f"{stem}.ram-dump.json"
+                                    ram_dump_path.write_text(
+                                        json.dumps(ram_dump, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["ram_dump_path"] = str(ram_dump_path)
+                                except (OSError, ProtocolError) as exc:
+                                    sample["ram_dump_error"] = str(exc)
+                            if args.sw_draw_state:
+                                try:
+                                    sw_draw_state = dolphin.client.request("sw_draw_state")
+                                    sw_draw_state_path = output_dir / f"{stem}.sw-draw-state.json"
+                                    sw_draw_state_path.write_text(
+                                        json.dumps(sw_draw_state, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["sw_draw_state_path"] = str(sw_draw_state_path)
+                                except (OSError, ProtocolError) as exc:
+                                    sample["sw_draw_state_error"] = str(exc)
+                            if getattr(args, "xf_context_state", False):
+                                try:
+                                    xf_context_state = dolphin.client.request(
+                                        "xf_context_state",
+                                        count=args.xf_context_count,
+                                    )
+                                    xf_context_state_path = (
+                                        output_dir / f"{stem}.xf-context-state.json"
+                                    )
+                                    xf_context_state_path.write_text(
+                                        json.dumps(xf_context_state, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    sample["xf_context_state_path"] = str(
+                                        xf_context_state_path
+                                    )
+                                except (OSError, ProtocolError) as exc:
+                                    sample["xf_context_state_error"] = str(exc)
+                            if args.convert_png:
+                                png_path = output_dir / f"{stem}.png"
+                                subprocess.run(
+                                    [args.magick, str(output_dir / ppm_name), str(png_path)],
+                                    check=True,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                sample["png_path"] = str(png_path)
+                    except (OSError, ProtocolError, subprocess.SubprocessError) as exc:
+                        sample["accepted"] = False
+                        sample["error"] = str(exc)
+                    samples.append(sample)
+                    item["samples"].append(sample)
+
+                poll.write(json.dumps(item, separators=(",", ":")) + "\n")
+                poll.flush()
+                if not pending:
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Dolphin IPL sweep did not reach all targets within "
+                        f"{args.wait_timeout:g}s (last_pub_count={last_pub}, "
+                        f"pending={pending})"
+                    )
+                time.sleep(args.poll_interval)
+
+        if pending:
+            raise ProtocolError(f"Dolphin IPL sweep missing targets: {pending}")
+
+        summary = {
+            "ok": True,
+            "output_dir": str(output_dir),
+            "poll_path": str(poll_path),
+            "targets": targets,
+            "samples": samples,
+            "last_pub_count": last_pub,
+        }
+        summary_path = output_dir / "dolphin-ipl-sweep.summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        summary["summary_path"] = str(summary_path)
+        print(json.dumps(summary, separators=(",", ":")))
+        return 0
+    finally:
+        dolphin.close(timeout=args.quit_timeout)
 
 
 def compare_states(
@@ -934,6 +2160,109 @@ def parse_gpr_range(spec: str) -> tuple[int, int, int]:
     return gpr, offset, length
 
 
+def parse_ram_dump_spec(spec: str) -> tuple[int, int]:
+    fields = spec.split(":")
+    if len(fields) != 2:
+        raise argparse.ArgumentTypeError("RAM dump must be ADDRESS:LENGTH")
+    try:
+        address, length = (int(field, 0) for field in fields)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 <= address <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("RAM dump address must fit in 32 bits")
+    if length <= 0:
+        raise argparse.ArgumentTypeError("RAM dump length must be positive")
+    if length > 65536:
+        raise argparse.ArgumentTypeError("RAM dump length must be <= 65536")
+    return address, length
+
+
+def parse_ram_dump_deref_spec(spec: str) -> tuple[int, int, int]:
+    fields = spec.split(":")
+    if len(fields) != 3:
+        raise argparse.ArgumentTypeError(
+            "RAM deref dump must be POINTER_ADDRESS:READ_OFFSET:LENGTH"
+        )
+    try:
+        pointer_address, read_offset, length = (int(field, 0) for field in fields)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 <= pointer_address <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("pointer address must fit in 32 bits")
+    if length <= 0:
+        raise argparse.ArgumentTypeError("RAM deref dump length must be positive")
+    if length > 65536:
+        raise argparse.ArgumentTypeError("RAM deref dump length must be <= 65536")
+    return pointer_address, read_offset, length
+
+
+def parse_gpr_probe_memory(spec: str) -> tuple[int | None, int, int, int]:
+    fields = spec.split(":")
+    if len(fields) == 3:
+        pc: int | None = None
+        gpr_s, offset_s, length_s = fields
+    elif len(fields) == 4:
+        pc_s, gpr_s, offset_s, length_s = fields
+        try:
+            pc = int(pc_s, 0)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+        if not 0 <= pc <= 0xFFFFFFFF:
+            raise argparse.ArgumentTypeError("PC must fit in 32 bits")
+    else:
+        raise argparse.ArgumentTypeError(
+            "GPR probe memory must be GPR:OFFSET:LENGTH or PC:GPR:OFFSET:LENGTH"
+        )
+    try:
+        gpr, offset, length = int(gpr_s, 0), int(offset_s, 0), int(length_s, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 <= gpr < 32:
+        raise argparse.ArgumentTypeError("GPR must be in 0..31")
+    if length <= 0:
+        raise argparse.ArgumentTypeError("range length must be positive")
+    if length > 4096:
+        raise argparse.ArgumentTypeError("range length must be <= 4096")
+    return pc, gpr, offset, length
+
+
+def parse_gpr_probe_memory_deref(
+    spec: str,
+) -> tuple[int | None, int, int, int, int]:
+    fields = spec.split(":")
+    if len(fields) == 4:
+        pc: int | None = None
+        gpr_s, ptr_offset_s, read_offset_s, length_s = fields
+    elif len(fields) == 5:
+        pc_s, gpr_s, ptr_offset_s, read_offset_s, length_s = fields
+        try:
+            pc = int(pc_s, 0)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+        if not 0 <= pc <= 0xFFFFFFFF:
+            raise argparse.ArgumentTypeError("PC must fit in 32 bits")
+    else:
+        raise argparse.ArgumentTypeError(
+            "GPR probe deref memory must be "
+            "GPR:PTR_OFFSET:READ_OFFSET:LENGTH or "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH"
+        )
+    try:
+        gpr = int(gpr_s, 0)
+        ptr_offset = int(ptr_offset_s, 0)
+        read_offset = int(read_offset_s, 0)
+        length = int(length_s, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not 0 <= gpr < 32:
+        raise argparse.ArgumentTypeError("GPR must be in 0..31")
+    if length <= 0:
+        raise argparse.ArgumentTypeError("range length must be positive")
+    if length > 4096:
+        raise argparse.ArgumentTypeError("range length must be <= 4096")
+    return pc, gpr, ptr_offset, read_offset, length
+
+
 def parse_u32_patch(spec: str) -> tuple[int, int]:
     address, separator, value = spec.partition(":")
     if not separator:
@@ -961,6 +2290,424 @@ def runtime_memory(client: JsonTcp, address: int, length: int) -> bytes:
             raise ProtocolError("runtime returned a short memory read")
         data.extend(chunk)
     return bytes(data)
+
+
+def tcp_memory(client: JsonTcp, address: int, length: int, name: str) -> bytes:
+    """Read guest RAM over the runtime/Dolphin JSON TCP `read_ram` command.
+
+    Both sides now expose the same shape for this diagnostic path: hex bytes,
+    capped to 64 KiB per request. This is deliberately separate from the GDB
+    memory helper below so attract-demo visual probes do not need Dolphin's GDB
+    stub once the process is already running with GCN_TRACE_TCP_PORT.
+    """
+    data = bytearray()
+    while len(data) < length:
+        chunk_len = min(65536, length - len(data))
+        reply = client.request("read_ram", addr=address + len(data), len=chunk_len)
+        if not reply.get("ok", False):
+            raise ProtocolError(f"{name} read_ram failed: {reply}")
+        chunk = bytes.fromhex(reply["hex"])
+        if len(chunk) != chunk_len:
+            raise ProtocolError(
+                f"{name} returned a short memory read at 0x{address + len(data):08X}: "
+                f"{len(chunk)} != {chunk_len}"
+            )
+        data.extend(chunk)
+    return bytes(data)
+
+
+def guest_ram_range_name(address: int, length: int) -> str | None:
+    if length <= 0:
+        return None
+    end = address + length
+    if end > 0x100000000:
+        return None
+    ranges = (
+        ("mem1", 0x80000000, 0x01800000),
+        ("mem1_uncached", 0xC0000000, 0x01800000),
+        ("mem2", 0x90000000, 0x04000000),
+        ("mem2_uncached", 0xD0000000, 0x04000000),
+        ("locked_l1", 0xE0000000, 0x00040000),
+    )
+    for range_name, base, size in ranges:
+        if address >= base and end <= base + size:
+            return range_name
+    return None
+
+
+def gpr_probe_records(dump: dict[str, Any]) -> list[dict[str, Any]]:
+    records = dump.get("records")
+    if isinstance(records, list):
+        return records
+    entries = dump.get("entries")
+    if isinstance(entries, list):
+        return entries
+    return []
+
+
+def sample_gpr_probe_memory(
+    client: JsonTcp,
+    gpr_probe_dump: dict[str, Any],
+    specs: list[tuple[int | None, int, int, int]],
+    name: str,
+    deref_specs: list[tuple[int | None, int, int, int, int]] | None = None,
+    max_unique: int = 1024,
+) -> dict[str, Any]:
+    records = gpr_probe_records(gpr_probe_dump)
+    windows: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    errors = 0
+    truncated = False
+    deref_specs = [] if deref_specs is None else deref_specs
+
+    def result() -> dict[str, Any]:
+        return {
+            "ok": errors == 0,
+            "kind": "gpr_probe_memory",
+            "source_records": len(records),
+            "specs": [
+                {
+                    "pc": None if pc is None else f"0x{pc:08X}",
+                    "gpr": gpr,
+                    "offset": offset,
+                    "len": length,
+                }
+                for pc, gpr, offset, length in specs
+            ],
+            "deref_specs": [
+                {
+                    "pc": None if pc is None else f"0x{pc:08X}",
+                    "gpr": gpr,
+                    "ptr_offset": ptr_offset,
+                    "read_offset": read_offset,
+                    "len": length,
+                }
+                for pc, gpr, ptr_offset, read_offset, length in deref_specs
+            ],
+            "windows": windows,
+            "window_count": len(windows),
+            "truncated": truncated,
+            "errors": errors,
+        }
+
+    for rec in records:
+        rec_pc = int(rec.get("pc", 0)) & 0xFFFFFFFF
+        gprs = rec.get("gpr", [])
+        if not isinstance(gprs, list):
+            continue
+        for want_pc, gpr, offset, length in specs:
+            if want_pc is not None and rec_pc != want_pc:
+                continue
+            if gpr >= len(gprs):
+                continue
+            base = int(gprs[gpr]) & 0xFFFFFFFF
+            addr = (base + offset) & 0xFFFFFFFF
+            key = (want_pc, rec_pc, gpr, offset, addr)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(windows) >= max_unique:
+                truncated = True
+                return result()
+            entry = {
+                "seq": rec.get("seq"),
+                "block": rec.get("block"),
+                "pc": f"0x{rec_pc:08X}",
+                "gpr": gpr,
+                "base": f"0x{base:08X}",
+                "offset": offset,
+                "addr": f"0x{addr:08X}",
+                "len": length,
+            }
+            try:
+                data = tcp_memory(client, addr, length, name)
+                entry["ok"] = True
+                entry["sha256"] = hashlib.sha256(data).hexdigest()
+                entry["hex"] = data.hex()
+            except (OSError, ProtocolError) as exc:
+                errors += 1
+                entry["ok"] = False
+                entry["error"] = str(exc)
+            windows.append(entry)
+        for want_pc, gpr, ptr_offset, read_offset, length in deref_specs:
+            if want_pc is not None and rec_pc != want_pc:
+                continue
+            if gpr >= len(gprs):
+                continue
+            base = int(gprs[gpr]) & 0xFFFFFFFF
+            ptr_addr = (base + ptr_offset) & 0xFFFFFFFF
+            ptr_key = ("deref-ptr", want_pc, rec_pc, gpr, ptr_offset, ptr_addr)
+            if ptr_key in seen:
+                continue
+            if len(windows) >= max_unique:
+                truncated = True
+                return result()
+            entry = {
+                "kind": "deref",
+                "seq": rec.get("seq"),
+                "block": rec.get("block"),
+                "pc": f"0x{rec_pc:08X}",
+                "gpr": gpr,
+                "base": f"0x{base:08X}",
+                "ptr_offset": ptr_offset,
+                "ptr_addr": f"0x{ptr_addr:08X}",
+                "read_offset": read_offset,
+                "len": length,
+            }
+            try:
+                ptr_bytes = tcp_memory(client, ptr_addr, 4, name)
+                pointer = int.from_bytes(ptr_bytes, "big")
+                addr = (pointer + read_offset) & 0xFFFFFFFF
+                range_name = guest_ram_range_name(addr, length)
+                key = (
+                    "deref",
+                    want_pc,
+                    rec_pc,
+                    gpr,
+                    ptr_offset,
+                    read_offset,
+                    pointer,
+                    addr,
+                )
+                if key in seen:
+                    continue
+                seen.add(ptr_key)
+                seen.add(key)
+                if len(windows) >= max_unique:
+                    truncated = True
+                    return result()
+                entry["pointer"] = f"0x{pointer:08X}"
+                entry["addr"] = f"0x{addr:08X}"
+                if range_name is None:
+                    entry["ok"] = False
+                    entry["skipped"] = True
+                    entry["error"] = "pointer target is outside guest RAM ranges"
+                    windows.append(entry)
+                    continue
+                entry["range"] = range_name
+                data = tcp_memory(client, addr, length, name)
+                entry["ok"] = True
+                entry["sha256"] = hashlib.sha256(data).hexdigest()
+                entry["hex"] = data.hex()
+            except (OSError, ProtocolError) as exc:
+                if ptr_key in seen:
+                    continue
+                seen.add(ptr_key)
+                if len(windows) >= max_unique:
+                    truncated = True
+                    continue
+                errors += 1
+                entry["ok"] = False
+                entry["error"] = str(exc)
+            windows.append(entry)
+    return result()
+
+
+def sample_ram_dumps(
+    client: JsonTcp,
+    specs: list[tuple[int, int]],
+    name: str,
+    deref_specs: list[tuple[int, int, int]] | None = None,
+) -> dict[str, Any]:
+    windows: list[dict[str, Any]] = []
+    errors = 0
+    deref_specs = [] if deref_specs is None else deref_specs
+    for address, length in specs:
+        entry: dict[str, Any] = {
+            "addr": f"0x{address:08X}",
+            "len": length,
+            "range": guest_ram_range_name(address, length),
+        }
+        try:
+            data = tcp_memory(client, address, length, name)
+            entry["ok"] = True
+            entry["sha256"] = hashlib.sha256(data).hexdigest()
+            entry["hex"] = data.hex()
+        except (OSError, ProtocolError) as exc:
+            errors += 1
+            entry["ok"] = False
+            entry["error"] = str(exc)
+        windows.append(entry)
+    for pointer_address, read_offset, length in deref_specs:
+        entry = {
+            "kind": "deref",
+            "ptr_addr": f"0x{pointer_address:08X}",
+            "read_offset": read_offset,
+            "len": length,
+        }
+        try:
+            ptr_bytes = tcp_memory(client, pointer_address, 4, name)
+            pointer = int.from_bytes(ptr_bytes, "big")
+            address = (pointer + read_offset) & 0xFFFFFFFF
+            entry["pointer"] = f"0x{pointer:08X}"
+            entry["addr"] = f"0x{address:08X}"
+            entry["range"] = guest_ram_range_name(address, length)
+            if entry["range"] is None:
+                entry["ok"] = False
+                entry["skipped"] = True
+                entry["error"] = "pointer target is outside guest RAM ranges"
+                windows.append(entry)
+                continue
+            data = tcp_memory(client, address, length, name)
+            entry["ok"] = True
+            entry["sha256"] = hashlib.sha256(data).hexdigest()
+            entry["hex"] = data.hex()
+        except (OSError, ProtocolError) as exc:
+            errors += 1
+            entry["ok"] = False
+            entry["error"] = str(exc)
+        windows.append(entry)
+    return {
+        "ok": errors == 0,
+        "kind": "ram_dump",
+        "direct_specs": [
+            {"addr": f"0x{address:08X}", "len": length}
+            for address, length in specs
+        ],
+        "deref_specs": [
+            {
+                "ptr_addr": f"0x{pointer_address:08X}",
+                "read_offset": read_offset,
+                "len": length,
+            }
+            for pointer_address, read_offset, length in deref_specs
+        ],
+        "windows": windows,
+        "window_count": len(windows),
+        "errors": errors,
+    }
+
+
+def first_byte_difference(a: bytes, b: bytes) -> int | None:
+    for i, (byte_a, byte_b) in enumerate(zip(a, b)):
+        if byte_a != byte_b:
+            return i
+    if len(a) != len(b):
+        return min(len(a), len(b))
+    return None
+
+
+def wait_for_xfb_pub(
+    client: JsonTcp, target: int | None, timeout: float, name: str
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] | None = None
+    while True:
+        last = client.request("xfb_pub_count")
+        pub = int(last.get("pub_count", 0))
+        if target is None or pub >= target:
+            return last
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{name} pub_count {pub} did not reach {target}")
+        time.sleep(0.025)
+
+
+def sample_tcp_ranges(
+    client: JsonTcp, ranges: list[tuple[int, int]], name: str
+) -> dict[str, Any]:
+    status = client.request("xfb_pub_count")
+    samples = {
+        (address, length): tcp_memory(client, address, length, name)
+        for address, length in ranges
+    }
+    return {"status": status, "samples": samples}
+
+
+def wait_and_sample_tcp_ranges(
+    runtime: JsonTcp, dolphin: JsonTcp, args: argparse.Namespace
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.monotonic() + args.wait_timeout
+    runtime_result: dict[str, Any] | None = None
+    dolphin_result: dict[str, Any] | None = None
+    last_runtime: dict[str, Any] | None = None
+    last_dolphin: dict[str, Any] | None = None
+    while runtime_result is None or dolphin_result is None:
+        if runtime_result is None:
+            last_runtime = runtime.request("xfb_pub_count")
+            runtime_pub = int(last_runtime.get("pub_count", 0))
+            if args.runtime_pub is None or runtime_pub >= args.runtime_pub:
+                runtime_result = sample_tcp_ranges(runtime, args.memory, "runtime")
+        if dolphin_result is None:
+            last_dolphin = dolphin.request("xfb_pub_count")
+            dolphin_pub = int(last_dolphin.get("pub_count", 0))
+            if args.dolphin_pub is None or dolphin_pub >= args.dolphin_pub:
+                dolphin_result = sample_tcp_ranges(dolphin, args.memory, "dolphin")
+        if runtime_result is not None and dolphin_result is not None:
+            return runtime_result, dolphin_result
+        if time.monotonic() >= deadline:
+            runtime_pub = 0 if last_runtime is None else int(last_runtime.get("pub_count", 0))
+            dolphin_pub = 0 if last_dolphin is None else int(last_dolphin.get("pub_count", 0))
+            raise TimeoutError(
+                "publication wait timed out: "
+                f"runtime {runtime_pub}/{args.runtime_pub}, "
+                f"dolphin {dolphin_pub}/{args.dolphin_pub}"
+            )
+        time.sleep(0.025)
+    raise AssertionError("unreachable")
+
+
+def cmd_tcp_state_diff(args: argparse.Namespace) -> int:
+    """Compare live guest RAM ranges over runtime and Dolphin TCP sockets.
+
+    This is the visual-parity companion to xfb-diff: after the EFB-source
+    captures identify a publication/copy boundary, use this command to sample
+    candidate scene-state ranges at matched publication thresholds without
+    bringing up Dolphin's GDB stub.
+    """
+    runtime = JsonTcp(args.runtime_port, timeout=args.timeout)
+    dolphin = JsonTcp(args.dolphin_port, timeout=args.timeout)
+    try:
+        runtime_result, dolphin_result = wait_and_sample_tcp_ranges(runtime, dolphin, args)
+        runtime_status = runtime_result["status"]
+        dolphin_status = dolphin_result["status"]
+
+        all_equal = True
+        for address, length in args.memory:
+            runtime_bytes = runtime_result["samples"][(address, length)]
+            dolphin_bytes = dolphin_result["samples"][(address, length)]
+            first = first_byte_difference(runtime_bytes, dolphin_bytes)
+            equal = first is None
+            all_equal = all_equal and equal
+            entry: dict[str, Any] = {
+                "kind": "memory_range",
+                "label": args.label,
+                "address": f"0x{address:08X}",
+                "length": length,
+                "runtime_pub_count": runtime_status.get("pub_count"),
+                "runtime_generation": runtime_status.get("generation"),
+                "dolphin_pub_count": dolphin_status.get("pub_count"),
+                "equal": equal,
+                "runtime_sha256": hashlib.sha256(runtime_bytes).hexdigest(),
+                "dolphin_sha256": hashlib.sha256(dolphin_bytes).hexdigest(),
+            }
+            if first is not None:
+                window_start = max(0, first - args.context)
+                window_end = min(length, first + args.context)
+                entry["first_difference"] = {
+                    "offset": first,
+                    "address": f"0x{address + first:08X}",
+                    "runtime_byte": runtime_bytes[first],
+                    "dolphin_byte": dolphin_bytes[first],
+                    "runtime_context": runtime_bytes[window_start:window_end].hex(),
+                    "dolphin_context": dolphin_bytes[window_start:window_end].hex(),
+                    "context_start_offset": window_start,
+                }
+            print(json.dumps(entry, separators=(",", ":")))
+
+        summary = {
+            "kind": "summary",
+            "label": args.label,
+            "runtime_pub_count": runtime_status.get("pub_count"),
+            "runtime_generation": runtime_status.get("generation"),
+            "dolphin_pub_count": dolphin_status.get("pub_count"),
+            "ranges": len(args.memory),
+            "result": "pass" if all_equal else "fail",
+        }
+        print(json.dumps(summary, separators=(",", ":")))
+        return 0 if all_equal else 1
+    finally:
+        runtime.close()
+        dolphin.close()
 
 
 def dolphin_memory(gdb: GdbRemote, address: int, length: int) -> bytes:
@@ -1595,6 +3342,41 @@ def add_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", type=int, default=4410)
 
 
+def add_runtime_checkpoint_snapshot_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--checkpoint-pc",
+        type=lambda value: int(value, 0),
+        help="arm GCN_CHECKPOINT_PC before launch; useful for one-shot early probes",
+    )
+    parser.add_argument(
+        "--checkpoint-gpr",
+        type=int,
+        help="optional GCN_CHECKPOINT_GPR condition for --checkpoint-pc",
+    )
+    parser.add_argument(
+        "--checkpoint-gpr-value",
+        type=lambda value: int(value, 0),
+        help="optional GCN_CHECKPOINT_GPR_VALUE condition for --checkpoint-pc",
+    )
+    parser.add_argument(
+        "--checkpoint-lr",
+        type=lambda value: int(value, 0),
+        help="optional GCN_CHECKPOINT_LR condition for --checkpoint-pc",
+    )
+    parser.add_argument(
+        "--snapshot-save",
+        help="write GCN_SNAPSHOT_SAVE when the checkpoint is reached",
+    )
+    parser.add_argument(
+        "--snapshot-exit",
+        action="store_true",
+        help=(
+            "exit the runtime after writing --snapshot-save; capture commands "
+            "return success once the snapshot exists"
+        ),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1617,6 +3399,413 @@ def main() -> int:
     gate3.add_argument("--gpr", type=int, default=7)
     gate3.add_argument("--xor", type=lambda value: int(value, 0), default=1)
     gate3.set_defaults(func=cmd_gate3)
+
+    runtime_capture = sub.add_parser(
+        "runtime-capture",
+        help=(
+            "launch gcnrecomp headless and capture a runtime TCP screenshot "
+            "at an XFB publication threshold"
+        ),
+    )
+    add_runtime_args(runtime_capture)
+    add_runtime_checkpoint_snapshot_args(runtime_capture)
+    runtime_capture.add_argument(
+        "--backend",
+        default="software",
+        help="GCN_GX_BACKEND for the capture run; empty string leaves runtime default",
+    )
+    runtime_capture.add_argument(
+        "--snapshot-load",
+        help="optional GCN_SNAPSHOT_LOAD path for starting from a known state",
+    )
+    runtime_capture.add_argument(
+        "--no-memcard-a",
+        action="store_true",
+        help="leave runtime EXI slot A empty, matching Dolphin SlotA=None",
+    )
+    runtime_capture.add_argument(
+        "--target-pub",
+        type=int,
+        default=1640,
+        help="capture once runtime xfb_pub_count is at least this value",
+    )
+    runtime_capture.add_argument("--min-height", type=int, default=240)
+    runtime_capture.add_argument("--min-luma", type=float, default=40.0)
+    runtime_capture.add_argument(
+        "--screenshot-name", default="runtime-capture.ppm"
+    )
+    runtime_capture.add_argument("--screenshot-every", type=int, default=1)
+    runtime_capture.add_argument("--poll-interval", type=float, default=0.05)
+    runtime_capture.add_argument("--wait-timeout", type=float, default=240.0)
+    runtime_capture.add_argument("--max-polls", type=int, default=100000)
+    runtime_capture.add_argument(
+        "--max-blocks",
+        type=lambda value: int(value, 0),
+        default=0,
+        help="gcn_boot block budget argument; 0 means unbounded until TCP quit",
+    )
+    runtime_capture.add_argument("--tcp-ready-timeout", type=float, default=30.0)
+    runtime_capture.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        help="per TCP diagnostic request timeout after the debug port is ready",
+    )
+    runtime_capture.add_argument("--quit-timeout", type=float, default=3.0)
+    runtime_capture.add_argument(
+        "--sync-gx",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run with GCN_GX_PIPELINE=0 for deterministic capture timing",
+    )
+    runtime_capture.add_argument(
+        "--draw-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="dump runtime gx_draw_state at the accepted screenshot frame",
+    )
+    runtime_capture.add_argument(
+        "--draw-min-y",
+        type=int,
+        help=(
+            "with --draw-state, retain lower-screen draws whose bbox reaches "
+            "this Y even when their area is small"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--tev-census",
+        action="store_true",
+        help="also enable full GCN_GX_TEV_CENSUS draw config buckets (slow)",
+    )
+    runtime_capture.add_argument(
+        "--skip-draw-pc",
+        help="diagnostic: set GCN_GX_SKIP_DRAW_PC to skip draws stamped with this PC",
+    )
+    runtime_capture.add_argument(
+        "--pc-seen",
+        type=lambda value: int(value, 0),
+        action="append",
+        default=[],
+        help="query pc_seen for this guest PC at the accepted screenshot frame; repeatable",
+    )
+    runtime_capture.add_argument(
+        "--block-dump-count",
+        type=int,
+        default=0,
+        help="dump this many recent block-ring entries at the accepted screenshot frame",
+    )
+    runtime_capture.add_argument(
+        "--fifo-dump-count",
+        type=int,
+        default=0,
+        help="dump this many recent gather-pipe FIFO ring entries at the accepted screenshot frame",
+    )
+    runtime_capture.add_argument(
+        "--watch-range",
+        help=(
+            "set runtime GCN_WATCH=<lo_hex>:<hi_hex> to record guest RAM writes "
+            "into that address range"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--watch-dump-count",
+        type=int,
+        default=0,
+        help=(
+            "request a runtime watch_dump at the accepted screenshot frame; "
+            "the ring text is written to runtime-capture.err.log"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--gpr-probe-pc",
+        type=lambda value: int(value, 0),
+        action="append",
+        default=[],
+        help=(
+            "set GCN_PROBE_PCS for this guest block-entry PC; repeatable. "
+            "Use with --gpr-probe-dump-count to persist snapshots."
+        ),
+    )
+    runtime_capture.add_argument(
+        "--gpr-probe-dump-count",
+        type=int,
+        default=0,
+        help="dump this many env-gated guest GPR probe entries at the accepted screenshot frame",
+    )
+    runtime_capture.add_argument(
+        "--gpr-probe-inline-memory",
+        action="append",
+        default=[],
+        help=(
+            "snapshot RAM at probe time as PC:GPR:OFFSET:LENGTH, or deref as "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--gpr-probe-memory",
+        type=parse_gpr_probe_memory,
+        action="append",
+        default=[],
+        help=(
+            "after dumping GPR probe records, read unique guest RAM windows as "
+            "GPR:OFFSET:LENGTH or PC:GPR:OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--gpr-probe-memory-deref",
+        type=parse_gpr_probe_memory_deref,
+        action="append",
+        default=[],
+        help=(
+            "after dumping GPR probe records, read a big-endian pointer from "
+            "GPR+PTR_OFFSET, then read guest RAM at pointer+READ_OFFSET as "
+            "GPR:PTR_OFFSET:READ_OFFSET:LENGTH or "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--ram-dump",
+        type=parse_ram_dump_spec,
+        action="append",
+        default=[],
+        help="dump absolute guest RAM at the accepted screenshot as ADDRESS:LENGTH; repeatable",
+    )
+    runtime_capture.add_argument(
+        "--ram-dump-deref",
+        type=parse_ram_dump_deref_spec,
+        action="append",
+        default=[],
+        help=(
+            "read a big-endian pointer at POINTER_ADDRESS, then dump "
+            "pointer+READ_OFFSET as POINTER_ADDRESS:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_capture.add_argument(
+        "--efb-copy-dump",
+        action="store_true",
+        help="write runtime EFB/XFB copy payloads and metadata into --output-dir",
+    )
+    runtime_capture.add_argument("--efb-copy-dump-every", type=int, default=1)
+    runtime_capture.add_argument(
+        "--efb-source-dump",
+        action="store_true",
+        help="write runtime sampled EFB-source PPMs for copied regions into --output-dir",
+    )
+    runtime_capture.add_argument("--efb-source-dump-every", type=int, default=1)
+    runtime_capture.add_argument(
+        "--efb-source-dump-addr",
+        help="only dump EFB-source PPMs for copies whose destination address matches this value",
+    )
+    runtime_capture.add_argument(
+        "--convert-png",
+        action="store_true",
+        help="also convert the PPM capture to PNG with ImageMagick",
+    )
+    runtime_capture.add_argument("--magick", default="magick")
+    runtime_capture.set_defaults(func=cmd_runtime_capture)
+
+    runtime_sweep = sub.add_parser(
+        "runtime-pub-sweep",
+        help=(
+            "launch gcnrecomp once and sample runtime TCP screenshots and "
+            "diagnostic rings at multiple XFB publication thresholds"
+        ),
+    )
+    add_runtime_args(runtime_sweep)
+    add_runtime_checkpoint_snapshot_args(runtime_sweep)
+    runtime_sweep.add_argument(
+        "--backend",
+        default="software",
+        help="GCN_GX_BACKEND for the capture run; empty string leaves runtime default",
+    )
+    runtime_sweep.add_argument(
+        "--snapshot-load",
+        help="optional GCN_SNAPSHOT_LOAD path for starting from a known state",
+    )
+    runtime_sweep.add_argument(
+        "--no-memcard-a",
+        action="store_true",
+        help="leave runtime EXI slot A empty, matching Dolphin SlotA=None",
+    )
+    runtime_sweep.add_argument(
+        "--sample-pub",
+        type=int,
+        action="append",
+        required=True,
+        help="sample once runtime xfb_pub_count reaches this threshold; repeatable",
+    )
+    runtime_sweep.add_argument("--min-height", type=int, default=240)
+    runtime_sweep.add_argument("--min-luma", type=float, default=40.0)
+    runtime_sweep.add_argument("--screenshot-prefix", default="runtime-sweep")
+    runtime_sweep.add_argument("--screenshot-every", type=int, default=1)
+    runtime_sweep.add_argument("--poll-interval", type=float, default=0.05)
+    runtime_sweep.add_argument("--wait-timeout", type=float, default=600.0)
+    runtime_sweep.add_argument("--max-polls", type=int, default=100000)
+    runtime_sweep.add_argument(
+        "--max-blocks",
+        type=lambda value: int(value, 0),
+        default=0,
+        help="gcn_boot block budget argument; 0 means unbounded until TCP quit",
+    )
+    runtime_sweep.add_argument("--tcp-ready-timeout", type=float, default=30.0)
+    runtime_sweep.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        help="per TCP diagnostic request timeout after the debug port is ready",
+    )
+    runtime_sweep.add_argument("--quit-timeout", type=float, default=3.0)
+    runtime_sweep.add_argument(
+        "--sync-gx",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run with GCN_GX_PIPELINE=0 for deterministic capture timing",
+    )
+    runtime_sweep.add_argument(
+        "--draw-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="dump runtime gx_draw_state at every accepted sample",
+    )
+    runtime_sweep.add_argument(
+        "--draw-min-y",
+        type=int,
+        help=(
+            "with --draw-state, retain lower-screen draws whose bbox reaches "
+            "this Y even when their area is small"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--tev-census",
+        action="store_true",
+        help="also enable full GCN_GX_TEV_CENSUS draw config buckets (slow)",
+    )
+    runtime_sweep.add_argument(
+        "--skip-draw-pc",
+        help="diagnostic: set GCN_GX_SKIP_DRAW_PC to skip draws stamped with this PC",
+    )
+    runtime_sweep.add_argument(
+        "--pc-seen",
+        type=lambda value: int(value, 0),
+        action="append",
+        default=[],
+        help="query pc_seen for this guest PC at every accepted sample; repeatable",
+    )
+    runtime_sweep.add_argument(
+        "--block-dump-count",
+        type=int,
+        default=0,
+        help="dump this many recent block-ring entries at every accepted sample",
+    )
+    runtime_sweep.add_argument(
+        "--fifo-dump-count",
+        type=int,
+        default=0,
+        help="dump this many recent gather-pipe FIFO ring entries at every accepted sample",
+    )
+    runtime_sweep.add_argument(
+        "--watch-range",
+        help=(
+            "set runtime GCN_WATCH=<lo_hex>:<hi_hex> to record guest RAM writes "
+            "into that address range"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--watch-dump-count",
+        type=int,
+        default=0,
+        help=(
+            "request a runtime watch_dump at every accepted sample; the ring "
+            "text is written to runtime-capture.err.log"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--gpr-probe-pc",
+        type=lambda value: int(value, 0),
+        action="append",
+        default=[],
+        help=(
+            "set GCN_PROBE_PCS for this guest block-entry PC; repeatable. "
+            "Use with --gpr-probe-dump-count to persist snapshots."
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--gpr-probe-dump-count",
+        type=int,
+        default=0,
+        help="dump this many env-gated guest GPR probe entries at every accepted sample",
+    )
+    runtime_sweep.add_argument(
+        "--gpr-probe-inline-memory",
+        action="append",
+        default=[],
+        help=(
+            "snapshot RAM at probe time as PC:GPR:OFFSET:LENGTH, or deref as "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--gpr-probe-memory",
+        type=parse_gpr_probe_memory,
+        action="append",
+        default=[],
+        help=(
+            "after dumping GPR probe records, read unique guest RAM windows as "
+            "GPR:OFFSET:LENGTH or PC:GPR:OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--gpr-probe-memory-deref",
+        type=parse_gpr_probe_memory_deref,
+        action="append",
+        default=[],
+        help=(
+            "after dumping GPR probe records, read a big-endian pointer from "
+            "GPR+PTR_OFFSET, then read guest RAM at pointer+READ_OFFSET as "
+            "GPR:PTR_OFFSET:READ_OFFSET:LENGTH or "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--ram-dump",
+        type=parse_ram_dump_spec,
+        action="append",
+        default=[],
+        help="dump absolute guest RAM at every accepted sample as ADDRESS:LENGTH; repeatable",
+    )
+    runtime_sweep.add_argument(
+        "--ram-dump-deref",
+        type=parse_ram_dump_deref_spec,
+        action="append",
+        default=[],
+        help=(
+            "read a big-endian pointer at POINTER_ADDRESS, then dump "
+            "pointer+READ_OFFSET as POINTER_ADDRESS:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    runtime_sweep.add_argument(
+        "--efb-copy-dump",
+        action="store_true",
+        help="write runtime EFB/XFB copy payloads and metadata into --output-dir",
+    )
+    runtime_sweep.add_argument("--efb-copy-dump-every", type=int, default=1)
+    runtime_sweep.add_argument(
+        "--efb-source-dump",
+        action="store_true",
+        help="write runtime sampled EFB-source PPMs for copied regions into --output-dir",
+    )
+    runtime_sweep.add_argument("--efb-source-dump-every", type=int, default=1)
+    runtime_sweep.add_argument(
+        "--efb-source-dump-addr",
+        help="only dump EFB-source PPMs for copies whose destination address matches this value",
+    )
+    runtime_sweep.add_argument(
+        "--convert-png",
+        action="store_true",
+        help="also convert the PPM captures to PNG with ImageMagick",
+    )
+    runtime_sweep.add_argument("--magick", default="magick")
+    runtime_sweep.set_defaults(func=cmd_runtime_pub_sweep)
 
     probe = sub.add_parser("dolphin-probe", help="query a parked Dolphin GDB stub")
     probe.add_argument("--port", type=int, required=True)
@@ -1816,6 +4005,366 @@ def main() -> int:
     )
     ab_milestone.set_defaults(func=cmd_ab_milestone)
 
+    dolphin_ipl_capture = sub.add_parser(
+        "dolphin-ipl-capture",
+        help=(
+            "launch the patched Dolphin NoGUI IPL oracle and capture a TCP PPM "
+            "screenshot at a target XFB publication count"
+        ),
+    )
+    dolphin_ipl_capture.add_argument("--dolphin-exe", required=True)
+    dolphin_ipl_capture.add_argument("--ipl", required=True)
+    dolphin_ipl_capture.add_argument("--disc", required=True)
+    dolphin_ipl_capture.add_argument("--dsp-rom", required=True)
+    dolphin_ipl_capture.add_argument("--dsp-coef", required=True)
+    dolphin_ipl_capture.add_argument("--output-dir", required=True)
+    dolphin_ipl_capture.add_argument("--dolphin-port", type=int, default=4588)
+    dolphin_ipl_capture.add_argument(
+        "--region",
+        choices=("NTSC_U", "NTSC_J", "PAL", "USA", "JAP", "JPN", "EUR"),
+        default="NTSC_U",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--video-backend", default="Software Renderer"
+    )
+    dolphin_ipl_capture.add_argument(
+        "--cpu-core",
+        type=int,
+        help=(
+            "optional Dolphin.Core.CPUCore override; use 0 for Interpreter "
+            "when sw_draw_state needs guest PC attribution"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--no-memcard-a",
+        action="store_true",
+        help="force Dolphin.Core.SlotA=None for the no-memory-card attract route",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--target-pub",
+        type=int,
+        default=1740,
+        help=(
+            "capture once Dolphin reaches this XFB publication count; use 0 "
+            "with --min-luma/--min-height to accept the first qualifying frame"
+        ),
+    )
+    dolphin_ipl_capture.add_argument("--min-height", type=int, default=240)
+    dolphin_ipl_capture.add_argument("--min-luma", type=float, default=0.0)
+    dolphin_ipl_capture.add_argument("--min-screenshot-pub", type=int, default=0)
+    dolphin_ipl_capture.add_argument(
+        "--screenshot-name", default="dolphin-ipl-capture.ppm"
+    )
+    dolphin_ipl_capture.add_argument("--screenshot-every", type=int, default=5)
+    dolphin_ipl_capture.add_argument("--poll-interval", type=float, default=0.05)
+    dolphin_ipl_capture.add_argument("--wait-timeout", type=float, default=180.0)
+    dolphin_ipl_capture.add_argument("--max-polls", type=int, default=100000)
+    dolphin_ipl_capture.add_argument("--tcp-ready-timeout", type=float, default=30.0)
+    dolphin_ipl_capture.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        help="per TCP diagnostic request timeout after the trace port is ready",
+    )
+    dolphin_ipl_capture.add_argument("--quit-timeout", type=float, default=3.0)
+    dolphin_ipl_capture.add_argument(
+        "--efb-copy-dump",
+        action="store_true",
+        help="write Dolphin EFB/XFB copy payloads and metadata into --output-dir",
+    )
+    dolphin_ipl_capture.add_argument("--efb-copy-dump-every", type=int, default=1)
+    dolphin_ipl_capture.add_argument(
+        "--efb-source-dump",
+        action="store_true",
+        help="write Dolphin sampled EFB-source PPMs for copied regions into --output-dir",
+    )
+    dolphin_ipl_capture.add_argument("--efb-source-dump-every", type=int, default=1)
+    dolphin_ipl_capture.add_argument(
+        "--efb-source-dump-addr",
+        help="only dump EFB-source PPMs for copies whose destination address matches this value",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--sw-draw-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="dump the Dolphin software-renderer lower/large triangle draw ring",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--sw-draw-min-area",
+        type=int,
+        default=8192,
+        help="minimum scissored triangle bbox area retained by --sw-draw-state",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--sw-draw-min-y",
+        type=int,
+        default=180,
+        help="retain smaller --sw-draw-state triangles only if they reach this Y",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--xf-context-state",
+        action="store_true",
+        help="dump the Dolphin XF write context ring beside the screenshot",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--xf-context-count",
+        type=int,
+        default=8192,
+        help="number of newest Dolphin XF context records to dump",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--gpr-probe-pc",
+        type=lambda value: int(value, 0),
+        action="append",
+        default=[],
+        help=(
+            "set Dolphin GCN_TRACE_PROBE_PCS for this guest PC; repeatable. "
+            "Use with --cpu-core 0 so the interpreter samples the registers"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--gpr-probe-dump-count",
+        type=int,
+        default=0,
+        help="dump the newest N Dolphin GPR probe records beside the screenshot",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--gpr-probe-inline-memory",
+        action="append",
+        default=[],
+        help=(
+            "snapshot RAM at probe time as PC:GPR:OFFSET:LENGTH, or deref as "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--gpr-probe-memory",
+        type=parse_gpr_probe_memory,
+        action="append",
+        default=[],
+        help=(
+            "after dumping GPR probe records, read unique guest RAM windows as "
+            "GPR:OFFSET:LENGTH or PC:GPR:OFFSET:LENGTH; repeatable"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--gpr-probe-memory-deref",
+        type=parse_gpr_probe_memory_deref,
+        action="append",
+        default=[],
+        help=(
+            "after dumping GPR probe records, read a big-endian pointer from "
+            "GPR+PTR_OFFSET, then read guest RAM at pointer+READ_OFFSET as "
+            "GPR:PTR_OFFSET:READ_OFFSET:LENGTH or "
+            "PC:GPR:PTR_OFFSET:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--ram-dump",
+        type=parse_ram_dump_spec,
+        action="append",
+        default=[],
+        help="dump absolute guest RAM at the accepted screenshot as ADDRESS:LENGTH; repeatable",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--ram-dump-deref",
+        type=parse_ram_dump_deref_spec,
+        action="append",
+        default=[],
+        help=(
+            "read a big-endian pointer at POINTER_ADDRESS, then dump "
+            "pointer+READ_OFFSET as POINTER_ADDRESS:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--pad-pulse-pub",
+        type=int,
+        help="when Dolphin reaches this XFB publication count, pulse pad 0",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--pad-pulse",
+        type=parse_pad_pulse,
+        action="append",
+        default=[],
+        help=(
+            "repeatable pad pulse as PUB:BUTTONS[:POLLS[:STICK_X:STICK_Y]]; "
+            "for example 1850:0x0100:25 then 2050:0x0101:25"
+        ),
+    )
+    dolphin_ipl_capture.add_argument(
+        "--pad-pulse-buttons",
+        type=lambda value: int(value, 0),
+        default=0x0100,
+        help="pad buttons used by --pad-pulse-pub; default is A",
+    )
+    dolphin_ipl_capture.add_argument(
+        "--pad-pulse-polls",
+        type=int,
+        default=30,
+        help="number of capture polls to hold --pad-pulse-buttons before release",
+    )
+    dolphin_ipl_capture.add_argument("--pad-pulse-stick-x", type=int, default=0x80)
+    dolphin_ipl_capture.add_argument("--pad-pulse-stick-y", type=int, default=0x80)
+    dolphin_ipl_capture.add_argument(
+        "--convert-png",
+        action="store_true",
+        help="also convert the PPM capture to PNG with ImageMagick",
+    )
+    dolphin_ipl_capture.add_argument("--magick", default="magick")
+    dolphin_ipl_capture.set_defaults(func=cmd_dolphin_ipl_capture)
+
+    dolphin_ipl_sweep = sub.add_parser(
+        "dolphin-ipl-sweep",
+        help=(
+            "launch one patched Dolphin NoGUI IPL oracle and capture TCP PPM "
+            "screenshots at multiple XFB publication counts"
+        ),
+    )
+    dolphin_ipl_sweep.add_argument("--dolphin-exe", required=True)
+    dolphin_ipl_sweep.add_argument("--ipl", required=True)
+    dolphin_ipl_sweep.add_argument("--disc", required=True)
+    dolphin_ipl_sweep.add_argument("--dsp-rom", required=True)
+    dolphin_ipl_sweep.add_argument("--dsp-coef", required=True)
+    dolphin_ipl_sweep.add_argument("--output-dir", required=True)
+    dolphin_ipl_sweep.add_argument("--dolphin-port", type=int, default=4588)
+    dolphin_ipl_sweep.add_argument(
+        "--region",
+        choices=("NTSC_U", "NTSC_J", "PAL", "USA", "JAP", "JPN", "EUR"),
+        default="NTSC_U",
+    )
+    dolphin_ipl_sweep.add_argument("--video-backend", default="Software Renderer")
+    dolphin_ipl_sweep.add_argument(
+        "--cpu-core",
+        type=int,
+        help="optional Dolphin.Core.CPUCore override; use 0 for interpreter probes",
+    )
+    dolphin_ipl_sweep.add_argument(
+        "--no-memcard-a",
+        action="store_true",
+        help="force Dolphin.Core.SlotA=None for the no-memory-card attract route",
+    )
+    dolphin_ipl_sweep.add_argument(
+        "--sample-pub",
+        type=int,
+        action="append",
+        default=[],
+        help="XFB publication count to capture; repeatable",
+    )
+    dolphin_ipl_sweep.add_argument("--screenshot-prefix", default="dolphin-ipl-sweep")
+    dolphin_ipl_sweep.add_argument("--min-height", type=int, default=240)
+    dolphin_ipl_sweep.add_argument("--min-luma", type=float, default=0.0)
+    dolphin_ipl_sweep.add_argument("--min-screenshot-pub", type=int, default=0)
+    dolphin_ipl_sweep.add_argument("--screenshot-every", type=int, default=5)
+    dolphin_ipl_sweep.add_argument("--poll-interval", type=float, default=0.05)
+    dolphin_ipl_sweep.add_argument("--wait-timeout", type=float, default=180.0)
+    dolphin_ipl_sweep.add_argument("--max-polls", type=int, default=100000)
+    dolphin_ipl_sweep.add_argument("--tcp-ready-timeout", type=float, default=30.0)
+    dolphin_ipl_sweep.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        help="per TCP diagnostic request timeout after the trace port is ready",
+    )
+    dolphin_ipl_sweep.add_argument("--quit-timeout", type=float, default=3.0)
+    dolphin_ipl_sweep.add_argument(
+        "--sw-draw-state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="dump the Dolphin software-renderer lower/large triangle draw ring per sample",
+    )
+    dolphin_ipl_sweep.add_argument("--sw-draw-min-area", type=int, default=8192)
+    dolphin_ipl_sweep.add_argument("--sw-draw-min-y", type=int, default=180)
+    dolphin_ipl_sweep.add_argument(
+        "--xf-context-state",
+        action="store_true",
+        help="dump the Dolphin XF write context ring per accepted sample",
+    )
+    dolphin_ipl_sweep.add_argument(
+        "--xf-context-count",
+        type=int,
+        default=8192,
+        help="number of newest Dolphin XF context records to dump per sample",
+    )
+    dolphin_ipl_sweep.add_argument("--gpr-probe-pc", type=lambda value: int(value, 0),
+                                   action="append", default=[])
+    dolphin_ipl_sweep.add_argument("--gpr-probe-inline-memory", action="append", default=[])
+    dolphin_ipl_sweep.add_argument(
+        "--ram-dump",
+        type=parse_ram_dump_spec,
+        action="append",
+        default=[],
+        help="dump absolute guest RAM at every accepted sample as ADDRESS:LENGTH; repeatable",
+    )
+    dolphin_ipl_sweep.add_argument(
+        "--ram-dump-deref",
+        type=parse_ram_dump_deref_spec,
+        action="append",
+        default=[],
+        help=(
+            "read a big-endian pointer at POINTER_ADDRESS, then dump "
+            "pointer+READ_OFFSET as POINTER_ADDRESS:READ_OFFSET:LENGTH; repeatable"
+        ),
+    )
+    dolphin_ipl_sweep.add_argument("--efb-copy-dump", action="store_true")
+    dolphin_ipl_sweep.add_argument("--efb-copy-dump-every", type=int, default=1)
+    dolphin_ipl_sweep.add_argument("--efb-source-dump", action="store_true")
+    dolphin_ipl_sweep.add_argument("--efb-source-dump-every", type=int, default=1)
+    dolphin_ipl_sweep.add_argument("--efb-source-dump-addr")
+    dolphin_ipl_sweep.add_argument(
+        "--convert-png",
+        action="store_true",
+        help="also convert PPM captures to PNG with ImageMagick",
+    )
+    dolphin_ipl_sweep.add_argument("--magick", default="magick")
+    dolphin_ipl_sweep.set_defaults(func=cmd_dolphin_ipl_sweep)
+
+    tcp_state_diff = sub.add_parser(
+        "tcp-state-diff",
+        help=(
+            "compare live runtime and Dolphin guest RAM over JSON TCP "
+            "`read_ram`; useful for correlating XFB/EFB-copy divergence "
+            "with scene-state bytes"
+        ),
+    )
+    tcp_state_diff.add_argument("--runtime-port", type=int, required=True)
+    tcp_state_diff.add_argument("--dolphin-port", type=int, required=True)
+    tcp_state_diff.add_argument("--timeout", type=float, default=10.0)
+    tcp_state_diff.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=120.0,
+        help="seconds to wait for requested publication thresholds",
+    )
+    tcp_state_diff.add_argument(
+        "--runtime-pub",
+        type=int,
+        help="wait until runtime xfb_pub_count is at least this value",
+    )
+    tcp_state_diff.add_argument(
+        "--dolphin-pub",
+        type=int,
+        help="wait until Dolphin xfb_pub_count is at least this value",
+    )
+    tcp_state_diff.add_argument(
+        "--memory",
+        type=parse_range,
+        action="append",
+        required=True,
+        help="guest memory range ADDRESS:LENGTH (repeatable)",
+    )
+    tcp_state_diff.add_argument(
+        "--context",
+        type=int,
+        default=16,
+        help="bytes of context around the first difference in each direction",
+    )
+    tcp_state_diff.add_argument(
+        "--label",
+        default="tcp-state-diff",
+        help="freeform label echoed into JSON output",
+    )
+    tcp_state_diff.set_defaults(func=cmd_tcp_state_diff)
+
     xfb_diff = sub.add_parser(
         "xfb-diff",
         help=(
@@ -1863,7 +4412,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return args.func(args)
-    except (OSError, ProtocolError, subprocess.SubprocessError) as exc:
+    except (OSError, ProtocolError, subprocess.SubprocessError, TimeoutError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
         return 2
 

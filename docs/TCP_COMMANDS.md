@@ -51,6 +51,7 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `write_ram` | `addr`, `hex` | write hex bytes to guest RAM |
 | `mmio_dump` | opt `addr`, `rw`, `count` | newest N MMIO entries; `addr`/`rw` filter over the **full** ring before the cap |
 | `block_dump` | opt `count` | newest N retired-block PCs |
+| `gpr_probe_dump` | opt `count` | newest N `GCN_PROBE_PCS` block-entry snapshots: PC, LR/CTR/CR/XER/FPSCR, and all 32 GPRs. Use for call/return argument audits without editing generated code. |
 | `pc_seen` | `pc` | non-evicting exact coverage query for an AOT dispatcher-entry PC in MEM1/MEM2 or the IPL ROM window; records continuously from process start |
 | `checkpoint_arm` | `pc`; optional `gpr` + `gpr_value`; optional `lr` | arm an AOT-safe dispatcher-boundary checkpoint, optionally conditional on one live GPR and/or LR; native shards remain enabled |
 | `checkpoint_status` | — | report armed/parked state, condition, live PC, and block index |
@@ -61,7 +62,7 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `dsp_state` | — | live DSP-LLE core state: `pc`, `control`, non-consuming peeks of both mailboxes (bit 31 = mail pending). For diagnosing CPU↔DSP handshake stalls. |
 | `rtc_state` | — | latch the live EXI RTC from current emulated CPU cycles and report `counter`, `running`, `anchor_cycles`, and `cpu_cycles`; this never resamples host time. |
 | `audio_state` | — | report the live AID-to-host stream: WASAPI open state, sample rate, signal peak, received/audible/buffered frames, submitted packets, underruns, waits, and dropped frames. |
-| `gx_draw_state` | — | with `GCN_GX_TEV_CENSUS=1`, return the last observed draw in every shading-config bucket: raw BP/TEV words, primitive/vertex metadata, and each active texture's MEM1 address, exact tiled byte length, draw-time FNV-1a hash, and first 32 bytes. Use the reported physical ranges with `cosim_pages`/`read_ram` to trace a pixel mismatch back to guest memory. |
+| `gx_draw_state` | — | with `GCN_GX_DRAW_STATE=1`, return lightweight recent/large draw rings with screen-space bounds, coverage counters, and primitive metadata. Add `GCN_GX_DRAW_MIN_Y=<y>` to retain lower-screen draws even when their area is small. Add `GCN_GX_TEV_CENSUS=1` for slower per-shading-config buckets with raw BP/TEV words and each active texture's MEM1 address, exact tiled byte length, draw-time FNV-1a hash, and first 32 bytes. Use the reported physical ranges with `cosim_pages`/`read_ram` to trace a pixel mismatch back to guest memory. |
 | `set_input` | opt `buttons`, `stick_x`, `stick_y`, `substick_x`, `substick_y`, `trigger_l`, `trigger_r` (ints, unspecified = leave unchanged); opt `reset`:1 (snap to neutral, ignoring every other field) | Drive the SI model's injected GC-controller pad report (ROADMAP M3/M4 input-injection surface) — the menu polls this every frame through `si.c`. `buttons` is the raw OR of GC pad bits (LEFT 0x0001, RIGHT 0x0002, DOWN 0x0004, UP 0x0008, Z 0x0010, R 0x0020, L 0x0040, A 0x0100, B 0x0200, X 0x0400, Y 0x0800, START 0x1000 — `PAD_USE_ORIGIN` 0x0080 is ORed in unconditionally by the model, never passed here); sticks/substick/triggers are raw bytes, 0x80 = centered. Echoes the resulting state. Hold a direction/button for 30-60 frames of guest time (PAD lib debounces a single poll) before releasing. |
 | `quit` | — | end the run + shut the server down cleanly |
 
@@ -77,6 +78,18 @@ python tools/gcn_debug_client.py [--port N] <cmd> [key=value ...]
 | `cosim_pages` | optional `space` (`mem1`/`mem2`/`l1`), `start`, `count` | FNV-1a hashes for up to 256 4-KiB pages, used to localize a memory sub-hash mismatch before fetching bytes with `read_ram`. |
 | `cosim_inject` | `kind` (`gpr`/`ram`/`timebase`), `index` or `addr`, optional `xor`, or `value_hi` + `value_lo` | Parked-only fault injection for the mandatory detection gate, or an explicitly disclosed oracle-seam normalization. |
 
+## Dolphin oracle extras
+
+The patched Dolphin oracle uses the same JSON-over-newline shape on
+`GCN_TRACE_TCP_PORT`. `screenshot_ppm`, `read_ram`, `regs`, `sw_draw_state`,
+`set_input`, and `gpr_probe_dump` are available for Wind Waker attract-demo
+comparisons.
+Set `GCN_TRACE_PROBE_PCS=0x803262C8,...` and run with interpreter CPU core
+when GPR snapshots are needed; `tools/gcn_cosim.py dolphin-ipl-capture`
+exposes this as repeatable `--gpr-probe-pc` plus `--gpr-probe-dump-count`.
+Use `--pad-pulse 0:0:10000` to hold pad 0 neutral from boot; this prevents
+ambient/default host input from pressing through Wind Waker's title screen.
+
 ### Examples
 
 ```bash
@@ -88,6 +101,47 @@ python tools/gcn_debug_client.py set_input buttons=0x0008   # hold D-pad UP
 python tools/gcn_debug_client.py set_input reset=1          # release back to neutral
 python tools/gcn_debug_client.py quit
 ```
+
+## Visual harness helpers
+
+`tools/gcn_cosim.py runtime-capture` launches `gcn_boot` headless, waits for a
+single XFB publication threshold, then saves the accepted screenshot plus any
+requested diagnostics:
+
+- `runtime-capture.ppm` / optional PNG;
+- `runtime-capture.draw-state.json` with `--draw-state`;
+- `runtime-capture.pc-seen.json` with repeated `--pc-seen PC`;
+- `runtime-capture.block-dump.json` with `--block-dump-count N`;
+- `runtime-capture.fifo-dump.json` with `--fifo-dump-count N`;
+- `runtime-capture.err.log` watch-ring text with
+  `--watch-range LO:HI --watch-dump-count N`, which passes `GCN_WATCH` through
+  to the runtime and requests a `watch_dump` at the accepted frame;
+- `runtime-capture.gpr-probe.json` with repeated `--gpr-probe-pc PC` and
+  `--gpr-probe-dump-count N`.
+- `runtime-capture.gpr-probe-memory.json` with repeated
+  `--gpr-probe-memory [PC:]GPR:OFFSET:LENGTH`, which reads deduplicated
+  pointer-relative RAM windows from the dumped GPR probe records while the
+  emulator is still alive. Use repeated
+  `--gpr-probe-memory-deref [PC:]GPR:PTR_OFFSET:READ_OFFSET:LENGTH` to read a
+  big-endian guest pointer at `GPR+PTR_OFFSET` first, then dump the object at
+  `pointer+READ_OFFSET`.
+
+`tools/gcn_cosim.py runtime-pub-sweep` uses the same runtime launch path but
+samples multiple repeated `--sample-pub N` thresholds in one process. Each
+accepted threshold writes `<prefix>-pubNNNN.ppm`, optional PNG, and matching
+`<prefix>-pubNNNN.draw-state.json`, `.pc-seen.json`, `.block-dump.json`,
+`.fifo-dump.json`, `.watch-dump.json`, `.gpr-probe.json`, or
+`.gpr-probe-memory.json` sidecars. Watch-ring text is written to the shared
+`runtime-capture.err.log`.
+Use it when a Dolphin oracle draw state is absent at one runtime frame and you
+need to prove whether the pass appears earlier or later on the same route.
+
+Both runtime helpers also accept launch-time checkpoint/snapshot controls:
+`--checkpoint-pc PC`, optional `--checkpoint-gpr N --checkpoint-gpr-value V`,
+optional `--checkpoint-lr LR`, `--snapshot-save PATH`, and `--snapshot-exit`.
+This is the preferred headless way to create a current-route snapshot before a
+one-time setup write, then iterate from that focused state with screenshots and
+GPR/RAM sidecars.
 
 ## Not yet wired (grows with the milestones)
 

@@ -449,7 +449,7 @@ void gcn_gx_xfb_write_end(void)   { ReleaseSRWLockExclusive(&s_xfb_lock); }
  * feed the same accumulator does. */
 static int s_xfb_hash_on = -1;
 static u64 s_xfb_hash_chain = 0xcbf29ce484222325ULL; /* FNV-1a-64 offset basis */
-static u64 s_xfb_hash_pubs = 0;
+static u64 s_xfb_pub_count = 0;
 
 static int gx_xfb_hash_on(void) {
     if (s_xfb_hash_on < 0) {
@@ -473,6 +473,69 @@ void gcn_gx_xfb_hash_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows) {
     s_xfb_hash_chain = h;
 }
 
+static int s_xfb_dump_init = 0;
+static char s_xfb_dump_dir[512];
+static u64 s_xfb_dump_every = 1;
+static u32 s_xfb_dump_errors = 0;
+
+static int gx_xfb_dump_on(void) {
+    if (!s_xfb_dump_init) {
+        const char* dir = getenv("GCN_GX_XFB_DUMP");
+        if (dir && dir[0]) {
+            snprintf(s_xfb_dump_dir, sizeof s_xfb_dump_dir, "%s", dir);
+            CreateDirectoryA(s_xfb_dump_dir, NULL);
+            const char* every = getenv("GCN_GX_XFB_DUMP_EVERY");
+            if (every && every[0]) {
+                char* end = NULL;
+                unsigned long long parsed = strtoull(every, &end, 0);
+                if (end && *end == '\0' && parsed > 0)
+                    s_xfb_dump_every = (u64)parsed;
+            }
+        }
+        s_xfb_dump_init = 1;
+    }
+    return s_xfb_dump_dir[0] != '\0';
+}
+
+void gcn_gx_xfb_dump_feed(const u8* base, u32 stride, u32 row_bytes, u32 rows) {
+    if (!gx_xfb_dump_on())
+        return;
+    u64 pub = __atomic_load_n(&s_xfb_pub_count, __ATOMIC_ACQUIRE);
+    if (s_xfb_dump_every == 0 || (pub % s_xfb_dump_every) != 0)
+        return;
+    u32 width = row_bytes / 2u;
+    u32 height = rows;
+    u64 bytes = (u64)stride * rows;
+    char path[768];
+    size_t dir_len = strlen(s_xfb_dump_dir);
+    const char sep = (dir_len && (s_xfb_dump_dir[dir_len - 1] == '\\' ||
+                                  s_xfb_dump_dir[dir_len - 1] == '/')) ? '\0' : '\\';
+    if (sep)
+        snprintf(path, sizeof path, "%s\\runtime.%llu.yuy2",
+                 s_xfb_dump_dir, (unsigned long long)pub);
+    else
+        snprintf(path, sizeof path, "%sruntime.%llu.yuy2",
+                 s_xfb_dump_dir, (unsigned long long)pub);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        if (s_xfb_dump_errors < 8)
+            fprintf(stderr, "gx: failed to open XFB dump '%s'\n", path);
+        s_xfb_dump_errors++;
+        return;
+    }
+    u32 header[3] = { width, height, stride };
+    int ok = fwrite(header, sizeof header, 1, f) == 1;
+    if (ok && bytes)
+        ok = fwrite(base, 1, (size_t)bytes, f) == (size_t)bytes;
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok && s_xfb_dump_errors < 8)
+        fprintf(stderr, "gx: failed while writing XFB dump '%s'\n", path);
+    if (!ok)
+        s_xfb_dump_errors++;
+}
+
 /* GCN_GX_XFB_HASH_EVERY=1: print the chain at EVERY publication instead of
  * just the first + every 256th — SNAPSHOT_RESUME pass C's mechanical
  * offline diff (full-boot sequence vs. resumed sequence) needs the complete
@@ -488,19 +551,23 @@ static int gx_xfb_hash_every(void) {
 }
 
 void gcn_gx_xfb_hash_publish_done(void) {
+    u64 pub = __atomic_add_fetch(&s_xfb_pub_count, 1, __ATOMIC_RELEASE);
     if (!gx_xfb_hash_on())
         return;
-    s_xfb_hash_pubs++;
     /* First publication plus every 256th thereafter: enough breadcrumbs to
      * bisect a divergence to a <=256-publication window without printing a
      * line per frame. GCN_GX_XFB_HASH_EVERY=1 prints all of them instead. */
-    if (gx_xfb_hash_every() || s_xfb_hash_pubs == 1 || (s_xfb_hash_pubs % 256) == 0)
+    if (gx_xfb_hash_every() || pub == 1 || (pub % 256) == 0)
         fprintf(stderr, "[gx-xfb-hash] publication=%llu chain=%016llx\n",
-                (unsigned long long)s_xfb_hash_pubs,
+                (unsigned long long)pub,
                 (unsigned long long)s_xfb_hash_chain);
 }
 u64 gcn_gx_xfb_generation(void) {
     return __atomic_load_n(&s_xfb_generation, __ATOMIC_ACQUIRE);
+}
+
+u64 gcn_gx_xfb_pub_count(void) {
+    return __atomic_load_n(&s_xfb_pub_count, __ATOMIC_ACQUIRE);
 }
 
 u64 gcn_gx_frame_count(void) { return s_gx_frames; }
@@ -515,11 +582,11 @@ u64 gcn_gx_frame_count(void) { return s_gx_frames; }
  * and resuming process; harmless (never read back) otherwise. */
 void gcn_gx_xfb_hash_get_state(u64* chain, u64* pubs) {
     if (chain) *chain = s_xfb_hash_chain;
-    if (pubs) *pubs = s_xfb_hash_pubs;
+    if (pubs) *pubs = __atomic_load_n(&s_xfb_pub_count, __ATOMIC_ACQUIRE);
 }
 void gcn_gx_xfb_hash_set_state(u64 chain, u64 pubs) {
     s_xfb_hash_chain = chain;
-    s_xfb_hash_pubs = pubs;
+    __atomic_store_n(&s_xfb_pub_count, pubs, __ATOMIC_RELEASE);
 }
 void gcn_gx_set_frame_count(u64 frames) { s_gx_frames = frames; }
 
@@ -741,7 +808,7 @@ void gcn_gx_pipeline_shutdown(void) {
             s_dl_max_bytes);
     if (gx_xfb_hash_on())
         fprintf(stderr, "[gx-xfb-hash] publications=%llu chain=%016llx\n",
-                (unsigned long long)s_xfb_hash_pubs,
+                (unsigned long long)gcn_gx_xfb_pub_count(),
                 (unsigned long long)s_xfb_hash_chain);
     gx_render_shutdown();
 }
@@ -1332,12 +1399,64 @@ static void gx_on_xf(GcnGx* gx, u16 address, u8 count, const u8* data) {
     for (u8 i = 0; i < count; i++) {
         u32 addr = (u32)address + i;
         if (addr < GX_XF_MEM_WORDS) {
-            gx->xf[addr] = rd32(&data[i * 4u]);
+            u32 value = rd32(&data[i * 4u]);
+            gx_raster_record_xf_write(addr, value,
+                                      gx->cpu ? gx->cpu->pc : 0u,
+                                      gx->cur_dl_addr);
+            gx->xf[addr] = value;
         } else {
             static int warned = 0;
             if (!warned) {
                 fprintf(stderr, "gx: XF load out of range (addr 0x%04X) — ignored\n",
                         addr);
+                warned = 1;
+            }
+        }
+    }
+}
+
+static void gx_on_indexed_xf(GcnGx* gx, u8 op, u32 value) {
+    u32 index = value >> 16;
+    u16 address = (u16)(value & 0x0FFFu);
+    u8 count = (u8)(((value >> 12) & 0xFu) + 1u);
+    u32 array = (op / 8u) + 8u; /* LOAD_INDX_A..D -> CPArray::XF_A..XF_D */
+    if (array >= 16u)
+        return;
+
+    u32 base = gx->cpst.array_bases[array] & 0x1FFFFFFFu;
+    u32 stride = gx->cpst.array_strides[array];
+    u64 src = (u64)base + (u64)index * stride;
+    u64 bytes = (u64)count * 4u;
+    if (!gx->cpu || !gx->cpu->ram || src + bytes > (u64)gx->cpu->ram_size) {
+        static u32 warned = 0;
+        if (warned < 8u) {
+            fprintf(stderr,
+                    "gx: indexed XF load out of MEM1 "
+                    "(op=0x%02X array=%u index=%u addr=0x%04X count=%u "
+                    "base=0x%08X stride=%u)\n",
+                    op, array, index, address, count, gx->cpst.array_bases[array],
+                    stride);
+            warned++;
+        }
+        return;
+    }
+
+    const u8* data = gx->cpu->ram + src;
+    for (u8 i = 0; i < count; ++i) {
+        u32 addr = (u32)address + i;
+        if (addr < GX_XF_MEM_WORDS) {
+            u32 word = rd32(&data[(u32)i * 4u]);
+            gx_raster_record_xf_write(addr, word,
+                                      gx->cpu ? gx->cpu->pc : 0u,
+                                      gx->cur_dl_addr);
+            gx->xf[addr] = word;
+        } else {
+            static int warned = 0;
+            if (!warned) {
+                fprintf(stderr,
+                        "gx: indexed XF load out of range "
+                        "(addr 0x%04X count %u) ignored\n",
+                        addr, count);
                 warned = 1;
             }
         }
@@ -1416,6 +1535,8 @@ static void gx_on_bp(GcnGx* gx, u8 cmd, u32 value) {
         e->cmd   = cmd;
         s_bpaudit_n++;
     }
+
+    gx_raster_record_bp_write(cmd, value, gx->cpu ? gx->cpu->pc : 0u, gx->cur_dl_addr);
 
     if (gx->bp[cmd] != value)
         gx_raster_notify_bp_write(cmd);
@@ -1563,9 +1684,10 @@ static u32 gx_run_command(GcnGx* gx, const u8* data, u32 available) {
     case GX_OP_LOAD_INDX_D: {
         if (available < 5u) return 0;
         if (note_once(&gx->seen_opcode[op]))
-            fprintf(stderr, "gx: opcode LOAD_INDX_%c UNIMPLEMENTED (indexed XF "
+            fprintf(stderr, "gx: opcode LOAD_INDX_%c first seen (indexed XF "
                             "load) — payload consumed, load skipped\n",
                     'A' + (int)((op - GX_OP_LOAD_INDX_A) / 8));
+        gx_on_indexed_xf(gx, op, rd32(&data[1]));
         return 5;
     }
 

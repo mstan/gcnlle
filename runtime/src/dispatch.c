@@ -632,6 +632,8 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
                           * block/PC timeline, now with the CPU state that
                           * explains HOW we got here (indirect-branch or
                           * exception-vector entry chain) */
+        gcn_ring_gpr_probe(ctx, ctx->pc, ctx->gpr, ctx->lr, ctx->ctr, ctx->cr,
+                           ctx->xer, ctx->fpscr);
         gcn_dispatch_pc_trigger_check(ctx);   /* env-gated conditional dump,
                           * see GCN_TRIGGER_PCS doc comment above its impl */
 
@@ -754,7 +756,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
             u64 t3 = __rdtsc(); s_tsc[2] += t3 - t2;
             gcn_vi_tick(device_cycles);
             u64 t4 = __rdtsc(); s_tsc[3] += t4 - t3;
-            gcn_di_tick();
+            gcn_di_tick(ctx, derived ? ai_cycles : GCN_CORE_CYCLES_PER_BLOCK);
             u64 t5 = __rdtsc(); s_tsc[4] += t5 - t4;
             gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);
             u64 t6 = __rdtsc(); s_tsc[5] += t6 - t5;
@@ -807,7 +809,7 @@ int gcn_dispatch_run(CPUState* ctx, u32 max_blocks) {
         if (derived) gcn_ai_tick(ai_cycles);      /* pace AISCNT / AIINT while PSTAT=1 */
         else         gcn_ai_tick_legacy();
         gcn_vi_tick(device_cycles);              /* sweep the VI beam + latch DIs */
-        gcn_di_tick();                           /* complete a deferred DI command */
+        gcn_di_tick(ctx, derived ? ai_cycles : GCN_CORE_CYCLES_PER_BLOCK);
         gcn_gx_tick(GCN_CORE_CYCLES_PER_BLOCK);  /* drain + execute GX FIFO commands */
         }
         gcn_debug_server_cosim_after_instruction();

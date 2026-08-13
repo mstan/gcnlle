@@ -71,6 +71,8 @@ void gx_raster_init(CPUState* cpu, const u32* bp, const u32* xf);
  * gx_raster_get_config_cache_stats and the cfg-cache block above
  * gx_raster_draw's cache lookup). */
 void gx_raster_notify_bp_write(u32 cmd);
+void gx_raster_record_bp_write(u32 cmd, u32 value, u32 pc, u32 dl);
+void gx_raster_record_xf_write(u32 addr, u32 value, u32 pc, u32 dl);
 
 /* Execute one primitive draw (OpcodeDecoder RunCommand -> SWVertexLoader ->
  * TransformUnit -> Clipper -> Rasterizer -> Tev). `prim` is the GX primitive
