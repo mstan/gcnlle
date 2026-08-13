@@ -68,6 +68,7 @@ static u64 s_edge_count;
 static FILE* s_journal;
 static char s_blob_dir[1024];
 static int s_capture_initialized;
+static int s_log_native_misses;
 
 static u32 hash_pair(u32 a, u32 b) {
     u32 x = a * 0x9E3779B1u ^ b * 0x85EBCA77u;
@@ -82,6 +83,9 @@ static void capture_init(void) {
         return;
     s_capture_initialized = 1;
     atexit(gcn_interpreter_shutdown);
+    const char* log_native_misses = getenv("GCN_INTERP_LOG_NATIVE_MISSES");
+    s_log_native_misses = log_native_misses && *log_native_misses &&
+                           strcmp(log_native_misses, "0") != 0;
     const char* journal = getenv("GCN_INTERP_JOURNAL");
     const char* blobs = getenv("GCN_INTERP_BLOB_DIR");
     if (blobs && *blobs) {
@@ -243,13 +247,15 @@ int gcn_interpreter_note_native_miss(CPUState* cpu) {
     u32 raw = mem_read32(cpu, cpu->pc, cpu->pc);
     PPCInst inst = ppc_decode(raw, cpu->pc);
     gcn_ring_event(GCN_EV_NATIVE_MISS, cpu->pc, crc, cpu->pc);
-    fprintf(stderr,
-            "[native-miss] #%llu pc=%08X lr=%08X cycles=%llu page=%08X "
-            "crc32=%08X raw=%08X op=%s -> interpreter\n",
-            (unsigned long long)s_unique_miss_count, cpu->pc, cpu->lr,
-            (unsigned long long)cpu->cycles, page, crc, raw,
-            ppc_op_name(inst.op));
-    fflush(stderr);
+    if (s_log_native_misses) {
+        fprintf(stderr,
+                "[native-miss] #%llu pc=%08X lr=%08X cycles=%llu page=%08X "
+                "crc32=%08X raw=%08X op=%s -> interpreter\n",
+                (unsigned long long)s_unique_miss_count, cpu->pc, cpu->lr,
+                (unsigned long long)cpu->cycles, page, crc, raw,
+                ppc_op_name(inst.op));
+        fflush(stderr);
+    }
 
     write_page_blob(page, crc, bytes);
     if (s_journal) {
