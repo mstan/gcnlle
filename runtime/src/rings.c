@@ -7,8 +7,25 @@
  * dump walk the live window oldest->newest.
  */
 #include "debug/rings.h"
-#include "gx/gx.h"
 #include "memory/memory.h"
+
+/* XFB publication counter (see debug/rings.h). Owned here, in the always-linked
+ * ring layer, and driven by GX -- rings must never call up into a device model,
+ * which is what broke the link for every gcn_runtime_core consumer without
+ * gx.c (beads-u2x.10). */
+static u64 s_xfb_pub_count = 0;
+
+u64 gcn_ring_xfb_pub_advance(void) {
+    return __atomic_add_fetch(&s_xfb_pub_count, 1, __ATOMIC_RELEASE);
+}
+
+u64 gcn_ring_xfb_pub_count(void) {
+    return __atomic_load_n(&s_xfb_pub_count, __ATOMIC_ACQUIRE);
+}
+
+void gcn_ring_xfb_pub_set(u64 pubs) {
+    __atomic_store_n(&s_xfb_pub_count, pubs, __ATOMIC_RELEASE);
+}
 
 #include <stdio.h>
 #include <stdlib.h>      /* getenv/strtoul — GCN_WATCH parse (gcn_ring_watch_init) */
@@ -300,7 +317,7 @@ void gcn_ring_gpr_probe(CPUState* cpu, u32 pc, const u32 gpr[32], u32 lr,
     GprProbeEntry* e = &s_gpr_probe[s_gpr_probe_count & (GCN_GPR_PROBE_RING_CAP - 1)];
     e->seq = s_gpr_probe_count++;
     e->block = s_block_index;
-    e->xfb_pub = gcn_gx_xfb_pub_count();
+    e->xfb_pub = gcn_ring_xfb_pub_count();
     e->pc = pc;
     e->lr = lr;
     e->ctr = ctr;
@@ -470,7 +487,7 @@ static u64 s_watch_count;
 void gcn_ring_watch_hit(u32 ea, u64 value, u32 size, u32 cia) {
     WatchEntry* e = &s_watch[s_watch_count & (GCN_WATCH_RING_CAP - 1)];
     e->block = s_block_index;
-    e->xfb_pub = gcn_gx_xfb_pub_count();
+    e->xfb_pub = gcn_ring_xfb_pub_count();
     e->pc = cia; e->ea = ea; e->value = value; e->size = (u8)size;
     s_watch_count++;
     if (s_watch_count <= 12u) {
@@ -490,7 +507,7 @@ void gcn_ring_watch_hit(u32 ea, u64 value, u32 size, u32 cia) {
 void gcn_ring_watch_hit_span(u32 ea, u32 len, u32 tag) {
     WatchEntry* e = &s_watch[s_watch_count & (GCN_WATCH_RING_CAP - 1)];
     e->block = s_block_index;
-    e->xfb_pub = gcn_gx_xfb_pub_count();
+    e->xfb_pub = gcn_ring_xfb_pub_count();
     e->pc = tag; e->ea = ea; e->value = len; e->size = 0;   /* size 0 = span */
     s_watch_count++;
     fprintf(stderr, "[gcn-watch] SPAN #%llu blk=%llu pub=%llu tag=%08X ea=%08X len=%u\n",
