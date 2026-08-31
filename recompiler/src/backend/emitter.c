@@ -3,6 +3,7 @@
 
 #include "emitter.h"
 #include "ppc_cycles.h"
+#include "dispatch.h"   /* dolrecomp_symbol_suffix (overlay variant symbols) */
 #include <stdlib.h>
 #include <string.h>
 
@@ -2825,7 +2826,8 @@ void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
         compute_block_costs(insts, count, func_addr, func_end, is_leader, cum);
     }
 
-    fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
+    fprintf(out, "void func_%08X%s(CPUState* ctx) {\n", func_addr,
+            dolrecomp_symbol_suffix());
     /* In-chunk bl/blr fast-path shadow call stack (see emit_direct_branch's
      * lk-branch handling and emit_dynamic_branch's is_blr_class handling).
      * Declared UNCONDITIONALLY, before the switch, so `dr_ret_sp = 0` runs on

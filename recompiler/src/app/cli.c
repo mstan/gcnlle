@@ -17,6 +17,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -jN                            Use N worker jobs for split C output (e.g. -j14)\n");
     fprintf(stderr, "  --chunk-instructions <N>       Instructions per C shard (power of two, default: 1024)\n");
+    fprintf(stderr, "  --symbol-suffix <s>            Append <s> to every emitted func_<addr> symbol\n");
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --gamecube-ipl                 Recompile a flat descrambled BS2/IPL blob\n");
@@ -156,6 +157,7 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
     opts->cpu = DOLRECOMP_CPU_GEKKO;
     opts->jobs = 1;
     opts->chunk_instructions = EMIT_CHUNK_INSTRUCTIONS_DEFAULT;
+    opts->symbol_suffix = "";
 
     for (int i = 1; i < argc; i++) {
         const char* arg = argv[i];
@@ -191,6 +193,24 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
             if (!parse_chunk_instruction_count(arg + 21,
                                                &opts->chunk_instructions))
                 return 0;
+            continue;
+        }
+
+        /* Overlay/REL support: several recompiles of DIFFERENT code bodies can
+         * share one guest address, so the address alone stops identifying the
+         * code. A suffix (in practice the content hash) keeps their symbols
+         * distinct in a single link. */
+        if (strcmp(arg, "--symbol-suffix") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --symbol-suffix needs a value\n");
+                return 0;
+            }
+            opts->symbol_suffix = argv[++i];
+            continue;
+        }
+
+        if (strncmp(arg, "--symbol-suffix=", 16) == 0) {
+            opts->symbol_suffix = arg + 16;
             continue;
         }
 

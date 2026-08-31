@@ -14,6 +14,7 @@ typedef struct {
     const char* input_path;
     const char* title_id_arg;
     const char* output_arg;
+    const char* symbol_suffix;   /* appended to emitted func_<addr> symbols */
     DolRecompCPU cpu;
     u32 jobs;
     u32 chunk_instructions;
