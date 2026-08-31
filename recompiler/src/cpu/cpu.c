@@ -123,8 +123,36 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
     return NULL;
 }
 
+/* A lwarx reservation is held on a PHYSICAL address, so a store clears it
+ * whenever it touches the same physical granule through ANY alias. MEM1 is
+ * reachable through three windows -- cached GC_RAM_BASE (0x80000000), uncached
+ * GC_RAM_UNCACHED (0xC0000000), and the bare physical window below
+ * GC_MAIN_RAM_SIZE -- so comparing raw effective addresses lets a reservation
+ * taken through one alias survive a store through another, and the following
+ * stwcx. then succeeds where hardware fails it: a silent failure of an atomic
+ * primitive in the lock/queue code the IPL runs.
+ *
+ * Upstream DolRecomp (93b881c) folds only the cached/uncached pair by masking
+ * bit 0x40000000; that is insufficient for our address map, which also accepts
+ * the bare physical window, so canonicalize to a RAM offset instead.
+ * reserve_addr stays the raw EA the guest presented, so this happens only at
+ * compare time. Must stay semantically identical to reservation_key() in
+ * runtime/src/memory.c and to dolrecomp_reservation_key() emitted by
+ * backend/emitter.c emit_header_for_cpu. */
+static u32 reservation_key(u32 addr) {
+    if (addr >= GC_RAM_BASE && addr < GC_RAM_BASE + GC_MAIN_RAM_SIZE)
+        return addr - GC_RAM_BASE;
+    if (addr >= GC_RAM_UNCACHED && addr < GC_RAM_UNCACHED + GC_MAIN_RAM_SIZE)
+        return addr - GC_RAM_UNCACHED;
+    if (addr < GC_MAIN_RAM_SIZE)
+        return addr;
+    return addr; /* not RAM: no alias to fold, compare raw */
+}
+
 static void clear_matching_reservation(CPUState* cpu, u32 addr) {
-    if (cpu->reserve_valid && ((cpu->reserve_addr ^ addr) & ~31u) == 0)
+    if (!cpu->reserve_valid)
+        return;
+    if (((reservation_key(cpu->reserve_addr) ^ reservation_key(addr)) & ~31u) == 0)
         cpu->reserve_valid = false;
 }
 
@@ -703,6 +731,41 @@ void ppc_rfi(CPUState* cpu, u32 cia) {
     cpu->pc = cpu->srr0 & ~3u;
 }
 
+/* dcbz allocates a zeroed DATA-cache line. It does NOT invalidate the
+ * corresponding instruction-cache line -- that distinction is load-bearing at
+ * the retail IPL handoff, where the IPL zeroes its own RAM image while still
+ * executing from I-cache before branching to the title.
+ *
+ * These two helpers are declared in cpu.h and CALLED BY EMITTED CODE, but were
+ * only ever implemented in the runtime (runtime/src/cpu_glue.c). That left this
+ * reference host unable to link its own generated output -- invisible until the
+ * emitted #include "debug/rings.h" was made optional, because the codegen tests
+ * could not get far enough to reach the link step. The runtime's counterparts
+ * additionally maintain its native-dispatch content identity and title-module
+ * caches; those are runtime concerns with no analogue here. */
+void ppc_dcbz(CPUState* cpu, u32 ea, u32 cia) {
+    u32 block = ea & ~31u;
+    u32 avail = 0;
+    u8* host = resolve_addr(cpu, block, &avail);
+    if (host && avail >= 32u) {
+        clear_matching_reservation(cpu, block);
+        memset(host, 0, 32u);
+        return;
+    }
+    /* Non-RAM effective address: ordinary writes are the conservative
+     * fallback, preserving the exception/MMIO behaviour of this window. */
+    for (u32 i = 0; i < 32u; i += 4u)
+        mem_write32(cpu, block + i, 0u, cia);
+}
+
+/* Guest visibility of modified instructions begins at the explicit
+ * instruction-cache invalidation, not at the preceding data writes. This
+ * reference host holds no translated code, so there is nothing to drop. */
+void ppc_icbi(CPUState* cpu, u32 ea) {
+    (void)cpu;
+    (void)ea;
+}
+
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {
     if (cpu->msr & PPC_MSR_PR) {
         ppc_program_exception(cpu, PPC_PROGRAM_PRIV, cia);
@@ -1183,4 +1246,274 @@ bool ppc_fctiw(CPUState* cpu, f64 value, bool toward_zero, u64* output) {
     *output = 0xFFF8000000000000ull | result |
               ((result == 0 && signbit(value)) ? 0x100000000ull : 0ull);
     return true;
+}
+
+void ppc_fcmp(CPUState* cpu, u8 crfd, f64 a, f64 b, bool ordered) {
+    u32 compare;
+    if (isnan(a) || isnan(b)) {
+        compare = 1u;
+        if (is_snan(a) || is_snan(b)) {
+            set_fp_exception(cpu, 0x01000000u);
+            if (ordered && (cpu->fpscr & 0x80u) == 0)
+                set_fp_exception(cpu, 0x00080000u);
+        } else if (ordered) {
+            set_fp_exception(cpu, 0x00080000u);
+        }
+    } else if (a < b) {
+        compare = 8u;
+    } else if (a > b) {
+        compare = 4u;
+    } else {
+        compare = 2u;
+    }
+    // FPCC is the low four bits of FPRF (bits 12-15 here); bit 16 is the C
+    // class bit, which a compare leaves alone. Replace rather than OR, or a
+    // less-than followed by an equal reads back as 0xA instead of 0x2.
+    cpu->fpscr = (cpu->fpscr & ~(0xFu << 12)) | (compare << 12);
+    u32 shift = 4u * (7u - crfd);
+    cpu->cr = (cpu->cr & ~(0xFu << shift)) | (compare << shift);
+}
+
+enum {
+    FPSCR_ZX = 0x04000000u,
+    FPSCR_XX = 0x02000000u,
+    FPSCR_VXSNAN = 0x01000000u,
+    FPSCR_VXISI = 0x00800000u,
+    FPSCR_VXIDI = 0x00400000u,
+    FPSCR_VXZDZ = 0x00200000u,
+    FPSCR_VXIMZ = 0x00100000u,
+    FPSCR_FR = 0x00040000u,
+    FPSCR_FI = 0x00020000u,
+    FPSCR_VE = 0x00000080u,
+    FPSCR_ZE = 0x00000010u,
+    FPSCR_NI = 0x00000004u,
+};
+
+typedef struct {
+    f64 value;
+    u32 exception;
+} FPBinaryResult;
+
+typedef enum {
+    FP_ADD,
+    FP_SUB,
+    FP_MUL,
+    FP_DIV,
+} FPBinaryOp;
+
+static f64 quiet_nan(f64 value) {
+    return f64_value(f64_bits(value) | 0x0008000000000000ull);
+}
+
+static f32 force_single(CPUState* cpu, f64 value) {
+    if (cpu->fpscr & FPSCR_NI) {
+        u64 bits = f64_bits(value);
+        if ((bits & 0x7FFFFFFFFFFFFFFFull) < 0x3810000000000000ull)
+            return f32_value((u32)(bits >> 32) & 0x80000000u);
+    }
+
+    f32 result = (f32)value;
+    if ((cpu->fpscr & FPSCR_NI) && fpclassify(result) == FP_SUBNORMAL)
+        return copysignf(0.0f, result);
+    return result;
+}
+
+static f64 force_double(CPUState* cpu, f64 value) {
+    if ((cpu->fpscr & FPSCR_NI) && fpclassify(value) == FP_SUBNORMAL)
+        return copysign(0.0, value);
+    return value;
+}
+
+static void clear_fi_fr(CPUState* cpu) {
+    cpu->fpscr &= ~(FPSCR_FI | FPSCR_FR);
+}
+
+static void set_fi_fr(CPUState* cpu, f64 exact, f64 rounded) {
+    clear_fi_fr(cpu);
+    if (isnan(exact) || exact == rounded)
+        return;
+    set_fp_exception(cpu, FPSCR_XX);
+    cpu->fpscr |= FPSCR_FI;
+    if (fabs(rounded) > fabs(exact))
+        cpu->fpscr |= FPSCR_FR;
+}
+
+static FPBinaryResult binary_fp(CPUState* cpu, FPBinaryOp op, f64 a, f64 b) {
+    FPBinaryResult result = {0};
+    switch (op) {
+    case FP_ADD: result.value = a + b; break;
+    case FP_SUB: result.value = a - b; break;
+    case FP_MUL: result.value = a * b; break;
+    case FP_DIV: result.value = a / b; break;
+    }
+
+    if (op == FP_DIV && isinf(result.value) && b == 0.0) {
+        result.exception = FPSCR_ZX;
+    } else if (isnan(result.value)) {
+        if (is_snan(a) || is_snan(b))
+            result.exception = FPSCR_VXSNAN;
+        clear_fi_fr(cpu);
+
+        if (isnan(a))
+            result.value = quiet_nan(a);
+        else if (isnan(b))
+            result.value = quiet_nan(b);
+        else if (op == FP_MUL) {
+            result.value = f64_value(0x7FF8000000000000ull);
+            result.exception = FPSCR_VXIMZ;
+        } else if (op == FP_DIV) {
+            result.value = f64_value(0x7FF8000000000000ull);
+            result.exception = b == 0.0 ? FPSCR_VXZDZ : FPSCR_VXIDI;
+        } else {
+            result.value = f64_value(0x7FF8000000000000ull);
+            result.exception = FPSCR_VXISI;
+        }
+    } else if ((op == FP_ADD || op == FP_SUB) && (isinf(a) || isinf(b))) {
+        clear_fi_fr(cpu);
+    }
+
+    if (result.exception)
+        set_fp_exception(cpu, result.exception);
+    return result;
+}
+
+static bool binary_result_enabled(const CPUState* cpu, FPBinaryResult result) {
+    const u32 invalid = FPSCR_VXSNAN | FPSCR_VXISI | FPSCR_VXIDI |
+                        FPSCR_VXZDZ | FPSCR_VXIMZ;
+    if ((result.exception & invalid) && (cpu->fpscr & FPSCR_VE))
+        return false;
+    if (result.exception == FPSCR_ZX && (cpu->fpscr & FPSCR_ZE))
+        return false;
+    return true;
+}
+
+static void write_single_result(CPUState* cpu, u8 d, f32 value) {
+    cpu->fpr[d] = (f64)value;
+    cpu->ps1[d] = (f64)value;
+    set_fprf(cpu, classify_f32(value));
+}
+
+static void binary_single(CPUState* cpu, u8 d, f64 a, f64 b, FPBinaryOp op) {
+    FPBinaryResult result = binary_fp(cpu, op, a, b);
+    if (!binary_result_enabled(cpu, result))
+        return;
+    f32 rounded = force_single(cpu, result.value);
+    if (isfinite(result.value))
+        set_fi_fr(cpu, result.value, (f64)rounded);
+    write_single_result(cpu, d, rounded);
+}
+
+static void binary_double(CPUState* cpu, u8 d, f64 a, f64 b, FPBinaryOp op) {
+    FPBinaryResult result = binary_fp(cpu, op, a, b);
+    if (!binary_result_enabled(cpu, result))
+        return;
+    cpu->fpr[d] = force_double(cpu, result.value);
+    if (op == FP_MUL)
+        clear_fi_fr(cpu);
+    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+}
+
+void ppc_fadds(CPUState* cpu, u8 d, u8 a, u8 b) {
+    binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_ADD);
+}
+
+void ppc_fsubs(CPUState* cpu, u8 d, u8 a, u8 b) {
+    binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_SUB);
+}
+
+void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
+    binary_single(cpu, d, cpu->fpr[a], force_25_bit(cpu->fpr[c]), FP_MUL);
+}
+
+void ppc_fdivs(CPUState* cpu, u8 d, u8 a, u8 b) {
+    binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_DIV);
+}
+
+void ppc_fadd(CPUState* cpu, u8 d, u8 a, u8 b) {
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_ADD);
+}
+
+void ppc_fsub(CPUState* cpu, u8 d, u8 a, u8 b) {
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_SUB);
+}
+
+void ppc_fmul(CPUState* cpu, u8 d, u8 a, u8 c) {
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[c], FP_MUL);
+}
+
+void ppc_fdiv(CPUState* cpu, u8 d, u8 a, u8 b) {
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_DIV);
+}
+
+void ppc_frsp(CPUState* cpu, u8 d, u8 b) {
+    f64 value = cpu->fpr[b];
+    f32 rounded = force_single(cpu, value);
+    if (isnan(value)) {
+        bool snan = is_snan(value);
+        if (snan)
+            set_fp_exception(cpu, FPSCR_VXSNAN);
+        clear_fi_fr(cpu);
+        if (snan && (cpu->fpscr & FPSCR_VE))
+            return;
+    } else {
+        set_fi_fr(cpu, value, (f64)rounded);
+    }
+    write_single_result(cpu, d, rounded);
+}
+
+/* Paired-single binary arithmetic. Previously emitted inline per lane as
+ * dolrecomp_ps_round((f32)a OP (f32)b), which dropped FPRF entirely and -- for
+ * ps_mul -- skipped the Gekko's 25-bit truncation of the C operand on BOTH
+ * lanes. Ported from upstream DolRecomp 44f3fdb; paired-single is the SIMD unit
+ * the vertex and matrix maths run on, so these lanes are load-bearing for
+ * geometry. The scalar single-precision helpers above are what stop ps1 going
+ * stale in the first place; these keep the paired ops themselves exact. */
+static void write_paired_result(CPUState* cpu, u8 d, f64 ps0, f64 ps1) {
+    cpu->fpr[d] = (f64)(f32)ps0;
+    cpu->ps1[d] = (f64)(f32)ps1;
+    set_fprf(cpu, classify_f32((f32)ps0));
+}
+
+static f64 paired_binary_nan(f64 a, f64 b, f64 result) {
+    if (isnan(a))
+        return quiet_nan(a);
+    if (isnan(b))
+        return quiet_nan(b);
+    if (isnan(result))
+        return f64_value(0x7FF8000000000000ull);
+    return result;
+}
+
+void ppc_ps_add_op(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[b],
+                                          cpu->fpr[a] + cpu->fpr[b]),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[b],
+                                          cpu->ps1[a] + cpu->ps1[b]));
+}
+
+void ppc_ps_sub_op(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[b],
+                                          cpu->fpr[a] - cpu->fpr[b]),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[b],
+                                          cpu->ps1[a] - cpu->ps1[b]));
+}
+
+void ppc_ps_mul_op(CPUState* cpu, u8 d, u8 a, u8 c) {
+    f64 c0 = force_25_bit(cpu->fpr[c]);
+    f64 c1 = force_25_bit(cpu->ps1[c]);
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[c],
+                                          cpu->fpr[a] * c0),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[c],
+                                          cpu->ps1[a] * c1));
+}
+
+void ppc_ps_div_op(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[b],
+                                          cpu->fpr[a] / cpu->fpr[b]),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[b],
+                                          cpu->ps1[a] / cpu->ps1[b]));
 }

@@ -87,6 +87,45 @@ void gcn_mem_fill_mem1(CPUState* cpu, u32 pattern_be);
  * `size` are borrowed (caller owns the lifetime); NULL/0 unmaps it again. */
 void gcn_mem_set_rom_window(CPUState* cpu, const u8* rom, u32 size);
 
+/* Canonicalize an effective address for lwarx/stwcx. reservation comparison.
+ *
+ * A reservation is held on a PHYSICAL address, so a store must clear it
+ * whenever it touches the same physical granule through ANY alias. MEM1 is
+ * reachable through three windows -- cached GC_RAM_BASE (0x80000000), uncached
+ * GC_RAM_UNCACHED (0xC0000000), and the bare physical window below
+ * GC_MAIN_RAM_SIZE (real mode, MSR[IR]/[DR] clear; see gcn_mem_resolve).
+ * Comparing raw effective addresses lets a reservation taken through one alias
+ * survive a store through another, and the following stwcx. then succeeds where
+ * hardware fails it -- a silent failure of an atomic primitive in the lock and
+ * queue code the IPL runs.
+ *
+ * Upstream DolRecomp (93b881c) folds only the cached/uncached pair by masking
+ * bit 0x40000000; that is insufficient here because of the physical window.
+ * reserve_addr stays the raw EA the guest presented (snapshots and the debug
+ * server expose it), so canonicalization happens only at compare time.
+ *
+ * Lives in this header so every runtime call site shares ONE implementation --
+ * memory.c's bus primitives and cpu_glue.c's dcbz path. The recompiler's
+ * reference host mirrors it as reservation_key() in recompiler/src/cpu/cpu.c,
+ * and the emitter emits it as dolrecomp_reservation_key(); all three must stay
+ * semantically identical. */
+static inline u32 gcn_reservation_key(u32 addr) {
+    if (addr >= GC_RAM_BASE && addr < GC_RAM_BASE + GC_MAIN_RAM_SIZE)
+        return addr - GC_RAM_BASE;
+    if (addr >= GC_RAM_UNCACHED && addr < GC_RAM_UNCACHED + GC_MAIN_RAM_SIZE)
+        return addr - GC_RAM_UNCACHED;
+    if (addr < GC_MAIN_RAM_SIZE)
+        return addr;
+    return addr; /* not RAM: no alias to fold, compare raw */
+}
+
+/* True when a store to `addr` must break a reservation held at `reserve_addr`
+ * (32-byte granule, alias-folded). */
+static inline bool gcn_reservation_hit(u32 reserve_addr, u32 addr) {
+    return ((gcn_reservation_key(reserve_addr) ^ gcn_reservation_key(addr)) &
+            ~31u) == 0;
+}
+
 #ifdef __cplusplus
 }
 #endif

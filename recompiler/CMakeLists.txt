@@ -171,6 +171,37 @@ add_test(NAME codegen_compile
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/codegen_compile.cmake
 )
 
+# Ported from upstream DolRecomp tests/test_fpscr.c, tests/test_float_semantics.c
+# and tests/test_c_execute.c (beads-u2x.6): backend-agnostic (dr_cpu-only)
+# regression gate for the Gekko non-FMA scalar float helpers (ppc_fcmp,
+# ppc_fadds/fsubs/fmuls/fdivs/fadd/fsub/fmul/fdiv, ppc_frsp), plus an
+# end-to-end emit -> compile -> execute proof via the additive
+# test_codegen_emit.c fixtures above. These build and (for fpscr/
+# float_semantics) may still fail to LINK until the concurrent helper port
+# lands in recompiler/src/cpu/cpu.c -- see that bead for status.
+add_executable(test_fpscr tests/test_fpscr.c)
+target_link_libraries(test_fpscr PRIVATE dr_cpu)
+add_test(NAME fpscr COMMAND test_fpscr)
+
+add_executable(test_float_semantics tests/test_float_semantics.c)
+target_link_libraries(test_float_semantics PRIVATE dr_cpu)
+add_test(NAME float_semantics COMMAND test_float_semantics)
+
+set(DOLRECOMP_C_TEST_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/c_execute_generated.c)
+add_custom_command(
+    OUTPUT ${DOLRECOMP_C_TEST_SOURCE}
+    COMMAND test_codegen_emit ${DOLRECOMP_C_TEST_SOURCE}
+    DEPENDS test_codegen_emit
+    VERBATIM
+)
+add_executable(test_c_execute
+    tests/test_c_execute.c
+    ${DOLRECOMP_C_TEST_SOURCE}
+)
+target_include_directories(test_c_execute PRIVATE ${DOLRECOMP_SRC})
+target_link_libraries(test_c_execute PRIVATE dr_cpu)
+add_test(NAME c_execute COMMAND test_c_execute)
+
 # Phase D2 (codegen speed campaign): real link+execute exactness proof for
 # the in-chunk bl/blr shadow-call-stack fast path (emitter.c's
 # emit_direct_branch lk-branch push / emit_dynamic_branch is_blr_class pop).

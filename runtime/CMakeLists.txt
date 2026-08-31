@@ -384,6 +384,15 @@ if(GCN_WITH_GENERATED)
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm ole32 uuid avrt
                          user32 gdi32 opengl32)
+  # Opt the generated guest code into the real write-watch ring. The emitter
+  # emits gcn_ring_watch_check calls in every store fast path, but guards the
+  # #include "debug/rings.h" behind this macro so emitted C still compiles
+  # standalone against the recompiler include path alone -- which is what the
+  # recompiler's own codegen_compile / bl_shadow_exactness / poll_loop_exactness
+  # / c_execute tests do. Only a hosting runtime, which has debug/rings.h, sets
+  # it. Applies to this target's own generated chunks AND the optional per-title
+  # module chunks, both of which are sources of gcn_boot.
+  target_compile_definitions(gcn_boot PRIVATE DOLRECOMP_HOST_RINGS=1)
   # SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md): stamp the framework commit id
   # into the snapshot header (snapshot.c's GCN_BUILD_GIT_SHA). Best-effort —
   # falls back to snapshot.h's own "unknown" default if git isn't available

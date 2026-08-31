@@ -193,11 +193,17 @@ numeric core.
   invalid-add, ZE-suppressed div-by-zero, FI/FR/XX on inexact.
 - `tests/test_float_semantics.c` — links `dr_cpu` only. Pins the 12545/100000
   divergence exactly, and the `ps1`-staleness → `ps_add` ps1-lane corruption chain.
-- `tests/test_c_execute.c` + a small additive diff to `test_codegen_emit.c` —
+- `tests/test_c_execute.c` + an additive diff to `test_codegen_emit.c` —
   end-to-end: emit C from PPC words, compile it, execute it, assert
-  registers/FPSCR/CR. **Our `test_codegen_emit.c` is already byte-identical to
-  upstream's pre-change version**, so this is a mechanical port and it validates
-  1a/1b end-to-end.
+  registers/FPSCR/CR. This is the one that earns its keep (see the
+  implementation postscript).
+
+  **Correction:** an earlier draft of this document claimed our
+  `test_codegen_emit.c` was "already byte-identical to upstream's pre-change
+  version". That was wrong — it matches upstream `5d1ee26`, five commits behind
+  the real pre-change point `93b881c`, so it was also missing `native_loop`,
+  `local_call` and `memory_loop`. The port was larger than one commit's worth of
+  fixtures.
 
 ### 1e. Standalone tooling, free but not yet actionable
 
@@ -467,3 +473,86 @@ locally with our own toolchain, and the float-divergence figures are the stdout
 of upstream's `test_float_semantics` binary compiled here. Subagent surveys were
 used for breadth; their load-bearing claims were re-verified against the code
 before being written down.
+
+---
+
+## Implementation postscript — Stage 1, 2026-08-31
+
+Stage 1 (Category 1a/1b/1f + the tests) is implemented on branch
+`fix/gekko-fp-and-reservations`. **Recompiler suite: 16/16 green**, up from 13
+registered tests with 3 failing on `master`.
+
+Our ported helpers are numerically identical to upstream's — `test_float_semantics`
+reproduces upstream's pinned count exactly against our own `cpu.c`:
+
+```
+25-bit C operand : C from lfs   0/100000 differ (0.0%)
+                 : C full f64   12545/100000 differ (12.5%)
+ps1              : inline leaves it stale=yes, helper writes it=yes
+FPRF             : inline 0x00, helper 0x04
+fcmpo vs fcmpu   : VXVC ordered=0x00080000 unordered=0x00000000
+ps_* consumer    : ps0 13 (want 13), ps1 22 (want 22)
+```
+
+### Four bugs found during implementation that the assessment had not predicted
+
+The assessment predicted the float and reservation defects. Implementing them
+surfaced four more, three of them ours:
+
+1. **`7c1bb73` broke the recompiler's own codegen gate.** The emitter emitted
+   `#include "debug/rings.h"` unconditionally, but generated C must also compile
+   standalone against the recompiler include path — that is what
+   `codegen_compile`, `bl_shadow_exactness` and `poll_loop_exactness` do. Three
+   tests had been red on `master` since that commit. Fixed: the include sits
+   behind `DOLRECOMP_HOST_RINGS`, with a no-op inline fallback and the call sites
+   byte-identical in both configurations, so the codegen tests keep testing what
+   ships. The runtime opts in via `target_compile_definitions(gcn_boot ...)`.
+2. **`ppc_dcbz` and `ppc_icbi` were declared and called but never implemented in
+   the recompiler's reference host** — only in `runtime/src/cpu_glue.c`. So the
+   recompiler could not link its own generated output. This was invisible
+   *because* of bug 1: the codegen tests never reached the link step. Fixed with
+   reference implementations in `recompiler/src/cpu/cpu.c`.
+3. **`ps_merge` rounded through f32.** It is a pure lane move; ours called
+   `dolrecomp_ps_round` on each lane, destroying the low mantissa bits of any
+   double that is not single-representable — live corruption on the
+   vertex/matrix path. It also wrote `fpr[rD]` before reading `rB`, so a merge
+   with `rD == rB` read back the value it had just written. Both fixed by
+   porting upstream's `emit_ps_merge` (verbatim moves via temporaries).
+4. **Paired-single compares had the same FPSCR gap as scalar `fcmp`.**
+   `ps_cmpu0/o0/u1/o1` wrote only CR, never FPSCR[FPCC]/FPRF, collapsed the
+   ordered/unordered distinction (so `ps_cmpo*` never signalled VXVC on a NaN),
+   and truncated both operands to f32 before comparing. Routed through
+   `ppc_fcmp` with bank and ordered selection.
+
+**Bugs 3 and 4 were caught by the ported `c_execute` test on its first run** —
+its "compare" fixture is `ps_cmpo0`, not `fcmpo`, and its merge fixture
+deliberately uses `0x1.0000000000001p+0`, a double chosen to be non-single-representable.
+That is the clearest possible argument for adopting upstream's tests as a shared
+contract: they immediately found defects in our code that no upstream commit
+mentions.
+
+### Scope actually delivered
+
+Beyond the ten scalar helpers, the paired-single **binary** ops
+(`ps_add/sub/mul/div`) were also ported and routed — `ps_mul` now applies the
+Gekko 25-bit C-operand truncation on **both** lanes, which the inline form
+skipped. Still inline and pending a later pass: `ps_madd*`, `ps_sum*`,
+`ps_muls*`, `ps_res`, `ps_rsqrte`, `ps_sel`, and `ps_neg/abs/nabs/mr`.
+
+The reservation fix landed at all 15 comparison sites, consolidated to **one**
+implementation per tree rather than the copies it replaced:
+`gcn_reservation_key()` / `gcn_reservation_hit()` in
+`runtime/include/memory/memory.h` (shared by `memory.c` and `cpu_glue.c`),
+`reservation_key()` in `recompiler/src/cpu/cpu.c`, and
+`dolrecomp_reservation_key()` emitted once into the generated header instead of
+twelve duplicated string literals.
+
+### Still outstanding for Stage 1
+
+- **The Wind Waker hypothesis is UNTESTED.** Nothing here has been run through a
+  regen + IPL/title boot yet, so there is no evidence for or against
+  `beads-u2x.2` / `beads-u2x.4`. That is Stage 2 and it needs the regen chain
+  (`_work/regen_chain.sh`).
+- No throughput measurement yet on routing FP through out-of-line helpers.
+- `beads-u2x.10` (the `gcn_runtime_core` link break, also from `7c1bb73`) is
+  still open and still blocks the runtime unit-test suite.

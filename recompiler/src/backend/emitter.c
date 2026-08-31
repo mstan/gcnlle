@@ -70,20 +70,41 @@ static void emit_compare_u32(FILE* out, u8 crf, const char* lhs, const char* rhs
     fprintf(out, "    }\n");
 }
 
-static void emit_fcompare(FILE* out, const PPCInst* inst) {
-    u32 shift = cr_field_shift(inst->crfD);
+/* ps_merge is a pure LANE MOVE: it copies register halves verbatim and must
+ * not round. Ours pushed each lane through dolrecomp_ps_round, which destroys
+ * the low mantissa bits of any double that is not single-representable -- real
+ * corruption on the vertex/matrix path, and caught by the ported c_execute
+ * test. It also wrote fpr[rD] before reading rB, so a merge with rD == rB read
+ * back the value it had just written; the temporaries below fix that too.
+ * Ported from upstream DolRecomp (emit_ps_merge, 44f3fdb lineage). */
+static void emit_ps_merge(FILE* out, const PPCInst* inst,
+                          bool use_a_ps1, bool use_b_ps1) {
+    const char* a_bank = use_a_ps1 ? "ps1" : "fpr";
+    const char* b_bank = use_b_ps1 ? "ps1" : "fpr";
 
     fprintf(out, "    {\n");
-    fprintf(out, "        f64 val_a = ctx->fpr[%u];\n", inst->rA);
-    fprintf(out, "        f64 val_b = ctx->fpr[%u];\n", inst->rB);
-    fprintf(out, "        u32 cr_bits = 0;\n");
-    fprintf(out, "        if (val_a < val_b)       cr_bits = 0x8u;\n");
-    fprintf(out, "        else if (val_a > val_b)  cr_bits = 0x4u;\n");
-    fprintf(out, "        else if (val_a == val_b) cr_bits = 0x2u;\n");
-    fprintf(out, "        else                     cr_bits = 0x1u;\n");
-    fprintf(out, "        ctx->cr = (ctx->cr & ~(0xFu << %u)) | (cr_bits << %u);\n",
-            shift, shift);
+    fprintf(out, "        f64 ps0 = ctx->%s[%u];\n",
+            a_bank, inst->rA);
+    fprintf(out, "        f64 ps1 = ctx->%s[%u];\n",
+            b_bank, inst->rB);
+    fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
+    fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
     fprintf(out, "    }\n");
+}
+
+/* fcmpu/fcmpo through the runtime helper. The previous inline form wrote only
+ * CR: FPSCR[FPCC]/FPRF was never updated at all, so anything reading FPSCR
+ * after a compare (mffs, mcrfs) saw stale bits, and -- because the inline form
+ * had no `ordered` parameter -- fcmpo and fcmpu compiled to identical code
+ * even though only fcmpo signals VXVC on a NaN operand. ppc_fcmp also REPLACES
+ * the four FPCC bits rather than OR-ing into them (preserving bit 16, the C
+ * class bit, which a compare does not modify), which is the bug upstream fixed
+ * in 2515808 and which we could not inherit because we had no ppc_fcmp at all.
+ * See docs/UPSTREAM_SYNC_ASSESSMENT.md section 1b. */
+static void emit_fcompare(FILE* out, const PPCInst* inst) {
+    fprintf(out, "    ppc_fcmp(ctx, %u, ctx->fpr[%u], ctx->fpr[%u], %s);\n",
+            inst->crfD, inst->rA, inst->rB,
+            inst->op == PPC_OP_FCMPO ? "true" : "false");
 }
 
 static void emit_dform_ea(FILE* out, u8 ra, s16 simm, bool update) {
@@ -203,7 +224,7 @@ static void emit_fload_fast(FILE* out, const PPCInst* inst, bool single, bool up
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        f64 value = (f64)dolrecomp_f32_from_bits(dolrecomp_mem_read32_fast(ctx, dr_ram, ea, 0x%08Xu));\n",
+        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(dolrecomp_mem_read32_fast(ctx, dr_ram, ea, 0x%08Xu));\n",
                 inst->address);
         fprintf(out, "        ctx->fpr[%u] = value;\n", inst->rD);
         fprintf(out, "        ctx->ps1[%u] = value;\n", inst->rD);
@@ -223,7 +244,7 @@ static void emit_floadx_fast(FILE* out, const PPCInst* inst, bool single, bool u
     emit_xform_ea(out, inst->rA, inst->rB, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        f64 value = (f64)dolrecomp_f32_from_bits(dolrecomp_mem_read32_fast(ctx, dr_ram, ea, 0x%08Xu));\n",
+        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(dolrecomp_mem_read32_fast(ctx, dr_ram, ea, 0x%08Xu));\n",
                 inst->address);
         fprintf(out, "        ctx->fpr[%u] = value;\n", inst->rD);
         fprintf(out, "        ctx->ps1[%u] = value;\n", inst->rD);
@@ -243,7 +264,7 @@ static void emit_fstore_fast(FILE* out, const PPCInst* inst, bool single, bool u
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        dolrecomp_mem_write32_fast(ctx, dr_ram, ea, dolrecomp_f32_to_bits((f32)ctx->fpr[%u]), 0x%08Xu);\n",
+        fprintf(out, "        dolrecomp_mem_write32_fast(ctx, dr_ram, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]), 0x%08Xu);\n",
                 inst->rS, inst->address);
     } else {
         fprintf(out, "        dolrecomp_mem_write64_fast(ctx, dr_ram, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]), 0x%08Xu);\n",
@@ -261,7 +282,7 @@ static void emit_fstorex_fast(FILE* out, const PPCInst* inst, bool single, bool 
     emit_xform_ea(out, inst->rA, inst->rB, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        dolrecomp_mem_write32_fast(ctx, dr_ram, ea, dolrecomp_f32_to_bits((f32)ctx->fpr[%u]), 0x%08Xu);\n",
+        fprintf(out, "        dolrecomp_mem_write32_fast(ctx, dr_ram, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]), 0x%08Xu);\n",
                 inst->rS, inst->address);
     } else {
         fprintf(out, "        dolrecomp_mem_write64_fast(ctx, dr_ram, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]), 0x%08Xu);\n",
@@ -687,7 +708,26 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "#include <string.h>\n"
         "#include <math.h>\n"
         "#include \"cpu/cpu.h\"\n"
+        /* The store fast paths below call gcn_ring_watch_check -- the always-on
+         * write-watch ring. That instrument lives in the RUNTIME, but generated
+         * code must also compile standalone: the recompiler's own codegen tests
+         * (codegen_compile, bl_shadow_exactness, poll_loop_exactness, and the
+         * ported c_execute) build emitted C against the recompiler include path
+         * alone, where debug/rings.h does not exist. Emitting the include
+         * unconditionally (as 7c1bb73 did) breaks those three tests.
+         *
+         * A hosting runtime defines DOLRECOMP_HOST_RINGS to opt into the real
+         * ring; without it the hook compiles to nothing. The CALL SITES stay
+         * identical in both configurations on purpose -- the shape of emitted
+         * code must not depend on whether the instrument is present, or the
+         * codegen tests would stop testing what actually ships. */
+        "#ifdef DOLRECOMP_HOST_RINGS\n"
         "#include \"debug/rings.h\"\n"
+        "#else\n"
+        "static inline void gcn_ring_watch_check(u32 ea, u64 value, u32 size, u32 cia) {\n"
+        "    (void)ea; (void)value; (void)size; (void)cia;\n"
+        "}\n"
+        "#endif\n"
         "\n"
         /* E1 (perf campaign 2): every emit_function body keeps ctx->cycles in
          * a local (dr_cycles) for the whole invocation -- ctx->cycles is
@@ -709,16 +749,60 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return sh ? ((value << sh) | (value >> (32u - sh))) : value;\n"
         "}\n"
         "\n"
-        "static inline f32 dolrecomp_f32_from_bits(u32 bits) {\n"
-        "    f32 value;\n"
-        "    memcpy(&value, &bits, sizeof(value));\n"
+        /* Preserve the PPC bit-level single conversion, including denormals.
+         * These had degenerated into a plain cast-plus-reinterpret, which is
+         * wrong for denormals and for any value that is not already
+         * single-representable -- and because the old signatures were f32, the
+         * (f32)/(f64) casts at the call sites truncated the input BEFORE the
+         * conversion could see it. Restored to upstream's form (44f3fdb), which
+         * follows Dolphin's ConvertToSingle / ConvertToDouble; the call-site
+         * casts are removed accordingly. */
+        "static inline f64 dolrecomp_f32_from_bits(u32 bits) {\n"
+        "    u64 x = bits;\n"
+        "    u64 exp = (x >> 23) & 0xFFu;\n"
+        "    u64 frac = x & 0x007FFFFFu;\n"
+        "    u64 result;\n"
+        "    if (exp > 0 && exp < 255) {\n"
+        "        u64 y = !(exp >> 7);\n"
+        "        u64 z = (y << 61) | (y << 60) | (y << 59);\n"
+        "        result = ((x & 0xC0000000u) << 32) | z |\n"
+        "                 ((x & 0x3FFFFFFFu) << 29);\n"
+        "    } else if (exp == 0 && frac != 0) {\n"
+        "        exp = 1023 - 126;\n"
+        "        do {\n"
+        "            frac <<= 1;\n"
+        "            exp -= 1;\n"
+        "        } while ((frac & 0x00800000u) == 0);\n"
+        "        result = ((x & 0x80000000u) << 32) | (exp << 52) |\n"
+        "                 ((frac & 0x007FFFFFu) << 29);\n"
+        "    } else {\n"
+        "        u64 y = exp >> 7;\n"
+        "        u64 z = (y << 61) | (y << 60) | (y << 59);\n"
+        "        result = ((x & 0xC0000000u) << 32) | z |\n"
+        "                 ((x & 0x3FFFFFFFu) << 29);\n"
+        "    }\n"
+        "    f64 value;\n"
+        "    memcpy(&value, &result, sizeof(value));\n"
         "    return value;\n"
         "}\n"
         "\n"
-        "static inline u32 dolrecomp_f32_to_bits(f32 value) {\n"
-        "    u32 bits;\n"
+        "static inline u32 dolrecomp_f32_to_bits(f64 value) {\n"
+        "    u64 bits;\n"
         "    memcpy(&bits, &value, sizeof(bits));\n"
-        "    return bits;\n"
+        "    u32 exp = (u32)((bits >> 52) & 0x7FFu);\n"
+        "    if (exp > 896 || (bits & 0x7FFFFFFFFFFFFFFFull) == 0) {\n"
+        "        return (u32)(((bits >> 32) & 0xC0000000u) |\n"
+        "                     ((bits >> 29) & 0x3FFFFFFFu));\n"
+        "    }\n"
+        "    if (exp >= 874) {\n"
+        "        u32 result =\n"
+        "            (u32)(0x80000000u | ((bits & 0x000FFFFFFFFFFFFFull) >> 21));\n"
+        "        result >>= 905 - exp;\n"
+        "        result |= (u32)((bits >> 32) & 0x80000000u);\n"
+        "        return result;\n"
+        "    }\n"
+        "    return (u32)(((bits >> 32) & 0xC0000000u) |\n"
+        "                 ((bits >> 29) & 0x3FFFFFFFu));\n"
         "}\n"
         "\n"
         "static inline f64 dolrecomp_f64_from_bits(u64 bits) {\n"
@@ -738,11 +822,11 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "}\n"
         "\n"
         "static inline f64 dolrecomp_ps_from_bits(u32 bits) {\n"
-        "    return (f64)dolrecomp_f32_from_bits(bits);\n"
+        "    return dolrecomp_f32_from_bits(bits);\n"
         "}\n"
         "\n"
         "static inline u32 dolrecomp_ps_to_bits(f64 value) {\n"
-        "    return dolrecomp_f32_to_bits((f32)value);\n"
+        "    return dolrecomp_f32_to_bits(value);\n"
         "}\n"
         "\n"
         "/* Phase C (codegen speed campaign): inline replica of memory.c's\n"
@@ -801,21 +885,53 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return mem_read64(ctx, ea, cia);\n"
         "}\n"
         "\n"
+        /* A lwarx reservation is held on a PHYSICAL address, so a store must
+         * clear it whenever it touches the same physical granule through ANY
+         * alias. MEM1 is reachable here through three windows -- cached
+         * GC_RAM_BASE (0x80000000), uncached GC_RAM_UNCACHED (0xC0000000), and
+         * the bare physical window below GC_MAIN_RAM_SIZE -- so comparing raw
+         * effective addresses lets a reservation taken through one alias
+         * survive a store through another, and the following stwcx. then
+         * succeeds where hardware fails it. That is a silent failure of an
+         * atomic primitive, in exactly the lock/queue code the IPL runs.
+         *
+         * Upstream DolRecomp (93b881c) fixes the cached/uncached pair by
+         * masking bit 0x40000000. That is not sufficient for our address map,
+         * which also accepts the bare physical window, so canonicalize to a RAM
+         * offset instead. reserve_addr itself stays the raw EA the guest
+         * presented -- snapshots and the debug server expose it -- so the
+         * canonicalization happens only at compare time.
+         *
+         * Cost: the no-live-reservation case is the same single test it was
+         * before, because we early-out on reserve_valid first. */
+        "DR_MEM_INLINE u32 dolrecomp_reservation_key(u32 ea) {\n"
+        "    if (ea >= GC_RAM_BASE && ea < GC_RAM_BASE + GC_MAIN_RAM_SIZE) return ea - GC_RAM_BASE;\n"
+        "    if (ea >= GC_RAM_UNCACHED && ea < GC_RAM_UNCACHED + GC_MAIN_RAM_SIZE) return ea - GC_RAM_UNCACHED;\n"
+        "    if (ea < GC_MAIN_RAM_SIZE) return ea;\n"
+        "    return ea; /* not RAM: no alias to fold, compare raw */\n"
+        "}\n"
+        "\n"
+        "DR_MEM_INLINE void dolrecomp_clear_reservation(CPUState* ctx, u32 ea) {\n"
+        "    if (!ctx->reserve_valid) return;\n"
+        "    if (((dolrecomp_reservation_key(ctx->reserve_addr) ^ dolrecomp_reservation_key(ea)) & ~31u) == 0)\n"
+        "        ctx->reserve_valid = false;\n"
+        "}\n"
+        "\n"
         "DR_MEM_INLINE void dolrecomp_mem_write8_fast(CPUState* ctx, u8* const ram, u32 ea, u8 value, u32 cia) {\n"
         "    if (ea >= GC_RAM_BASE && ea < GC_RAM_BASE + GC_MAIN_RAM_SIZE) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 1u, cia);\n"
         "        ram[ea - GC_RAM_BASE] = value;\n"
         "        return;\n"
         "    }\n"
         "    if (ea >= GC_RAM_UNCACHED && ea < GC_RAM_UNCACHED + GC_MAIN_RAM_SIZE) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 1u, cia);\n"
         "        ram[ea - GC_RAM_UNCACHED] = value;\n"
         "        return;\n"
         "    }\n"
         "    if (ea < GC_MAIN_RAM_SIZE) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 1u, cia);\n"
         "        ram[ea] = value;\n"
         "        return;\n"
@@ -825,19 +941,19 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "\n"
         "DR_MEM_INLINE void dolrecomp_mem_write16_fast(CPUState* ctx, u8* const ram, u32 ea, u16 value, u32 cia) {\n"
         "    if (ea >= GC_RAM_BASE && ea <= GC_RAM_BASE + (GC_MAIN_RAM_SIZE - 2u)) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 2u, cia);\n"
         "        write_be16(ram + (ea - GC_RAM_BASE), value);\n"
         "        return;\n"
         "    }\n"
         "    if (ea >= GC_RAM_UNCACHED && ea <= GC_RAM_UNCACHED + (GC_MAIN_RAM_SIZE - 2u)) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 2u, cia);\n"
         "        write_be16(ram + (ea - GC_RAM_UNCACHED), value);\n"
         "        return;\n"
         "    }\n"
         "    if (ea <= GC_MAIN_RAM_SIZE - 2u) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 2u, cia);\n"
         "        write_be16(ram + ea, value);\n"
         "        return;\n"
@@ -847,19 +963,19 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "\n"
         "DR_MEM_INLINE void dolrecomp_mem_write32_fast(CPUState* ctx, u8* const ram, u32 ea, u32 value, u32 cia) {\n"
         "    if (ea >= GC_RAM_BASE && ea <= GC_RAM_BASE + (GC_MAIN_RAM_SIZE - 4u)) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 4u, cia);\n"
         "        write_be32(ram + (ea - GC_RAM_BASE), value);\n"
         "        return;\n"
         "    }\n"
         "    if (ea >= GC_RAM_UNCACHED && ea <= GC_RAM_UNCACHED + (GC_MAIN_RAM_SIZE - 4u)) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 4u, cia);\n"
         "        write_be32(ram + (ea - GC_RAM_UNCACHED), value);\n"
         "        return;\n"
         "    }\n"
         "    if (ea <= GC_MAIN_RAM_SIZE - 4u) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 4u, cia);\n"
         "        write_be32(ram + ea, value);\n"
         "        return;\n"
@@ -869,19 +985,19 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "\n"
         "DR_MEM_INLINE void dolrecomp_mem_write64_fast(CPUState* ctx, u8* const ram, u32 ea, u64 value, u32 cia) {\n"
         "    if (ea >= GC_RAM_BASE && ea <= GC_RAM_BASE + (GC_MAIN_RAM_SIZE - 8u)) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 8u, cia);\n"
         "        write_be64(ram + (ea - GC_RAM_BASE), value);\n"
         "        return;\n"
         "    }\n"
         "    if (ea >= GC_RAM_UNCACHED && ea <= GC_RAM_UNCACHED + (GC_MAIN_RAM_SIZE - 8u)) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 8u, cia);\n"
         "        write_be64(ram + (ea - GC_RAM_UNCACHED), value);\n"
         "        return;\n"
         "    }\n"
         "    if (ea <= GC_MAIN_RAM_SIZE - 8u) {\n"
-        "        if (ctx->reserve_valid && ((ctx->reserve_addr ^ ea) & ~31u) == 0) ctx->reserve_valid = false;\n"
+        "        dolrecomp_clear_reservation(ctx, ea);\n"
         "        gcn_ring_watch_check(ea, value, 8u, cia);\n"
         "        write_be64(ram + ea, value);\n"
         "        return;\n"
@@ -1445,24 +1561,38 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         }
         break;
 
+    /* Single-precision arithmetic goes through the runtime helpers, never an
+     * inline (f64)(f32) cast chain. The cast form computes a plausible value
+     * but silently drops four things the Gekko does: fmuls truncates its C
+     * operand to a 25-bit mantissa (12.5% of full-mantissa products differ),
+     * a single-precision result occupies BOTH halves of the paired-single
+     * register so ps1 must be written too (leaving it stale corrupts whatever
+     * ps_* reads it next -- the vertex/matrix path), FPRF/FI/FR are never
+     * updated, and NaN/invalid-operation gating is skipped. The record forms
+     * were also ignored entirely; they set CR1 from FPSCR.
+     * Ported from upstream DolRecomp 44f3fdb + 19ddaf5. */
     case PPC_OP_FADDS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]);\n",
+        fprintf(out, "    ppc_fadds(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSUBS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]);\n",
+        fprintf(out, "    ppc_fsubs(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FMULS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * ctx->fpr[%u]);\n",
+        fprintf(out, "    ppc_fmuls(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FDIVS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
+        fprintf(out, "    ppc_fdivs(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRES:
@@ -1487,24 +1617,33 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
     }
 
+    /* Double-precision arithmetic: the bare C operator touched FPSCR not at
+     * all -- no FPRF, no FI/FR, no invalid-operation gating, no VE/ZE
+     * suppression, and no CR1 on the record forms. Route through the helpers
+     * (upstream 44f3fdb + 19ddaf5). Unlike the single-precision forms these
+     * correctly leave ps1 alone: a double result occupies only ps0. */
     case PPC_OP_FADD:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] + ctx->fpr[%u];\n",
+        fprintf(out, "    ppc_fadd(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSUB:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] - ctx->fpr[%u];\n",
+        fprintf(out, "    ppc_fsub(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FMUL:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] * ctx->fpr[%u];\n",
+        fprintf(out, "    ppc_fmul(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FDIV:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] / ctx->fpr[%u];\n",
+        fprintf(out, "    ppc_fdiv(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRSQRTE:
@@ -1555,8 +1694,13 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
                 inst->rD, inst->rB);
         break;
 
+    /* frsp rounds double -> single in place. The inline cast dropped ps1 (a
+     * single-precision result occupies both halves), FPRF, FI/FR/XX on an
+     * inexact round, and VXSNAN plus VE suppression on a signalling NaN
+     * operand (upstream 44f3fdb + 19ddaf5). */
     case PPC_OP_FRSP:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)ctx->fpr[%u];\n", inst->rD, inst->rB);
+        fprintf(out, "    ppc_frsp(ctx, %u, %u);\n", inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSEL:
@@ -1623,44 +1767,33 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "    }\n");
         break;
 
+    /* Paired-single binary arithmetic through the runtime helpers. The inline
+     * per-lane dolrecomp_ps_round((f32)a OP (f32)b) form dropped FPRF entirely
+     * and, for ps_mul, skipped the Gekko's 25-bit truncation of the C operand
+     * on BOTH lanes. Paired-single is the SIMD unit the vertex and matrix maths
+     * run on. Ported from upstream DolRecomp 44f3fdb. */
     case PPC_OP_PS_ADD:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] + (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_add_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_SUB:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] - (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] - (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_sub_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_MUL:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_mul_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_DIV:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] / (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] / (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_div_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_RES:
@@ -1780,50 +1913,42 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_MERGE00:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, false, false);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE01:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, false, true);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE10:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, true, false);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE11:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, true, true);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
+    /* Paired-single compares through ppc_fcmp, for the same reason the scalar
+     * fcmp does: the inline form wrote only CR, never FPSCR[FPCC]/FPRF, and
+     * collapsed the ordered/unordered distinction so ps_cmpo* never signalled
+     * VXVC on a NaN operand. It also truncated both operands to f32 before
+     * comparing. Ported from upstream DolRecomp. */
     case PPC_OP_PS_CMPU0:
     case PPC_OP_PS_CMPO0:
     case PPC_OP_PS_CMPU1:
-    case PPC_OP_PS_CMPO1:
-        fprintf(out, "    {\n");
-        if (inst->op == PPC_OP_PS_CMPU0 || inst->op == PPC_OP_PS_CMPO0) {
-            fprintf(out, "        f32 val_a = (f32)ctx->fpr[%u];\n", inst->rA);
-            fprintf(out, "        f32 val_b = (f32)ctx->fpr[%u];\n", inst->rB);
-        } else {
-            fprintf(out, "        f32 val_a = (f32)ctx->ps1[%u];\n", inst->rA);
-            fprintf(out, "        f32 val_b = (f32)ctx->ps1[%u];\n", inst->rB);
-        }
-        fprintf(out, "        u32 cr_bits = 0;\n");
-        fprintf(out, "        if (val_a < val_b)       cr_bits = 0x8u;\n");
-        fprintf(out, "        else if (val_a > val_b)  cr_bits = 0x4u;\n");
-        fprintf(out, "        else if (val_a == val_b) cr_bits = 0x2u;\n");
-        fprintf(out, "        else                     cr_bits = 0x1u;\n");
-        fprintf(out, "        ctx->cr = (ctx->cr & ~(0xFu << %u)) | (cr_bits << %u);\n",
-                cr_field_shift(inst->crfD), cr_field_shift(inst->crfD));
-        fprintf(out, "    }\n");
+    case PPC_OP_PS_CMPO1: {
+        bool lane1 = inst->op == PPC_OP_PS_CMPU1 || inst->op == PPC_OP_PS_CMPO1;
+        bool ordered = inst->op == PPC_OP_PS_CMPO0 || inst->op == PPC_OP_PS_CMPO1;
+        const char* bank = lane1 ? "ps1" : "fpr";
+        fprintf(out, "    ppc_fcmp(ctx, %u, ctx->%s[%u], ctx->%s[%u], %s);\n",
+                inst->crfD, bank, inst->rA, bank, inst->rB,
+                ordered ? "true" : "false");
         break;
+    }
 
     case PPC_OP_PS_SEL:
         fprintf(out, "    ctx->fpr[%u] = ((f32)ctx->fpr[%u] >= 0.0f) ? ctx->fpr[%u] : ctx->fpr[%u];\n",
