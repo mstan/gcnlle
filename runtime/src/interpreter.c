@@ -16,6 +16,7 @@
 #include "backend/ppc_cycles.h"
 #include "cpu/native_code.h"
 #include "cpu/title_module.h"
+#include "cpu/overlay_module.h"
 #include "debug/rings.h"
 #include "frontend/decoder.h"
 #include "memory/memory.h"
@@ -1114,6 +1115,7 @@ static bool try_batch_cache_loop(CPUState* cpu, const PPCInst* in, u32 cia) {
         const u32 range = (u32)(k * 32ull);
         gcn_native_code_invalidate(start_addr & ~31u, range);
         gcn_title_module_icbi(start_addr & ~31u, range);
+        gcn_overlay_icbi(start_addr & ~31u, range);
     }
     /* dcbi/dcbf/dcbst/dcbtst/dcbt are architectural hints with no modeled
      * side effect in this interpreter (see the no-op case in

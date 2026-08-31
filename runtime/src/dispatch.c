@@ -12,6 +12,7 @@
 #include "cpu/native_code.h"
 #include "cpu/timing.h"
 #include "cpu/title_module.h"
+#include "cpu/overlay_module.h"
 #include "dsp/dsp.h"          /* advance the real DSP core alongside the CPU */
 #include "ai/ai.h"            /* advance the AI sample counter/AIINT per block */
 #include "vi/vi.h"            /* advance the VI beam counter per block       */
@@ -487,7 +488,14 @@ static inline int gcn_dispatch_native(CPUState* ctx) {
     if (!gcn_native_code_is_invalid(ctx->pc) &&
         dolrecomp_call(ctx, ctx->pc))
         return 1;
-    return gcn_title_module_call(ctx, ctx->pc);
+    if (gcn_title_module_call(ctx, ctx->pc))
+        return 1;
+    /* Relocated overlay code (REL modules) is keyed by CONTENT, not address,
+     * so it is tried last: the address-keyed modules above own their ranges,
+     * and anything still unclaimed may be an overlay resident in RAM. A page
+     * whose live bytes match nothing we compiled misses here and falls through
+     * to the interpreter, same as before. */
+    return gcn_overlay_call(ctx, ctx->pc);
 }
 
 /* SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md) SAVE-side timing-model state.
