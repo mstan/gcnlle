@@ -123,12 +123,54 @@ Take them together: `44f3fdb` (re-route emission, emitter-only), `19ddaf5`
 growth), and `2515808` (the FPCC replace-not-OR fix). `2938368` / `0f0c995`
 follow up on keeping the C backend independent of the inline FP helper.
 
-Also worth knowing, from a scan of every upstream commit touching
-`src/frontend` and `src/analysis` since base: **there are no free decoder
-fixes.** The only commits touching decode are LLVM plumbing (`f0a86be`,
-`789240f`, `3606fbd`) and `2595de5` (code-mod support). All of upstream's
-CPU-semantics fixes since base are the float cluster above — so Category 1a/1b
-is the whole of the free correctness work, not a sample of it.
+There are **no free decoder fixes**: the only commits touching `src/frontend`
+or `src/analysis` since base are LLVM plumbing (`f0a86be`, `789240f`,
+`3606fbd`) and `2595de5` (code-mod support).
+
+But the float cluster is **not** the whole of the free correctness work — see
+1f, which was found only by reading a commit whose title says "refactor".
+
+### 1f. `lwarx`/`stwcx.` reservations ignore the MEM1 cached/uncached alias bit
+
+Hidden inside upstream `93b881c`, titled *"optimize C backend and split LLVM
+backend"*:
+
+```c
+ static void clear_matching_reservation(CPUState* cpu, u32 addr) {
+-    if (cpu->reserve_valid && ((cpu->reserve_addr ^ addr) & ~31u) == 0)
++    const u32 reserve_addr = cpu->reserve_addr & ~0x40000000u;
++    const u32 store_addr = addr & ~0x40000000u;
++    if (cpu->reserve_valid && ((reserve_addr ^ store_addr) & ~31u) == 0)
+         cpu->reserve_valid = false;
+ }
+```
+
+A reservation is held on a **physical** address, but we compare raw effective
+addresses. MEM1 is visible through two aliases differing by exactly one bit —
+cached `0x80xxxxxx` and uncached `0xC0xxxxxx`, and
+`0x80000000 ^ 0xC0000000 == 0x40000000`. So a `lwarx` through one alias
+followed by a store to the same physical word through the other **fails to
+clear the reservation**, and the following `stwcx.` succeeds where hardware
+fails it. That is an atomic primitive failing silently — lock queues and
+interrupt-safe list manipulation, which IPL/OS code uses.
+
+**We have it at 15 comparison sites across 4 locations**, and the two that
+actually ship are in `runtime/`:
+
+- `runtime/src/memory.c:278-281` — the bus primitive generated C calls; its own
+  comment calls it a "mirror of recompiler cpu.c"
+- `runtime/src/cpu_glue.c:434-436` — the `dcbz_l` path
+- `recompiler/src/cpu/cpu.c:126-128`
+- `recompiler/src/backend/emitter.c:806-884` — **12 inlined copies** emitted
+  into the generated fast-path stores
+
+Filed as `beads-u2x.9`. Note the emitter repeats the compare as a raw string 12
+times, so the fix shape is one shared emitted helper, not 12 edited string
+literals.
+
+**Method lesson worth keeping:** I scanned the same 72-commit list and skipped
+`93b881c` on its title. Title-based triage of upstream history is unsafe — the
+commit that carried a CPU-semantics fix advertised itself as a refactor.
 
 ### 1c. Two landing sites, not one — the trap to design for
 
@@ -329,10 +371,13 @@ None of that moves the axis the rejection was about. Re-verified at master:
 
 ## Recommended order
 
-1. **Category 1a + 1b** — float pipeline and `fcmp`, landed in **both**
-   `recompiler/src/cpu/cpu.c` and `runtime/src/cpu_glue.c` (1c), with 1d's
-   tests as the gate. This is correctness, it is cheap, and it may explain
-   `beads-u2x.2` / `beads-u2x.4`.
+1. **Category 1a + 1b** — float pipeline and `fcmp` (`beads-u2x.6`, P0),
+   landed in **both** `recompiler/src/cpu/cpu.c` and `runtime/src/cpu_glue.c`
+   (1c), with 1d's tests as the gate. This is correctness, it is cheap, and it
+   may explain `beads-u2x.2` / `beads-u2x.4`.
+1b. **Category 1f** — the reservation alias mask (`beads-u2x.9`, P1). Small,
+   self-contained, and provably wrong today; do it alongside 1a since it lands
+   in the same files.
 2. **Re-vendor decision.** Either merge `up/main` into the public fork
    (measured: 33 hunks, ~5 of them substantive) or cherry-pick 1a/1b/1d. The
    full merge also brings 2a/2b and forces 2d — the cherry-pick defers all
