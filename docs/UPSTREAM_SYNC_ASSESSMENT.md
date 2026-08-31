@@ -116,6 +116,20 @@ We can't inherit that bug because **we never had `ppc_fcmp` at all** — base
 
 Upstream's `ppc_fcmp` (`src/cpu/cpu.c:1321-1345`) handles all of it.
 
+### 1b-note. The fix is a three-commit cluster, not one commit
+
+Take them together: `44f3fdb` (re-route emission, emitter-only), `19ddaf5`
+("fix emitted float semantics", +169 in `cpu.c`, −75 in `emitter.c`, plus test
+growth), and `2515808` (the FPCC replace-not-OR fix). `2938368` / `0f0c995`
+follow up on keeping the C backend independent of the inline FP helper.
+
+Also worth knowing, from a scan of every upstream commit touching
+`src/frontend` and `src/analysis` since base: **there are no free decoder
+fixes.** The only commits touching decode are LLVM plumbing (`f0a86be`,
+`789240f`, `3606fbd`) and `2595de5` (code-mod support). All of upstream's
+CPU-semantics fixes since base are the float cluster above — so Category 1a/1b
+is the whole of the free correctness work, not a sample of it.
+
 ### 1c. Two landing sites, not one — the trap to design for
 
 Our runtime **reimplements** the DolRecomp cpu.c ABI in
