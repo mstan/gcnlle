@@ -2,8 +2,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+static const char* g_symbol_suffix = "";
+
+void dolrecomp_set_symbol_suffix(const char* suffix) {
+    g_symbol_suffix = (suffix && *suffix) ? suffix : "";
+}
+
+const char* dolrecomp_symbol_suffix(void) { return g_symbol_suffix; }
+
 void emit_chunk_prototype(FILE* out, u32 func_addr) {
-    fprintf(out, "void func_%08X(CPUState* ctx);\n", func_addr);
+    fprintf(out, "void func_%08X%s(CPUState* ctx);\n", func_addr,
+            g_symbol_suffix);
 }
 
 void function_list_free(FunctionList* list) {
@@ -104,7 +113,8 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
         for (u32 m = 0; m < runs[k].count; m++) {
             if (m % 4u == 0u)
                 fprintf(out, "    ");
-            fprintf(out, "func_%08X,", sorted[runs[k].first + m].start);
+            fprintf(out, "func_%08X%s,", sorted[runs[k].first + m].start,
+                    g_symbol_suffix);
             fprintf(out, (m % 4u == 3u || m + 1u == runs[k].count) ? "\n" : " ");
         }
         fprintf(out, "};\n");
@@ -116,8 +126,8 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
         if (rn->table < 0) {
             fprintf(out,
                     "    if (address >= 0x%08Xu && address < 0x%08Xu && "
-                    "((address - 0x%08Xu) & 3u) == 0u) return func_%08X;\n",
-                    rn->base, rn->end, rn->base, rn->base);
+                    "((address - 0x%08Xu) & 3u) == 0u) return func_%08X%s;\n",
+                    rn->base, rn->end, rn->base, rn->base, g_symbol_suffix);
         } else if (u32_is_pow2(rn->stride)) {
             fprintf(out,
                     "    if (address >= 0x%08Xu && address < 0x%08Xu && "

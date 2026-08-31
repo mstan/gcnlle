@@ -104,3 +104,113 @@ bypassing the IPL, so it cannot substitute for that evidence.
 - <https://github.com/ExpansionPak/ModernGekko/blob/4b94e358098970bb6d0482cf383df560e463ed07/src/runtime/legacy_runtime.cpp>
 - <https://github.com/ExpansionPak/ModernGekko/blob/4b94e358098970bb6d0482cf383df560e463ed07/src/hardware/disc_interface.cpp>
 - <https://github.com/ExpansionPak/ModernGekko/blob/4b94e358098970bb6d0482cf383df560e463ed07/include/moderngekko/module_abi.h>
+
+---
+
+# Delta re-audit addendum — 2026-08-31
+
+Re-audited snapshot: ExpansionPak/ModernGekko `master` @
+`5417826` (2026-08-23). The audited commit `4b94e358` **is** an ancestor of
+master, so this is a genuine delta, not a fork or rewrite. Full findings and the
+parallel DolRecomp assessment are in
+[`UPSTREAM_SYNC_ASSESSMENT.md`](UPSTREAM_SYNC_ASSESSMENT.md).
+
+## Decision: unchanged
+
+**The reject-as-foundation/dependency/device-model-source decision stands, with
+its original reasoning intact.** Do not revisit on maturity grounds alone.
+
+## What actually changed
+
+66 commits, 56 files, +9146/-588 since the audit. It is no longer the
+"two commits, README says unfinished" repo the audit described:
+
+- New subsystems under `src/`: `hardware/`, `gpu/`, `audio/`, `memory/`,
+  `timing/`, `dolphin_shims/`. New tooling under `tools/` (netplay, PGO, DOL
+  patching, cache affinity, an automation protocol).
+- CI now builds and tests on three platforms (`.github/workflows/build.yml`).
+- The README dropped its "Repo is not done" disclaimer and now documents a
+  code-mod ABI plus a "Hall of Fame" of third-party recomps built on it
+  (unverified third-party claims, not evidence this survey validated).
+- Its lighter `LegacyRuntime` now owns real device objects (`AddressSpace`,
+  `MmioBus`, `EventScheduler`, `ProcessorInterface`, `DiscInterface`,
+  `AudioSystem`, GX command processor) instead of delegating everything to full
+  Dolphin. This is a genuine architectural refinement.
+
+## Why the decision survives it anyway
+
+Every axis the rejection rested on is unchanged, re-verified at master:
+
+| Audit finding | Status at `5417826` |
+|---|---|
+| Boots extracted `sys/main.dol` through Dolphin, not the real IPL | **Unchanged.** `src/runtime/dolphin_runtime.cpp:758-785` still builds `BootParameters::GenerateFromFile(main_dol)` and calls `BootManager::BootCore`. |
+| No real-IPL path | **Unchanged.** No `ipl`/`bs1`/`bs2`/`bootrom` reference exists anywhere in its own sources. |
+| No EXI / RTC / SRAM / memory-card / ARAM | **Unchanged.** No matches in ModernGekko-owned code. |
+| No VI timing model | **Unchanged.** VI appears only as an interrupt-cause bit, `src/hardware/processor_interface.cpp:31`. |
+| No DSP LLE | **Unchanged.** `src/audio/audio_system.cpp` models DSP MMIO control/interrupt registers only; no DSP ROM execution. |
+| DI recognizes only `0xA8`, completes in 1 cycle | **Unchanged.** `src/hardware/disc_interface.cpp:96,103`. |
+| HLE as baseline | **Unchanged.** `LegacyRuntime::Reset()` still bootstraps low memory via Dolphin's `DolphinBoot::SetupMemory` (`src/runtime/legacy_runtime.cpp:87`) — the fake-post-BS2 pattern `CLAUDE.md` names. |
+| No byte-exact validation evidence | **Unchanged.** `tests/gx_state_test.cpp:89` asserts a mock device flag, not a golden framebuffer or hash. |
+
+## Module ABI: no backport opportunity (audit item 1 closed)
+
+The audit retained "versioned module descriptors" as an idea and noted
+ModernGekko carried chunk hashes but never verified them. Its module ABI has
+since bumped 2 → 3 (`include/moderngekko/module_abi.h:14`), but **the
+verification gap is unchanged**: `src/runtime/module.cpp:30` still only checks
+`chunk_hashes == NULL` and that ranges structurally tile. The only other
+non-assert use folds the *self-reported* hash values into a netplay fingerprint
+(`tools/netplay_compatibility.cpp:91`) — trust-on-receipt, not verification.
+
+Our `runtime/src/aot_module.c:56-92` already implements the stronger design the
+audit told us to build ourselves: real FNV-1a64 hashing over live guest RAM per
+chunk, compared against the stored hash, with VERIFIED/FAILED/UNVERIFIED state
+and write-invalidation (`:94-115`). No change warranted to `aot_module.c` or
+`gen_title_module_tables.py` on this account.
+
+## Provenance hygiene: did not net-improve
+
+- `vendor/dolphin_legacy` still has no aggregate `LICENSE`/`COPYING`/`NOTICE`/
+  `AUTHORS`; 681 of 700 files carry per-file SPDX tags.
+- `fmt` and `picojson` origins are still not inventoried in `PROVENANCE.md`
+  (zero matches), though both vendor their own license text.
+- The hard-coded-revision defect the audit flagged in
+  `tools/moderngekko_port.cpp` is **fixed in code** — its
+  `RECOMPCORE_REVISION` now matches the pinned gitlink `55c7b023` exactly and
+  has been bumped in lockstep since. But the defect **moved** rather than
+  closed: `PROVENANCE.md` still names the retired
+  `RecompCore-ModernGekko.git` / `main` @ `8b47e90b`, while `.gitmodules` points
+  at `https://github.com/ExpansionPak/RecompCore.git` branch
+  `moderngekko-vendor`. Same class of problem — documented facts not
+  mechanically kept in sync with the pin — now document-vs-code instead of
+  code-vs-code.
+
+Note for future reference: `RecompCore-ModernGekko` no longer exists as a
+repository (404). ModernGekko commit `048c426` folded it back into
+`ExpansionPak/RecompCore` as branch `moderngekko-vendor`. The submodule is not
+checked out in the survey clone, so DolRecomp's revision beneath it was **not
+confirmed** — recorded as unknown rather than assumed.
+
+## Newly worth retaining (ideas only, reimplement independently)
+
+Consistent with the original audit's posture — retain the idea, write our own code:
+
+4. **Cache-domain thread affinity.** `tools/cache_affinity.hpp` uses
+   `GetLogicalProcessorInformationEx(RelationCache, ...)` to find the logical
+   processors sharing the largest same-level cache and pins the process to that
+   domain (opt-in). Header-only, Windows-only, no Dolphin includes, no HLE-boot
+   assumption. Public Win32 technique, not creative expression worth copying —
+   relevant to our own performance campaign.
+5. **PGO profile content-hash and stale rejection.** `tools/pgo_support.*`
+   derives a deterministic per-build workspace, merges `llvm-profdata` output,
+   computes a `merged_profile_sha256`, and carries an explicit
+   `reject_stale_profile` flag. PGO is our one codegen lever that has repeatedly
+   measured a real win, and upstream DolRecomp independently built the same guard
+   (`e07701f`, "Gate a PGO build against a stale profile instead of degrading
+   silently"). Worth having as a build-reproducibility guard.
+
+Everything else screened out: `tools/dol_patch.*` is per-title byte patching of
+the HLE-boot artifact; `tools/automation_protocol.*` depends on Dolphin's
+`InputOverrider.h` and duplicates our TCP debug surface; netplay tooling is
+chassis-coupled and not a goal; the new `src/gpu`/`src/audio`/`src/hardware`
+device models are device models, and still shallower than what we have.

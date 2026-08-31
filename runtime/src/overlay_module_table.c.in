@@ -1,0 +1,60 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Generated overlay module binding. The table itself
+ * (overlay_module_tables.inc) is produced by
+ * runtime/tools/gen_overlay_module.py from captured guest pages; this file is
+ * only the glue that owns its residency state and counters.
+ */
+#include "cpu/overlay_module.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "overlay_module_tables.inc"
+
+static u32 s_resident[GCN_OVERLAY_PAGE_COUNT];
+static GcnOverlayModule s_module = {
+    s_overlay_pages,
+    s_overlay_variants,
+    s_resident,
+    GCN_OVERLAY_PAGE_COUNT,
+    GCN_OVERLAY_VARIANT_COUNT,
+};
+static int s_started;
+
+static void print_summary(void) {
+    fprintf(stderr,
+            "[overlay] summary: dispatches=%llu page-hashes=%llu "
+            "invalidations=%llu resident-pages=%u of %u\n",
+            (unsigned long long)s_module.dispatches,
+            (unsigned long long)s_module.hashes,
+            (unsigned long long)s_module.invalidations,
+            s_module.pages_resident, GCN_OVERLAY_PAGE_COUNT);
+}
+
+/* Residency starts UNKNOWN, which is NOT the zero value -- index 0 is a real
+ * variant -- so the array must be initialized before either entry point
+ * touches it. icbi can legitimately fire before the first dispatch, hence the
+ * shared lazy init rather than doing it in gcn_overlay_call alone. Kept out of
+ * a static initializer so the table stays in .bss. */
+static void ensure_init(void) {
+    if (s_started)
+        return;
+    for (u32 i = 0; i < GCN_OVERLAY_PAGE_COUNT; i++)
+        s_resident[i] = GCN_OVERLAY_UNKNOWN;
+    s_started = 1;
+    atexit(print_summary);
+    fprintf(stderr,
+            "[overlay] %u pages / %u content-keyed variants available\n",
+            GCN_OVERLAY_PAGE_COUNT, GCN_OVERLAY_VARIANT_COUNT);
+}
+
+bool gcn_overlay_call(CPUState* cpu, u32 address) {
+    ensure_init();
+    return gcn_overlay_module_call(&s_module, cpu, address);
+}
+
+void gcn_overlay_icbi(u32 address, u32 size) {
+    ensure_init();
+    gcn_overlay_module_invalidate(&s_module, address, size);
+}

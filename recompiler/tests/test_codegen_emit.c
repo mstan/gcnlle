@@ -116,9 +116,73 @@ int main(int argc, char** argv) {
     external_branch[2] = ppc_decode(0x4E800020, BASE + 0x1008);
     emit_function(out, external_branch, 3, BASE + 0x1000);
 
+    /* PORT NOTE (gcnrecomp, fix/gekko-fp-and-reservations): the six fixtures
+     * below (native_loop .. paired_merge) are ported from upstream DolRecomp
+     * tests/test_codegen_emit.c to feed tests/test_c_execute.c, which calls
+     * func_80004020/func_80004040/func_80004060/func_80004068/func_80004070
+     * directly. Deliberately NOT ported: upstream's `adjacent_branch`
+     * (BASE+0x100C) and `linked_lr_branch` (BASE+0x1018) fixtures -- neither
+     * is referenced by test_c_execute.c or needed for the function_list
+     * layout below; they exist upstream purely as extra codegen_compile
+     * smoke coverage. `local_call` (BASE+0x1030) is likewise never called by
+     * test_c_execute.c (its own internal control flow is a self-contained
+     * bl/blr loop that upstream's own test never executes either -- see
+     * upstream tests/test_c_cfg.c's separate, correctly-terminating 3-word
+     * version of the same idea), but it is kept here because upstream's
+     * fixture layout expects it to occupy BASE+0x1030..0x1040 ahead of
+     * memory_loop, and it is real, compilable emitter-coverage input either
+     * way (compile-only; test_c_execute.c never invokes func_80004030). */
+    PPCInst native_loop[4];
+    native_loop[0] = ppc_decode(0x3863FFFFu, BASE + 0x1020);
+    native_loop[1] = ppc_decode(0x2C030000u, BASE + 0x1024);
+    native_loop[2] = ppc_decode(0x4082FFF8u, BASE + 0x1028);
+    native_loop[3] = ppc_decode(0x4E800020u, BASE + 0x102C);
+    emit_function(out, native_loop, 4, BASE + 0x1020);
+
+    PPCInst local_call[4];
+    local_call[0] = ppc_decode(0x48000009u, BASE + 0x1030);
+    local_call[1] = ppc_decode(0x48000008u, BASE + 0x1034);
+    local_call[2] = ppc_decode(0x4E800020u, BASE + 0x1038);
+    local_call[3] = ppc_decode(0x4E800020u, BASE + 0x103C);
+    emit_function(out, local_call, 4, BASE + 0x1030);
+
+    PPCInst memory_loop[6];
+    memory_loop[0] = ppc_decode(0x80850000u, BASE + 0x1040);
+    memory_loop[1] = ppc_decode(0x38A50004u, BASE + 0x1044);
+    memory_loop[2] = ppc_decode(0x3863FFFFu, BASE + 0x1048);
+    memory_loop[3] = ppc_decode(0x2C030000u, BASE + 0x104C);
+    memory_loop[4] = ppc_decode(0x4082FFF0u, BASE + 0x1050);
+    memory_loop[5] = ppc_decode(0x4E800020u, BASE + 0x1054);
+    emit_function(out, memory_loop, 6, BASE + 0x1040);
+
+    PPCInst paired_compare[2];
+    paired_compare[0] = ppc_decode((4u << 26) | (2u << 23) | (1u << 16) |
+                                   (2u << 11) | (32u << 1), BASE + 0x1060);
+    paired_compare[1] = ppc_decode(0x4E800020u, BASE + 0x1064);
+    emit_function(out, paired_compare, 2, BASE + 0x1060);
+
+    PPCInst record_float[2];
+    record_float[0] = ppc_decode((59u << 26) | (3u << 21) | (1u << 16) |
+                                 (2u << 11) | (21u << 1) | 1u,
+                                 BASE + 0x1068);
+    record_float[1] = ppc_decode(0x4E800020u, BASE + 0x106C);
+    emit_function(out, record_float, 2, BASE + 0x1068);
+
+    PPCInst paired_merge[2];
+    paired_merge[0] = ppc_decode((4u << 26) | (5u << 21) | (1u << 16) |
+                                 (2u << 11) | (528u << 1), BASE + 0x1070);
+    paired_merge[1] = ppc_decode(0x4E800020u, BASE + 0x1074);
+    emit_function(out, paired_merge, 2, BASE + 0x1070);
+
     FunctionList funcs = {0};
     if (!function_list_add(&funcs, BASE, BASE + (u32)count * 4u) ||
-        !function_list_add(&funcs, BASE + 0x1000, BASE + 0x100C)) {
+        !function_list_add(&funcs, BASE + 0x1000, BASE + 0x100C) ||
+        !function_list_add(&funcs, BASE + 0x1020, BASE + 0x1030) ||
+        !function_list_add(&funcs, BASE + 0x1030, BASE + 0x1040) ||
+        !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058) ||
+        !function_list_add(&funcs, BASE + 0x1060, BASE + 0x1068) ||
+        !function_list_add(&funcs, BASE + 0x1068, BASE + 0x1070) ||
+        !function_list_add(&funcs, BASE + 0x1070, BASE + 0x1078)) {
         function_list_free(&funcs);
         free(insts);
         if (out != stdout) fclose(out);

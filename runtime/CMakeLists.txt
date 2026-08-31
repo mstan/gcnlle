@@ -93,9 +93,11 @@ add_library(gcn_runtime_core STATIC
   src/cpu_glue.c
   src/interpreter.c
   src/aot_module.c
+  src/overlay_module.c
   src/native_code.c
   src/dsp_regs.c
   src/title_module_none.c
+  src/overlay_none.c
   src/rings.c
   src/seed.c
   src/trace.c
@@ -312,6 +314,46 @@ if(GCN_WITH_GENERATED)
       "LLE content-validated title module: ${GCN_TITLE_GENERATED_DIR}")
   endif()
 
+  # Optional content-keyed OVERLAY module (runtime/tools/gen_overlay_module.py).
+  #
+  # Relocatable overlay code -- Wind Waker's REL modules -- is loaded into RAM
+  # at runtime, so it appears in no static image and every execution of it falls
+  # back to the interpreter. This links recompiled copies of pages captured from
+  # a real run. Unlike the title module above, an address here does NOT identify
+  # code (one page hosts many overlays over a run), so each variant is keyed by
+  # the hash of the exact bytes it was compiled from and the runtime picks the
+  # resident one. No match means a miss and the interpreter runs, as before.
+  set(GCN_OVERLAY_GENERATED_DIR "" CACHE PATH
+      "gen_overlay_module.py output directory for content-keyed overlay code")
+  set(GCN_OVERLAY_MODULE_SOURCE)
+  set(GCN_OVERLAY_GENERATED_CHUNKS)
+  if(GCN_OVERLAY_GENERATED_DIR)
+    if(NOT EXISTS "${GCN_OVERLAY_GENERATED_DIR}/overlay_module_tables.inc")
+      message(FATAL_ERROR
+        "GCN_OVERLAY_GENERATED_DIR has no overlay_module_tables.inc: "
+        "${GCN_OVERLAY_GENERATED_DIR}")
+    endif()
+    file(GLOB GCN_OVERLAY_GENERATED_CHUNKS CONFIGURE_DEPENDS
+         "${GCN_OVERLAY_GENERATED_DIR}/chunks/*.c")
+    if(NOT GCN_OVERLAY_GENERATED_CHUNKS)
+      message(FATAL_ERROR "overlay module has no chunks")
+    endif()
+    configure_file(src/overlay_module_table.c.in
+                   "${CMAKE_CURRENT_BINARY_DIR}/overlay_module_table.c" @ONLY)
+    set(GCN_OVERLAY_MODULE_SOURCE
+        "${CMAKE_CURRENT_BINARY_DIR}/overlay_module_table.c")
+    # The .inc and the shared ABI header both live in the generated dir.
+    set_source_files_properties("${GCN_OVERLAY_MODULE_SOURCE}" PROPERTIES
+      INCLUDE_DIRECTORIES "${GCN_OVERLAY_GENERATED_DIR}")
+    # Overlay chunks are numerous but tiny (one 4 KiB page each); -O1 keeps
+    # build time sane and matches the ITERATE posture for generated guest code.
+    set_source_files_properties(${GCN_OVERLAY_GENERATED_CHUNKS} PROPERTIES
+      COMPILE_OPTIONS "-O1;-g0")
+    list(LENGTH GCN_OVERLAY_GENERATED_CHUNKS GCN_OVERLAY_CHUNK_TOTAL)
+    message(STATUS
+      "content-keyed overlay module: ${GCN_OVERLAY_CHUNK_TOTAL} variants from ${GCN_OVERLAY_GENERATED_DIR}")
+  endif()
+
   add_executable(gcn_boot
     src/boot.c
     src/dispatch.c
@@ -341,6 +383,8 @@ if(GCN_WITH_GENERATED)
     ${GCN_TITLE_MODULE_SOURCE}
     ${GCN_TITLE_MODULE_TABLES}
     ${GCN_TITLE_GENERATED_CHUNKS}
+    ${GCN_OVERLAY_MODULE_SOURCE}
+    ${GCN_OVERLAY_GENERATED_CHUNKS}
     generated/generated.c
     ${GCN_GENERATED_CHUNKS}
   )
@@ -384,6 +428,15 @@ if(GCN_WITH_GENERATED)
   target_link_libraries(gcn_boot PRIVATE gcn_runtime_core gcn_dsp_lle
                          ipl_descramble_core ws2_32 synchronization winmm ole32 uuid avrt
                          user32 gdi32 opengl32)
+  # Opt the generated guest code into the real write-watch ring. The emitter
+  # emits gcn_ring_watch_check calls in every store fast path, but guards the
+  # #include "debug/rings.h" behind this macro so emitted C still compiles
+  # standalone against the recompiler include path alone -- which is what the
+  # recompiler's own codegen_compile / bl_shadow_exactness / poll_loop_exactness
+  # / c_execute tests do. Only a hosting runtime, which has debug/rings.h, sets
+  # it. Applies to this target's own generated chunks AND the optional per-title
+  # module chunks, both of which are sources of gcn_boot.
+  target_compile_definitions(gcn_boot PRIVATE DOLRECOMP_HOST_RINGS=1)
   # SNAPSHOT_RESUME (docs/SNAPSHOT_RESUME.md): stamp the framework commit id
   # into the snapshot header (snapshot.c's GCN_BUILD_GIT_SHA). Best-effort —
   # falls back to snapshot.h's own "unknown" default if git isn't available

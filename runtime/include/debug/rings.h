@@ -220,6 +220,27 @@ static inline void gcn_ring_watch_check_span(u32 ea, u32 len, u32 tag) {
  * FIFO payload (did an IRQ land while the guest was building/pushing it?). */
 void gcn_ring_event_dump_stderr(int max_entries);
 
+/* ---------------------------------------------------------------------------
+ * XFB publication counter — owned by the ring layer, driven by GX.
+ *
+ * Ring events stamp the current XFB publication count so a captured event can
+ * be located against presentation. The counter used to live in gx.c and rings.c
+ * called gcn_gx_xfb_pub_count() to read it -- a debug ring reaching UPWARD into
+ * a device model. That broke the link for every target that uses
+ * gcn_runtime_core without gx.c (gcn_runtime and all the light unit tests),
+ * because gx.c is only a source of gcn_boot. See beads-u2x.10; introduced by
+ * 7c1bb73.
+ *
+ * The storage now lives in the ring layer, which is below GX and always linked.
+ * GX advances it at publication and saves/restores it for snapshots; gx.c keeps
+ * gcn_gx_xfb_pub_count() as a thin forwarder so its existing callers are
+ * unchanged. In a build with no GX the counter simply stays 0, which is the
+ * truth for that build rather than a synthesized value.
+ * ------------------------------------------------------------------------- */
+u64 gcn_ring_xfb_pub_advance(void);       /* ++, returns the new value */
+u64 gcn_ring_xfb_pub_count(void);
+void gcn_ring_xfb_pub_set(u64 pubs);      /* snapshot restore */
+
 #ifdef __cplusplus
 }
 #endif

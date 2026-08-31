@@ -1,4 +1,5 @@
 #include "app/cli.h"
+#include "backend/dispatch.h"   /* dolrecomp_set_symbol_suffix */
 #include "app/setup.h"
 #include "app/database.h"
 #include "app/paths.h"
@@ -23,6 +24,9 @@ int main(int argc, char** argv) {
         return 1;
     if (opts.show_help)
         return 0;
+    /* Applies to every emission path below; empty by default, which keeps
+     * the historical func_<addr> names byte for byte. */
+    dolrecomp_set_symbol_suffix(opts.symbol_suffix);
     if (opts.setup_mode)
         return run_setup() ? 0 : 1;
 

@@ -275,8 +275,13 @@ static const u8* rom_window_resolve(CPUState* cpu, u32 addr, u32* avail) {
  * Reservation bookkeeping (lwarx/stwcx) — mirror of recompiler cpu.c
  * ------------------------------------------------------------------------- */
 
+/* Alias-folded reservation compare; see gcn_reservation_key() in
+ * memory/memory.h for why the raw effective address is the wrong thing to
+ * compare and which three MEM1 windows have to be folded together. */
 static void clear_matching_reservation(CPUState* cpu, u32 addr) {
-    if (cpu->reserve_valid && ((cpu->reserve_addr ^ addr) & ~31u) == 0)
+    if (!cpu->reserve_valid)
+        return;
+    if (gcn_reservation_hit(cpu->reserve_addr, addr))
         cpu->reserve_valid = false;
 }
 

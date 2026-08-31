@@ -21,6 +21,7 @@
 #include "dsp_lle_c.h"
 #include "cpu/native_code.h"
 #include "cpu/title_module.h"
+#include "cpu/overlay_module.h"
 #include "debug/rings.h"
 
 #include <stdio.h>
@@ -1299,6 +1300,7 @@ int gcn_snapshot_load(const char* path, CPUState* cpu, const GcnDebugCtx* ctx,
      * entry point (title_module.c.in) that calls gcn_aot_module_invalidate
      * on the live module singleton. */
     gcn_title_module_icbi(GC_RAM_BASE, GC_MAIN_RAM_SIZE);
+    gcn_overlay_icbi(GC_RAM_BASE, GC_MAIN_RAM_SIZE);
     /* Rings: pure observability, always safe to fully clear. */
     gcn_rings_reset();
     /* GX draw-config-cache/census/texel-cache host memos: gx_raster_init
