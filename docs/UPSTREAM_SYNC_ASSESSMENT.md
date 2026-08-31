@@ -268,6 +268,40 @@ own trailing-runtime-only-fields contract, and our runtime owns its own
 and it **gates the LLVM backend**, which reads state through ~50 hardcoded
 `offsetof(CPUState, field)` sites.
 
+**Split the ripple — our ABI contract is by field name, not byte layout**
+(`runtime/include/cpu/cpu.h:20-23`: generated code "only names fields, never
+assumes sizeof or trailing layout"). So what matters is only what the *C
+emitter emits*:
+
+- **The SPR restructuring is a non-issue for us.** `spr_read`, `spr_write`,
+  `cache_control` and `external_pointer` are **never named by the C emitter** —
+  they are cpu.c- and LLVM-internal. We can decline that change and keep
+  `spr[1024]`; our 22 `spr[...]` uses across `cpu_glue.c`, `debug_server.c` and
+  `dispatch.c` are safe.
+- **`downcount` is a real collision, and it is the deepest one in the tree.**
+  Upstream's C emitter emits it throughout: `emitter.c:1947` charges
+  `ctx->downcount -= block_cycles[i]` per basic block in the main emission
+  loop, `:1958` yields on `downcount <= -DOLRECOMP_C_LOOP_CYCLE_BUDGET`,
+  `:387`/`:401` emit that same yield check on every local backward branch
+  inside the general `emit_direct_branch`, and `:1892` does it again in the
+  outlined-loop path.
+
+That is **a second, complete cycle-accounting and yield architecture**, sitting
+in exactly the emitter regions where we built ours (`dr_cycles`,
+`dr_deadline`, `DR_RET`, Phase A coalesced per-basic-block charging, and
+`ppc_cycles.c` derived per-instruction Dolphin-model costs with lazy DSP flush).
+The two are mutually exclusive, and its per-block costs come from `c_cfg`'s
+`block_cycles` — so declining `c_cfg` (2c) does **not** cleanly decline
+`downcount`; they are entangled.
+
+**Ours should win.** Theirs is a fixed cycle budget; ours is oracle-gated
+derived cycle accuracy modeled on Dolphin's per-instruction costs. Adopting
+theirs would be a fidelity regression, not a gain.
+
+**Consequence for sequencing:** a blind full merge is *not* the cheap route to
+the Category 1 fixes. It drags in an architecture fight whose resolution is
+"keep ours" anyway. See the revised order below.
+
 ### 2e. FP-unavailable — convergent, and each side has the better half
 
 Base had no FP-unavailable modeling. Both sides added it **independently,
@@ -371,20 +405,59 @@ None of that moves the axis the rejection was about. Re-verified at master:
 
 ## Recommended order
 
-1. **Category 1a + 1b** — float pipeline and `fcmp` (`beads-u2x.6`, P0),
-   landed in **both** `recompiler/src/cpu/cpu.c` and `runtime/src/cpu_glue.c`
-   (1c), with 1d's tests as the gate. This is correctness, it is cheap, and it
-   may explain `beads-u2x.2` / `beads-u2x.4`.
-1b. **Category 1f** — the reservation alias mask (`beads-u2x.9`, P1). Small,
-   self-contained, and provably wrong today; do it alongside 1a since it lands
-   in the same files.
-2. **Re-vendor decision.** Either merge `up/main` into the public fork
-   (measured: 33 hunks, ~5 of them substantive) or cherry-pick 1a/1b/1d. The
-   full merge also brings 2a/2b and forces 2d — the cherry-pick defers all
-   three. Carry the 3 fork-absent local commits forward either way.
-3. **2a dispatch** head-to-head, then **2b** cross-chunk calls.
-4. **2d `CPUState`** reconciliation — the gate on anything LLVM.
-5. Offer 2e's psq priority ordering upstream.
+Revised after finding the `downcount` collision (2d). The guiding rule is
+**take what is better or neutral, decline what would regress us** — not
+"import the maximum number of upstream commits."
+
+**Stage 1 — the correctness pass (do this first, as one unit).**
+Port, do not merge: the float cluster (`44f3fdb` + `19ddaf5` + `2515808`,
+`beads-u2x.6`, P0) and the reservation alias mask (`93b881c`'s fix,
+`beads-u2x.9`, P1). These are genuinely separable — they concern *which helper
+computes a value*, not how cycles are charged, so they carry none of the
+`downcount`/`c_cfg` entanglement. They land in the same four files
+(`recompiler/src/cpu/cpu.c`, `recompiler/src/backend/emitter.c`,
+`runtime/src/cpu_glue.c`, `runtime/src/memory.c`), so one regen + validation
+cycle covers both. Gate with `test_fpscr.c` + `test_float_semantics.c` + the
+`test_c_execute.c` port (1d), which build against `dr_cpu` alone and are already
+verified green here.
+
+**Stage 2 — test the Wind Waker hypothesis immediately.** With Stage 1 in,
+re-run the title screen and the ocean and record the result **either way**.
+If the FP fix explains `beads-u2x.4` / `beads-u2x.2`, it redirects a whole line
+of GX-side investigation; if it doesn't, that disproof belongs in both beads
+before anyone re-derives it.
+
+**Stage 3 — the re-vendor decision (`beads-u2x.7`), now informed.** With
+Stage 1 already banked, the merge's remaining value is dispatch (2a),
+cross-chunk calls (2b), the symbol-map tooling (1e) and staying close to
+upstream. Its remaining cost is the `downcount` reconciliation, which must
+resolve as "keep our cycle architecture." Do it as an explicit merge with that
+resolution rule written down in advance, not hunk-by-hunk improvisation. Carry
+the 3 fork-absent local commits forward.
+
+**Stage 4 — measure, don't assume.** Dispatch head-to-head on our own images
+(`beads-u2x.8`; may legitimately be a null for the single-run IPL), then
+cross-chunk calls. Under the standing bench protocol: runaway check first, no
+device-kill A/B.
+
+**Stage 5 — `CPUState` for LLVM only.** The SPR half is a non-issue for the C
+backend (2d); the `offsetof` reconciliation only matters if LLVM is ever
+adopted, which needs a measurement on our workload first.
+
+**Offer upstream:** our psq FP-unavailable exception priority ordering (2e).
+
+### Still open (work, not decisions)
+
+- Does routing FP through helpers cost throughput? Upstream measured the FP
+  gate at ~7.1% self time when called per site and answered it with an
+  inlinable form (`79534d8`). If re-routing measures a real loss, take that
+  same approach — emit an inlinable helper — rather than keeping wrong
+  arithmetic.
+- Is `~0x40000000` the complete alias story for *our* address map? Check
+  against the configured RAM/MMIO windows before hardcoding upstream's constant.
+- `runtime/src/interpreter.c:689-690` implements `stwcx.` by checking
+  `reserve_valid` alone, never comparing the address — inconsistent with the
+  recompiled path. Justify in a comment or align.
 
 ## Method note
 
